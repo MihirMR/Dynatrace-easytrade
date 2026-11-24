@@ -86,6 +86,14 @@ func InitFlags() map[string]*Flag {
 			IsModifiable: enableModify,
 			Tag:          "problem_pattern",
 		},
+		"portfolio-insights-enabled": {
+			ID:           "portfolio-insights-enabled",
+			Enabled:      getEnvBool("ENABLE_PORTFOLIO_INSIGHTS", false),
+			Name:         "Portfolio insights",
+			Description:  "When enabled, shows the simulated Portfolio Insights page and alerts and enables alert evaluation in broker-service. Demo feature, not financial advice.",
+			IsModifiable: enableModify,
+			Tag:          "feature",
+		},
 	}
 
 	for _, f := range flags {

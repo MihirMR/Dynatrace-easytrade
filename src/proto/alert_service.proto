@@ -39,6 +39,7 @@ message CreateAlertRequest {
 message ListAlertsRequest {
   // Empty means all accounts
   string account_id = 1;
+  // Enabled and not triggered
   bool armed_only = 2;
   bool triggered_only = 3;
   bool unacknowledged_only = 4;
@@ -69,7 +70,8 @@ message TriggerAlertResponse {
 }
 
 service AlertService {
-  // Insert an armed alert (enabled = true, arming_revision = 1, acknowledged = false); the adapter stamps created_at
+  // Insert an armed alert (enabled = true, arming_revision = 1, acknowledged = false)
+  // The database generates the id and the adapter stamps created_at
   rpc CreateAlert(CreateAlertRequest) returns (AlertMessage) {}
 
   // Get alerts filtered as flagged, ordered by created_at DESC, id DESC (triggered_at DESC with triggered_only)
@@ -79,16 +81,18 @@ service AlertService {
   rpc GetAlert(AlertIdRequest) returns (AlertMessage) {}
 
   // enabled = true re-arms: clears triggered_at, trigger_value and acknowledged and adds 1 to arming_revision
-  // enabled = false only disables. Returns the row as this update wrote it
+  // enabled = false only disables. Returns the row as this update wrote it, read in the same transaction
+  // NotFound when no row matched
   rpc UpdateAlertEnabled(UpdateAlertEnabledRequest) returns (AlertMessage) {}
 
   // Delete one alert by id (NotFound when no row is deleted)
   rpc DeleteAlert(AlertIdRequest) returns (easytrade.dbadapter.common.BatchResponse) {}
 
-  // The only writer of triggered_at: one conditional update (id and arming_revision match, enabled AND triggered_at IS NULL)
-  // Zero rows returns triggered = false, not an error
+  // The only writer of a non-null triggered_at: one conditional update on id and arming_revision
+  // where enabled = true AND triggered_at IS NULL. Zero rows returns triggered = false, not an error
   rpc TriggerAlert(TriggerAlertRequest) returns (TriggerAlertResponse) {}
 
-  // Set acknowledged = true on a triggered alert; an untriggered alert is a no-op reporting affected = 0
+  // Set acknowledged = true when the current arming has triggered; otherwise a no-op reporting affected = 0
+  // NotFound for an unknown id
   rpc AcknowledgeAlert(AlertIdRequest) returns (easytrade.dbadapter.common.BatchResponse) {}
 }
