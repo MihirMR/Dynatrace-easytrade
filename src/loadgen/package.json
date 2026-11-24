@@ -8,7 +8,8 @@
     "start": "node .",
     "dev": "node -r ts-node/register --env-file=.env ./src/main.ts",
     "format": "prettier -w .",
-    "lint": "eslint ./src"
+    "lint": "eslint ./src",
+    "test": "tsc && node --test \"build/**/*.test.js\""
   },
   "dependencies": {
     "@demoability/loadgen-core": "^1.3.36",

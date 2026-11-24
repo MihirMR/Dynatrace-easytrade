@@ -1,0 +1,94 @@
+syntax = "proto3";
+
+package easytrade.dbadapter.alert;
+
+option csharp_namespace = "EasyTrade.DbAdapter.Alert.Grpc";
+option go_package = "github.com/dynatrace/easytrade/dbadapter/proto";
+option java_package = "com.dynatrace.easytrade.dbadapter.alert.grpc";
+option java_multiple_files = true;
+
+import "google/protobuf/timestamp.proto";
+import "google/protobuf/wrappers.proto";
+import "common.proto";
+
+// Decimals (threshold, trigger_value) travel as normalised invariant-culture strings, never as double
+// An empty trigger_value and an unset triggered_at mean no trigger
+message AlertMessage {
+  string id = 1;
+  string account_id = 2;
+  string type = 3;
+  string instrument_id = 4;
+  string direction = 5;
+  string threshold = 6;
+  bool enabled = 7;
+  int32 arming_revision = 8;
+  google.protobuf.Timestamp triggered_at = 9;
+  string trigger_value = 10;
+  bool acknowledged = 11;
+  google.protobuf.Timestamp created_at = 12;
+}
+
+message CreateAlertRequest {
+  string account_id = 1;
+  string type = 2;
+  string instrument_id = 3;
+  string direction = 4;
+  string threshold = 5;
+}
+
+message ListAlertsRequest {
+  // Empty means all accounts
+  string account_id = 1;
+  bool armed_only = 2;
+  bool triggered_only = 3;
+  bool unacknowledged_only = 4;
+}
+
+message AlertsResponse {
+  repeated AlertMessage alerts = 1;
+}
+
+message AlertIdRequest {
+  string id = 1;
+}
+
+message UpdateAlertEnabledRequest {
+  string id = 1;
+  // Wrapper type, so an omitted value is distinguishable from false
+  google.protobuf.BoolValue enabled = 2;
+}
+
+message TriggerAlertRequest {
+  string id = 1;
+  int32 arming_revision = 2;
+  string trigger_value = 3;
+}
+
+message TriggerAlertResponse {
+  bool triggered = 1;
+}
+
+service AlertService {
+  // Insert an armed alert (enabled = true, arming_revision = 1, acknowledged = false); the adapter stamps created_at
+  rpc CreateAlert(CreateAlertRequest) returns (AlertMessage) {}
+
+  // Get alerts filtered as flagged, ordered by created_at DESC, id DESC (triggered_at DESC with triggered_only)
+  rpc ListAlerts(ListAlertsRequest) returns (AlertsResponse) {}
+
+  // Get one alert by id (NotFound for an unknown id)
+  rpc GetAlert(AlertIdRequest) returns (AlertMessage) {}
+
+  // enabled = true re-arms: clears triggered_at, trigger_value and acknowledged and adds 1 to arming_revision
+  // enabled = false only disables. Returns the row as this update wrote it
+  rpc UpdateAlertEnabled(UpdateAlertEnabledRequest) returns (AlertMessage) {}
+
+  // Delete one alert by id (NotFound when no row is deleted)
+  rpc DeleteAlert(AlertIdRequest) returns (easytrade.dbadapter.common.BatchResponse) {}
+
+  // The only writer of triggered_at: one conditional update (id and arming_revision match, enabled AND triggered_at IS NULL)
+  // Zero rows returns triggered = false, not an error
+  rpc TriggerAlert(TriggerAlertRequest) returns (TriggerAlertResponse) {}
+
+  // Set acknowledged = true on a triggered alert; an untriggered alert is a no-op reporting affected = 0
+  rpc AcknowledgeAlert(AlertIdRequest) returns (easytrade.dbadapter.common.BatchResponse) {}
+}

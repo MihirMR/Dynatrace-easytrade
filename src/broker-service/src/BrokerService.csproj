@@ -26,5 +26,6 @@
     <Protobuf Include="..\..\proto\instrument_service.proto" GrpcServices="Client" />
     <Protobuf Include="..\..\proto\product_service.proto" GrpcServices="Client" />
     <Protobuf Include="..\..\proto\trade_service.proto" GrpcServices="Client" />
+    <Protobuf Include="..\..\proto\alert_service.proto" GrpcServices="Client" />
   </ItemGroup>
 </Project>
