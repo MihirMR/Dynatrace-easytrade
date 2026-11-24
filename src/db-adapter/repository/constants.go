@@ -2,6 +2,7 @@ package repository
 
 const (
 	TableAccounts              = "Accounts"
+	TableAlerts                = "Alerts"
 	TableBalances              = "Balance"
 	TableBalanceHistory        = "Balancehistory"
 	TableCreditCardOrders      = "CreditCardOrders"
@@ -30,10 +31,22 @@ const (
 	ColTradeClosed       = "TradeClosed"
 	ColTimestampOpen     = "TimestampOpen"
 	ColTimestampClose    = "TimestampClose"
+	ColType              = "Type"
+	ColThreshold         = "Threshold"
+	ColEnabled           = "Enabled"
+	ColArmingRevision    = "ArmingRevision"
+	ColTriggeredAt       = "TriggeredAt"
+	ColTriggerValue      = "TriggerValue"
+	ColAcknowledged      = "Acknowledged"
+	ColCreatedAt         = "CreatedAt"
 )
 
 const (
-	StatusOrderCreated = "order_created"
-	DirectionLongBuy   = "longbuy"
-	DirectionLongSell  = "longsell"
+	StatusOrderCreated   = "order_created"
+	DirectionLongBuy     = "longbuy"
+	DirectionLongSell    = "longsell"
+	AlertTypeTargetPrice = "TARGET_PRICE"
+	AlertTypeProfitLoss  = "PROFIT_LOSS"
+	AlertDirectionAbove  = "ABOVE"
+	AlertDirectionBelow  = "BELOW"
 )
