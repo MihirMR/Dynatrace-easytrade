@@ -17,6 +17,7 @@ type DBBackend interface {
 	Pricing() PricingRepository
 	Product() ProductRepository
 	Trade() TradeRepository
+	Alert() AlertRepository
 }
 
 type AccountRepository interface {
@@ -85,4 +86,26 @@ type TradeRepository interface {
 	GetExpired(ctx context.Context) ([]*pb.TradeMessage, error)
 	GetByAccount(ctx context.Context, accountID string, onlyOpen, onlyLong bool) ([]*pb.TradeMessage, error)
 	DeleteOlderThan(ctx context.Context, date time.Time) (int32, error)
+}
+
+type AlertRepository interface {
+	// Create inserts an armed alert: enabled, arming revision 1, not acknowledged, no trigger
+	Create(ctx context.Context, req *pb.CreateAlertRequest) (*pb.AlertMessage, error)
+	// List returns all accounts' alerts when req.AccountId is empty; ArmedOnly, TriggeredOnly
+	// and UnacknowledgedOnly combine with AND
+	List(ctx context.Context, req *pb.ListAlertsRequest) ([]*pb.AlertMessage, error)
+	// GetByID returns ErrNotFound for an unknown id
+	GetByID(ctx context.Context, id string) (*pb.AlertMessage, error)
+	// UpdateEnabled with true re-arms: enables, clears the trigger fields and acknowledged, and adds
+	// 1 to ArmingRevision; with false it only sets Enabled = false. It returns the row as this call
+	// wrote it, read in the same transaction, and ErrNotFound for an unknown id
+	UpdateEnabled(ctx context.Context, id string, enabled bool) (*pb.AlertMessage, error)
+	// Delete returns ErrNotFound for an unknown id
+	Delete(ctx context.Context, id string) (int32, error)
+	// Trigger is the only writer of a non-null TriggeredAt: one conditional statement on id,
+	// arming revision, enabled and untriggered. Zero matching rows returns (false, nil), not an error
+	Trigger(ctx context.Context, id string, armingRevision int32, triggerValue string) (bool, error)
+	// Acknowledge returns ErrNotFound for an unknown id and (0, nil) for a known id whose current
+	// arming has not triggered
+	Acknowledge(ctx context.Context, id string) (int32, error)
 }

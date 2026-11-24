@@ -24,6 +24,7 @@ type sqlBackend struct {
 	pricing    repository.PricingRepository
 	product    repository.ProductRepository
 	trade      repository.TradeRepository
+	alert      repository.AlertRepository
 }
 
 var _ repository.DBBackend = (*sqlBackend)(nil)
@@ -50,6 +51,7 @@ func (r *sqlBackend) Package() repository.PackageRepository            { return 
 func (r *sqlBackend) Pricing() repository.PricingRepository            { return r.pricing }
 func (r *sqlBackend) Product() repository.ProductRepository            { return r.product }
 func (r *sqlBackend) Trade() repository.TradeRepository                { return r.trade }
+func (r *sqlBackend) Alert() repository.AlertRepository                { return r.alert }
 func (r *sqlBackend) Ping(ctx context.Context) error {
 	sqlDB, err := r.gormDB.DB()
 	if err != nil {

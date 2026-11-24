@@ -17,12 +17,14 @@ public class BrokerExceptionFilter(ILogger<BrokerExceptionFilter> logger) : IExc
             or InstrumentNotFoundException
             or ProductNotFoundException
             or PriceNotFoundException
+            or AlertNotFoundException
                 => StatusCodes.Status404NotFound,
             NotEnoughMoneyException
             or NotEnoughAssetsException
             or NegativeAmountException
+            or InvalidAlertException
                 => StatusCodes.Status400BadRequest,
-            DbException => StatusCodes.Status503ServiceUnavailable,
+            DbException or PricingUnavailableException => StatusCodes.Status503ServiceUnavailable,
             _ => StatusCodes.Status500InternalServerError,
         };
 

@@ -32,6 +32,8 @@ UNION ALL
 SELECT 'CreditCardOrderStatus',         COUNT(*)           FROM [dbo].[CreditCardOrderStatus]
 UNION ALL
 SELECT 'CreditCards',                   COUNT(*)           FROM [dbo].[CreditCards]
+UNION ALL
+SELECT 'Alerts',                        COUNT(*)           FROM [dbo].[Alerts]
 ORDER BY [Table];
 "
 
