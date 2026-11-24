@@ -143,3 +143,65 @@ func TestUpdate_notFound_404(t *testing.T) {
 		t.Errorf("expected 404, got %d", w.Code)
 	}
 }
+
+func hyphenatedIDTestFlags() map[string]*Flag {
+	return map[string]*Flag{
+		"portfolio-insights-enabled": {ID: "portfolio-insights-enabled", Enabled: false, Name: "Portfolio insights", Description: "Test portfolio insights flag", IsModifiable: true, Tag: "feature"},
+	}
+}
+
+func TestGetByID_hyphenatedID_200(t *testing.T) {
+	r := newTestRouter(NewService(hyphenatedIDTestFlags()))
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest(http.MethodGet, "/v1/flags/portfolio-insights-enabled", nil)
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Errorf("expected 200, got %d", w.Code)
+	}
+	var f Flag
+	if err := json.Unmarshal(w.Body.Bytes(), &f); err != nil {
+		t.Fatalf("failed to unmarshal response: %v", err)
+	}
+	if f.ID != "portfolio-insights-enabled" {
+		t.Errorf("expected portfolio-insights-enabled, got %s", f.ID)
+	}
+}
+
+func TestUpdate_hyphenatedID_200(t *testing.T) {
+	r := newTestRouter(NewService(hyphenatedIDTestFlags()))
+	w := httptest.NewRecorder()
+	body := bytes.NewBufferString(`{"enabled": true}`)
+	req, _ := http.NewRequest(http.MethodPut, "/v1/flags/portfolio-insights-enabled", body)
+	req.Header.Set("Content-Type", "application/json")
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Errorf("expected 200, got %d", w.Code)
+	}
+	var f Flag
+	if err := json.Unmarshal(w.Body.Bytes(), &f); err != nil {
+		t.Fatalf("failed to unmarshal: %v", err)
+	}
+	if f.Enabled != true {
+		t.Error("expected enabled to be true")
+	}
+}
+
+func TestGetByTag_feature_listsPortfolioInsights(t *testing.T) {
+	r := newTestRouter(NewService(InitFlags()))
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest(http.MethodGet, "/v1/flags?tag=feature", nil)
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Errorf("expected 200, got %d", w.Code)
+	}
+	var container FlagContainer
+	if err := json.Unmarshal(w.Body.Bytes(), &container); err != nil {
+		t.Fatalf("failed to unmarshal: %v", err)
+	}
+	if len(container.Results) != 1 {
+		t.Fatalf("expected 1 feature flag, got %d", len(container.Results))
+	}
+	if container.Results[0].ID != "portfolio-insights-enabled" {
+		t.Errorf("expected portfolio-insights-enabled, got %s", container.Results[0].ID)
+	}
+}
