@@ -163,4 +163,53 @@ export const selectors = {
         "order-id-view",
         '//p[@id="order-id"]'
     ),
+    navigation_portfolioInsightsPage: new XpathSelector(
+        "portfolio-insights-page-nav",
+        '//a[@id="nav-portfolio-insights"]'
+    ),
+    portfolioInsightsPage_root: new XpathSelector(
+        "portfolio-insights-root",
+        '//div[@id="portfolio-insights"]'
+    ),
+    portfolioInsightsPage_alertType: new XpathSelector(
+        "alert-type-select",
+        '//select[@id="alert-type"]'
+    ),
+    portfolioInsightsPage_alertInstrument: new XpathSelector(
+        "alert-instrument-select",
+        '//select[@id="alert-instrument"]'
+    ),
+    portfolioInsightsPage_alertDirection: new XpathSelector(
+        "alert-direction-select",
+        '//select[@id="alert-direction"]'
+    ),
+    portfolioInsightsPage_alertThreshold: new XpathSelector(
+        "alert-threshold-input",
+        '//input[@id="alert-threshold"]'
+    ),
+    portfolioInsightsPage_alertInstrumentOption: new XpathSelector(
+        "alert-instrument-option",
+        '//select[@id="alert-instrument"]/option[@value!=""]'
+    ),
+    portfolioInsightsPage_alertSubmit: new XpathSelector(
+        "alert-submit-button",
+        '//button[@id="alert-submit"]'
+    ),
+    portfolioInsightsPage_createdAlert: (marker: string) =>
+        new XpathSelector(
+            "alert-created-id-view",
+            `//output[@id="alert-created-id"][@data-threshold="${marker}"]`
+        ),
+    portfolioInsightsPage_deletedAlert: (id: string) =>
+        new XpathSelector(
+            "alert-deleted-id-view",
+            `//output[@id="alert-deleted-id"][@value="${id}"]`
+        ),
+    portfolioInsightsPage_alertRow: (id: string) =>
+        new XpathSelector("alert-row", `//li[@data-alert-id="${id}"]`),
+    portfolioInsightsPage_alertRowDelete: (id: string) =>
+        new XpathSelector(
+            "alert-row-delete-button",
+            `//li[@data-alert-id="${id}"]//button[contains(@class, "alert-delete")]`
+        ),
 }

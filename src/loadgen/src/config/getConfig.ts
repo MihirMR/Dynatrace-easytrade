@@ -100,6 +100,10 @@ export function getConfig(): Config {
                 "SELL_AND_WITHDRAW_SUCCESS_WEIGHT",
                 1
             ),
+            portfolio_insights_alert: EnvConfig.ensureNumber(
+                "PORTFOLIO_INSIGHTS_ALERT_WEIGHT",
+                0
+            ),
         },
     }
 }

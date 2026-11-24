@@ -1,0 +1,191 @@
+import "@testing-library/jest-dom/vitest"
+import {
+    getJsonWithTimeout,
+    patchJson,
+    postJsonText,
+    services,
+} from "../../api/http"
+
+// Transport-level cases for http.ts itself, chiefly the caller-signal paths of
+// getJsonWithTimeout, which the feature API suites never pass a signal through.
+
+type Respond = (init: RequestInit | undefined) => Promise<Response>
+
+function jsonResponse(body: unknown, status = 200): Response {
+    return new Response(JSON.stringify(body), {
+        status,
+        headers: { "Content-Type": "application/json" },
+    })
+}
+
+/** Never settles on its own; rejects with AbortError once its signal aborts. */
+function hangUntilAborted(init: RequestInit | undefined): Promise<Response> {
+    return new Promise<Response>((_, reject) => {
+        const signal = init?.signal
+        const abort = (): void =>
+            reject(new DOMException("Aborted", "AbortError"))
+        if (signal?.aborted) {
+            abort()
+            return
+        }
+        signal?.addEventListener("abort", abort, { once: true })
+    })
+}
+
+function stubFetch(respond: Respond) {
+    return vi
+        .spyOn(window, "fetch")
+        .mockImplementation((_input, init) => respond(init))
+}
+
+/** Resolves with the rejection reason, or a marker when the call succeeded. */
+function settle(pending: Promise<unknown>): Promise<unknown> {
+    return pending.then(
+        (value) => ({ resolved: value }),
+        (error: unknown) => error
+    )
+}
+
+const url = `${services.featureFlag()}/flags/portfolio-insights-enabled`
+
+afterEach(() => {
+    vi.restoreAllMocks()
+    vi.useRealTimers()
+})
+
+const abortSources: {
+    source: string
+    run: () => Promise<unknown>
+}[] = [
+    {
+        source: "deadline",
+        run: async () => {
+            const pending = settle(getJsonWithTimeout(url, 2000))
+            await vi.advanceTimersByTimeAsync(2000)
+            return pending
+        },
+    },
+    {
+        source: "pre-aborted signal",
+        run: () => {
+            const caller = new AbortController()
+            caller.abort()
+            return settle(getJsonWithTimeout(url, 2000, caller.signal))
+        },
+    },
+    {
+        source: "signal aborted mid-request",
+        run: async () => {
+            const caller = new AbortController()
+            const pending = settle(getJsonWithTimeout(url, 2000, caller.signal))
+            await vi.advanceTimersByTimeAsync(100)
+            caller.abort()
+            return pending
+        },
+    },
+]
+
+it.each(abortSources)(
+    "getJsonWithTimeout_abortSource_rejectsAbortErrorWithoutPendingTimer ($source)",
+    async ({ run }) => {
+        vi.useFakeTimers()
+        stubFetch(hangUntilAborted)
+
+        const error = await run()
+
+        expect({
+            name: (error as Error).name,
+            pendingTimers: vi.getTimerCount(),
+        }).toEqual({ name: "AbortError", pendingTimers: 0 })
+    }
+)
+
+it("getJsonWithTimeout_callerAbortsAfterSettling_requestUnaffected", async () => {
+    vi.useFakeTimers()
+    let sent: RequestInit | undefined
+    stubFetch((init) => {
+        sent = init
+        return Promise.resolve(jsonResponse({ enabled: true }))
+    })
+    const caller = new AbortController()
+
+    const value = await getJsonWithTimeout(url, 2000, caller.signal)
+    caller.abort()
+    await vi.advanceTimersByTimeAsync(2000)
+
+    expect({
+        value,
+        requestAborted: sent?.signal?.aborted,
+        pendingTimers: vi.getTimerCount(),
+    }).toEqual({
+        value: { enabled: true },
+        requestAborted: false,
+        pendingTimers: 0,
+    })
+})
+
+it("getJsonWithTimeout_noSignal_sendsAcceptHeaderOnly", async () => {
+    let sent: RequestInit | undefined
+    stubFetch((init) => {
+        sent = init
+        return Promise.resolve(jsonResponse({ version: "1" }))
+    })
+
+    const value = await getJsonWithTimeout(url, 2000)
+
+    expect({ value, method: sent?.method, headers: sent?.headers }).toEqual({
+        value: { version: "1" },
+        method: undefined,
+        headers: { Accept: "application/json" },
+    })
+})
+
+const writeHelpers: {
+    helper: string
+    call: (target: string) => Promise<unknown>
+    method: string
+    body: string
+}[] = [
+    {
+        helper: "patchJson",
+        call: (target) => patchJson(target, { enabled: true }),
+        method: "PATCH",
+        body: '{"enabled":true}',
+    },
+    {
+        helper: "postJsonText",
+        call: (target) =>
+            postJsonText(target, '{"threshold":9999999999.99999999}'),
+        method: "POST",
+        body: '{"threshold":9999999999.99999999}',
+    },
+]
+
+it.each(writeHelpers)(
+    "jsonWriteHelper_success_sendsBodyAndParsesResponse ($helper)",
+    async ({ call, method, body }) => {
+        const target = `${services.broker()}/alerts`
+        let sent: RequestInit | undefined
+        stubFetch((init) => {
+            sent = init
+            return Promise.resolve(jsonResponse({ id: "alert-1" }))
+        })
+
+        const value = await call(target)
+
+        expect({
+            value,
+            method: sent?.method,
+            headers: sent?.headers,
+            body: sent?.body,
+        }).toEqual({
+            value: { id: "alert-1" },
+            method,
+            headers: {
+                Accept: "application/json",
+                "Content-Type": "application/json",
+            },
+            body,
+        })
+    }
+)

@@ -64,6 +64,23 @@ export async function post(url: string, body: unknown): Promise<void> {
     })
 }
 
+/**
+ * POST a body that is already serialised JSON text, sent unchanged. Lets a
+ * caller send a number token exactly as typed, without a round trip through a
+ * JavaScript number; the caller is responsible for producing valid JSON.
+ */
+export async function postJsonText<T>(
+    url: string,
+    bodyText: string
+): Promise<T> {
+    const response = await request(url, {
+        method: "POST",
+        headers: JSON_HEADERS,
+        body: bodyText,
+    })
+    return (await response.json()) as T
+}
+
 export async function put<T>(
     url: string,
     body: unknown
@@ -75,6 +92,15 @@ export async function put<T>(
     })
     const text = await response.text()
     return text ? (JSON.parse(text) as T) : undefined
+}
+
+export async function patchJson<T>(url: string, body: unknown): Promise<T> {
+    const response = await request(url, {
+        method: "PATCH",
+        headers: JSON_HEADERS,
+        body: JSON.stringify(body),
+    })
+    return (await response.json()) as T
 }
 
 export async function del(url: string): Promise<void> {
@@ -90,12 +116,26 @@ export async function getXml(
     return await response.text()
 }
 
+/**
+ * GET JSON, aborted after `timeoutMs` or when the optional caller `signal`
+ * aborts, whichever comes first. Both paths abort one internal controller, so
+ * the rejection is always the standard `AbortError`. The caller signal is
+ * linked by hand because `AbortSignal.any` is missing from older browsers; its
+ * listener is removed once the request settles.
+ */
 export async function getJsonWithTimeout<T>(
     url: string,
-    timeoutMs: number
+    timeoutMs: number,
+    signal?: AbortSignal
 ): Promise<T> {
     const controller = new AbortController()
     const timer = setTimeout(() => controller.abort(), timeoutMs)
+    const onAbort = (): void => controller.abort()
+    if (signal?.aborted) {
+        controller.abort()
+    } else {
+        signal?.addEventListener("abort", onAbort, { once: true })
+    }
     try {
         const response = await request(url, {
             headers: { Accept: "application/json" },
@@ -104,5 +144,6 @@ export async function getJsonWithTimeout<T>(
         return (await response.json()) as T
     } finally {
         clearTimeout(timer)
+        signal?.removeEventListener("abort", onAbort)
     }
 }

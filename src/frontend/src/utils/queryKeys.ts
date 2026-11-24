@@ -39,12 +39,23 @@ export const featureFlagKeys = {
     all: ["feature-flags"] as const,
     problemPatterns: ["feature-flags", "problem-patterns"] as const,
     config: ["feature-flags", "config"] as const,
+    portfolioInsights: ["feature-flags", "portfolio-insights"] as const,
 }
 
 export const portfolioKeys = {
     all: ["portfolio"] as const,
     history: (accountId: string) =>
         ["portfolio", "history", accountId] as const,
+    insightsAll: ["portfolio", "insights"] as const,
+    insights: (accountId: string) =>
+        ["portfolio", "insights", accountId] as const,
+}
+
+export const alertKeys = {
+    all: ["alerts"] as const,
+    list: (accountId: string) => ["alerts", "list", accountId] as const,
+    notifications: (accountId: string) =>
+        ["alerts", "notifications", accountId] as const,
 }
 
 export const versionKeys = {
@@ -78,4 +89,5 @@ export function invalidateOnLogout(client: QueryClient) {
     client.removeQueries({ queryKey: balanceKeys.current })
     client.removeQueries({ queryKey: creditCardKeys.all })
     client.removeQueries({ queryKey: portfolioKeys.all })
+    client.removeQueries({ queryKey: alertKeys.all })
 }

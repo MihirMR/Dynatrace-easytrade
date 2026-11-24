@@ -5,6 +5,7 @@ import {
     DepositAndBuyVisit,
     DepositAndLongBuyVisit,
     LongSellVisit,
+    PortfolioInsightsAlertVisit,
     RegularVisits,
     SellAndWithdrawVisit,
     errorBuyCalculator,
@@ -113,6 +114,13 @@ export function getRegularProviderFunction(
                     user,
                     assetSellRatio,
                     withdrawMinValue
+                )
+            }
+            case "portfolio_insights_alert": {
+                return new PortfolioInsightsAlertVisit(
+                    "portfolio_insights_alert",
+                    easytradeUrl,
+                    user
                 )
             }
         }
