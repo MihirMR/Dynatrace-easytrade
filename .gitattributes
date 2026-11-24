@@ -1,0 +1,14 @@
+# Check out text files with the LF endings the repository stores, whatever
+# core.autocrlf is set to. Linux images run the shell scripts and the Gradle
+# wrapper straight from this tree, and CSharpier, Prettier and gofmt expect LF
+# (src/broker-service/.editorconfig: end_of_line = lf).
+* text=auto eol=lf
+
+# Committed with CRLF; left byte-for-byte as stored.
+src/broker-service/.dockerignore -text
+src/broker-service/Dockerfile -text
+src/credit-card-order-service/gradlew.bat -text
+src/offer-service/.dockerignore -text
+src/offer-service/.gitignore -text
+src/offer-service/Dockerfile -text
+src/offer-service/tsconfig.json -text
