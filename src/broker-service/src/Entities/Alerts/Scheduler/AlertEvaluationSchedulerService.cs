@@ -1,4 +1,5 @@
 using System.Globalization;
+using System.Text;
 using EasyTrade.BrokerService.Entities.Alerts.Service;
 using EasyTrade.BrokerService.Helpers;
 
@@ -26,9 +27,18 @@ namespace EasyTrade.BrokerService.Entities.Alerts.Scheduler
         public const int MaxIntervalSeconds = 4_294_967;
 
         /// <summary>
+        /// The most characters of an invalid interval value that its Warning carries. Valid
+        /// values have at most seven digits; the bound still keeps a mistyped or unexpanded
+        /// placeholder readable while capping what configuration can write into the log.
+        /// </summary>
+        private const int MaxLoggedValueLength = 64;
+
+        /// <summary>
         /// Reads <c>ALERT_EVALUATION_INTERVAL_SECONDS</c>. A whole number from 1 to
         /// <see cref="MaxIntervalSeconds"/> is used as given; anything else, an unset value
-        /// included, logs a Warning and gives <see cref="DefaultIntervalSeconds"/>.
+        /// included, logs a Warning and gives <see cref="DefaultIntervalSeconds"/>. The Warning
+        /// carries the value as <see cref="ToSingleLineLogValue"/> renders it, so configuration
+        /// text can neither break the record across lines nor grow it without bound.
         /// </summary>
         public static int ResolveInterval(IConfiguration configuration, ILogger logger)
         {
@@ -47,15 +57,34 @@ namespace EasyTrade.BrokerService.Entities.Alerts.Scheduler
                 return seconds;
             }
 
-            logger.LogWarning("Invalid ALERT_EVALUATION_INTERVAL_SECONDS [{value}], using 60", raw);
+            // The guard skips escaping the value when Warning is off (CA1873).
+            if (logger.IsEnabled(LogLevel.Warning))
+            {
+                logger.LogWarning(
+                    "Invalid ALERT_EVALUATION_INTERVAL_SECONDS [{value}], using 60",
+                    ToSingleLineLogValue(raw)
+                );
+            }
             return DefaultIntervalSeconds;
         }
 
         /// <summary>
         /// Runs one cycle immediately, then one more each time <paramref name="waitForNextTick"/>
-        /// yields <c>true</c>, and returns when it yields <c>false</c> or the token is cancelled.
-        /// A failed cycle is logged and the loop continues; the method never throws.
+        /// yields <c>true</c>, and returns when it yields <c>false</c>.
         /// </summary>
+        /// <remarks>
+        /// A cycle that throws while <paramref name="cancellationToken"/> is live, whatever the
+        /// exception type, is logged at Error by the per-cycle handler, and the loop waits for
+        /// the next tick. An <see cref="OperationCanceledException"/> thrown by
+        /// <paramref name="waitForNextTick"/>, or any exception raised while
+        /// <paramref name="cancellationToken"/> is cancelled, ends the loop normally without
+        /// logging.
+        /// </remarks>
+        /// <exception cref="Exception">
+        /// An exception other than <see cref="OperationCanceledException"/> that
+        /// <paramref name="waitForNextTick"/> throws while <paramref name="cancellationToken"/>
+        /// is live propagates to the caller.
+        /// </exception>
         public async Task RunLoopAsync(
             Func<CancellationToken, ValueTask<bool>> waitForNextTick,
             CancellationToken cancellationToken
@@ -68,8 +97,17 @@ namespace EasyTrade.BrokerService.Entities.Alerts.Scheduler
                     await RunCycleInScopeAsync(cancellationToken);
                 } while (await waitForNextTick(cancellationToken));
             }
-            catch (OperationCanceledException) { }
-            catch (Exception) when (cancellationToken.IsCancellationRequested) { }
+            catch (OperationCanceledException)
+            {
+                // Shutdown is the normal end of the loop, never a cycle failure.
+                return;
+            }
+            catch (Exception) when (cancellationToken.IsCancellationRequested)
+            {
+                // A fault raised while the loop is stopping is treated as the stop it
+                // accompanies, never as a cycle failure.
+                return;
+            }
         }
 
         protected override async Task ExecuteAsync(CancellationToken stoppingToken)
@@ -79,7 +117,7 @@ namespace EasyTrade.BrokerService.Entities.Alerts.Scheduler
             if (logger.IsEnabled(LogLevel.Information))
             {
                 logger.LogInformation(
-                    "Starting alert evaluation scheduler with an interval of {interval}s.",
+                    "Starting alert evaluation scheduler with an interval of [{interval}]s.",
                     intervalSeconds
                 );
             }
@@ -104,6 +142,76 @@ namespace EasyTrade.BrokerService.Entities.Alerts.Scheduler
             {
                 logger.LogError(exception, "Error running alert evaluation cycle");
             }
+        }
+
+        /// <summary>
+        /// Renders a configuration value for one log line. A backslash becomes <c>\\</c>;
+        /// carriage return, line feed and tab become <c>\r</c>, <c>\n</c> and <c>\t</c>; every
+        /// other control character, every format character of the Basic Multilingual Plane
+        /// (such as a bidirectional override) and the Unicode line and paragraph separators
+        /// become <c>\uXXXX</c>. A value longer than <see cref="MaxLoggedValueLength"/>
+        /// characters keeps at most that many, never half of a surrogate pair, followed by
+        /// <c>...(truncated from N chars)</c>. Null stays null, and a value within the bound
+        /// that holds none of those characters renders unchanged.
+        /// </summary>
+        private static string? ToSingleLineLogValue(string? value)
+        {
+            if (value is null)
+            {
+                return null;
+            }
+
+            int kept = value.Length;
+            if (kept > MaxLoggedValueLength)
+            {
+                kept = char.IsSurrogatePair(
+                    value[MaxLoggedValueLength - 1],
+                    value[MaxLoggedValueLength]
+                )
+                    ? MaxLoggedValueLength - 1
+                    : MaxLoggedValueLength;
+            }
+
+            StringBuilder builder = new(kept);
+            for (int index = 0; index < kept; index++)
+            {
+                char character = value[index];
+                string? shortEscape = character switch
+                {
+                    '\\' => @"\\",
+                    '\r' => @"\r",
+                    '\n' => @"\n",
+                    '\t' => @"\t",
+                    _ => null,
+                };
+                if (shortEscape is not null)
+                {
+                    builder.Append(shortEscape);
+                }
+                else if (
+                    char.GetUnicodeCategory(character)
+                    is UnicodeCategory.Control
+                        or UnicodeCategory.Format
+                        or UnicodeCategory.LineSeparator
+                        or UnicodeCategory.ParagraphSeparator
+                )
+                {
+                    builder.Append(CultureInfo.InvariantCulture, $"\\u{(int)character:X4}");
+                }
+                else
+                {
+                    builder.Append(character);
+                }
+            }
+
+            if (kept < value.Length)
+            {
+                builder.Append(
+                    CultureInfo.InvariantCulture,
+                    $"...(truncated from {value.Length} chars)"
+                );
+            }
+            return builder.ToString();
         }
     }
 }
