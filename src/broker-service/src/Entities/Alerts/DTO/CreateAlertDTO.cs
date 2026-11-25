@@ -5,9 +5,15 @@ namespace EasyTrade.BrokerService.Entities.Alerts.DTO
     /// <summary>
     /// Request body of <c>POST /v1/alerts</c>:
     /// <c>{accountId, type, instrumentId, direction, threshold}</c>. The class only carries the
-    /// values; every rule (missing fields, exact enum names, the threshold domain, account,
-    /// instrument and holding checks) is applied by <c>AlertService.CreateAlertAsync</c> in its
-    /// documented order.
+    /// values; its rules apply in two layers. During model binding, which runs only once
+    /// <see cref="EasyTrade.BrokerService.Helpers.FeatureFlags.PortfolioInsightsFeatureGate"/>
+    /// has let the request through, <see cref="ExactDecimalJsonConverter"/> applies the
+    /// exact-token rule to the threshold: it must be a JSON number in plain decimal form within
+    /// the threshold domain, and a rejected token fails model binding, so <c>[ApiController]</c>
+    /// answers 400 without <c>AlertService.CreateAlertAsync</c> being called. Every
+    /// remaining rule (missing fields, exact enum names, a <c>TARGET_PRICE</c> threshold that is
+    /// not positive, and the account, instrument and holding checks) is applied afterwards by
+    /// <c>AlertService.CreateAlertAsync</c> in its documented order.
     /// </summary>
     /// <remarks>
     /// Every member is nullable so that a missing field binds to <c>null</c> and reaches the alert

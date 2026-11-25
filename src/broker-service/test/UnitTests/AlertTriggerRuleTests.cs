@@ -33,5 +33,22 @@ namespace EasyTrade.BrokerService.Test.UnitTests
             // Assert
             Assert.Equal(expected, crossed);
         }
+
+        [Fact]
+        public void IsCrossed_UndefinedDirection_ShouldThrowArgumentOutOfRange()
+        {
+            // Arrange
+            const AlertDirection undefinedDirection = (AlertDirection)99;
+            const decimal threshold = 10;
+            const decimal observed = 11;
+
+            // Act
+            ArgumentOutOfRangeException exception = Assert.Throws<ArgumentOutOfRangeException>(
+                () => AlertTriggerRule.IsCrossed(undefinedDirection, observed, threshold)
+            );
+
+            // Assert
+            Assert.Equal("direction", exception.ParamName);
+        }
     }
 }

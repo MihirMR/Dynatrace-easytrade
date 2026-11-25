@@ -18,7 +18,10 @@ namespace EasyTrade.BrokerService.Entities.Alerts
 
         /// <summary>
         /// Largest trigger-value magnitude: 20 integer and 8 fractional digits (28 significant
-        /// digits), held exactly by .NET <c>decimal</c>, Go and <c>DECIMAL(28, 8)</c>.
+        /// digits), which .NET <c>decimal</c> arithmetic holds exactly. Across gRPC and in
+        /// db-adapter it stays decimal text, never a Go numeric type: db-adapter validates it with
+        /// the trigger-value pattern on <see cref="AlertNumber"/> and passes it unchanged as the
+        /// SQL parameter, and <c>DECIMAL(28, 8)</c> stores it exactly.
         /// </summary>
         public const decimal MaxTriggerValue = 99_999_999_999_999_999_999.99999999m;
 
