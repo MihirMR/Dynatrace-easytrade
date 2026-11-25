@@ -26,7 +26,9 @@ namespace EasyTrade.BrokerService.Test.Fakes
     /// Whether the token the handler received could be cancelled; see the remarks.
     /// </param>
     /// <param name="CancelledDuringCall">
-    /// Whether that token was cancelled while the handler held the request.
+    /// Whether that token was cancelled while the handler held the request. Never set for a
+    /// request recorded before the handler's last <see cref="RecordingHttpMessageHandler.Clear"/>
+    /// or <see cref="RecordingHttpMessageHandler.Reset"/>, which no longer lists it.
     /// </param>
     public sealed record RecordedHttpRequest(
         HttpMethod Method,
@@ -109,7 +111,9 @@ namespace EasyTrade.BrokerService.Test.Fakes
 
         /// <summary>
         /// Whether the token of a held request was cancelled since creation, <see cref="Clear"/>
-        /// or <see cref="Reset"/>.
+        /// or <see cref="Reset"/>, while <see cref="Requests"/> listed it. A request recorded
+        /// before the last <see cref="Clear"/> or <see cref="Reset"/> never sets it, even when its
+        /// token is cancelled later.
         /// </summary>
         public bool ObservedCancellation
         {
@@ -124,10 +128,16 @@ namespace EasyTrade.BrokerService.Test.Fakes
 
         /// <summary>
         /// Completes once the first request since creation, <see cref="Clear"/> or
-        /// <see cref="Reset"/> has been recorded, before it is answered or held. Await it with a
-        /// bound, for example <c>WaitAsync(TimeSpan)</c>, to cancel a held request only after it
-        /// has arrived.
+        /// <see cref="Reset"/> has been recorded, before it is answered or held. A request
+        /// recorded before the last <see cref="Clear"/> or <see cref="Reset"/> never completes
+        /// it. Await it with a bound, for example <c>WaitAsync(TimeSpan)</c>, to cancel a held
+        /// request only after it has arrived.
         /// </summary>
+        /// <remarks>
+        /// Read it again after <see cref="Clear"/> or <see cref="Reset"/>: a task already
+        /// completed stays completed, while one still pending carries over and completes with the
+        /// first request recorded after the clear.
+        /// </remarks>
         public Task RequestReceived
         {
             get
@@ -157,6 +167,11 @@ namespace EasyTrade.BrokerService.Test.Fakes
         /// <see cref="ObservedCancellation"/>. The configured reply is kept for
         /// <see cref="Release"/>.
         /// </summary>
+        /// <remarks>
+        /// A request recorded before the last <see cref="Clear"/> or <see cref="Reset"/> stays
+        /// held until its token is cancelled and then marks neither its removed record nor
+        /// <see cref="ObservedCancellation"/>. Its caller still receives the cancellation.
+        /// </remarks>
         public void Hold()
         {
             lock (_gate)
@@ -177,7 +192,12 @@ namespace EasyTrade.BrokerService.Test.Fakes
             }
         }
 
-        /// <summary>Forgets the recorded requests and cancellation; keeps the reply mode.</summary>
+        /// <summary>
+        /// Forgets the recorded requests and cancellation; keeps the reply mode. A request
+        /// recorded before the call, held or not, then neither completes
+        /// <see cref="RequestReceived"/> nor sets <see cref="ObservedCancellation"/>, even when
+        /// its token is cancelled later.
+        /// </summary>
         public void Clear()
         {
             lock (_gate)
@@ -188,7 +208,9 @@ namespace EasyTrade.BrokerService.Test.Fakes
 
         /// <summary>
         /// Restores the default reply, ends hold mode and forgets the recorded requests and
-        /// cancellation.
+        /// cancellation. A request recorded before the call stays held if it was, but neither
+        /// completes <see cref="RequestReceived"/> nor sets <see cref="ObservedCancellation"/>,
+        /// even when its token is cancelled later.
         /// </summary>
         public void Reset()
         {
@@ -205,7 +227,6 @@ namespace EasyTrade.BrokerService.Test.Fakes
         )
         {
             ArgumentNullException.ThrowIfNull(request);
-            Reply reply = _reply;
             RecordedHttpRequest recorded = new(
                 request.Method,
                 request.RequestUri,
@@ -213,7 +234,7 @@ namespace EasyTrade.BrokerService.Test.Fakes
                 cancellationToken.CanBeCanceled,
                 CancelledDuringCall: false
             );
-            Record(recorded);
+            Reply reply = Record(recorded);
 
             if (reply.HoldUntilCancelled)
             {
@@ -272,32 +293,38 @@ namespace EasyTrade.BrokerService.Test.Fakes
             return response;
         }
 
-        private void Record(RecordedHttpRequest recorded)
+        // Lists the request, signals its arrival and takes its reply in one step, so a request is
+        // served in the mode current when it was recorded and Clear or Reset cannot run between.
+        private Reply Record(RecordedHttpRequest recorded)
         {
-            TaskCompletionSource received;
             lock (_gate)
             {
                 _requests.Add(recorded);
-                received = _requestReceived;
+                // Safe under the lock: the signal runs its continuations asynchronously.
+                _requestReceived.TrySetResult();
+                return _reply;
             }
-            received.TrySetResult();
         }
 
         private void MarkCancelled(RecordedHttpRequest recorded)
         {
             lock (_gate)
             {
-                _observedCancellation = true;
-                // Records compare by value, so the held entry is located by reference.
+                // Records compare by value, so the held entry is located by reference. A request
+                // that Clear or Reset removed is no longer listed and leaves the state unchanged.
                 int index = _requests.FindIndex(entry => ReferenceEquals(entry, recorded));
                 if (index >= 0)
                 {
+                    _observedCancellation = true;
                     _requests[index] = recorded with { CancelledDuringCall = true };
                 }
             }
         }
 
-        // Callers hold _gate.
+        // Callers hold _gate. Record completes the signal in the same step that lists a request,
+        // so a pending signal proves nothing was recorded since the last clear: keeping it lets a
+        // waiter that read RequestReceived before the clear complete with the first request
+        // after it. A completed signal is replaced, so no earlier request satisfies a new waiter.
         private void ClearRecords()
         {
             _requests.Clear();

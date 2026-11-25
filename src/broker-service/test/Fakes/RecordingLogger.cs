@@ -255,8 +255,13 @@ namespace EasyTrade.BrokerService.Test.Fakes
             return NoopScope.Instance;
         }
 
-        // Always enabled: ASP.NET Core hosting creates the request Activity only while a logger is
-        // enabled, and the trace-context tests depend on that Activity.
+        // Always enabled: an enabled Microsoft.AspNetCore.Hosting.Diagnostics logger makes ASP.NET
+        // Core hosting create the request Activity, parented to any inbound traceparent, whatever
+        // any ActivitySource listener's sampling decides. A DiagnosticListener subscribed to the
+        // HttpRequestIn event does the same; an ActivitySource listener alone only samples the
+        // Activity, so a declined sample leaves none. The test hosts register neither listener,
+        // so the trace-context tests rely on this logger for the Activity their outbound calls
+        // carry.
         public bool IsEnabled(LogLevel logLevel)
         {
             return logLevel != LogLevel.None;
