@@ -12,8 +12,8 @@ echo "=== Row Counts ==="
 # sqlcmd exits 0 on SQL errors here, so the count batch's output decides the exit status.
 # Alerts is reported by its missing-table notice or by its own count row. Output with
 # neither means the batch did not complete, such as after a SQL error or a deadlock.
-# Departs from the unit-test rule: tests never mock the database, so these branches
-# are verified by running this script against MSSQL with and without dbo.Alerts.
+# scripts/portfolio-insights/check-db-test.sh tests these branches against a
+# disposable MSSQL container.
 alerts_missing_notice="Table [dbo].[Alerts] is missing; sql-alerts.sql must be applied."
 row_counts_status=0
 row_counts="$(sqlcmd "

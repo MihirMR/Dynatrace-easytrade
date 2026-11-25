@@ -1,6 +1,7 @@
 using System.Collections.Concurrent;
 using System.Net;
 using System.Net.Sockets;
+using System.Runtime.ExceptionServices;
 using System.Text.Json;
 using EasyTrade.BrokerService.Entities.Prices;
 using EasyTrade.BrokerService.Entities.Prices.DTO;
@@ -79,12 +80,19 @@ namespace EasyTrade.BrokerService.Test.Fakes
     /// recorded before it is answered.
     /// </summary>
     /// <remarks>
-    /// Only the portfolio insights flag and the latest prices follow the configured
-    /// <see cref="StubMode"/>; every other path answers 404. In Respond and Hold, every other
-    /// flag id answers 404. While the flag route refuses, every flag id at the flag address is
-    /// refused, and OpenFeature's client resolves a failed read to the caller's default as it
-    /// does a 404. Either way problem-pattern reads resolve to their defaults, so problem-pattern
-    /// behaviour stays at its defaults (Guardrails directive 1).
+    /// While an HTTP listener listens, its route in <see cref="StubMode.Respond"/> or
+    /// <see cref="StubMode.Hold"/>, only a GET of that route's path, the portfolio insights flag
+    /// or the latest prices, follows the configured <see cref="StubMode"/>; every other request
+    /// answers 404, including every other flag id at the flag address and every other pricing
+    /// route at the pricing address. While a route is in <see cref="StubMode.Refuse"/>, its
+    /// connects are refused and get no HTTP response, and nothing is recorded: every flag id at
+    /// the flag address is refused, and OpenFeature's client resolves the failed read to the
+    /// caller's default as it does a 404. Either way problem-pattern reads resolve to their
+    /// defaults, so problem-pattern behaviour stays at its defaults (Guardrails directive 1).
+    /// The gRPC listener has no mode and serves HTTP/2 only: it records every HTTP/2 request,
+    /// whatever its path or method, and answers HTTP 200 with a trailers-only <c>grpc-status</c>
+    /// 12 (Unimplemented), which Grpc.Net.Client raises as RpcException(Unimplemented). Kestrel
+    /// answers an HTTP/1.1 request on it with 400 before the stub sees it, so it is not recorded.
     /// </remarks>
     public sealed class StubHttpServer : IAsyncDisposable
     {
@@ -131,6 +139,10 @@ namespace EasyTrade.BrokerService.Test.Fakes
         private bool _flagEnabled;
         private IReadOnlyList<Price> _latestPrices = [];
         private bool _clientAborted;
+
+        // Advanced by every clear and reset. A client abort counts only for a request recorded
+        // in the current generation, so a request held across a clear or reset leaves no trace.
+        private long _recordingGeneration;
         private bool _grpcAppStarted;
         private int _disposed;
 
@@ -169,9 +181,10 @@ namespace EasyTrade.BrokerService.Test.Fakes
         public IReadOnlyList<StubRecordedRequest> Requests => _requests.ToArray();
 
         /// <summary>
-        /// Whether a client aborted a held request since start or the last clear. Requests the
-        /// stub drops itself, when their route enters <see cref="StubMode.Refuse"/> or the stub
-        /// stops, do not count.
+        /// Whether a client aborted a held request recorded since start or the last clear or
+        /// reset. A request held across a clear or reset and aborted later does not count, nor
+        /// do requests the stub drops itself, when their route enters
+        /// <see cref="StubMode.Refuse"/> or the stub stops.
         /// </summary>
         public bool ClientAborted
         {
@@ -189,6 +202,11 @@ namespace EasyTrade.BrokerService.Test.Fakes
         /// <paramref name="enableGrpcListener"/> is set, the gRPC listener, each on its own free
         /// loopback port.
         /// </summary>
+        /// <exception cref="AggregateException">
+        /// Starting failed and releasing what had started failed too; it holds the start failure
+        /// first, then the cleanup failure. A start failure whose cleanup succeeds is rethrown as
+        /// it was raised.
+        /// </exception>
         public static async Task<StubHttpServer> StartAsync(
             bool enableGrpcListener = false,
             CancellationToken cancellationToken = default
@@ -211,9 +229,22 @@ namespace EasyTrade.BrokerService.Test.Fakes
                 }
                 return server;
             }
-            catch
+            catch (Exception startException)
             {
-                await server.DisposeAsync();
+                try
+                {
+                    await server.DisposeAsync();
+                }
+                catch (Exception cleanupException)
+                {
+                    // Neither hides the other: the start failure is the cause, the cleanup
+                    // failure names what may still be held.
+                    throw new AggregateException(
+                        "The stub failed to start, and releasing what it had started failed too.",
+                        startException,
+                        cleanupException
+                    );
+                }
                 throw;
             }
         }
@@ -289,11 +320,26 @@ namespace EasyTrade.BrokerService.Test.Fakes
             }
         }
 
-        /// <summary>Candles the latest-prices route returns; empty by default.</summary>
+        /// <summary>
+        /// Candles the latest-prices route returns; empty by default. Each candle's fields,
+        /// <see cref="Price.Id"/> included, are copied when this is called, so later changes to
+        /// the source candles or to <paramref name="prices"/> do not change the reply.
+        /// </summary>
+        /// <exception cref="ArgumentException">
+        /// An element of <paramref name="prices"/> is null; the candles set before stay in place.
+        /// </exception>
         public void SetLatestPrices(IEnumerable<Price> prices)
         {
             ArgumentNullException.ThrowIfNull(prices);
-            Price[] copy = [.. prices];
+            List<Price> copy = [];
+            foreach (Price price in prices)
+            {
+                if (price is null)
+                {
+                    throw new ArgumentException("A candle is null.", nameof(prices));
+                }
+                copy.Add(CopyPrice(price));
+            }
             lock (_gate)
             {
                 _latestPrices = copy;
@@ -307,7 +353,10 @@ namespace EasyTrade.BrokerService.Test.Fakes
             return _requests.Count(request => IsPath(request, path));
         }
 
-        /// <summary>Held requests to <paramref name="path"/> that their client aborted.</summary>
+        /// <summary>
+        /// Held requests to <paramref name="path"/>, recorded since start or the last clear or
+        /// reset, that their client aborted.
+        /// </summary>
         public int AbortedCount(string path)
         {
             ArgumentNullException.ThrowIfNull(path);
@@ -318,8 +367,10 @@ namespace EasyTrade.BrokerService.Test.Fakes
         }
 
         /// <summary>
-        /// Clears the recorded requests, the abort counts and <see cref="ClientAborted"/>; waits
-        /// already pending stay registered.
+        /// Clears the recorded requests, the abort counts and <see cref="ClientAborted"/>, and
+        /// discards the later client abort of every request recorded before the clear, one still
+        /// held included. Waits already pending stay registered; a pending abort wait completes
+        /// only on the abort of a request recorded after the clear.
         /// </summary>
         public void ClearRecordings()
         {
@@ -332,7 +383,9 @@ namespace EasyTrade.BrokerService.Test.Fakes
         /// <summary>
         /// Listens again on the port of every refused route, puts every route back to
         /// <see cref="StubMode.Respond"/> with 200, the flag to false and the prices to empty,
-        /// and clears the recordings.
+        /// and clears the recordings as <see cref="ClearRecordings"/> does. A held request stays
+        /// held, because leaving Hold keeps its listener open, and its client's later abort is
+        /// discarded.
         /// </summary>
         /// <exception cref="InvalidOperationException">
         /// A refused route's port could not be listened on again; its listener stays closed.
@@ -406,9 +459,10 @@ namespace EasyTrade.BrokerService.Test.Fakes
         }
 
         /// <summary>
-        /// Completes once a client has aborted a held request since start or the last clear,
-        /// at once when one already has. On expiry a <see cref="TimeoutException"/> names the
-        /// held paths.
+        /// Completes once a client has aborted a held request recorded since start or the last
+        /// clear or reset, at once when one already has. A wait still pending at a clear or reset
+        /// stays registered and completes only on the abort of a request recorded after it. On
+        /// expiry a <see cref="TimeoutException"/> names the held paths.
         /// </summary>
         public async Task WaitForClientAbortAsync(TimeSpan timeout)
         {
@@ -447,8 +501,16 @@ namespace EasyTrade.BrokerService.Test.Fakes
 
         /// <summary>
         /// Releases held requests first, so no listener waits for them, then stops and disposes
-        /// every listener and frees the ports refused routes hold. Calling it again does nothing.
+        /// every listener and frees the ports refused routes hold. Every step is attempted even
+        /// when an earlier one fails, so one listener's failure leaves no other listener or port
+        /// behind. The transition lock is always released, so a transition waiting for it, or
+        /// started later, throws <see cref="ObjectDisposedException"/>. Calling it again does
+        /// nothing, even after a failure.
         /// </summary>
+        /// <exception cref="AggregateException">
+        /// Several steps failed; it holds their failures in step order. A single failure is
+        /// rethrown as it was raised. Either is thrown only once every step has been attempted.
+        /// </exception>
         public async ValueTask DisposeAsync()
         {
             if (Interlocked.Exchange(ref _disposed, 1) == 1)
@@ -456,28 +518,59 @@ namespace EasyTrade.BrokerService.Test.Fakes
                 return;
             }
 
-            await _shutdown.CancelAsync();
+            List<Exception> failures = [];
+            await AttemptAsync(failures, _shutdown.CancelAsync);
             // A transition in progress finishes first; with held requests released it is brief.
             await _transitions.WaitAsync();
             try
             {
-                await _flagListener.StopAsync();
-                await _latestPricesListener.StopAsync();
-                if (_grpcApp is not null && _grpcAppStarted)
+                await AttemptAsync(failures, _flagListener.StopAsync);
+                await AttemptAsync(failures, _latestPricesListener.StopAsync);
+                WebApplication? grpcApp = _grpcApp;
+                if (grpcApp is not null && _grpcAppStarted)
                 {
-                    await _grpcApp.StopAsync();
+                    await AttemptAsync(failures, () => grpcApp.StopAsync());
+                }
+                await AttemptAsync(failures, () => _flagListener.DisposeAsync().AsTask());
+                await AttemptAsync(failures, () => _latestPricesListener.DisposeAsync().AsTask());
+                if (grpcApp is not null)
+                {
+                    await AttemptAsync(failures, () => grpcApp.DisposeAsync().AsTask());
+                }
+                try
+                {
+                    _shutdown.Dispose();
+                }
+                catch (Exception exception)
+                {
+                    failures.Add(exception);
                 }
             }
             finally
             {
-                await _flagListener.DisposeAsync();
-                await _latestPricesListener.DisposeAsync();
-                if (_grpcApp is not null)
-                {
-                    await _grpcApp.DisposeAsync();
-                }
-                _shutdown.Dispose();
                 _transitions.Release();
+            }
+
+            if (failures.Count == 1)
+            {
+                ExceptionDispatchInfo.Throw(failures[0]);
+            }
+            if (failures.Count > 1)
+            {
+                throw new AggregateException("The stub could not release all it held.", failures);
+            }
+        }
+
+        // Runs one teardown step and records its failure, so the steps after it still run.
+        private static async Task AttemptAsync(List<Exception> failures, Func<Task> step)
+        {
+            try
+            {
+                await step();
+            }
+            catch (Exception exception)
+            {
+                failures.Add(exception);
             }
         }
 
@@ -490,12 +583,20 @@ namespace EasyTrade.BrokerService.Test.Fakes
                     ContentRootPath = AppContext.BaseDirectory,
                 }
             );
-            // An explicit URL overrides ASPNETCORE_URLS and ASPNETCORE_HTTP_PORTS of the test run;
-            // port 0 asks for a free port.
-            builder.WebHost.UseUrls($"{HttpScheme}{IPAddress.Loopback}:{port}");
+            // Kestrel binds hosting URLs (ASPNETCORE_URLS, ASPNETCORE_HTTP_PORTS) instead of
+            // explicit endpoints only when preferHostingUrls is true; this overrides an
+            // ASPNETCORE_PREFERHOSTINGURLS of the test run.
+            builder.WebHost.PreferHostingUrls(false);
             builder.WebHost.ConfigureKestrel(options =>
-                options.ConfigureEndpointDefaults(listen => listen.Protocols = protocols)
-            );
+            {
+                // Replaces the slim builder's loader for the "Kestrel" configuration section with
+                // an empty one, so no endpoint, endpoint default or certificate configured there,
+                // for example by a Kestrel__Endpoints__* variable, is bound or applied.
+                options.Configure();
+                // The only endpoint, on loopback alone and with the listener's protocols; port 0
+                // asks for a free port.
+                options.Listen(IPAddress.Loopback, port, listen => listen.Protocols = protocols);
+            });
             // The stub logs nothing, so its lines never mix with the broker host's recorded logs.
             builder.Logging.ClearProviders();
             builder.Services.Configure<HostOptions>(options =>
@@ -509,16 +610,32 @@ namespace EasyTrade.BrokerService.Test.Fakes
             return string.Equals(request.Path, path, StringComparison.Ordinal);
         }
 
+        // The stub's own copy: Price has public setters, and the reply serializes what is stored.
+        private static Price CopyPrice(Price price)
+        {
+            return new Price(
+                price.InstrumentId,
+                price.Timestamp,
+                price.Open,
+                price.High,
+                price.Low,
+                price.Close
+            )
+            {
+                Id = price.Id,
+            };
+        }
+
         private async Task HandleRouteAsync(
             HttpContext context,
             RouteListener listener,
             CancellationToken closingToken
         )
         {
-            StubRecordedRequest request = Record(HttpListenerName, context);
+            (StubRecordedRequest request, long generation) = Record(HttpListenerName, context);
             if (HttpMethods.IsGet(request.Method) && IsPath(request, listener.Path))
             {
-                await ServeAsync(context, listener.Route, request.Path, closingToken);
+                await ServeAsync(context, listener.Route, request.Path, generation, closingToken);
                 return;
             }
             // Every other flag id, every other pricing route and anything else.
@@ -541,6 +658,7 @@ namespace EasyTrade.BrokerService.Test.Fakes
             HttpContext context,
             StubRoute route,
             string path,
+            long generation,
             CancellationToken closingToken
         )
         {
@@ -562,7 +680,7 @@ namespace EasyTrade.BrokerService.Test.Fakes
                     context.Abort();
                     return;
                 case StubMode.Hold:
-                    await HoldAsync(context, path, closingToken);
+                    await HoldAsync(context, path, generation, closingToken);
                     return;
             }
 
@@ -591,10 +709,12 @@ namespace EasyTrade.BrokerService.Test.Fakes
             );
         }
 
-        // closingToken is cancelled when the listener closes or the stub stops.
+        // generation is the recording generation Record put the request in; closingToken is
+        // cancelled when the listener closes or the stub stops.
         private async Task HoldAsync(
             HttpContext context,
             string path,
+            long generation,
             CancellationToken closingToken
         )
         {
@@ -613,7 +733,7 @@ namespace EasyTrade.BrokerService.Test.Fakes
                 context.Abort();
                 return;
             }
-            RecordClientAbort(path);
+            RecordClientAbort(path, generation);
         }
 
         // Listens on the listener's port, or on a free port the first time.
@@ -676,7 +796,12 @@ namespace EasyTrade.BrokerService.Test.Fakes
             };
         }
 
-        private StubRecordedRequest Record(string listener, HttpContext context)
+        // Also returns the request's recording generation, read under the lock that enqueues it,
+        // so a clear or reset comes either before both or after both.
+        private (StubRecordedRequest Request, long Generation) Record(
+            string listener,
+            HttpContext context
+        )
         {
             Dictionary<string, string> headers = new(StringComparer.OrdinalIgnoreCase);
             foreach (KeyValuePair<string, StringValues> header in context.Request.Headers)
@@ -693,9 +818,11 @@ namespace EasyTrade.BrokerService.Test.Fakes
             );
 
             List<RequestWaiter> matched = [];
+            long generation;
             lock (_gate)
             {
                 _requests.Enqueue(request);
+                generation = _recordingGeneration;
                 _requestWaiters.RemoveAll(waiter =>
                 {
                     if (!IsPath(request, waiter.Path))
@@ -711,14 +838,21 @@ namespace EasyTrade.BrokerService.Test.Fakes
             {
                 waiter.Completion.TrySetResult(request);
             }
-            return request;
+            return (request, generation);
         }
 
-        private void RecordClientAbort(string path)
+        // generation is the one Record returned for the held request.
+        private void RecordClientAbort(string path, long generation)
         {
             TaskCompletionSource[] waiters;
             lock (_gate)
             {
+                if (generation != _recordingGeneration)
+                {
+                    // Recorded before the last clear or reset: no current recording holds the
+                    // request, so its abort sets nothing and completes no wait.
+                    return;
+                }
                 _clientAborted = true;
                 _abortCounts[path] = _abortCounts.GetValueOrDefault(path) + 1;
                 waiters = [.. _abortWaiters];
@@ -758,6 +892,8 @@ namespace EasyTrade.BrokerService.Test.Fakes
             _requests.Clear();
             _abortCounts.Clear();
             _clientAborted = false;
+            // Every request recorded so far, held ones included, now belongs to a past generation.
+            _recordingGeneration++;
         }
 
         // Called with _gate held.
@@ -788,7 +924,8 @@ namespace EasyTrade.BrokerService.Test.Fakes
 
             public StubRoute Route { get; } = route;
 
-            // The one path that follows the route's settings; every other path answers 404.
+            // The one path whose GET follows the route's settings; while the listener listens,
+            // every other request answers 404.
             public string Path { get; } = path;
 
             public string Address { get; private set; } = string.Empty;
@@ -875,11 +1012,18 @@ namespace EasyTrade.BrokerService.Test.Fakes
                 await running.App.StopAsync();
             }
 
+            // Frees the held port even when the app's disposal fails.
             public async ValueTask DisposeAsync()
             {
-                await DisposeAppAsync();
-                _placeholder?.Dispose();
-                _placeholder = null;
+                try
+                {
+                    await DisposeAppAsync();
+                }
+                finally
+                {
+                    _placeholder?.Dispose();
+                    _placeholder = null;
+                }
             }
 
             private static Socket HoldPort(int port)
