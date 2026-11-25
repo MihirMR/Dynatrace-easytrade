@@ -4,14 +4,25 @@ import js from "@eslint/js"
 import tseslint from "typescript-eslint"
 import pluginReact from "eslint-plugin-react"
 
+// One glob per extension: minimatch 3 under eslint cannot expand brace globs
+// with the brace-expansion version package.json pins.
+const sourceFiles = [
+    "**/*.js",
+    "**/*.mjs",
+    "**/*.cjs",
+    "**/*.ts",
+    "**/*.jsx",
+    "**/*.tsx",
+]
+
 export default defineConfig([
-    { files: ["**/*.{js,mjs,cjs,ts,jsx,tsx}"] },
+    { files: sourceFiles },
     {
-        files: ["**/*.{js,mjs,cjs,ts,jsx,tsx}"],
+        files: sourceFiles,
         languageOptions: { globals: globals.browser },
     },
     {
-        files: ["**/*.{js,mjs,cjs,ts,jsx,tsx}"],
+        files: sourceFiles,
         plugins: { js },
         extends: ["js/recommended"],
     },
