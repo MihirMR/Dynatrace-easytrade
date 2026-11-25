@@ -1,5 +1,5 @@
-using System.Net;
 using EasyTrade.BrokerService.Helpers;
+using System.Net;
 
 namespace EasyTrade.BrokerService.ProblemPatterns.OpenFeature.Providers.FeatureFlagService;
 
@@ -14,7 +14,10 @@ public class FeatureFlagServiceConnector(
     private readonly ILogger _logger = logger;
     private string FeatureFlagServiceUrl => $"{_config[Constants.FeatureFlagServiceAddress]}/v1/";
 
-    public Task<Flag?> GetFlag(string id) => GetFlag(id, CancellationToken.None);
+    public Task<Flag?> GetFlag(string id)
+    {
+        return GetFlag(id, CancellationToken.None);
+    }
 
     public async Task<Flag?> GetFlag(string id, CancellationToken cancellationToken)
     {

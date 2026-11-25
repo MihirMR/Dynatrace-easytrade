@@ -18,7 +18,7 @@ public class PluginProvider(IFeatureFlagServiceConnector flagServiceConnector) :
         CancellationToken cancellationToken = default
     )
     {
-        var flag = await _flagServiceConnector.GetFlag(flagKey, cancellationToken);
+        Flag? flag = await _flagServiceConnector.GetFlag(flagKey, cancellationToken);
         var value = flag is null ? defaultValue : flag.Enabled;
         return new ResolutionDetails<bool>(flagKey, value);
     }

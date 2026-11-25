@@ -39,6 +39,10 @@ namespace EasyTrade.BrokerService.Helpers.FeatureFlags
                         deadline.Token
                     )
                     .WaitAsync(deadline.Token);
+                // Rechecked because a provider can complete successfully after the caller
+                // cancelled. Only the caller's token is checked: a read that succeeded as the
+                // deadline expired still answers.
+                cancellationToken.ThrowIfCancellationRequested();
                 return result.Value;
             }
             catch (Exception exception)
@@ -47,8 +51,9 @@ namespace EasyTrade.BrokerService.Helpers.FeatureFlags
                 cancellationToken.ThrowIfCancellationRequested();
                 string reason =
                     exception is OperationCanceledException ? "timeout" : exception.GetType().Name;
+                // The exception is deliberately not attached: transport and parser errors can
+                // carry endpoint and response details. Only the bounded reason is recorded.
                 _logger.LogWarning(
-                    exception,
                     "Portfolio insights flag unreadable, treating as disabled: reason [{reason}]",
                     reason
                 );
