@@ -1,4 +1,5 @@
 using System.Collections.Concurrent;
+using System.Threading.Channels;
 using EasyTrade.BrokerService.Entities.Alerts.Scheduler;
 using EasyTrade.BrokerService.Entities.Alerts.Service;
 using EasyTrade.BrokerService.Helpers;
@@ -14,6 +15,10 @@ namespace EasyTrade.BrokerService.Test.UnitTests
         private const string InvalidIntervalPrefix = "Invalid ALERT_EVALUATION_INTERVAL_SECONDS";
         private const string CycleErrorPrefix = "Error running alert evaluation cycle";
         private const string StartupPrefix = "Starting alert evaluation scheduler";
+
+        // The variable name the deployment manifests publish, written out rather than taken from
+        // Constants so that renaming the key the scheduler reads fails the resolution matrix.
+        private const string PublishedIntervalKey = "ALERT_EVALUATION_INTERVAL_SECONDS";
 
         // 63 characters, one short of the length bound on a logged interval value, so a row can
         // end its value at the bound, past it, or with a surrogate pair straddling it.
@@ -32,6 +37,10 @@ namespace EasyTrade.BrokerService.Test.UnitTests
             SourceEndsLoopStops,
             CancelledLoopStops,
             FaultWhileStoppingEndsQuietly,
+            HeldCycleDefersNextTick,
+            CycleCancellationWhileLiveLoggedAndNextRuns,
+            TickCancellationWhileLiveEndsQuietly,
+            TickFaultWhileLivePropagates,
         }
 
         [Theory]
@@ -40,6 +49,7 @@ namespace EasyTrade.BrokerService.Test.UnitTests
         [InlineData("0", 60, true, "0")]
         [InlineData("-5", 60, true, "-5")]
         [InlineData("4294968", 60, true, "4294968")]
+        [InlineData("1", 1, false, null)]
         [InlineData("15", 15, false, null)]
         [InlineData("4294967", 4294967, false, null)]
         [InlineData(
@@ -68,7 +78,7 @@ namespace EasyTrade.BrokerService.Test.UnitTests
             Dictionary<string, string?> settings = [];
             if (value is not null)
             {
-                settings[Constants.AlertEvaluationIntervalSeconds] = value;
+                settings[PublishedIntervalKey] = value;
             }
             IConfiguration configuration = new ConfigurationBuilder()
                 .AddInMemoryCollection(settings)
@@ -119,7 +129,7 @@ namespace EasyTrade.BrokerService.Test.UnitTests
             Dictionary<string, string?> settings = [];
             if (value is not null)
             {
-                settings[Constants.AlertEvaluationIntervalSeconds] = value;
+                settings[PublishedIntervalKey] = value;
             }
             IConfiguration configuration = new ConfigurationBuilder()
                 .AddInMemoryCollection(settings)
@@ -285,15 +295,39 @@ namespace EasyTrade.BrokerService.Test.UnitTests
         [InlineData(LoopScenario.SourceEndsLoopStops)]
         [InlineData(LoopScenario.CancelledLoopStops)]
         [InlineData(LoopScenario.FaultWhileStoppingEndsQuietly)]
+        [InlineData(LoopScenario.HeldCycleDefersNextTick)]
+        [InlineData(LoopScenario.CycleCancellationWhileLiveLoggedAndNextRuns)]
+        [InlineData(LoopScenario.TickCancellationWhileLiveEndsQuietly)]
+        [InlineData(LoopScenario.TickFaultWhileLivePropagates)]
         public async Task RunLoop_TickSource_ShouldDriveCycles(LoopScenario scenario)
         {
             // Arrange
-            bool holdFault = scenario == LoopScenario.FaultWhileStoppingEndsQuietly;
-            int? throwOnCycle =
-                scenario == LoopScenario.ThrowingCycleLoggedAndNextRuns || holdFault ? 1 : null;
-            await using LoopHarness harness = new(throwOnCycle, holdFault);
+            Exception? cycleFault = scenario switch
+            {
+                LoopScenario.ThrowingCycleLoggedAndNextRuns
+                or LoopScenario.FaultWhileStoppingEndsQuietly => new InvalidOperationException(
+                    "Cycle 1 failed on purpose."
+                ),
+                // Cancelled through a token of the cycle's own, as an internal timeout is, while
+                // the loop's token stays live.
+                LoopScenario.CycleCancellationWhileLiveLoggedAndNextRuns =>
+                    new OperationCanceledException(
+                        "Cycle 1 timed out on purpose.",
+                        new CancellationToken(canceled: true)
+                    ),
+                _ => null,
+            };
+            bool holdFirstCycle =
+                scenario
+                    is LoopScenario.FaultWhileStoppingEndsQuietly
+                        or LoopScenario.HeldCycleDefersNextTick;
+            await using LoopHarness harness = new(cycleFault, holdFirstCycle);
             int expectedCycles = 1;
             int expectedErrors = 0;
+            // Whether the log ends with the tick requested after the last cycle; null when the
+            // row accepts the log either with or without that request.
+            bool? tickAfterLastCycle = true;
+            TaskStatus expectedStatus = TaskStatus.RanToCompletion;
 
             // Act
             harness.Start();
@@ -301,11 +335,18 @@ namespace EasyTrade.BrokerService.Test.UnitTests
             switch (scenario)
             {
                 case LoopScenario.StartRunsOneCycle:
-                    // No tick was released, so the loop must be parked on the tick source.
+                    // With the token live, the loop asks for the tick that follows the startup
+                    // cycle. No tick is released, so it stays parked on that request.
+                    Assert.True(
+                        await harness.Probe.WaitForTickRequestsAsync(1),
+                        "The loop did not ask for a tick after the startup cycle."
+                    );
                     Assert.False(harness.Loop.IsCompleted);
                     break;
 
                 case LoopScenario.ThreeTicksRunThreeMore:
+                    // Each released tick runs one more cycle. The loop is stopped only once it
+                    // has asked, with the token live, for the tick after the fourth cycle.
                     for (int tick = 1; tick <= 3; tick++)
                     {
                         harness.ReleaseTick();
@@ -314,20 +355,32 @@ namespace EasyTrade.BrokerService.Test.UnitTests
                             $"No cycle ran after tick {tick}."
                         );
                     }
+                    Assert.True(
+                        await harness.Probe.WaitForTickRequestsAsync(4),
+                        "The loop did not ask for a tick after the fourth cycle."
+                    );
                     expectedCycles = 4;
                     break;
 
                 case LoopScenario.ThrowingCycleLoggedAndNextRuns:
+                case LoopScenario.CycleCancellationWhileLiveLoggedAndNextRuns:
+                    // The startup cycle throws while the token is live: it is logged at Error,
+                    // the released tick runs a second cycle, and the loop stays live to ask, with
+                    // the token live, for the tick after that cycle.
                     LogEntry error = await harness.Logger.Sink.WaitForMessageStartingWithAsync(
                         CycleErrorPrefix,
                         WaitBound
                     );
                     Assert.Equal(LogLevel.Error, error.Level);
-                    Assert.IsType<InvalidOperationException>(error.Exception);
+                    Assert.Same(cycleFault, error.Exception);
                     harness.ReleaseTick();
                     Assert.True(
                         await harness.Probe.WaitForCycleAsync(),
                         "No cycle ran after the failed one."
+                    );
+                    Assert.True(
+                        await harness.Probe.WaitForTickRequestsAsync(2),
+                        "The loop did not ask for a tick after the second cycle."
                     );
                     Assert.False(harness.Loop.IsCompleted);
                     expectedCycles = 2;
@@ -335,12 +388,20 @@ namespace EasyTrade.BrokerService.Test.UnitTests
                     break;
 
                 case LoopScenario.SourceEndsLoopStops:
+                    // The tick requested after the startup cycle reports the source as finished,
+                    // so that request is what ends the loop.
                     harness.EndSource();
                     await harness.Loop.WaitAsync(WaitBound);
                     Assert.True(harness.Loop.IsCompletedSuccessfully);
                     break;
 
                 case LoopScenario.CancelledLoopStops:
+                    // The token is cancelled only once the loop has asked for the tick after the
+                    // startup cycle, so the cancellation ends that pending tick wait.
+                    Assert.True(
+                        await harness.Probe.WaitForTickRequestsAsync(1),
+                        "The loop did not ask for a tick after the startup cycle."
+                    );
                     await harness.CancelAsync();
                     await harness.Loop.WaitAsync(WaitBound);
                     Assert.True(harness.Loop.IsCompletedSuccessfully);
@@ -349,11 +410,51 @@ namespace EasyTrade.BrokerService.Test.UnitTests
                 case LoopScenario.FaultWhileStoppingEndsQuietly:
                     // The startup cycle is held before it throws. Shutdown begins first, so its
                     // ordinary exception must end the loop as the stop, not as a failed cycle.
+                    // The loop may end on that fault, or absorb it in its cycle handler and end on
+                    // the cancelled wait for the next tick, so the log may end with that request.
                     Assert.False(harness.Loop.IsCompleted);
                     await harness.CancelAsync();
-                    harness.Probe.ReleaseFault();
+                    harness.Probe.ReleaseHeldCycle();
                     await harness.Loop.WaitAsync(WaitBound);
                     Assert.True(harness.Loop.IsCompletedSuccessfully);
+                    tickAfterLastCycle = null;
+                    break;
+
+                case LoopScenario.HeldCycleDefersNextTick:
+                    // The next tick is released while the startup cycle is held. A loop that does
+                    // not await its running cycle has already asked for that tick, so it starts
+                    // the next cycle before the held one ends. The loop is stopped only once it
+                    // has asked, with the token live, for the tick after the second cycle.
+                    harness.ReleaseTick();
+                    harness.Probe.ReleaseHeldCycle();
+                    Assert.True(
+                        await harness.Probe.WaitForCycleAsync(),
+                        "No cycle ran after the held one."
+                    );
+                    Assert.True(
+                        await harness.Probe.WaitForTickRequestsAsync(2),
+                        "The loop did not ask for a tick after the second cycle."
+                    );
+                    expectedCycles = 2;
+                    break;
+
+                case LoopScenario.TickCancellationWhileLiveEndsQuietly:
+                    // The loop's token stays live; only the tick requested after the startup
+                    // cycle reports cancellation, and that request ends the loop quietly.
+                    harness.FailTick(new OperationCanceledException("Tick cancelled on purpose."));
+                    await harness.Loop.WaitAsync(WaitBound);
+                    break;
+
+                case LoopScenario.TickFaultWhileLivePropagates:
+                    // The tick requested after the startup cycle throws an ordinary fault while
+                    // the token is live, and the loop must end by propagating it.
+                    InvalidOperationException tickFault = new("Tick source failed on purpose.");
+                    harness.FailTick(tickFault);
+                    Assert.Same(
+                        tickFault,
+                        await Record.ExceptionAsync(() => harness.Loop.WaitAsync(WaitBound))
+                    );
+                    expectedStatus = TaskStatus.Faulted;
                     break;
 
                 default:
@@ -362,54 +463,121 @@ namespace EasyTrade.BrokerService.Test.UnitTests
             await harness.StopAsync();
 
             // Assert
-            Assert.True(harness.Loop.IsCompletedSuccessfully);
-            Assert.Equal(expectedCycles, harness.Probe.CycleCount);
-            Assert.Equal(
-                expectedCycles,
-                harness.Probe.Instances.Distinct(ReferenceEqualityComparer.Instance).Count()
-            );
+            Assert.Equal(expectedStatus, harness.Loop.Status);
+            // Read after the loop is joined and before the provider is disposed, so every
+            // Disposed entry is a scope the scheduler disposed itself. The order and disposal
+            // between cycles are exact in every row. The tick request after the last cycle is
+            // required where the row waited for it with the token live or where that request
+            // drives the outcome. Only the stop during a held cycle accepts either ending: it is
+            // held to the variant its log ends with, so the whole log is still compared exactly.
+            string log = harness.Probe.Log;
+            bool trailingTick =
+                tickAfterLastCycle ?? log.EndsWith(" TickRequested", StringComparison.Ordinal);
+            Assert.Equal(SerialCycleLog(expectedCycles, trailingTick), log);
             Assert.Equal(expectedErrors, harness.Logger.Sink.ByLevel(LogLevel.Error).Count);
         }
 
         /// <summary>
-        /// Singleton shared by every cycle: counts cycles, keeps the scoped service instance that
-        /// ran each one, and signals <see cref="CycleRan"/> once per cycle. A held fault keeps the
-        /// failing cycle waiting on <see cref="FaultReleased"/> until <see cref="ReleaseFault"/>.
+        /// The probe log of <paramref name="cycles"/> cycles run one at a time: each cycle starts
+        /// and ends and its own scoped service is disposed before the next tick is requested, so
+        /// no cycle starts before the previous one ends. With
+        /// <paramref name="tickAfterLastCycle"/> true the log ends with the tick requested after
+        /// the last cycle; with it false the log ends with the last cycle's disposal.
         /// </summary>
-        private sealed class CycleProbe(int? throwOnCycle, bool holdFault) : IDisposable
+        private static string SerialCycleLog(int cycles, bool tickAfterLastCycle)
         {
-            private readonly ConcurrentQueue<IAlertEvaluationService> _instances = new();
+            List<string> events = [];
+            for (int cycle = 1; cycle <= cycles; cycle++)
+            {
+                events.Add($"CycleStarted({cycle})");
+                events.Add($"CycleEnded({cycle})");
+                events.Add($"Disposed({cycle})");
+                if (cycle < cycles || tickAfterLastCycle)
+                {
+                    events.Add("TickRequested");
+                }
+            }
+            return string.Join(' ', events);
+        }
+
+        /// <summary>
+        /// Singleton shared by every cycle. It numbers the cycles, signals
+        /// <see cref="CycleRan"/> as each one starts, counts and signals each tick request for
+        /// <see cref="WaitForTickRequestsAsync"/>, and keeps the loop's event log, which is
+        /// safe for concurrent writers and keeps the order the events happened in. The first
+        /// cycle can be held on a gate until <see cref="ReleaseHeldCycle"/>, and can end by
+        /// throwing a given fault.
+        /// </summary>
+        /// <param name="firstCycleFault">What the first cycle throws as it ends, or null.</param>
+        /// <param name="holdFirstCycle">Whether the first cycle waits on the gate to end.</param>
+        private sealed class CycleProbe(Exception? firstCycleFault, bool holdFirstCycle)
+            : IDisposable
+        {
+            private readonly ConcurrentQueue<string> _log = new();
 
             // Continuations run asynchronously, so releasing the gate never runs the held cycle
             // on the releasing thread.
-            private readonly TaskCompletionSource _faultGate = new(
+            private readonly TaskCompletionSource _gate = new(
                 TaskCreationOptions.RunContinuationsAsynchronously
             );
+
+            // Released once per tick request, after the request is counted.
+            private readonly SemaphoreSlim _tickRequested = new(0);
             private int _cycleCount;
+            private int _tickRequestCount;
 
             public SemaphoreSlim CycleRan { get; } = new(0);
 
-            /// <summary>The 1-based cycle that fails, or null when every cycle succeeds.</summary>
-            public int? ThrowOnCycle { get; } = throwOnCycle;
+            /// <summary>
+            /// The events so far, space-separated in order: <c>CycleStarted(n)</c> and
+            /// <c>CycleEnded(n)</c> for cycle n, <c>Disposed(n)</c> when the scoped service that
+            /// ran cycle n is disposed, and <c>TickRequested</c> when the loop asks for a tick.
+            /// </summary>
+            public string Log => string.Join(' ', _log);
 
-            public int CycleCount => Volatile.Read(ref _cycleCount);
-
-            public IReadOnlyCollection<IAlertEvaluationService> Instances => _instances;
-
-            /// <summary>Completes when the failing cycle may throw: at once unless held.</summary>
-            public Task FaultReleased => holdFault ? _faultGate.Task : Task.CompletedTask;
-
-            public void ReleaseFault()
+            public void ReleaseHeldCycle()
             {
-                _faultGate.TrySetResult();
+                _gate.TrySetResult();
             }
 
-            public int Record(IAlertEvaluationService instance)
+            /// <summary>Numbers and logs a starting cycle, then signals its start.</summary>
+            public int StartCycle()
             {
-                _instances.Enqueue(instance);
                 int cycle = Interlocked.Increment(ref _cycleCount);
+                _log.Enqueue($"CycleStarted({cycle})");
                 CycleRan.Release();
                 return cycle;
+            }
+
+            /// <summary>
+            /// Holds the first cycle on the gate when asked to, logs the cycle's end, then throws
+            /// the first cycle's fault, if any. The gate is awaited without the cycle token, so a
+            /// held fault is still raised as an ordinary exception after shutdown begins.
+            /// </summary>
+            public async Task EndCycleAsync(int cycle)
+            {
+                if (cycle == 1 && holdFirstCycle)
+                {
+                    await _gate.Task;
+                }
+                _log.Enqueue($"CycleEnded({cycle})");
+                if (cycle == 1 && firstCycleFault is not null)
+                {
+                    throw firstCycleFault;
+                }
+            }
+
+            public void RecordDisposed(int cycle)
+            {
+                _log.Enqueue($"Disposed({cycle})");
+            }
+
+            /// <summary>Logs a tick request, then counts and signals it.</summary>
+            public void RecordTickRequested()
+            {
+                _log.Enqueue("TickRequested");
+                Interlocked.Increment(ref _tickRequestCount);
+                _tickRequested.Release();
             }
 
             public Task<bool> WaitForCycleAsync()
@@ -417,58 +585,84 @@ namespace EasyTrade.BrokerService.Test.UnitTests
                 return CycleRan.WaitAsync(WaitBound);
             }
 
+            /// <summary>
+            /// Waits until the loop has asked for at least <paramref name="count"/> ticks in all.
+            /// Each wait for a further request is bounded by <see cref="WaitBound"/>; the result
+            /// is false when a bound elapses first.
+            /// </summary>
+            public async Task<bool> WaitForTickRequestsAsync(int count)
+            {
+                while (Volatile.Read(ref _tickRequestCount) < count)
+                {
+                    if (!await _tickRequested.WaitAsync(WaitBound))
+                    {
+                        return false;
+                    }
+                }
+                return true;
+            }
+
             public void Dispose()
             {
                 CycleRan.Dispose();
+                _tickRequested.Dispose();
             }
         }
 
-        private sealed class ProbeEvaluationService(CycleProbe probe) : IAlertEvaluationService
+        /// <summary>
+        /// Scoped service that runs one cycle on the probe and logs its own disposal under that
+        /// cycle's number. It implements only <see cref="IAsyncDisposable"/>, so disposing its
+        /// scope synchronously throws instead of disposing it.
+        /// </summary>
+        private sealed class ProbeEvaluationService(CycleProbe probe)
+            : IAlertEvaluationService,
+                IAsyncDisposable
         {
-            public Task<AlertEvaluationResult> RunCycleAsync(CancellationToken cancellationToken)
+            private int _cycle;
+
+            public async Task<AlertEvaluationResult> RunCycleAsync(
+                CancellationToken cancellationToken
+            )
             {
-                int cycle = probe.Record(this);
-                if (cycle == probe.ThrowOnCycle)
-                {
-                    return FailAsync(cycle);
-                }
-                return Task.FromResult(
-                    new AlertEvaluationResult(
-                        AlertEvaluationOutcome.Completed,
-                        0,
-                        0,
-                        0,
-                        0,
-                        TimeSpan.Zero
-                    )
+                _cycle = probe.StartCycle();
+                await probe.EndCycleAsync(_cycle);
+                return new AlertEvaluationResult(
+                    AlertEvaluationOutcome.Completed,
+                    0,
+                    0,
+                    0,
+                    0,
+                    TimeSpan.Zero
                 );
             }
 
-            // Waits on the probe's gate without the cycle token, so a held fault is still raised
-            // as an ordinary exception after shutdown begins.
-            private async Task<AlertEvaluationResult> FailAsync(int cycle)
+            public ValueTask DisposeAsync()
             {
-                await probe.FaultReleased;
-                throw new InvalidOperationException($"Cycle {cycle} failed on purpose.");
+                probe.RecordDisposed(_cycle);
+                return ValueTask.CompletedTask;
             }
         }
 
         /// <summary>
         /// Owns the scheduler under test, its service provider and its tick source. Each
-        /// <see cref="ReleaseTick"/> completes exactly one tick.
+        /// <see cref="ReleaseTick"/>, <see cref="EndSource"/> or <see cref="FailTick"/> completes
+        /// exactly one tick, in the order they are called.
         /// </summary>
         private sealed class LoopHarness : IAsyncDisposable
         {
             private readonly ServiceProvider _provider;
             private readonly AlertEvaluationSchedulerService _scheduler;
-            private readonly SemaphoreSlim _ticks = new(0);
-            private readonly CancellationTokenSource _cts = new();
-            private bool _sourceEnded;
 
-            public LoopHarness(int? throwOnCycle, bool holdFault = false)
+            // Each item is one tick: it returns whether the source goes on, or throws as a
+            // failing source does.
+            private readonly Channel<Func<bool>> _ticks = Channel.CreateUnbounded<Func<bool>>();
+            private readonly CancellationTokenSource _cts = new();
+            private Task? _join;
+
+            public LoopHarness(Exception? firstCycleFault, bool holdFirstCycle)
             {
                 ServiceCollection services = new();
-                services.AddSingleton(_ => new CycleProbe(throwOnCycle, holdFault));
+                services.AddSingleton(_ => new CycleProbe(firstCycleFault, holdFirstCycle));
                 services.AddScoped<IAlertEvaluationService, ProbeEvaluationService>();
                 _provider = services.BuildServiceProvider(
                     new ServiceProviderOptions { ValidateOnBuild = true, ValidateScopes = true }
@@ -494,14 +688,20 @@ namespace EasyTrade.BrokerService.Test.UnitTests
 
             public void ReleaseTick()
             {
-                _ticks.Release();
+                QueueTick(() => true);
             }
 
             /// <summary>Completes one more tick that reports the source as finished.</summary>
             public void EndSource()
             {
-                Volatile.Write(ref _sourceEnded, true);
-                _ticks.Release();
+                QueueTick(() => false);
+            }
+
+            /// <summary>Completes one more tick by throwing <paramref name="fault"/>.</summary>
+            public void FailTick(Exception fault)
+            {
+                ArgumentNullException.ThrowIfNull(fault);
+                QueueTick(() => throw fault);
             }
 
             public Task CancelAsync()
@@ -510,35 +710,74 @@ namespace EasyTrade.BrokerService.Test.UnitTests
             }
 
             /// <summary>
-            /// Cancels the loop, then releases a held fault so no cycle stays parked, and waits
-            /// for the loop, so no cycle outlives the service provider.
+            /// Stops the loop and joins it, once: every call returns the same join. It cancels
+            /// the loop's token, closes the tick source so a pending or later tick wait reports
+            /// the end without relying on that token, and releases a held cycle. The join
+            /// fails with <see cref="TimeoutException"/> when the loop is still running after
+            /// <see cref="WaitBound"/>. A loop that ended by faulting has stopped, and its fault
+            /// is left to the test to assert.
             /// </summary>
-            public async Task StopAsync()
+            public Task StopAsync()
             {
-                await _cts.CancelAsync();
-                Probe.ReleaseFault();
-                await Loop.WaitAsync(WaitBound);
+                return _join ??= StopAndJoinAsync();
             }
 
+            /// <summary>
+            /// Joins the loop through <see cref="StopAsync"/>, so a join that already failed is
+            /// not waited for again, and never throws: a failed join is reported by the test's
+            /// own call, and an exception from teardown would replace the test's own failure.
+            /// The scheduler, the service provider and the token source are disposed only once
+            /// the loop has ended.
+            /// </summary>
             public async ValueTask DisposeAsync()
             {
-                try
+                await StopAsync().ConfigureAwait(ConfigureAwaitOptions.SuppressThrowing);
+                if (!Loop.IsCompleted)
                 {
-                    await StopAsync();
+                    // The loop may still hold a scope, the probe's signal or the token, so they
+                    // are left undisposed rather than torn down while it runs.
+                    return;
                 }
-                finally
+                _scheduler.Dispose();
+                await _provider.DisposeAsync();
+                _cts.Dispose();
+            }
+
+            private async Task StopAndJoinAsync()
+            {
+                await _cts.CancelAsync();
+                _ticks.Writer.TryComplete();
+                Probe.ReleaseHeldCycle();
+                await Loop.WaitAsync(WaitBound)
+                    .ConfigureAwait(ConfigureAwaitOptions.SuppressThrowing);
+                if (!Loop.IsCompleted)
                 {
-                    _scheduler.Dispose();
-                    await _provider.DisposeAsync();
-                    _ticks.Dispose();
-                    _cts.Dispose();
+                    throw new TimeoutException($"The loop was still running after {WaitBound}.");
+                }
+            }
+
+            private void QueueTick(Func<bool> tick)
+            {
+                if (!_ticks.Writer.TryWrite(tick))
+                {
+                    throw new InvalidOperationException("The tick source is already closed.");
                 }
             }
 
             private async ValueTask<bool> WaitForNextTickAsync(CancellationToken cancellationToken)
             {
-                await _ticks.WaitAsync(cancellationToken);
-                return !Volatile.Read(ref _sourceEnded);
+                // Logged and signalled on entry, before any wait, so the log shows when the loop
+                // asked and a test can wait for the request.
+                Probe.RecordTickRequested();
+                while (await _ticks.Reader.WaitToReadAsync(cancellationToken))
+                {
+                    if (_ticks.Reader.TryRead(out Func<bool>? tick))
+                    {
+                        return tick();
+                    }
+                }
+                // A closed source with no tick left has ended.
+                return false;
             }
         }
     }
