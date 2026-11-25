@@ -6,13 +6,22 @@ Load generator for the EasyTrade app based on the implementation using Puppeteer
 
 ## Visits:
 
-| Name              | Description                                                                       |
-| ----------------- | --------------------------------------------------------------------------------- |
-| depositAndBuy     | Deposit generated value and buys random instrument                                |
-| depositAndLongBuy | Deposit generated value and long buys random instrument with a generated duration |
-| longSell          | Long sells held instrument with a generated duration                              |
-| orderCreditCard   | Orders card for the user                                                          |
-| sellAndWithdraw   | Sells and withdraw generated amount of assets                                     |
+| Name                                                | Description                                                                                                                                                                                                |
+| --------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| depositAndBuy                                       | Deposit generated value and buys random instrument                                                                                                                                                         |
+| depositAndLongBuy                                   | Deposit generated value and long buys random instrument with a generated duration                                                                                                                          |
+| longSell                                            | Long sells held instrument with a generated duration                                                                                                                                                       |
+| orderCreditCard                                     | Orders card for the user                                                                                                                                                                                   |
+| sellAndWithdraw                                     | Sells and withdraw generated amount of assets                                                                                                                                                              |
+| portfolioInsightsAlert (`portfolio_insights_alert`) | Opt-in (weight 0 by default); skips while flag `portfolio-insights-enabled` is off or unreadable, otherwise logs in, opens Portfolio Insights, creates one target-price alert and deletes it by its own id |
+
+At visit start `portfolioInsightsAlert` reads `GET <EASYTRADE_URL>/feature-flag-service/v1/flags/portfolio-insights-enabled` with a 2 s deadline. Anything other than a 200 whose body is this flag with `enabled: true` counts as off, and the visit logs `Flag [portfolio-insights-enabled] is off, skipping portfolio insights visit` before opening any page.
+Otherwise the alert it creates carries a marker threshold, `1000000.` followed by 8 random digits, and the visit logs `Created alert [<id>] threshold [<marker>]`.
+It deletes only that id: through the UI (`Deleted alert [<id>] via ui`) or, as a fallback, through `DELETE /broker-service/v1/alerts/{id}` with a 5 s deadline (`Deleted alert [<id>] via api`, `Alert [<id>] already absent`, or `Alert [<id>] left in place: <status>`, where `<status>` is the HTTP status, `timeout` or `error`).
+When the create cannot be confirmed it logs `Create unconfirmed threshold [<marker>], outcome unknown` and deletes nothing; when the instrument options never load it logs `Alert instrument options did not load, no alert created`.
+It never touches another alert, so concurrent visits sharing a preset user are safe.
+
+Endpoints, the database recreate note and the demo walkthrough: see [Portfolio insights (demo feature)](../../README.md#portfolio-insights-demo-feature).
 
 ## Environment variables
 
@@ -80,6 +89,27 @@ This is an overview and may be out of date, check [`src/config/getConfig.ts`](sr
     - _default:_ 1
   - **SELL_AND_WITHDRAW_SUCCESS_WEIGHT**
     - _default:_ 1
+  - **PORTFOLIO_INSIGHTS_ALERT_WEIGHT**
+    - _default:_ 0
+    - opt-in weight of the `portfolio_insights_alert` visit: a weight of 0 or less drops the visit from the weighted provider, so the default workload is unchanged
+    - set it above 0 only together with the `portfolio-insights-enabled` flag on, otherwise every run of the visit only logs its skip line
+    - a value that is not a finite number, or a positive value so large relative to the other weights that the weighted provider could not schedule it, is rejected at startup
+
+To run the visit in a demo, start the stack with the flag on and the visit weighted, with no file edit (from the repository root):
+
+```bash
+# Compose: set both values for this start, or put the same two lines in .env, which Compose interpolates
+ENABLE_PORTFOLIO_INSIGHTS=true PORTFOLIO_INSIGHTS_ALERT_WEIGHT=1 make start
+
+# Helm
+helm upgrade --install easytrade helm/easytrade --namespace easytrade --create-namespace \
+--set feature-flag-service.env.ENABLE_PORTFOLIO_INSIGHTS="true" \
+--set loadgen.env.PORTFOLIO_INSIGHTS_ALERT_WEIGHT="1"
+```
+
+On a running stack the flag can also be switched with `PUT /feature-flag-service/v1/flags/portfolio-insights-enabled` and `{"enabled": true}`; the visit reads it again at every visit start.
+
+`PORTFOLIO_INSIGHTS_ALERT_WEIGHT` is declared in `compose.yaml` and `compose.dev.yaml` as `${PORTFOLIO_INSIGHTS_ALERT_WEIGHT:-0}`, and in `helm/easytrade/values.yaml` under `loadgen.env` as `"0"`.
 
 ## Local usage
 
@@ -89,6 +119,10 @@ make redeploy services=loadgen   # rebuild and recreate it in the running stack
 ```
 
 Run `make help` for every target.
+
+In `src/loadgen`, `npm ci && npm test` runs the `node:test` unit suites: `tsc` builds into `build/`, then `node --test "build/**/*.test.js"` runs every compiled test file.
+
+[`verification/portfolio-insights-page-check.mjs`](verification/portfolio-insights-page-check.mjs) is the browser check of the Portfolio Insights page; [`scripts/portfolio-insights/e2e.sh`](../../scripts/portfolio-insights/e2e.sh) runs it. It sits outside `src/`, so neither the build nor the image includes it.
 
 ## Health endpoints
 
