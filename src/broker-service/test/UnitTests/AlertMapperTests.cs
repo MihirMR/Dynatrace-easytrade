@@ -3,8 +3,8 @@ using EasyTrade.BrokerService.Entities.Alerts;
 using EasyTrade.BrokerService.Entities.Alerts.DTO;
 using EasyTrade.BrokerService.Entities.Alerts.Repository;
 using Google.Protobuf.WellKnownTypes;
-// Aliased because the generated namespace declares an AlertService type, which would clash
-// with the broker's own alert service.
+// Aliased so every db-adapter wire type reads as AlertGrpc.<Type>, visibly distinct from the
+// broker's Alert domain record and AlertDTO.
 using AlertGrpc = EasyTrade.DbAdapter.Alert.Grpc;
 
 namespace EasyTrade.BrokerService.Test.UnitTests
@@ -63,23 +63,33 @@ namespace EasyTrade.BrokerService.Test.UnitTests
         {
             Triggered,
             Untriggered,
+            DisabledTriggered,
             TriggeredAtWithoutValue,
             TriggerValueWithoutTriggeredAt,
             EmptyThreshold,
             InexactType,
             InexactDirection,
             MissingCreatedAt,
+            MalformedAlertId,
+            MalformedAccountId,
+            MalformedInstrumentId,
+            MalformedTriggerValue,
         }
 
         [Theory]
         [InlineData(ProtoCase.Triggered)]
         [InlineData(ProtoCase.Untriggered)]
+        [InlineData(ProtoCase.DisabledTriggered)]
         [InlineData(ProtoCase.TriggeredAtWithoutValue)]
         [InlineData(ProtoCase.TriggerValueWithoutTriggeredAt)]
         [InlineData(ProtoCase.EmptyThreshold)]
         [InlineData(ProtoCase.InexactType)]
         [InlineData(ProtoCase.InexactDirection)]
         [InlineData(ProtoCase.MissingCreatedAt)]
+        [InlineData(ProtoCase.MalformedAlertId)]
+        [InlineData(ProtoCase.MalformedAccountId)]
+        [InlineData(ProtoCase.MalformedInstrumentId)]
+        [InlineData(ProtoCase.MalformedTriggerValue)]
         public void FromProto_Alert_ShouldMapFields(ProtoCase protoCase)
         {
             // Arrange
@@ -116,17 +126,20 @@ namespace EasyTrade.BrokerService.Test.UnitTests
         }
 
         [Theory]
-        [InlineData(AlertType.TARGET_PRICE, AlertDirection.ABOVE, "TARGET_PRICE", "ABOVE")]
-        [InlineData(AlertType.PROFIT_LOSS, AlertDirection.BELOW, "PROFIT_LOSS", "BELOW")]
+        [InlineData(AlertType.TARGET_PRICE, AlertDirection.ABOVE, true, "TARGET_PRICE", "ABOVE")]
+        [InlineData(AlertType.PROFIT_LOSS, AlertDirection.BELOW, false, "PROFIT_LOSS", "BELOW")]
         public void ToDto_Alert_ShouldUseEnumNames(
             AlertType type,
             AlertDirection direction,
+            bool enabled,
             string expectedType,
             string expectedDirection
         )
         {
             // Arrange
-            // Domain-maximum decimals and non-default flags, so a dropped or rounded field shows.
+            // Domain-maximum decimals, a set acknowledgement and both enabled states, so a dropped,
+            // rounded or constant field shows. The disabled row keeps its trigger data, as a
+            // disable does.
             Alert alert = new(
                 Id: FixedAlertId,
                 AccountId: FixedAccountId,
@@ -134,7 +147,7 @@ namespace EasyTrade.BrokerService.Test.UnitTests
                 Type: type,
                 Direction: direction,
                 Threshold: AlertNumber.MaxThreshold,
-                Enabled: true,
+                Enabled: enabled,
                 ArmingRevision: 2,
                 TriggeredAt: TriggerTime,
                 TriggerValue: AlertNumber.MaxTriggerValue,
@@ -213,14 +226,22 @@ namespace EasyTrade.BrokerService.Test.UnitTests
         }
 
         [Fact]
-        public void ToName_UndefinedEnumValue_ShouldThrowArgumentOutOfRange()
+        public void ToName_UndefinedType_ShouldThrowArgumentOutOfRange()
         {
             // Arrange
             const AlertType undefinedType = (AlertType)99;
-            const AlertDirection undefinedDirection = (AlertDirection)99;
 
             // Act and Assert
             Assert.Throws<ArgumentOutOfRangeException>(() => AlertMapper.ToName(undefinedType));
+        }
+
+        [Fact]
+        public void ToName_UndefinedDirection_ShouldThrowArgumentOutOfRange()
+        {
+            // Arrange
+            const AlertDirection undefinedDirection = (AlertDirection)99;
+
+            // Act and Assert
             Assert.Throws<ArgumentOutOfRangeException>(
                 () => AlertMapper.ToName(undefinedDirection)
             );
@@ -238,6 +259,12 @@ namespace EasyTrade.BrokerService.Test.UnitTests
                     return (TriggeredMessage(), TriggeredAlert);
                 case ProtoCase.Untriggered:
                     return (message, UntriggeredAlert);
+                case ProtoCase.DisabledTriggered:
+                    // Disabling keeps the trigger data, so enabled maps apart from the trigger
+                    // fields and acknowledgement.
+                    message = TriggeredMessage();
+                    message.Enabled = false;
+                    return (message, TriggeredAlert with { Enabled = false });
                 case ProtoCase.TriggeredAtWithoutValue:
                     // db-adapter sets and clears both trigger fields together, so a reply with
                     // only one of them is malformed and must not read as untriggered.
@@ -257,6 +284,23 @@ namespace EasyTrade.BrokerService.Test.UnitTests
                     return (message, null);
                 case ProtoCase.MissingCreatedAt:
                     message.CreatedAt = null;
+                    return (message, null);
+                case ProtoCase.MalformedAlertId:
+                    // Each malformed id is one non-hex character away from its valid UUID, so a
+                    // length or shape check alone would let it through.
+                    message.Id = "e0000000-0000-4000-8000-00000000000z";
+                    return (message, null);
+                case ProtoCase.MalformedAccountId:
+                    message.AccountId = "a0000000-0000-4000-8000-00000000000z";
+                    return (message, null);
+                case ProtoCase.MalformedInstrumentId:
+                    message.InstrumentId = "c0000000-0000-4000-8000-00000000000z";
+                    return (message, null);
+                case ProtoCase.MalformedTriggerValue:
+                    // Nonempty with triggered_at set, so it reaches the decimal read. The wire form
+                    // has no exponent, so it must not read as 100000.
+                    message = TriggeredMessage();
+                    message.TriggerValue = "1e5";
                     return (message, null);
                 default:
                     throw new ArgumentOutOfRangeException(nameof(protoCase), protoCase, null);

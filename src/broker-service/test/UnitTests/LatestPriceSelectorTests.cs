@@ -17,7 +17,9 @@ namespace EasyTrade.BrokerService.Test.UnitTests
         public enum SelectorCase
         {
             NewerTimestampWins,
+            NewerInstantAcrossOffsetsWins,
             TiedTimestampGreaterClose,
+            EqualInstantsAcrossOffsetsGreaterClose,
             TiedTimestampAndCloseGreaterOpen,
             FullTieKeepsFirst,
             Empty,
@@ -25,7 +27,9 @@ namespace EasyTrade.BrokerService.Test.UnitTests
 
         [Theory]
         [InlineData(SelectorCase.NewerTimestampWins)]
+        [InlineData(SelectorCase.NewerInstantAcrossOffsetsWins)]
         [InlineData(SelectorCase.TiedTimestampGreaterClose)]
+        [InlineData(SelectorCase.EqualInstantsAcrossOffsetsGreaterClose)]
         [InlineData(SelectorCase.TiedTimestampAndCloseGreaterOpen)]
         [InlineData(SelectorCase.FullTieKeepsFirst)]
         [InlineData(SelectorCase.Empty)]
@@ -78,6 +82,20 @@ namespace EasyTrade.BrokerService.Test.UnitTests
                         [firstNewer, secondNewer]
                     );
                 }
+                case SelectorCase.NewerInstantAcrossOffsetsWins:
+                {
+                    // 13:00 +02:00 is 11:00 UTC, so the 12:00 +00:00 candle is newer and wins
+                    // although its displayed time is earlier and its close is lower.
+                    DateTimeOffset older = Time.AddHours(-1).ToOffset(TimeSpan.FromHours(2));
+                    Price firstOlder = Candle(FirstInstrumentId, older, open: 9, close: 10);
+                    Price firstNewer = Candle(FirstInstrumentId, Time, open: 2, close: 8);
+                    Price secondNewer = Candle(SecondInstrumentId, Time, open: 1, close: 3);
+                    Price secondOlder = Candle(SecondInstrumentId, older, open: 8, close: 9);
+                    return (
+                        [firstOlder, firstNewer, secondNewer, secondOlder],
+                        [firstNewer, secondNewer]
+                    );
+                }
                 case SelectorCase.TiedTimestampGreaterClose:
                 {
                     // The greater close wins although its open is lower.
@@ -88,6 +106,20 @@ namespace EasyTrade.BrokerService.Test.UnitTests
                     return (
                         [firstLowClose, firstHighClose, secondHighClose, secondLowClose],
                         [firstHighClose, secondHighClose]
+                    );
+                }
+                case SelectorCase.EqualInstantsAcrossOffsetsGreaterClose:
+                {
+                    // 12:00 +00:00 and 14:00 +02:00 are the same instant, so the greater close
+                    // wins although its displayed time is earlier and its open is lower.
+                    DateTimeOffset plusTwo = Time.ToOffset(TimeSpan.FromHours(2));
+                    Price firstPlusTwo = Candle(FirstInstrumentId, plusTwo, open: 9, close: 5);
+                    Price firstUtc = Candle(FirstInstrumentId, Time, open: 1, close: 7);
+                    Price secondUtc = Candle(SecondInstrumentId, Time, open: 1, close: 7);
+                    Price secondPlusTwo = Candle(SecondInstrumentId, plusTwo, open: 9, close: 5);
+                    return (
+                        [firstPlusTwo, firstUtc, secondUtc, secondPlusTwo],
+                        [firstUtc, secondUtc]
                     );
                 }
                 case SelectorCase.TiedTimestampAndCloseGreaterOpen:
