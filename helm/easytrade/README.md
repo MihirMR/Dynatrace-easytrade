@@ -87,6 +87,23 @@ The easytrade chart includes the following microservices:
 - `reverse-proxy` - Nginx reverse proxy
 - `user-service` - Account and authentication service
 
+The chart also deploys the simulated **Portfolio Insights and Alerts** demo feature: portfolio
+figures, a concentration-risk badge, and target-price or profit/loss alerts with in-app
+notifications. It uses simulated data and is **not financial advice**. It is gated end to end
+by the feature flag `portfolio-insights-enabled`, which is off by default, so the shipped
+values keep the feature off and the loadgen workload unchanged. Enable it at install time with
+`--set feature-flag-service.env.ENABLE_PORTFOLIO_INSIGHTS="true"`, and optionally drive it from
+loadgen with `--set loadgen.env.PORTFOLIO_INSIGHTS_ALERT_WEIGHT="1"`:
+
+```bash
+helm upgrade --install easytrade ./helm/easytrade -n easytrade --create-namespace \
+  --set feature-flag-service.env.ENABLE_PORTFOLIO_INSIGHTS="true" \
+  --set loadgen.env.PORTFOLIO_INSIGHTS_ALERT_WEIGHT="1"
+```
+
+The endpoints, runtime toggling and the demo walkthrough are in
+[Portfolio insights (demo feature)](../../README.md#portfolio-insights-demo-feature).
+
 ### Example Configurations
 
 #### Minimal installation with specific services
@@ -134,6 +151,29 @@ broker-service:
     LOG_LEVEL: "debug"
 ```
 
+**Portfolio Insights variables.** `values.yaml` declares three variables for the Portfolio
+Insights demo feature. Their defaults keep the feature off and the loadgen workload unchanged.
+
+| Variable | Service (values key) | Default | Purpose |
+|----------|----------------------|---------|---------|
+| `ENABLE_PORTFOLIO_INSIGHTS` | `feature-flag-service.env` | `"false"` | Startup default of the `portfolio-insights-enabled` flag. A restart restores this value. It can be toggled at runtime with `PUT /v1/flags/portfolio-insights-enabled` unless `ENABLE_MODIFY` is `false` |
+| `ALERT_EVALUATION_INTERVAL_SECONDS` | `broker-service.env` | `"60"` | Seconds between alert evaluation cycles. Valid range 1–4294967; any other value falls back to 60 with a warning |
+| `PORTFOLIO_INSIGHTS_ALERT_WEIGHT` | `loadgen.env` | `"0"` | Weight of the `portfolio_insights_alert` visit. `0` keeps it off (opt-in), so the existing workload is unchanged |
+
+The values-file equivalent of the `--set` demo values in [Available Services](#available-services):
+
+```yaml
+feature-flag-service:
+  env:
+    ENABLE_PORTFOLIO_INSIGHTS: "true"
+loadgen:
+  env:
+    PORTFOLIO_INSIGHTS_ALERT_WEIGHT: "1"
+```
+
+Write these values as quoted strings, as `values.yaml` does; the chart renders every `env`
+entry into the pod as a quoted string.
+
 #### Database with persistence
 
 ```yaml
@@ -152,6 +192,59 @@ db-mssql:
       cpu: "2"
       memory: 4Gi
 ```
+
+**Getting the Portfolio Insights `Alerts` table.** The table ships inside the `db-mssql` and
+`db-postgres` images (`sql-alerts.sql` and `13-alerts.sql`), so a database initialised from an
+image that contains the script has it. An existing database needs one of the steps below.
+
+- **Init scripts are not enough.** They never add the `Alerts` table to an existing database.
+  - PostgreSQL runs its init scripts only for an empty data directory.
+  - Restarting a persistent MSSQL database is not a way to get the table either. MSSQL reruns
+    its whole script list on every start without stopping on errors, and against surviving
+    data that duplicates the seeded holdings. A `helm upgrade` that changes the database image
+    restarts its pod too.
+- **Persistence off (the default).** `persistence` is commented out for `db-mssql` and
+  `db-postgres` in `values.yaml`, so a new database pod starts empty and initialises the full
+  schema, `Alerts` included, from the new image.
+- **Persistence on** (`persistence.enabled: true` with a `mountPath`, as in the example above).
+  `helm uninstall` leaves the StatefulSet's PersistentVolumeClaim in place, so a reinstall
+  reuses the old data. A fresh database needs that PVC deleted explicitly, and deleting it
+  **destroys the data**. The chart's volume claim template is named `data` and the StatefulSet
+  is `<release>-db-mssql` or `<release>-db-postgres`, so the PVC is `data-<release>-db-mssql-0`
+  or `data-<release>-db-postgres-0` (for example `data-easytrade-db-mssql-0`):
+
+  ```bash
+  helm uninstall <release> -n <namespace>
+  kubectl get pvc -n <namespace>          # confirm the name
+  kubectl delete pvc data-<release>-db-mssql-0 -n <namespace>
+  helm upgrade --install <release> ./helm/easytrade -n <namespace> -f custom-values.yaml
+  ```
+
+- **Keeping existing data.** Back up the database first, then apply the dialect's script once,
+  by hand, inside the running database pod. Both scripts are guarded
+  (`IF OBJECT_ID(...) IS NULL` / `CREATE TABLE IF NOT EXISTS`), so a repeat is harmless.
+  - MSSQL: the image keeps its scripts in `/my-app`, and `SA_PASSWORD` is the pod's
+    secret-backed environment variable:
+
+    ```bash
+    kubectl exec -n <namespace> <release>-db-mssql-0 -- bash -c \
+      '/opt/mssql-tools/bin/sqlcmd -S localhost -U sa -P "$SA_PASSWORD" -b -I -i /my-app/sql-alerts.sql'
+    ```
+
+  - PostgreSQL: the image keeps its scripts in `/docker-entrypoint-initdb.d`:
+
+    ```bash
+    kubectl exec -n <namespace> <release>-db-postgres-0 -- \
+      psql -v ON_ERROR_STOP=1 -U postgres -d TradeManagement -f /docker-entrypoint-initdb.d/13-alerts.sql
+    ```
+
+  - A pod still running an older image has no such file. Copy the script in from a checkout
+    first, for example
+    `kubectl cp src/db/mssql/sql-scripts/sql-alerts.sql <namespace>/<release>-db-mssql-0:/tmp/sql-alerts.sql`,
+    and pass `/tmp/sql-alerts.sql` instead.
+
+The per-dialect script layout is in [`src/db/README.md`](../../src/db/README.md), and the
+general procedure in the root README's [Database](../../README.md#database) section.
 
 #### Service with RBAC
 

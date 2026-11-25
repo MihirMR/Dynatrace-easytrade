@@ -21,5 +21,29 @@ Content-Type: application/json
 
 {"enabled": false}
 
+### Get the portfolio insights flag
+# Portfolio insights (demo feature, not financial advice). Flag id is hyphenated: portfolio-insights-enabled.
+# Walkthrough, variables (ENABLE_PORTFOLIO_INSIGHTS, ALERT_EVALUATION_INTERVAL_SECONDS, PORTFOLIO_INSIGHTS_ALERT_WEIGHT) and the database recreate note: ../../README.md#portfolio-insights-demo-feature
+# The feature endpoints are not served here; see ../broker-service/broker-service.http and ../broker-service/README.md#portfolio-insights-and-alerts
+# While the flag is off, every feature endpoint in broker-service answers 403 {"error":"feature_disabled"}.
+# The flag is not listed by ?tag=problem_pattern (the /feature-flags page); use ?tag=feature below.
+GET {{baseUrl}}/v1/flags/portfolio-insights-enabled
+
+### Enable portfolio insights (walkthrough step 1)
+# broker-service applies it on its next request, a visible frontend tab within about 15 s; a restart restores the startup default; 400 when ENABLE_MODIFY=false.
+PUT {{baseUrl}}/v1/flags/portfolio-insights-enabled
+Content-Type: application/json
+
+{"enabled": true}
+
+### Disable portfolio insights
+PUT {{baseUrl}}/v1/flags/portfolio-insights-enabled
+Content-Type: application/json
+
+{"enabled": false}
+
+### Get flags by tag feature
+GET {{baseUrl}}/v1/flags?tag=feature
+
 ### Version
 GET {{baseUrl}}/version

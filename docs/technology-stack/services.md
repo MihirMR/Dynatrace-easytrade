@@ -50,6 +50,20 @@ Hosts three of the injected faults:
 Depends on `user-service`, `pricing-service`, `feature-flag-service`, and `db-adapter`.
 The only service with a test project (xUnit).
 
+It also serves the **Portfolio Insights** demo (simulated, not financial advice), gated
+by the `portfolio-insights-enabled` flag: `GET /v1/portfolio/insights/{accountId}` plus
+six alert endpoints for create (`POST /v1/alerts`), list (`GET /v1/alerts?accountId=`),
+enable/disable (`PATCH /v1/alerts/{id}`), delete (`DELETE /v1/alerts/{id}`),
+notifications (`GET /v1/alerts/notifications?accountId=&unacknowledged=`) and acknowledge
+(`POST /v1/alerts/{id}/acknowledge`). All seven answer `403 {"error":"feature_disabled"}`
+while the flag is off or unreadable. Insights reuse the existing holdings, trade and
+latest-price access. A second hosted service, `AlertEvaluationSchedulerService`,
+evaluates armed alerts every `ALERT_EVALUATION_INTERVAL_SECONDS` (default `60`) and
+records each trigger through db-adapter's conditional `TriggerAlert`, so each arming
+yields one notification. See
+[Portfolio insights (demo feature)](../../README.md#portfolio-insights-demo-feature) for
+the walkthrough, flag and variables.
+
 ### `user-service` — Go + Gin
 
 Authentication and account management. All data access goes through `db-adapter` via the
@@ -84,6 +98,14 @@ The switchboard for every problem pattern. Flags live **in memory only** — res
 service resets each one to its environment default. Every other service reads it through
 an OpenFeature client.
 
+Besides the problem-pattern flags, it holds one `feature`-tagged flag,
+`portfolio-insights-enabled`, which gates Portfolio Insights in broker-service, the
+frontend and loadgen. Its startup default comes from `ENABLE_PORTFOLIO_INSIGHTS` (default
+`false`). `PUT /v1/flags/portfolio-insights-enabled` toggles it at runtime, unless
+`ENABLE_MODIFY=false` locks every flag, and a restart restores the startup default. The
+frontend's `/feature-flags` page does not list it, because that page shows only
+`problem_pattern` flags.
+
 ### `background-service` — Go
 
 A collection of supporting components that simulate external systems interacting with EasyTrade and perform background maintenance tasks. These components are grouped together to minimize infrastructure and resource overhead, since they are not part of the core application landscape that users interact with or typically monitor.
@@ -100,6 +122,8 @@ A collection of supporting components that simulate external systems interacting
 Every other service's route to storage, and the **only** service that opens a database
 connection. gRPC on `50051`, health on `8080`. The gRPC layer depends only on
 interfaces, so a new SQL dialect is added without touching the server layer.
+It also hosts the `AlertService` gRPC service (`src/proto/alert_service.proto`), which
+owns every statement on the `Alerts` table.
 See [Data layer](data-layer.md).
 
 ### `db` — Postgres, MSSQL, or another dialect
@@ -107,11 +131,23 @@ See [Data layer](data-layer.md).
 Schema and seed data, selected by `DB_TYPE`. Nothing outside `db-adapter` knows or cares
 which backend is running.
 
+Both dialects create an `Alerts` table for Portfolio Insights alerts, in
+`src/db/postgres/sql-scripts/13-alerts.sql` and `src/db/mssql/sql-scripts/sql-alerts.sql`.
+Init scripts do not add it to an already-initialised database; see
+[Recreating the database for alerts](data-layer.md#recreating-the-database-for-alerts).
+The feature is described in
+[Portfolio insights (demo feature)](../../README.md#portfolio-insights-demo-feature).
+
 ### `loadgen` — Puppeteer
 
 Real browser sessions driving five scripted journeys: `depositAndBuy`,
 `depositAndLongBuy`, `longSell`, `orderCreditCard`, `sellAndWithdraw`. This is what
 generates the browser-side traffic.
+
+An opt-in sixth visit, `portfolio_insights_alert`, opens Portfolio Insights, creates one
+alert and deletes it by its own id. It runs only when `PORTFOLIO_INSIGHTS_ALERT_WEIGHT` is
+above `0` (default `0`, so the default workload is unchanged), and it skips while
+`portfolio-insights-enabled` is off.
 
 ## How they fit together
 
