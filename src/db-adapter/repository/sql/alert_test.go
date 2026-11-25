@@ -1,10 +1,13 @@
 package sql
 
 import (
+	"bytes"
 	"context"
+	dbsql "database/sql"
 	"errors"
 	"flag"
 	"fmt"
+	"net"
 	"runtime"
 	"slices"
 	"strings"
@@ -13,10 +16,16 @@ import (
 	"time"
 
 	"github.com/dynatrace/easytrade/dbadapter/config"
+	"github.com/dynatrace/easytrade/dbadapter/db"
 	pb "github.com/dynatrace/easytrade/dbadapter/proto"
 	"github.com/dynatrace/easytrade/dbadapter/repository"
 	"github.com/google/uuid"
+	log "github.com/sirupsen/logrus"
 	"google.golang.org/protobuf/proto"
+	"gorm.io/driver/postgres"
+	"gorm.io/driver/sqlserver"
+	"gorm.io/gorm"
+	"gorm.io/gorm/logger"
 )
 
 // The real-database cases opt in through a test-binary flag rather than an environment variable, so
@@ -26,13 +35,18 @@ import (
 var integration = flag.Bool("integration", false, "run alert repository tests against the database in DB_TYPE/DB_URL")
 
 const (
-	// Seeded INTERNAL owner account and first instrument, identical on both dialects. The account has
-	// no holdings, so a broker evaluator on the same database skips its PROFIT_LOSS alerts
+	// Seeded INTERNAL owner account and first instrument, identical on both dialects. The account is
+	// seeded with no holdings, but an evaluator checks TARGET_PRICE alerts without consulting holdings
 	testOwnerAccountID = "a0000000-0000-4000-8000-000000000000"
 	testInstrumentID   = "c0000000-0000-4000-8000-000000000001"
-	// The threshold domain maximum: a TARGET_PRICE ABOVE it is never crossed, so a broker evaluator on
-	// the same database never triggers the rows these tests trigger themselves
-	neverReachedThreshold = "9999999999.99999999"
+	// The threshold domain maximum: the largest accepted threshold and the DECIMAL(18, 8) maximum. It
+	// bounds thresholds, not observed prices, so a TARGET_PRICE ABOVE it only makes a stray trigger
+	// unlikely. The rows these tests create are isolated from a live evaluator only while no broker
+	// evaluates this database's alerts: no broker-service uses the database, or
+	// portfolio-insights-enabled stays off for the whole run and every evaluation cycle that started
+	// while it was on has finished. A broker checks the flag only as a cycle starts, and a cycle past
+	// that check still lists armed alerts and triggers the crossed ones after the flag is switched off
+	thresholdDomainMax = "9999999999.99999999"
 )
 
 var (
@@ -51,27 +65,82 @@ func alertTestBackend(t *testing.T) *sqlBackend {
 	alertBackendOnce.Do(func() {
 		alertBackend, alertBackendErr = connectAlertTestBackend(config.Load().Database)
 	})
-	// With the flag set, a missing or unreachable database fails the run instead of skipping it
+	// With the flag set, a missing or unreachable database fails the run instead of skipping it. The
+	// error names the setting or the stage that failed and never carries DB_URL or a parser message
 	if alertBackendErr != nil {
 		t.Fatalf("alert repository tests need a database: %v", alertBackendErr)
 	}
 	return alertBackend
 }
 
+// connectAlertTestBackend validates the settings, then connects through the backend for DB_TYPE. Its
+// errors name a setting or a stage, never the DB_URL value
 func connectAlertTestBackend(cfg config.DatabaseConfig) (*sqlBackend, error) {
 	if cfg.Url == "" {
 		return nil, errors.New("DB_URL is not set")
 	}
-	var backend repository.DBBackend
-	var err error
+	// db.Connect hands the interval to time.NewTicker, which panics on the zero and negative durations
+	// the shared loader accepts
+	if cfg.RetryInterval <= 0 {
+		return nil, fmt.Errorf("DB_RETRY_INTERVAL must be a positive duration, got %s", cfg.RetryInterval)
+	}
+	// Each probe is the dialector NewPostgresBackend or NewMSSQLBackend builds from DB_URL, and onPool
+	// is the same driver over the pool that probe opens
+	var probe gorm.Dialector
+	var onPool func(*dbsql.DB) gorm.Dialector
 	switch cfg.Type {
 	case "postgres":
-		backend, err = NewPostgresBackend(cfg)
+		probe = postgres.Open(cfg.Url)
+		onPool = func(pool *dbsql.DB) gorm.Dialector { return postgres.New(postgres.Config{Conn: pool}) }
 	case "mssql":
-		backend, err = NewMSSQLBackend(cfg)
+		probe = sqlserver.Open(withGuidConversion(cfg.Url))
+		onPool = func(pool *dbsql.DB) gorm.Dialector { return sqlserver.New(sqlserver.Config{Conn: pool}) }
 	default:
 		return nil, fmt.Errorf("unsupported DB_TYPE %q", cfg.Type)
 	}
+	pool, err := openAlertTestPool(cfg.Type, probe)
+	if err != nil {
+		return nil, err
+	}
+	sb, err := connectAlertTestPool(cfg, pool, onPool(pool))
+	if err != nil {
+		err = fmt.Errorf("connecting with DB_TYPE=%s within DB_CONNECT_TIMEOUT=%s: %w", cfg.Type, cfg.ConnectTimeout, err)
+		if closeErr := pool.Close(); closeErr != nil {
+			err = errors.Join(err, fmt.Errorf("closing the DB_URL pool for DB_TYPE=%s: %w", cfg.Type, closeErr))
+		}
+		return nil, err
+	}
+	return sb, nil
+}
+
+// openAlertTestPool parses DB_URL, the only time it is parsed, through the probe dialector into a pool,
+// without connecting or logging. A parser error can echo the connection string and its password: pgx
+// redacts on a best-effort basis and go-mssqldb repeats rejected values, so the error reports neither
+func openAlertTestPool(dbType string, probe gorm.Dialector) (*dbsql.DB, error) {
+	opened, err := gorm.Open(probe, &gorm.Config{Logger: logger.Discard, DisableAutomaticPing: true})
+	if err != nil {
+		return nil, fmt.Errorf("checking DB_URL for DB_TYPE=%s: the connection string is invalid (value and parser message withheld: either can contain the password)", dbType)
+	}
+	pool, err := opened.DB()
+	if err != nil {
+		return nil, fmt.Errorf("checking DB_URL for DB_TYPE=%s: %w", dbType, err)
+	}
+	return pool, nil
+}
+
+// connectAlertTestPool waits until pool answers a ping, then builds through newBackend the backend
+// NewPostgresBackend or NewMSSQLBackend builds, with their dialector over the pool DB_URL was parsed
+// into once. No attempt parses DB_URL again, so db.Connect's retry log and error carry connection
+// failures only. The wait comes first because gorm.Open, inside newBackend, closes the pool when its
+// own ping fails
+func connectAlertTestPool(cfg config.DatabaseConfig, pool *dbsql.DB, dialector gorm.Dialector) (*sqlBackend, error) {
+	if _, err := db.Connect(context.Background(), db.ConnectOptions{
+		Timeout:       cfg.ConnectTimeout,
+		RetryInterval: cfg.RetryInterval,
+	}, func() (struct{}, error) { return struct{}{}, pool.Ping() }); err != nil {
+		return nil, err
+	}
+	backend, err := newBackend(cfg, dialector)
 	if err != nil {
 		return nil, err
 	}
@@ -104,10 +173,13 @@ func createTestAlert(t *testing.T, repo repository.AlertRepository, typ, directi
 	return alert
 }
 
-// createArmedTestAlert creates an alert that only the test itself can trigger
+// createArmedTestAlert creates an armed TARGET_PRICE ABOVE alert at the threshold domain maximum. Only
+// the test itself triggers it while no broker-service uses the database, or while
+// portfolio-insights-enabled stays off for the whole run and every evaluation cycle that started while
+// it was on has finished (see thresholdDomainMax)
 func createArmedTestAlert(t *testing.T, repo repository.AlertRepository) *pb.AlertMessage {
 	t.Helper()
-	return createTestAlert(t, repo, repository.AlertTypeTargetPrice, repository.AlertDirectionAbove, neverReachedThreshold)
+	return createTestAlert(t, repo, repository.AlertTypeTargetPrice, repository.AlertDirectionAbove, thresholdDomainMax)
 }
 
 func getTestAlert(t *testing.T, repo repository.AlertRepository, id string) *pb.AlertMessage {
@@ -174,6 +246,114 @@ func sortedIDs(ids ...string) []string {
 func cloneAlert(alert *pb.AlertMessage) *pb.AlertMessage {
 	return proto.Clone(alert).(*pb.AlertMessage)
 }
+
+// deleteAlertAtCleanup deletes the alert by id when the test ends; a row already absent is clean
+func deleteAlertAtCleanup(t *testing.T, repo repository.AlertRepository, id string) {
+	t.Helper()
+	t.Cleanup(func() {
+		if _, err := repo.Delete(context.Background(), id); err != nil && !errors.Is(err, repository.ErrNotFound) {
+			t.Errorf("cleanup Delete(%s): %v", id, err)
+		}
+	})
+}
+
+// insertRawAlert inserts an alert on the seeded owner account and instrument with a plain INSERT
+// and deletes it by id when the test ends. It bypasses the repository and its validation, so only
+// the table's own constraints judge the values; the caller's id and CreatedAt let a test read the
+// row back and fix the creation order.
+func insertRawAlert(t *testing.T, b *sqlBackend, id, typ, direction string, createdAt time.Time) error {
+	t.Helper()
+	deleteAlertAtCleanup(t, b.Alert(), id)
+	columns := []string{
+		repository.ColID, repository.ColAccountID, repository.ColType, repository.ColInstrumentID,
+		repository.ColDirection, repository.ColThreshold, repository.ColEnabled, repository.ColArmingRevision,
+		repository.ColAcknowledged, repository.ColCreatedAt,
+	}
+	quoted := make([]string, len(columns))
+	for i, column := range columns {
+		quoted[i] = q(column)
+	}
+	insertSQL := "INSERT INTO " + q(repository.TableAlerts) + " (" + strings.Join(quoted, ", ") + ")" +
+		" VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+	return b.gormDB.WithContext(context.Background()).Exec(insertSQL,
+		id, testOwnerAccountID, typ, testInstrumentID, direction, "1", true, 1, false, createdAt,
+	).Error
+}
+
+// pgDriverError and mssqlDriverError hold the methods of the drivers' error types, pgconn.PgError
+// and mssql.Error. Matching through them classifies a rejection without importing either driver,
+// which the module carries only indirectly through GORM.
+type pgDriverError interface {
+	error
+	SQLState() string
+}
+
+type mssqlDriverError interface {
+	error
+	SQLErrorNumber() int32
+}
+
+// dialectError is one kind of database rejection as each dialect reports it. An error matches when
+// its driver's code is listed for that dialect and its message contains every listed fragment.
+type dialectError struct {
+	name         string
+	pgStates     []string
+	pgText       []string
+	mssqlNumbers []int32
+	mssqlText    []string
+}
+
+func (want dialectError) matches(err error) bool {
+	var pgErr pgDriverError
+	if errors.As(err, &pgErr) {
+		return slices.Contains(want.pgStates, pgErr.SQLState()) && containsAll(pgErr.Error(), want.pgText)
+	}
+	var mssqlErr mssqlDriverError
+	if errors.As(err, &mssqlErr) {
+		return slices.Contains(want.mssqlNumbers, mssqlErr.SQLErrorNumber()) && containsAll(mssqlErr.Error(), want.mssqlText)
+	}
+	return false
+}
+
+func containsAll(s string, fragments []string) bool {
+	for _, fragment := range fragments {
+		if !strings.Contains(s, fragment) {
+			return false
+		}
+	}
+	return true
+}
+
+// checkViolation is the rejection by a column's CHECK. PostgreSQL names an unnamed column CHECK
+// <table>_<column>_check; SQL Server generates the name and gives the column in the message.
+func checkViolation(column string) dialectError {
+	return dialectError{
+		name:         "CHECK violation on " + column,
+		pgStates:     []string{"23514"},
+		pgText:       []string{`"` + repository.TableAlerts + "_" + column + `_check"`},
+		mssqlNumbers: []int32{547},
+		mssqlText:    []string{"CHECK constraint", "column '" + column + "'"},
+	}
+}
+
+// foreignKeyViolation is the rejection by a named FOREIGN KEY. SQL Server reports CHECK and FOREIGN
+// KEY conflicts under one number, so its message decides which.
+func foreignKeyViolation(constraint string) dialectError {
+	return dialectError{
+		name:         "FOREIGN KEY violation on " + constraint,
+		pgStates:     []string{"23503"},
+		pgText:       []string{`"` + constraint + `"`},
+		mssqlNumbers: []int32{547},
+		mssqlText:    []string{"FOREIGN KEY constraint", `"` + constraint + `"`},
+	}
+}
+
+var (
+	// A value longer than its column; SQL Server reports 8152, or 2628 from compatibility level 150
+	stringTruncation = dialectError{name: "string truncation", pgStates: []string{"22001"}, mssqlNumbers: []int32{8152, 2628}}
+	// Text that does not convert to uuid or uniqueidentifier
+	invalidUUIDText = dialectError{name: "invalid uuid text", pgStates: []string{"22P02"}, mssqlNumbers: []int32{8169}}
+)
 
 func TestAlertRepository_createAndGet_roundTrip(t *testing.T) {
 	repo := alertTestBackend(t).Alert()
@@ -493,76 +673,242 @@ func TestAlertRepository_unknownID_notFound(t *testing.T) {
 func TestAlertRepository_inexactEnum_rejectedByCheck(t *testing.T) {
 	b := alertTestBackend(t)
 	repo := b.Alert()
-	ctx := context.Background()
-	columns := []string{
-		repository.ColID, repository.ColAccountID, repository.ColType, repository.ColInstrumentID,
-		repository.ColDirection, repository.ColThreshold, repository.ColEnabled, repository.ColArmingRevision,
-		repository.ColAcknowledged, repository.ColCreatedAt,
-	}
-	quoted := make([]string, len(columns))
-	for i, column := range columns {
-		quoted[i] = q(column)
-	}
-	insertSQL := "INSERT INTO " + q(repository.TableAlerts) + " (" + strings.Join(quoted, ", ") + ")" +
-		" VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
 	// The raw insert bypasses the adapter's validation, so only the table's CHECKs stand between it
-	// and an inexact value. The explicit id lets the test read the row back and clean it up.
-	insert := func(t *testing.T, typ, direction string) (string, error) {
+	// and an inexact value
+	storedExactly := func(t *testing.T, id string) {
 		t.Helper()
-		id := uuid.New().String()
-		t.Cleanup(func() {
-			if _, err := repo.Delete(context.Background(), id); err != nil && !errors.Is(err, repository.ErrNotFound) {
-				t.Errorf("cleanup Delete(%s): %v", id, err)
-			}
-		})
-		err := b.gormDB.WithContext(ctx).Exec(insertSQL,
-			id, testOwnerAccountID, typ, testInstrumentID, direction,
-			"1", true, 1, false, time.Now().UTC().Truncate(time.Microsecond),
-		).Error
-		return id, err
+		got := getTestAlert(t, repo, id)
+		if got.Type != repository.AlertTypeTargetPrice || got.Direction != repository.AlertDirectionAbove {
+			t.Errorf("stored Type %q Direction %q, want exactly %q %q",
+				got.Type, got.Direction, repository.AlertTypeTargetPrice, repository.AlertDirectionAbove)
+		}
 	}
+
+	// The same INSERT with exact values succeeds, so each rejection below is its value's alone
+	t.Run("exactValuesControl", func(t *testing.T) {
+		id := uuid.New().String()
+
+		if err := insertRawAlert(t, b, id, repository.AlertTypeTargetPrice, repository.AlertDirectionAbove, alertNow()); err != nil {
+			t.Fatalf("insert of exact Type and Direction: %v", err)
+		}
+		storedExactly(t, id)
+	})
 
 	rejected := []struct {
 		name      string
 		typ       string
 		direction string
+		column    string
 	}{
-		{"lowercaseType", "target_price", repository.AlertDirectionAbove},
-		{"lowercaseDirection", repository.AlertTypeTargetPrice, "above"},
+		{"lowercaseType", "target_price", repository.AlertDirectionAbove, repository.ColType},
+		{"lowercaseDirection", repository.AlertTypeTargetPrice, "above", repository.ColDirection},
 		// Fits varchar(12), so only the CHECK can refuse it; SQL Server's = ignores trailing spaces
-		{"trailingSpaceTypeWithinWidth", "PROFIT_LOSS ", repository.AlertDirectionAbove},
+		{"trailingSpaceTypeWithinWidth", "PROFIT_LOSS ", repository.AlertDirectionAbove, repository.ColType},
 	}
 	for _, tc := range rejected {
 		t.Run(tc.name, func(t *testing.T) {
-			if _, err := insert(t, tc.typ, tc.direction); err == nil {
-				t.Errorf("insert of Type %q Direction %q succeeded, want a CHECK violation", tc.typ, tc.direction)
+			err := insertRawAlert(t, b, uuid.New().String(), tc.typ, tc.direction, alertNow())
+
+			if want := checkViolation(tc.column); !want.matches(err) {
+				t.Errorf("insert of Type %q Direction %q: err = %v, want the %s", tc.typ, tc.direction, err, want.name)
 			}
 		})
 	}
 
 	// One space beyond the column width: PostgreSQL truncates excess spaces before the CHECK, and SQL
-	// Server may too, so the guarantee is only that no inexact value is ever stored
+	// Server does too at its default settings. The value is refused by its column's CHECK or width,
+	// or exactly the canonical value is stored; any other outcome fails
 	overWidth := []struct {
 		name      string
 		typ       string
 		direction string
+		column    string
 	}{
-		{"trailingSpaceTypeOverWidth", "TARGET_PRICE ", repository.AlertDirectionAbove},
-		{"trailingSpaceDirectionOverWidth", repository.AlertTypeTargetPrice, "ABOVE "},
+		{"trailingSpaceTypeOverWidth", "TARGET_PRICE ", repository.AlertDirectionAbove, repository.ColType},
+		{"trailingSpaceDirectionOverWidth", repository.AlertTypeTargetPrice, "ABOVE ", repository.ColDirection},
 	}
 	for _, tc := range overWidth {
 		t.Run(tc.name, func(t *testing.T) {
-			id, err := insert(t, tc.typ, tc.direction)
+			id := uuid.New().String()
+
+			err := insertRawAlert(t, b, id, tc.typ, tc.direction, alertNow())
+
 			if err != nil {
-				t.Logf("insert of Type %q Direction %q refused: %v", tc.typ, tc.direction, err)
+				if check := checkViolation(tc.column); !check.matches(err) && !stringTruncation.matches(err) {
+					t.Errorf("insert of Type %q Direction %q: err = %v, want the %s, a %s, or the exact value stored",
+						tc.typ, tc.direction, err, check.name, stringTruncation.name)
+				}
 				return
 			}
+			storedExactly(t, id)
+		})
+	}
+}
 
-			got := getTestAlert(t, repo, id)
+func TestAlertRepository_cancelledContext_errorPropagated(t *testing.T) {
+	repo := alertTestBackend(t).Alert()
 
-			if got.Type != repository.AlertTypeTargetPrice || got.Direction != repository.AlertDirectionAbove {
-				t.Errorf("stored Type %q Direction %q, want exactly %q %q",
-					got.Type, got.Direction, repository.AlertTypeTargetPrice, repository.AlertDirectionAbove)
+	calls := []struct {
+		name string
+		// triggered triggers the alert first, so a call that ignored the cancellation would change it
+		triggered bool
+		// call reports the operation's result and whether that is its zero result
+		call func(t *testing.T, ctx context.Context, id string) (result any, zero bool, err error)
+	}{
+		{"Create", false, func(t *testing.T, ctx context.Context, _ string) (any, bool, error) {
+			alert, err := repo.Create(ctx, &pb.CreateAlertRequest{
+				AccountId:    testOwnerAccountID,
+				Type:         repository.AlertTypeTargetPrice,
+				InstrumentId: testInstrumentID,
+				Direction:    repository.AlertDirectionAbove,
+				Threshold:    "1",
+			})
+			if alert != nil {
+				deleteAlertAtCleanup(t, repo, alert.Id)
+			}
+			return alert, alert == nil, err
+		}},
+		{"List", false, func(_ *testing.T, ctx context.Context, _ string) (any, bool, error) {
+			alerts, err := repo.List(ctx, &pb.ListAlertsRequest{AccountId: testOwnerAccountID})
+			return alerts, alerts == nil, err
+		}},
+		{"GetByID", false, func(_ *testing.T, ctx context.Context, id string) (any, bool, error) {
+			alert, err := repo.GetByID(ctx, id)
+			return alert, alert == nil, err
+		}},
+		{"UpdateEnabledTrue", false, func(_ *testing.T, ctx context.Context, id string) (any, bool, error) {
+			snapshot, err := repo.UpdateEnabled(ctx, id, true)
+			return snapshot, snapshot == nil, err
+		}},
+		{"UpdateEnabledFalse", false, func(_ *testing.T, ctx context.Context, id string) (any, bool, error) {
+			snapshot, err := repo.UpdateEnabled(ctx, id, false)
+			return snapshot, snapshot == nil, err
+		}},
+		{"Delete", false, func(_ *testing.T, ctx context.Context, id string) (any, bool, error) {
+			n, err := repo.Delete(ctx, id)
+			return n, n == 0, err
+		}},
+		{"Trigger", false, func(_ *testing.T, ctx context.Context, id string) (any, bool, error) {
+			triggered, err := repo.Trigger(ctx, id, 1, "5")
+			return triggered, !triggered, err
+		}},
+		{"Acknowledge", true, func(_ *testing.T, ctx context.Context, id string) (any, bool, error) {
+			n, err := repo.Acknowledge(ctx, id)
+			return n, n == 0, err
+		}},
+	}
+	for _, tc := range calls {
+		t.Run(tc.name, func(t *testing.T) {
+			alert := createArmedTestAlert(t, repo)
+			if tc.triggered {
+				mustTrigger(t, repo, alert.Id, 1, "5")
+			}
+			before := getTestAlert(t, repo, alert.Id)
+			ctx, cancel := context.WithCancel(context.Background())
+			cancel()
+
+			result, zero, err := tc.call(t, ctx, alert.Id)
+
+			if !errors.Is(err, context.Canceled) || errors.Is(err, repository.ErrNotFound) {
+				t.Errorf("%s(cancelled context): err = %v, want context.Canceled, not ErrNotFound", tc.name, err)
+			}
+			if !zero {
+				t.Errorf("%s(cancelled context) returned %v, want its zero result", tc.name, result)
+			}
+			if got := getTestAlert(t, repo, alert.Id); !proto.Equal(got, before) {
+				t.Errorf("row after %s(cancelled context) = %v, want it unchanged from %v", tc.name, got, before)
+			}
+		})
+	}
+}
+
+func TestAlertRepository_createUnknownAccount_foreignKeyViolation(t *testing.T) {
+	repo := alertTestBackend(t).Alert()
+	ctx := context.Background()
+	accountID := uuid.New().String()
+
+	alert, err := repo.Create(ctx, &pb.CreateAlertRequest{
+		AccountId:    accountID,
+		Type:         repository.AlertTypeTargetPrice,
+		InstrumentId: testInstrumentID,
+		Direction:    repository.AlertDirectionAbove,
+		Threshold:    "1",
+	})
+
+	if alert != nil {
+		deleteAlertAtCleanup(t, repo, alert.Id)
+		t.Errorf("Create(unknown account) returned %v, want nil", alert)
+	}
+	if want := foreignKeyViolation("FK_Alerts_Accounts"); !want.matches(err) {
+		t.Errorf("Create(unknown account): err = %v, want the %s", err, want.name)
+	}
+	if stored, err := repo.List(ctx, &pb.ListAlertsRequest{AccountId: accountID}); err != nil || len(stored) != 0 {
+		t.Errorf("List(unknown account) = (%v, %v), want no rows", stored, err)
+	}
+}
+
+func TestAlertRepository_updateEnabledStatementFails_errorPropagated(t *testing.T) {
+	repo := alertTestBackend(t).Alert()
+	// The RPC validates ids before the repository sees them; here the malformed id makes the first
+	// UPDATE inside the transaction fail, and that failure must surface rather than a miss
+	const id = "not-a-uuid"
+
+	cases := []struct {
+		name    string
+		enabled bool
+	}{
+		{"rearm", true},
+		{"disable", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			snapshot, err := repo.UpdateEnabled(context.Background(), id, tc.enabled)
+
+			if !invalidUUIDText.matches(err) || errors.Is(err, repository.ErrNotFound) {
+				t.Errorf("UpdateEnabled(%q, %t): err = %v, want the %s, not ErrNotFound", id, tc.enabled, err, invalidUUIDText.name)
+			}
+			if snapshot != nil {
+				t.Errorf("UpdateEnabled(%q, %t) returned %v, want nil", id, tc.enabled, snapshot)
+			}
+		})
+	}
+}
+
+func TestAlertRepository_listSameCreatedAt_higherIdFirst(t *testing.T) {
+	b := alertTestBackend(t)
+	repo := b.Alert()
+
+	orders := []struct {
+		name              string
+		insertHigherFirst bool
+	}{
+		{"lowerIdInsertedFirst", false},
+		{"higherIdInsertedFirst", true},
+	}
+	for _, tc := range orders {
+		t.Run(tc.name, func(t *testing.T) {
+			// Ids differing only in the last hex digit order alike on both dialects: PostgreSQL compares
+			// uuid bytes left to right, SQL Server compares the last six-byte group first
+			base := uuid.New().String()
+			lower, higher := base[:len(base)-1]+"0", base[:len(base)-1]+"f"
+			inserted := []string{lower, higher}
+			if tc.insertHigherFirst {
+				inserted = []string{higher, lower}
+			}
+			createdAt := alertNow()
+			for _, id := range inserted {
+				if err := insertRawAlert(t, b, id, repository.AlertTypeTargetPrice, repository.AlertDirectionAbove, createdAt); err != nil {
+					t.Fatalf("insert %s: %v", id, err)
+				}
+				if stored := getTestAlert(t, repo, id).CreatedAt.AsTime(); !stored.Equal(createdAt) {
+					t.Fatalf("alert %s CreatedAt read back as %v, want the shared %v", id, stored, createdAt)
+				}
+			}
+
+			got := listOwnAlertIDs(t, repo, &pb.ListAlertsRequest{AccountId: testOwnerAccountID}, lower, higher)
+
+			if want := []string{higher, lower}; !slices.Equal(got, want) {
+				t.Errorf("List own ids at one CreatedAt = %v, want the higher id first %v", got, want)
 			}
 		})
 	}
@@ -766,6 +1112,147 @@ func TestDecimalTextValue_validity_textOrNil(t *testing.T) {
 
 			if err != nil || got != tc.want {
 				t.Errorf("Value() = (%#v, %v), want (%#v, nil)", got, err, tc.want)
+			}
+		})
+	}
+}
+
+// leakMarker is the password in the connection strings below, so a test can tell whether any output
+// repeats it
+const leakMarker = "Pw4LeakCheck"
+
+// captureConnectorLog collects the logrus output, where db.Connect logs every failed attempt, until the
+// test ends
+func captureConnectorLog(t *testing.T) *bytes.Buffer {
+	t.Helper()
+	var buf bytes.Buffer
+	previous := log.StandardLogger().Out
+	log.SetOutput(&buf)
+	t.Cleanup(func() { log.SetOutput(previous) })
+	return &buf
+}
+
+// clearPostgresEnv blanks, until the test ends, every PG* variable pgx reads as a connection default.
+// pgx treats an empty value as unset, so a developer's PGSERVICE, PGSSLMODE or similar cannot change
+// how the synthetic connection strings below parse or connect
+func clearPostgresEnv(t *testing.T) {
+	t.Helper()
+	for _, name := range []string{
+		"PGAPPNAME", "PGCHANNELBINDING", "PGCONNECT_TIMEOUT", "PGDATABASE", "PGHOST", "PGMAXPROTOCOLVERSION",
+		"PGMINPROTOCOLVERSION", "PGOPTIONS", "PGPASSFILE", "PGPASSWORD", "PGPORT", "PGREQUIREAUTH",
+		"PGSERVICE", "PGSERVICEFILE", "PGSSLCERT", "PGSSLKEY", "PGSSLMODE", "PGSSLNEGOTIATION",
+		"PGSSLPASSWORD", "PGSSLROOTCERT", "PGSSLSNI", "PGTARGETSESSIONATTRS", "PGTZ", "PGUSER",
+	} {
+		t.Setenv(name, "")
+	}
+}
+
+// closingDatabaseURLs returns, per DB_TYPE, a well-formed connection string with leakMarker as its
+// password, aimed at a loopback listener that closes every connection it accepts. Connecting fails
+// during the handshake at once, with no closed port or timeout to wait on
+func closingDatabaseURLs(t *testing.T) map[string]string {
+	t.Helper()
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen on loopback: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := listener.Close(); err != nil {
+			t.Errorf("close loopback listener: %v", err)
+		}
+	})
+	go func() {
+		for {
+			conn, err := listener.Accept()
+			if err != nil {
+				return
+			}
+			_ = conn.Close()
+		}
+	}()
+	addr := listener.Addr().String()
+	return map[string]string{
+		"postgres": "postgres://postgres:" + leakMarker + "@" + addr + "/TradeManagement?sslmode=disable",
+		"mssql":    "sqlserver://sa:" + leakMarker + "@" + addr + "?database=TradeManagement&encrypt=disable",
+	}
+}
+
+func TestConnectAlertTestBackend_malformedURL_errorWithholdsURL(t *testing.T) {
+	clearPostgresEnv(t)
+	cases := []struct {
+		name   string
+		dbType string
+		url    string
+	}{
+		{"postgresNonNumericPort", "postgres", "postgres://postgres:" + leakMarker + "@localhost:notaport/TradeManagement"},
+		{"postgresInvalidSslmode", "postgres", "postgres://postgres:" + leakMarker + "@localhost:5432/TradeManagement?sslmode=bogus"},
+		{"postgresKeywordValueNonNumericPort", "postgres", "host=localhost user=postgres password=" + leakMarker + " port=notaport dbname=TradeManagement"},
+		// pgx's best-effort redaction misses a password in the port position
+		{"postgresMarkerInPort", "postgres", "postgres://postgres@localhost:" + leakMarker + "/TradeManagement"},
+		{"mssqlNonNumericPort", "mssql", "sqlserver://sa:" + leakMarker + "@localhost:notaport?database=TradeManagement"},
+		{"mssqlInvalidEncrypt", "mssql", "sqlserver://sa:" + leakMarker + "@localhost:1433?database=TradeManagement&encrypt=bogus"},
+		// go-mssqldb repeats a rejected port value
+		{"mssqlKeywordValueMarkerInPort", "mssql", "server=localhost," + leakMarker + ";user id=sa;password=x"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			connectorLog := captureConnectorLog(t)
+
+			// A zero DB_CONNECT_TIMEOUT would end db.Connect after one attempt if the check let the URL through
+			_, err := connectAlertTestBackend(config.DatabaseConfig{Type: tc.dbType, Url: tc.url, RetryInterval: time.Hour})
+
+			if err == nil || !strings.Contains(err.Error(), "DB_URL") {
+				t.Fatalf("connectAlertTestBackend = %v, want an error naming DB_URL", err)
+			}
+			for _, leaked := range []string{leakMarker, tc.url} {
+				if strings.Contains(err.Error(), leaked) || strings.Contains(connectorLog.String(), leaked) {
+					t.Errorf("error %q or connector log %q repeats %q", err, connectorLog, leaked)
+				}
+			}
+		})
+	}
+}
+
+func TestConnectAlertTestBackend_nonpositiveRetryInterval_errorNamesSetting(t *testing.T) {
+	clearPostgresEnv(t)
+	urls := closingDatabaseURLs(t)
+	cases := []struct {
+		name     string
+		dbType   string
+		interval time.Duration
+	}{
+		{"postgresZero", "postgres", 0},
+		{"postgresNegative", "postgres", -time.Second},
+		{"mssqlZero", "mssql", 0},
+		{"mssqlNegative", "mssql", -time.Second},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			// Reaching time.NewTicker would panic and end the test binary instead of returning
+			_, err := connectAlertTestBackend(config.DatabaseConfig{Type: tc.dbType, Url: urls[tc.dbType], RetryInterval: tc.interval})
+
+			if err == nil || !strings.Contains(err.Error(), "DB_RETRY_INTERVAL") {
+				t.Errorf("connectAlertTestBackend(RetryInterval %s) = %v, want an error naming DB_RETRY_INTERVAL", tc.interval, err)
+			}
+		})
+	}
+}
+
+func TestConnectAlertTestBackend_unreachableDatabase_errorNamesConnectStage(t *testing.T) {
+	clearPostgresEnv(t)
+	urls := closingDatabaseURLs(t)
+	for _, dbType := range []string{"postgres", "mssql"} {
+		t.Run(dbType, func(t *testing.T) {
+			connectorLog := captureConnectorLog(t)
+
+			// A zero DB_CONNECT_TIMEOUT ends db.Connect after its first attempt
+			_, err := connectAlertTestBackend(config.DatabaseConfig{Type: dbType, Url: urls[dbType], RetryInterval: time.Hour})
+
+			if err == nil || !strings.Contains(err.Error(), "DB_CONNECT_TIMEOUT") {
+				t.Fatalf("connectAlertTestBackend = %v, want an error naming the DB_CONNECT_TIMEOUT stage", err)
+			}
+			if strings.Contains(err.Error(), leakMarker) || strings.Contains(connectorLog.String(), leakMarker) {
+				t.Errorf("error %q or connector log %q repeats the password", err, connectorLog)
 			}
 		})
 	}
