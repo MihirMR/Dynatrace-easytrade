@@ -43,6 +43,7 @@ services:
       PRICING_SERVICE_ADDRESS: *pricingServiceAddress
       FEATURE_FLAG_SERVICE_ADDRESS: *featureFlagServiceAddress
       DB_ADAPTER_ADDRESS: *dbAdapterAddress
+      ALERT_EVALUATION_INTERVAL_SECONDS: 60
 
   credit-card-order-service:
     <<: *default-service
@@ -78,6 +79,8 @@ services:
   feature-flag-service:
     <<: *default-service
     image: ${REGISTRY}/feature-flag-service:${TAG}
+    environment:
+      ENABLE_PORTFOLIO_INSIGHTS: ${ENABLE_PORTFOLIO_INSIGHTS:-false}
 
   frontend:
     <<: *default-service
@@ -110,6 +113,7 @@ services:
       - reverse-proxy
     environment:
       EASYTRADE_URL: *easytradeUrl
+      PORTFOLIO_INSIGHTS_ALERT_WEIGHT: ${PORTFOLIO_INSIGHTS_ALERT_WEIGHT:-0}
 
   offer-service:
     <<: *default-service

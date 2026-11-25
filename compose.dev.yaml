@@ -47,6 +47,7 @@ services:
       PRICING_SERVICE_ADDRESS: *pricingServiceAddress
       FEATURE_FLAG_SERVICE_ADDRESS: *featureFlagServiceAddress
       DB_ADAPTER_ADDRESS: *dbAdapterAddress
+      ALERT_EVALUATION_INTERVAL_SECONDS: 60
 
   credit-card-order-service:
     <<: *default-service
@@ -103,9 +104,10 @@ services:
     build: src/feature-flag-service
     ports:
       - 8094:8080
-    # environment:
-    #   ENABLE_MODIFY: "false"
-    #   ENABLE_FRONTEND_MODIFY: "false"
+    environment:
+      ENABLE_PORTFOLIO_INSIGHTS: ${ENABLE_PORTFOLIO_INSIGHTS:-false}
+      # ENABLE_MODIFY: "false"
+      # ENABLE_FRONTEND_MODIFY: "false"
 
   frontend:
     <<: *default-service
@@ -146,6 +148,7 @@ services:
       - 8097:8080
     environment:
       EASYTRADE_URL: *easytradeUrl
+      PORTFOLIO_INSIGHTS_ALERT_WEIGHT: ${PORTFOLIO_INSIGHTS_ALERT_WEIGHT:-0}
 
   offer-service:
     <<: *default-service
