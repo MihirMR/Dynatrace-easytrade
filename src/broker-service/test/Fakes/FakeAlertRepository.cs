@@ -30,8 +30,9 @@ namespace EasyTrade.BrokerService.Test.Fakes
     /// <param name="TriggerValue">Trigger value passed by the caller.</param>
     /// <param name="Result">
     /// The store's decision, recorded before <see cref="FakeAlertRepository.AfterTrigger"/> runs,
-    /// so a throwing hook leaves it intact. <c>null</c> when the call failed before deciding: an
-    /// injected exception or an already-cancelled token.
+    /// so a throwing hook, including one whose cancellation surfaces as a
+    /// <see cref="DbException"/>, leaves it intact. <c>null</c> when the call failed before
+    /// deciding: an injected exception or an already-cancelled token.
     /// </param>
     public sealed record AlertTriggerCall(
         Guid Id,
@@ -84,7 +85,11 @@ namespace EasyTrade.BrokerService.Test.Fakes
         /// <summary>
         /// Awaited by every successful <see cref="ListAsync"/> after its snapshot is taken and
         /// before it returns, with the call's 1-based ordinal (its index in
-        /// <see cref="ListCalls"/> plus one) and the caller's token.
+        /// <see cref="ListCalls"/> plus one) and the caller's token. A hook that completes
+        /// normally lets the call return its snapshot, even when it cancelled the caller's
+        /// token. An <see cref="OperationCanceledException"/> it throws while the caller's token
+        /// is cancelled surfaces as a <see cref="DbException"/> wrapping it, as the real
+        /// repository reports a cancelled call; any other hook exception propagates unchanged.
         /// </summary>
         public Func<int, CancellationToken, Task>? BeforeListReturns
         {
@@ -108,7 +113,12 @@ namespace EasyTrade.BrokerService.Test.Fakes
         /// Awaited by every <see cref="TriggerAsync"/> that reaches the store's decision, outside
         /// the lock and before it returns, with the alert id, the result and the caller's token.
         /// It runs after the committed write for <c>true</c> and after a miss that wrote nothing
-        /// for <c>false</c>, but not when the call failed before deciding.
+        /// for <c>false</c>, but not when the call failed before deciding. The decision stays
+        /// committed and recorded whatever the hook does. A hook that completes normally lets the
+        /// call return the decision, even when it cancelled the caller's token. An
+        /// <see cref="OperationCanceledException"/> it throws while the caller's token is
+        /// cancelled surfaces as a <see cref="DbException"/> wrapping it, as the real repository
+        /// reports a cancelled call; any other hook exception propagates unchanged.
         /// </summary>
         public Func<Guid, bool, CancellationToken, Task>? AfterTrigger
         {
@@ -368,7 +378,15 @@ namespace EasyTrade.BrokerService.Test.Fakes
 
             if (beforeListReturns is not null)
             {
-                await beforeListReturns(ordinal, cancellationToken);
+                try
+                {
+                    await beforeListReturns(ordinal, cancellationToken);
+                }
+                catch (OperationCanceledException cancellation)
+                    when (cancellationToken.IsCancellationRequested)
+                {
+                    throw CancelledCallFailure(cancellation);
+                }
             }
             return snapshot;
         }
@@ -494,7 +512,16 @@ namespace EasyTrade.BrokerService.Test.Fakes
 
             if (afterTrigger is not null)
             {
-                await afterTrigger(id, triggered, cancellationToken);
+                // The decision above stays committed and recorded whatever the hook does.
+                try
+                {
+                    await afterTrigger(id, triggered, cancellationToken);
+                }
+                catch (OperationCanceledException cancellation)
+                    when (cancellationToken.IsCancellationRequested)
+                {
+                    throw CancelledCallFailure(cancellation);
+                }
             }
             return triggered;
         }
@@ -509,11 +536,14 @@ namespace EasyTrade.BrokerService.Test.Fakes
         private static DbException? CancellationFailure(CancellationToken cancellationToken)
         {
             return cancellationToken.IsCancellationRequested
-                ? new DbException(
-                    "Db Adapter call error: cancelled",
-                    new OperationCanceledException(cancellationToken)
-                )
+                ? CancelledCallFailure(new OperationCanceledException(cancellationToken))
                 : null;
+        }
+
+        // The failure the real repository reports for a call its caller's token cancelled.
+        private static DbException CancelledCallFailure(OperationCanceledException cancellation)
+        {
+            return new DbException("Db Adapter call error: cancelled", cancellation);
         }
 
         private static Alert[] Ordered(IEnumerable<Alert> rows, bool byTriggeredAt)

@@ -41,6 +41,9 @@ namespace EasyTrade.BrokerService.Test.Fakes
         private readonly List<TimeSpan?> _requestTimeouts = [];
         private int _callCount;
         private bool _observedCancellation;
+
+        // Bumped by Clear(), so a call in flight when it runs never records into the new state.
+        private int _generation;
         private TaskCompletionSource _callReceived = NewSignal();
 
         // Immutable reply, swapped whole so a call in flight never sees a half-changed mode.
@@ -75,7 +78,8 @@ namespace EasyTrade.BrokerService.Test.Fakes
 
         /// <summary>
         /// Serialized request message of each received call without its 5-byte gRPC prefix, ready
-        /// for <c>Parser.ParseFrom</c>; same order as <see cref="RequestPaths"/>.
+        /// for <c>Parser.ParseFrom</c>; same order as <see cref="RequestPaths"/>. Each snapshot is
+        /// a private copy, so changing a returned array never alters what later reads return.
         /// </summary>
         public IReadOnlyList<byte[]> RequestMessages
         {
@@ -83,7 +87,7 @@ namespace EasyTrade.BrokerService.Test.Fakes
             {
                 lock (_gate)
                 {
-                    return [.. _requestMessages];
+                    return [.. _requestMessages.Select(static message => message.ToArray())];
                 }
             }
         }
@@ -108,6 +112,7 @@ namespace EasyTrade.BrokerService.Test.Fakes
         /// <summary>
         /// Whether the token of a call being served was cancelled. Grpc.Net.Client links the
         /// caller's <c>CallOptions.CancellationToken</c> and the call deadline into that token.
+        /// A call in flight when <see cref="Clear"/> runs never sets it.
         /// </summary>
         public bool ObservedCancellation
         {
@@ -122,8 +127,9 @@ namespace EasyTrade.BrokerService.Test.Fakes
 
         /// <summary>
         /// Completes once the first call since creation or the last <see cref="Clear"/> has been
-        /// recorded, before it is answered. Await it with a bound, for example
-        /// <c>WaitAsync(TimeSpan)</c>, to cancel a held call only after it has arrived.
+        /// recorded, before it is answered; a call in flight when <see cref="Clear"/> runs never
+        /// completes it. Await it with a bound, for example <c>WaitAsync(TimeSpan)</c>, to cancel
+        /// a held call only after it has arrived.
         /// </summary>
         public Task CallReceived
         {
@@ -156,14 +162,20 @@ namespace EasyTrade.BrokerService.Test.Fakes
 
         /// <summary>
         /// Holds every later call unanswered until its token is cancelled, which then sets
-        /// <see cref="ObservedCancellation"/>.
+        /// <see cref="ObservedCancellation"/> unless <see cref="Clear"/> has run since the call
+        /// started.
         /// </summary>
         public void Hold()
         {
             _reply = new HoldReply();
         }
 
-        /// <summary>Forgets the recorded calls and cancellation; the reply mode is kept.</summary>
+        /// <summary>
+        /// Forgets the recorded calls and cancellation; the reply mode is kept. A call in flight
+        /// when this runs is forgotten too: it keeps the reply it started with, but it is not
+        /// recorded, does not complete <see cref="CallReceived"/> and does not set
+        /// <see cref="ObservedCancellation"/>.
+        /// </summary>
         public void Clear()
         {
             lock (_gate)
@@ -173,6 +185,8 @@ namespace EasyTrade.BrokerService.Test.Fakes
                 _requestMessages.Clear();
                 _requestTimeouts.Clear();
                 _observedCancellation = false;
+                _generation++;
+                // An incomplete signal is kept: only a call of the new generation can complete it.
                 if (_callReceived.Task.IsCompleted)
                 {
                     _callReceived = NewSignal();
@@ -186,21 +200,32 @@ namespace EasyTrade.BrokerService.Test.Fakes
         )
         {
             ArgumentNullException.ThrowIfNull(request);
-            Reply reply = _reply;
+            Reply reply;
+            int generation;
+            // Read together under the lock, so a call recorded after Clear() never answers with a
+            // reply that was replaced before Clear() ran.
+            lock (_gate)
+            {
+                reply = _reply;
+                generation = _generation;
+            }
             try
             {
                 // Reading the body drives the client's push content and captures the sent message.
                 byte[] body = request.Content is null
                     ? []
                     : await request.Content.ReadAsByteArrayAsync(cancellationToken);
-                Record(request, body);
+                Record(request, body, generation);
                 return await reply.AnswerAsync(request, cancellationToken);
             }
             catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
             {
                 lock (_gate)
                 {
-                    _observedCancellation = true;
+                    if (generation == _generation)
+                    {
+                        _observedCancellation = true;
+                    }
                 }
                 throw;
             }
@@ -232,21 +257,25 @@ namespace EasyTrade.BrokerService.Test.Fakes
             };
         }
 
-        private void Record(HttpRequestMessage request, byte[] body)
+        private void Record(HttpRequestMessage request, byte[] body, int generation)
         {
             string path = request.RequestUri?.AbsolutePath ?? string.Empty;
             byte[] message = body.Length >= MessagePrefixLength ? body[MessagePrefixLength..] : [];
             TimeSpan? timeout = ReadTimeout(request);
-            TaskCompletionSource received;
             lock (_gate)
             {
+                if (generation != _generation)
+                {
+                    return;
+                }
                 _callCount++;
                 _requestPaths.Add(path);
                 _requestMessages.Add(message);
                 _requestTimeouts.Add(timeout);
-                received = _callReceived;
+                // Signalled in the same locked step, so Clear() cannot fall between recording and
+                // arrival; safe because the signal runs its continuations asynchronously.
+                _callReceived.TrySetResult();
             }
-            received.TrySetResult();
         }
 
         // Units of the gRPC wire form: H hours, M minutes, S seconds, m milliseconds,
