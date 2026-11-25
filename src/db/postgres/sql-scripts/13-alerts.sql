@@ -1,5 +1,5 @@
 -- Portfolio Insights alerts; guarded for reruns and manual applies. Kept in sync with src/db/mssql/sql-scripts/sql-alerts.sql.
--- An over-length "Type"/"Direction" whose excess is spaces is truncated to the exact value before the CHECKs, so only exact values are stored.
+-- PostgreSQL drops spaces beyond the declared width of "Type"/"Direction"; the CHECKs then validate the remaining value, so only exact values are stored.
 CREATE TABLE IF NOT EXISTS "Alerts" (
     "Id" uuid NOT NULL DEFAULT gen_random_uuid(),
     "AccountId" uuid NOT NULL,

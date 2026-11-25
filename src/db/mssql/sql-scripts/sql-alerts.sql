@@ -2,6 +2,7 @@ USE [TradeManagement]
 GO
 IF OBJECT_ID(N'dbo.Alerts', N'U') IS NULL
 BEGIN
+    -- The index is declared inline so the table and its index are created by one statement.
     CREATE TABLE [dbo].[Alerts] (
         [Id] UNIQUEIDENTIFIER NOT NULL DEFAULT NEWID(),
         [AccountId] UNIQUEIDENTIFIER NOT NULL,
@@ -17,8 +18,8 @@ BEGIN
         [CreatedAt] datetimeoffset(6) NOT NULL,
         CONSTRAINT [PK_Alerts] PRIMARY KEY CLUSTERED ([Id] ASC) ON [PRIMARY],
         CONSTRAINT [FK_Alerts_Accounts] FOREIGN KEY ([AccountId]) REFERENCES [Accounts]([Id]) ON DELETE CASCADE,
-        CONSTRAINT [FK_Alerts_Instruments] FOREIGN KEY ([InstrumentId]) REFERENCES [Instruments]([Id])
+        CONSTRAINT [FK_Alerts_Instruments] FOREIGN KEY ([InstrumentId]) REFERENCES [Instruments]([Id]),
+        INDEX [IX_Alerts_AccountId] NONCLUSTERED ([AccountId], [CreatedAt])
     );
-    CREATE NONCLUSTERED INDEX [IX_Alerts_AccountId] ON [dbo].[Alerts] ([AccountId], [CreatedAt]);
 END
 GO
