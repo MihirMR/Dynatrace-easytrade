@@ -1,7 +1,12 @@
 import { CancelledError, QueryClient } from "@tanstack/react-query"
 import { ApiError } from "../api/http"
 import { SESSION_KEY } from "../contexts/AuthContext/storage"
-import { alertKeys, featureFlagKeys, portfolioKeys } from "./queryKeys"
+import {
+    alertKeys,
+    currentLogoutCount,
+    featureFlagKeys,
+    portfolioKeys,
+} from "./queryKeys"
 
 /**
  * Portfolio Insights activation state for this tab, shared by the flag query,
@@ -21,8 +26,10 @@ const DEFAULT_QUERY_RETRIES = 3
 
 let activation = 0
 
-// The account seen by the latest capture, and how often it has changed.
+// The account and the logout count seen by the latest capture, and how often
+// either has changed.
 let lastSeenUserId: string | null = null
+let lastSeenLogoutCount = 0
 let userSession = 0
 
 /**
@@ -76,11 +83,12 @@ export function isFeatureDisabledError(error: unknown): boolean {
  * The account and activation a feature request started under.
  *
  * `session` is carried beside `userId` and `activation` because comparing the
- * account id alone would accept a result started before a switch to another
- * account and back. It advances whenever a capture sees a different account
- * than the capture before it, so it detects only changes some capture saw: a
- * logout and re-login as the same account with no feature request in between
- * leaves it unchanged.
+ * account id alone would accept a result started before a logout and a
+ * re-login as the same account, or a switch to another account and back. It
+ * advances whenever a capture sees a different account than the capture
+ * before it, or sees that `invalidateOnLogout` ran since that capture. Every
+ * logout therefore ends the session, even when the same account logs in again
+ * with no feature request in between.
  */
 export type FeatureContext = {
     userId: string | null
@@ -104,8 +112,10 @@ export function captureFeatureContext(): FeatureContext {
             error
         )
     }
-    if (userId !== lastSeenUserId) {
+    const logouts = currentLogoutCount()
+    if (userId !== lastSeenUserId || logouts !== lastSeenLogoutCount) {
         lastSeenUserId = userId
+        lastSeenLogoutCount = logouts
         userSession += 1
     }
     return { userId, activation: currentActivation(), session: userSession }
@@ -113,9 +123,10 @@ export function captureFeatureContext(): FeatureContext {
 
 /**
  * True only while the account, its session and the activation all still match
- * `ctx`. A result is discarded after a logout, an account switch (a switch
- * back too, once a capture saw the other account) or a shutdown (even after
- * the feature resumed).
+ * `ctx`. A result is discarded after a logout (even once the same account
+ * logged in again), an account switch (a switch back too, once a logout ran
+ * or a capture saw the other account) or a shutdown (even after the feature
+ * resumed).
  */
 export function isCurrentFeatureContext(ctx: FeatureContext): boolean {
     const now = captureFeatureContext()

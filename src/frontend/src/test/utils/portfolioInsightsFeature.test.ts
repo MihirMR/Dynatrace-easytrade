@@ -12,9 +12,16 @@ import {
 import {
     alertKeys,
     balanceKeys,
+    creditCardKeys,
+    currentLogoutCount,
     featureFlagKeys,
     instrumentKeys,
+    invalidateOnLogout,
     portfolioKeys,
+    priceKeys,
+    transactionKeys,
+    userKeys,
+    versionKeys,
 } from "../../utils/queryKeys"
 
 const ACCOUNT = "a0000000-0000-4000-8000-000000000000"
@@ -264,6 +271,15 @@ it.each([
         current: false,
     },
     {
+        change: "logout and same-account login with no capture between",
+        apply: () => {
+            sessionStorage.removeItem(SESSION_KEY)
+            invalidateOnLogout(newClient())
+            sessionStorage.setItem(SESSION_KEY, "user-1")
+        },
+        current: false,
+    },
+    {
         change: "shutdown",
         apply: () => onPortfolioInsightsDisabled(newClient()),
         current: false,
@@ -278,3 +294,48 @@ it.each([
         expect(isCurrentFeatureContext(ctx)).toBe(current)
     }
 )
+
+it("isCurrentFeatureContext_captureAfterSameAccountRelogin_isCurrent", () => {
+    captureFeatureContext()
+    sessionStorage.removeItem(SESSION_KEY)
+    invalidateOnLogout(newClient())
+    sessionStorage.setItem(SESSION_KEY, "user-1")
+
+    const ctx = captureFeatureContext()
+
+    expect(isCurrentFeatureContext(ctx)).toBe(true)
+})
+
+it("invalidateOnLogout_cachedQueries_removesAccountQueriesAndCountsLogout", () => {
+    const client = newClient()
+    const removed: QueryKey[] = [
+        transactionKeys.byUser(ACCOUNT),
+        instrumentKeys.byUser(ACCOUNT),
+        userKeys.byId(ACCOUNT),
+        balanceKeys.byId(ACCOUNT),
+        creditCardKeys.status,
+        portfolioKeys.history(ACCOUNT),
+        portfolioKeys.insights(ACCOUNT),
+        alertKeys.list(ACCOUNT),
+        alertKeys.notifications(ACCOUNT),
+    ]
+    const kept: [QueryKey, unknown][] = [
+        [userKeys.preset, []],
+        [featureFlagKeys.problemPatterns, [{ id: "db_not_responding" }]],
+        [priceKeys.byInstrument("1"), []],
+        [versionKeys.all, []],
+    ]
+    removed.forEach((key) => client.setQueryData(key, {}))
+    kept.forEach(([key, data]) => client.setQueryData(key, data))
+    const before = currentLogoutCount()
+
+    invalidateOnLogout(client)
+
+    expect({
+        logouts: currentLogoutCount() - before,
+        removed: removed.filter(
+            (key) => client.getQueryData(key) !== undefined
+        ),
+        kept: kept.map(([key]) => client.getQueryData(key)),
+    }).toEqual({ logouts: 1, removed: [], kept: kept.map(([, data]) => data) })
+})

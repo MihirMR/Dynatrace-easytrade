@@ -39,7 +39,9 @@ export const featureFlagKeys = {
     all: ["feature-flags"] as const,
     problemPatterns: ["feature-flags", "problem-patterns"] as const,
     config: ["feature-flags", "config"] as const,
-    portfolioInsights: ["feature-flags", "portfolio-insights"] as const,
+    // Kept outside `all`: the /feature-flags Refresh refetches that prefix and
+    // must neither read this flag nor run the feature shutdown.
+    portfolioInsights: ["portfolio-insights", "feature-flag"] as const,
 }
 
 export const portfolioKeys = {
@@ -82,7 +84,21 @@ export async function invalidateCreditCardStatus(client: QueryClient) {
     await client.invalidateQueries({ queryKey: creditCardKeys.status })
 }
 
+let logoutCount = 0
+
+/**
+ * How many times `invalidateOnLogout` has run in this tab. A changed value
+ * means a session ended in the meantime, even if the same account has logged
+ * in again since.
+ */
+export function currentLogoutCount(): number {
+    return logoutCount
+}
+
 export function invalidateOnLogout(client: QueryClient) {
+    // Counted before the removals, so any result checked from here on already
+    // belongs to an ended session.
+    logoutCount += 1
     client.removeQueries({ queryKey: transactionKeys.all })
     client.removeQueries({ queryKey: instrumentKeys.all })
     client.removeQueries({ queryKey: userKeys.current })

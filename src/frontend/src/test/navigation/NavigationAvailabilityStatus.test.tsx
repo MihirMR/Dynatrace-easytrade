@@ -15,6 +15,8 @@ const AVAILABLE = "Portfolio Insights is now available in the navigation."
 const UNAVAILABLE = "Portfolio Insights is no longer available."
 /** How long the region stays once the removal message is written. */
 const HOLD_MS = 4000
+/** The next flag poll, armed 15 s after each read starts while observed. */
+const FLAG_POLL_TIMER = 1
 
 const LEGACY_LINKS = [
     { id: "nav-home", href: "/home", className: "nav-link active" },
@@ -82,7 +84,8 @@ function stubFlagService(): FlagService {
 
 function renderNavigation(cached: boolean | undefined): QueryClient {
     // No garbage-collection timer, so the fake clock holds only the timers
-    // that Navigation and a flag read in flight schedule.
+    // that Navigation and a flag read in flight schedule, and the next flag
+    // poll while Navigation is mounted.
     const client = new QueryClient({
         defaultOptions: { queries: { retry: false, gcTime: Infinity } },
     })
@@ -497,7 +500,7 @@ it.each([
         },
         sameRegion: true,
         final: expectedState(true, AVAILABLE),
-        pendingTimers: 0,
+        pendingTimers: FLAG_POLL_TIMER,
     })
 })
 
@@ -525,13 +528,14 @@ it.each([
         steps.push(pendingWork(status))
     }
 
-    // Once the removal message is written, the one timer left is the hold.
+    // Once the removal message is written, the one timer left besides the
+    // next flag poll is the hold.
     expect({ steps, final: navigationState() }).toEqual({
         steps: [
-            { text: "", pendingTimers: 1 },
-            { text: "", pendingTimers: 1 },
-            { text: UNAVAILABLE, pendingTimers: 1 },
-            { text: UNAVAILABLE, pendingTimers: 1 },
+            { text: "", pendingTimers: 1 + FLAG_POLL_TIMER },
+            { text: "", pendingTimers: 1 + FLAG_POLL_TIMER },
+            { text: UNAVAILABLE, pendingTimers: 1 + FLAG_POLL_TIMER },
+            { text: UNAVAILABLE, pendingTimers: 1 + FLAG_POLL_TIMER },
         ],
         final: expectedState(false, UNAVAILABLE),
     })
@@ -576,7 +580,7 @@ it.each([
         holdEnding: expectedState(false, UNAVAILABLE),
         holdElapsed: expectedState(false, null),
         sidebar: coldOffSidebar,
-        pendingTimers: 0,
+        pendingTimers: FLAG_POLL_TIMER,
     })
 })
 
@@ -642,7 +646,7 @@ it.each([
             later: {
                 ...expectedState(true, AVAILABLE),
                 sameRegion: true,
-                pendingTimers: 0,
+                pendingTimers: FLAG_POLL_TIMER,
             },
         })
     }
@@ -694,7 +698,7 @@ it.each([
 
         expect({ mounted, beforeUnmount, afterUnmount, afterWaiting }).toEqual({
             mounted: expectedState(insightsLink, text),
-            beforeUnmount: { text, pendingTimers: 1 },
+            beforeUnmount: { text, pendingTimers: 1 + FLAG_POLL_TIMER },
             afterUnmount: { text, pendingTimers: 0 },
             afterWaiting: { text, pendingTimers: 0 },
         })
