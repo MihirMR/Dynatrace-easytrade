@@ -40,6 +40,7 @@ func newSQLBackend(db *gorm.DB) repository.DBBackend {
 		pricing:    NewPricingRepository(db),
 		product:    NewProductRepository(db),
 		trade:      NewTradeRepository(db),
+		alert:      NewAlertRepository(db),
 	}
 }
 

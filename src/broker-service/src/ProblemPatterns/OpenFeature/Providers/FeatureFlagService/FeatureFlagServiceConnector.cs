@@ -1,5 +1,5 @@
-using EasyTrade.BrokerService.Helpers;
 using System.Net;
+using EasyTrade.BrokerService.Helpers;
 
 namespace EasyTrade.BrokerService.ProblemPatterns.OpenFeature.Providers.FeatureFlagService;
 
@@ -14,14 +14,16 @@ public class FeatureFlagServiceConnector(
     private readonly ILogger _logger = logger;
     private string FeatureFlagServiceUrl => $"{_config[Constants.FeatureFlagServiceAddress]}/v1/";
 
-    public async Task<Flag?> GetFlag(string id)
+    public Task<Flag?> GetFlag(string id) => GetFlag(id, CancellationToken.None);
+
+    public async Task<Flag?> GetFlag(string id, CancellationToken cancellationToken)
     {
-        var endpoint = $"flags/{id}";
-        using var client = GetHttpClient();
-        using var response = await client.GetAsync(endpoint);
+        string endpoint = $"flags/{id}";
+        using HttpClient client = GetHttpClient();
+        using HttpResponseMessage response = await client.GetAsync(endpoint, cancellationToken);
         if (response.StatusCode == HttpStatusCode.OK)
         {
-            return await response.Content.ReadFromJsonAsync<Flag>();
+            return await response.Content.ReadFromJsonAsync<Flag>(cancellationToken);
         }
         _logger.LogWarning("Flag with id [{id}] not found", id);
         return null;
