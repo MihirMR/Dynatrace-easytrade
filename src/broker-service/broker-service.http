@@ -77,3 +77,46 @@ Content-Type: application/json
 
 ### Process long trades
 POST {{baseUrl}}/v1/trade/long/process
+
+### Get portfolio insights
+# Portfolio Insights demo feature: simulated data, not financial advice.
+# The flag portfolio-insights-enabled is off by default. Enable it first with the PUT request in ../feature-flag-service/feature-flag-service.http
+# While the flag is off or unreadable, every request below answers 403 with {"error":"feature_disabled"}.
+# Statuses and error bodies: README.md#portfolio-insights-and-alerts
+# Walkthrough, variables (ENABLE_PORTFOLIO_INSIGHTS, ALERT_EVALUATION_INTERVAL_SECONDS, PORTFOLIO_INSIGHTS_ALERT_WEIGHT) and the database recreate note: ../../README.md#portfolio-insights-demo-feature
+# Replace the all-zero account id with a real account, and the all-zero alert id with the id from the create response.
+GET {{baseUrl}}/v1/portfolio/insights/00000000-0000-0000-0000-000000000000
+
+### Create alert
+# type: TARGET_PRICE or PROFIT_LOSS (threshold is a percentage, needs a held instrument); direction: ABOVE or BELOW; threshold: a plain JSON number with at most 10 integer and 8 fractional digits; the seeded instrument c0000000-0000-4000-8000-000000000001 exists in both database seeds.
+POST {{baseUrl}}/v1/alerts
+Content-Type: application/json
+
+{
+  "accountId": "00000000-0000-0000-0000-000000000000",
+  "type": "TARGET_PRICE",
+  "instrumentId": "c0000000-0000-4000-8000-000000000001",
+  "direction": "ABOVE",
+  "threshold": 150.5
+}
+
+### List alerts for account
+GET {{baseUrl}}/v1/alerts?accountId=00000000-0000-0000-0000-000000000000
+
+### List unacknowledged notifications
+GET {{baseUrl}}/v1/alerts/notifications?accountId=00000000-0000-0000-0000-000000000000&unacknowledged=true
+
+### Acknowledge notification
+POST {{baseUrl}}/v1/alerts/00000000-0000-0000-0000-000000000000/acknowledge
+
+### Re-arm alert
+# {"enabled": false} disables the alert instead; true clears the trigger and increments armingRevision.
+PATCH {{baseUrl}}/v1/alerts/00000000-0000-0000-0000-000000000000
+Content-Type: application/json
+
+{
+  "enabled": true
+}
+
+### Delete alert
+DELETE {{baseUrl}}/v1/alerts/00000000-0000-0000-0000-000000000000
