@@ -20,6 +20,184 @@ namespace EasyTrade.BrokerService.Test.UnitTests
             "c0000000-0000-4000-8000-000000000001"
         );
 
+        // Values are invariant strings because attribute arguments cannot be decimals. The last
+        // row is an over-precision token that a plain decimal conversion would round to the
+        // valid 0.00000001.
+        [Theory]
+        [InlineData("0.00000001", true, "0.00000001")]
+        [InlineData("9999999999.99999999", true, "9999999999.99999999")]
+        [InlineData("-9999999999.99999999", true, "-9999999999.99999999")]
+        [InlineData("1.500000000", true, "1.5")]
+        [InlineData("0.000000001", false, null)]
+        [InlineData("10000000000", false, null)]
+        [InlineData("1e5", false, null)]
+        [InlineData("0.000000010000000000000000000001", false, null)]
+        public void TryParseThresholdToken_Token_ShouldMatchDomain(
+            string token,
+            bool expectedOk,
+            string? expectedValue
+        )
+        {
+            // Arrange
+            byte[] utf8Token = Encoding.UTF8.GetBytes(token);
+            decimal? expected = ParseOrNull(expectedValue);
+
+            // Act
+            bool accepted = AlertNumber.TryParseThresholdToken(utf8Token, out decimal value);
+            decimal? acceptedValue = accepted ? value : null;
+
+            // Assert
+            Assert.Equal((expectedOk, expected), (accepted, acceptedValue));
+        }
+
+        // Bound as MVC binds a request body. A null literal binds null; a quoted number, an
+        // exponent and an over-precision token fail binding instead of being rounded.
+        [Theory]
+        [InlineData("0.00000001", true, "0.00000001")]
+        [InlineData("9999999999.99999999", true, "9999999999.99999999")]
+        [InlineData("-9999999999.99999999", true, "-9999999999.99999999")]
+        [InlineData("1.500000000", true, "1.5")]
+        [InlineData("null", true, null)]
+        [InlineData("\"1.5\"", false, null)]
+        [InlineData("1e5", false, null)]
+        [InlineData("0.000000010000000000000000000001", false, null)]
+        public void Converter_ThresholdToken_ShouldBindExactly(
+            string token,
+            bool expectedBound,
+            string? expectedValue
+        )
+        {
+            // Arrange
+            string body = "{\"threshold\":" + token + "}";
+            decimal? expected = ParseOrNull(expectedValue);
+
+            // Act and Assert
+            if (!expectedBound)
+            {
+                Assert.Throws<JsonException>(
+                    () => JsonSerializer.Deserialize<CreateAlertDTO>(body, WireOptions)
+                );
+                return;
+            }
+
+            CreateAlertDTO? bound = JsonSerializer.Deserialize<CreateAlertDTO>(body, WireOptions);
+            Assert.Equal(expected, bound!.Threshold);
+        }
+
+        [Theory]
+        [InlineData("0")]
+        [InlineData("-1")]
+        public void IsValidThreshold_TargetPriceNotPositive_ShouldBeInvalid(string threshold)
+        {
+            // Arrange
+            decimal value = decimal.Parse(threshold, CultureInfo.InvariantCulture);
+
+            // Act
+            bool valid = AlertNumber.IsValidThreshold(AlertType.TARGET_PRICE, value);
+
+            // Assert
+            Assert.False(valid);
+        }
+
+        // The remaining branches: inside the DECIMAL(18, 8) domain a positive TARGET_PRICE and a
+        // PROFIT_LOSS of any sign are valid; outside it, or for an undefined type, nothing is.
+        [Theory]
+        [InlineData(AlertType.TARGET_PRICE, "0.00000001", true)]
+        [InlineData(AlertType.TARGET_PRICE, "9999999999.99999999", true)]
+        [InlineData(AlertType.PROFIT_LOSS, "0", true)]
+        [InlineData(AlertType.PROFIT_LOSS, "-9999999999.99999999", true)]
+        [InlineData(AlertType.TARGET_PRICE, "10000000000", false)]
+        [InlineData(AlertType.PROFIT_LOSS, "-10000000000", false)]
+        [InlineData(AlertType.PROFIT_LOSS, "0.000000001", false)]
+        [InlineData((AlertType)99, "1", false)]
+        public void IsValidThreshold_TypeAndValue_ShouldMatchDomain(
+            AlertType type,
+            string threshold,
+            bool expected
+        )
+        {
+            // Arrange
+            decimal value = decimal.Parse(threshold, CultureInfo.InvariantCulture);
+
+            // Act
+            bool valid = AlertNumber.IsValidThreshold(type, value);
+
+            // Assert
+            Assert.Equal(expected, valid);
+        }
+
+        // de-DE writes a comma decimal separator and a period group separator, so only the
+        // invariant, ungrouped, exponent-free format yields these strings under it.
+        [Theory]
+        [InlineData("1.500000000", "1.5")]
+        [InlineData("-9999999999.99999999", "-9999999999.99999999")]
+        [InlineData("0.00000001", "0.00000001")]
+        [InlineData("1234567.00", "1234567")]
+        public void ToWire_Value_ShouldNormalize(string value, string expected)
+        {
+            // Arrange
+            decimal number = decimal.Parse(value, CultureInfo.InvariantCulture);
+            CultureInfo original = CultureInfo.CurrentCulture;
+            CultureInfo.CurrentCulture = new CultureInfo("de-DE");
+
+            try
+            {
+                // Act
+                string wire = AlertNumber.ToWire(number);
+
+                // Assert
+                Assert.Equal(expected, wire);
+            }
+            finally
+            {
+                CultureInfo.CurrentCulture = original;
+            }
+        }
+
+        // Each row follows an observed value as the evaluator handles it: rounded to 8 places
+        // with midpoints away from zero, checked against the 20-integer-digit domain, and sent
+        // through the wire format, which returns the identical decimal.
+        [Theory]
+        [InlineData("99999999999999999999.99999999", "99999999999999999999.99999999", true)]
+        [InlineData("-99999999999999999999.99999999", "-99999999999999999999.99999999", true)]
+        [InlineData("100000000000000000000", "100000000000000000000", false)]
+        [InlineData("1.000000005", "1.00000001", true)]
+        [InlineData("-1.000000005", "-1.00000001", true)]
+        public void TriggerValue_Domain_ShouldMatch(
+            string observed,
+            string expectedRounded,
+            bool expectedValid
+        )
+        {
+            // Arrange
+            decimal value = decimal.Parse(observed, CultureInfo.InvariantCulture);
+            decimal rounded = decimal.Parse(expectedRounded, CultureInfo.InvariantCulture);
+
+            // Act
+            decimal triggerValue = AlertNumber.RoundTriggerValue(value);
+            bool valid = AlertNumber.IsValidTriggerValue(triggerValue);
+            decimal fromWire = AlertNumber.FromWire(AlertNumber.ToWire(triggerValue));
+
+            // Assert
+            Assert.Equal((rounded, expectedValid, rounded), (triggerValue, valid, fromWire));
+        }
+
+        // A ninth fractional digit is outside DECIMAL(28, 8) until RoundTriggerValue removes it.
+        [Theory]
+        [InlineData("1.000000005")]
+        [InlineData("-0.000000001")]
+        public void IsValidTriggerValue_MoreThanEightFractionDigits_ShouldBeInvalid(string value)
+        {
+            // Arrange
+            decimal unrounded = decimal.Parse(value, CultureInfo.InvariantCulture);
+
+            // Act
+            bool valid = AlertNumber.IsValidTriggerValue(unrounded);
+
+            // Assert
+            Assert.False(valid);
+        }
+
         // Called directly, because the JSON reader rejects each of these before the converter runs.
         [Theory]
         [InlineData("")]
@@ -230,6 +408,11 @@ namespace EasyTrade.BrokerService.Test.UnitTests
 
             // Assert
             Assert.Equal(expected, Encoding.UTF8.GetString(buffer.WrittenSpan));
+        }
+
+        private static decimal? ParseOrNull(string? text)
+        {
+            return text is null ? null : decimal.Parse(text, CultureInfo.InvariantCulture);
         }
 
         // Builds {"threshold":<number>} as three segments that cut the number text twice, so its

@@ -72,6 +72,7 @@ broker-service:
     PRICING_SERVICE_ADDRESS: "http://{{ .Release.Name }}-pricing-service:8080"
     FEATURE_FLAG_SERVICE_ADDRESS: "http://{{ .Release.Name }}-feature-flag-service:8080"
     DB_ADAPTER_ADDRESS: "{{ .Release.Name }}-db-adapter:50051"
+    ALERT_EVALUATION_INTERVAL_SECONDS: "60"
   livenessProbe:
     httpGet:
       path: /livez
@@ -253,6 +254,8 @@ db-adapter:
 
 feature-flag-service:
   enabled: true
+  env:
+    ENABLE_PORTFOLIO_INSIGHTS: "false"
   livenessProbe:
     httpGet:
       path: /livez
@@ -355,6 +358,7 @@ loadgen:
   env:
     EASYTRADE_URL: "http://{{ .Release.Name }}-reverse-proxy:8080"
     RARE_VISITS_INTERVAL_MINUTES: "60"
+    PORTFOLIO_INSIGHTS_ALERT_WEIGHT: "0"
   livenessProbe:
     httpGet:
       path: /livez
