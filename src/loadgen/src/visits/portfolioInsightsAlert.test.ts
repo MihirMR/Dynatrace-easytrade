@@ -2,10 +2,7 @@ import assert from "node:assert/strict"
 import { afterEach, beforeEach, mock, test } from "node:test"
 import { IHandleWrapper } from "@demoability/loadgen-core/lib/handles"
 import { IPageActions } from "@demoability/loadgen-core/lib/pageActions"
-import {
-    ISelector,
-    XpathSelector,
-} from "@demoability/loadgen-core/lib/selectors"
+import { ISelector } from "@demoability/loadgen-core/lib/selectors"
 import { Logger, createLogger, format, transports } from "winston"
 import { selectors } from "../selectors"
 import { User } from "../user"
@@ -37,10 +34,12 @@ function unexpected(action: string): never {
     throw new Error(`Unexpected page action [${action}]`)
 }
 
-function label(selector: ISelector): string {
-    return selector instanceof XpathSelector
-        ? selector.label
-        : selector.toString()
+/**
+ * Records a selector with its XPath: every alert row's selectors share one
+ * label, so only the XPath shows which alert an action targeted.
+ */
+function key(selector: ISelector): string {
+    return selector.toString()
 }
 
 class FakeOptionHandle implements IHandleWrapper {
@@ -72,12 +71,12 @@ class RecordingPageActions implements IPageActions {
     ])
 
     async isSelectorPresent(selector: ISelector): Promise<boolean> {
-        this.calls.push(`isSelectorPresent ${label(selector)}`)
+        this.calls.push(`isSelectorPresent ${key(selector)}`)
         return this.present.has(selector.toString())
     }
 
     async getAllHandles(selector: ISelector): Promise<IHandleWrapper[]> {
-        this.calls.push(`getAllHandles ${label(selector)}`)
+        this.calls.push(`getAllHandles ${key(selector)}`)
         return selector ===
             selectors.portfolioInsightsPage_alertInstrumentOption
             ? [new FakeOptionHandle(INSTRUMENT_ID)]
@@ -100,7 +99,7 @@ class RecordingPageActions implements IPageActions {
         selector: ISelector,
         propertyName: string
     ): Promise<Type> {
-        this.calls.push(`getProperty ${label(selector)} ${propertyName}`)
+        this.calls.push(`getProperty ${key(selector)} ${propertyName}`)
         if (
             selector.toString() !==
                 selectors
@@ -119,19 +118,19 @@ class RecordingPageActions implements IPageActions {
     }
 
     async input(selector: ISelector, value: string): Promise<void> {
-        this.calls.push(`input ${label(selector)}=${value}`)
+        this.calls.push(`input ${key(selector)}=${value}`)
     }
 
     async selectOption(selector: ISelector, option: string): Promise<void> {
-        this.calls.push(`selectOption ${label(selector)}=${option}`)
+        this.calls.push(`selectOption ${key(selector)}=${option}`)
     }
 
     async click(selector: ISelector): Promise<void> {
-        this.calls.push(`click ${label(selector)}`)
+        this.calls.push(`click ${key(selector)}`)
     }
 
     async navigate(selector: ISelector): Promise<void> {
-        this.calls.push(`navigate ${label(selector)}`)
+        this.calls.push(`navigate ${key(selector)}`)
     }
 
     async endDtSession(): Promise<void> {
@@ -290,18 +289,18 @@ test("run_flagOn_runsLoginLifecycleLogoutInOrder", async () => {
         {
             steps: [
                 "gotoPage http://easytrade.test/",
-                "input username-input=test_visitor",
-                "input password-input=test-visitor-password",
-                "navigate login-button",
-                "navigate portfolio-insights-page-nav",
-                "selectOption alert-type-select=TARGET_PRICE",
-                `selectOption alert-instrument-select=${INSTRUMENT_ID}`,
-                "selectOption alert-direction-select=ABOVE",
-                `input alert-threshold-input=${MARKER}`,
-                "click alert-submit-button",
-                "click alert-row-delete-button",
-                "click dropdown-toggler",
-                "navigate logout-button",
+                `input ${key(selectors.loginPage_username)}=test_visitor`,
+                `input ${key(selectors.loginPage_password)}=test-visitor-password`,
+                `navigate ${key(selectors.loginPage_loginButton)}`,
+                `navigate ${key(selectors.navigation_portfolioInsightsPage)}`,
+                `selectOption ${key(selectors.portfolioInsightsPage_alertType)}=TARGET_PRICE`,
+                `selectOption ${key(selectors.portfolioInsightsPage_alertInstrument)}=${INSTRUMENT_ID}`,
+                `selectOption ${key(selectors.portfolioInsightsPage_alertDirection)}=ABOVE`,
+                `input ${key(selectors.portfolioInsightsPage_alertThreshold)}=${MARKER}`,
+                `click ${key(selectors.portfolioInsightsPage_alertSubmit)}`,
+                `click ${key(selectors.portfolioInsightsPage_alertRowDelete(OWN_ID))}`,
+                `click ${key(selectors.navigation_dropdownToggler)}`,
+                `navigate ${key(selectors.navigation_logout)}`,
                 "endDtSession",
             ],
             requests: [FLAG_REQUEST],
@@ -334,16 +333,17 @@ test("constructor_depsOmitted_usesGlobalFetchAndMathRandom", async (t) => {
 
     await visit.run(page, logger)
 
+    const thresholdInput = `input ${key(selectors.portfolioInsightsPage_alertThreshold)}=`
     assert.deepEqual(
         {
             requests,
             threshold: page.calls.filter((call) =>
-                call.startsWith("input alert-threshold-input")
+                call.startsWith(thresholdInput)
             ),
         },
         {
             requests: [FLAG_REQUEST],
-            threshold: [`input alert-threshold-input=${MARKER}`],
+            threshold: [`${thresholdInput}${MARKER}`],
         }
     )
 })
