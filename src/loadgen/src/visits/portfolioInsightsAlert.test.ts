@@ -4,8 +4,10 @@ import { IHandleWrapper } from "@demoability/loadgen-core/lib/handles"
 import { IPageActions } from "@demoability/loadgen-core/lib/pageActions"
 import { ISelector } from "@demoability/loadgen-core/lib/selectors"
 import { Logger, createLogger, format, transports } from "winston"
+import { Config } from "../config"
+import { getRegularProviderFunction } from "../provider/regularVisits"
 import { selectors } from "../selectors"
-import { User } from "../user"
+import { User, getRandomUser } from "../user"
 import { PortfolioInsightsAlertVisit } from "./portfolioInsightsAlert"
 
 const BASE_URL = new URL("http://easytrade.test/")
@@ -344,6 +346,54 @@ test("constructor_depsOmitted_usesGlobalFetchAndMathRandom", async (t) => {
         {
             requests: [FLAG_REQUEST],
             threshold: [`${thresholdInput}${MARKER}`],
+        }
+    )
+})
+
+// The provider's dispatch to this visit is tested here, with the visit it
+// builds, because provider/ keeps no test file of its own; the Guardrails rule
+// requires a unit test for the switch case the provider gains for this visit.
+test("getRegularProviderFunction_portfolioInsightsAlert_buildsVisitWithConfigUrlAndUser", (t) => {
+    t.mock.method(Math, "random", () => 0)
+    const config: Config = {
+        concurrent_visits: 1,
+        concurrent_browsers: 1,
+        browserTimeToLiveMinutes: 60,
+        logLevel: "info",
+        rareVisitsIntervalMinutes: 30,
+        headlessMode: "headless",
+        visitsConfig: {
+            depositMinValue: 500,
+            depositMaxValue: 1500,
+            assetSellRatio: 0.1,
+            withdrawMinValue: 500,
+            transactionMinDuration: 1,
+            transactionMaxDuration: 24,
+            easytradeUrl: BASE_URL,
+        },
+        providerConfig: { type: "constant" },
+        regularVisitsWeights: {
+            deposit_and_buy_success: 1,
+            deposit_and_long_buy_error: 1,
+            deposit_and_long_buy_success: 1,
+            deposit_and_long_buy_timeout: 1,
+            long_sell_error: 1,
+            long_sell_success: 1,
+            long_sell_timeout: 1,
+            sell_and_withdraw_success: 1,
+            portfolio_insights_alert: 1,
+        },
+    }
+
+    const visit = getRegularProviderFunction(config)("portfolio_insights_alert")
+
+    assert.ok(visit instanceof PortfolioInsightsAlertVisit)
+    assert.deepEqual(
+        { name: visit.getName(), url: visit.url, user: visit.user },
+        {
+            name: "portfolio_insights_alert",
+            url: BASE_URL,
+            user: getRandomUser(),
         }
     )
 })
