@@ -21,6 +21,22 @@ namespace EasyTrade.BrokerService.Entities.Alerts.Repository
         ),
             IAlertRepository
     {
+        /// <summary>
+        /// Budget of each evaluator call, <see cref="ListAsync"/> and <see cref="TriggerAsync"/>,
+        /// sent as the gRPC deadline of that call when it starts.
+        /// </summary>
+        /// <remarks>
+        /// The host token stops these calls only at shutdown, so without a bound a db-adapter that
+        /// accepts a call but never answers would hold the cycle, and every later tick, while the
+        /// host runs. 10 s is far above a healthy list or conditional write and below the default
+        /// interval. Expiry fails the call with <c>DeadlineExceeded</c>, which
+        /// <see cref="GrpcHelper.ExecuteAsync{T}"/> wraps in a <c>DbException</c> while the host
+        /// token is still live: a failure, never a cancellation. A trigger that db-adapter
+        /// committed but answered too late stays committed; its arming no longer matches the
+        /// conditional write, so no second notification follows.
+        /// </remarks>
+        public static readonly TimeSpan EvaluatorCallTimeout = TimeSpan.FromSeconds(10);
+
         public async Task<Alert> CreateAsync(
             Guid accountId,
             AlertType type,
@@ -62,7 +78,11 @@ namespace EasyTrade.BrokerService.Entities.Alerts.Repository
                     AlertMapper.FromProto(
                         (
                             await GetClient()
-                                .ListAlertsAsync(request, cancellationToken: cancellationToken)
+                                .ListAlertsAsync(
+                                    request,
+                                    deadline: DateTime.UtcNow.Add(EvaluatorCallTimeout),
+                                    cancellationToken: cancellationToken
+                                )
                         ).Alerts
                     )
             );
@@ -128,7 +148,11 @@ namespace EasyTrade.BrokerService.Entities.Alerts.Repository
             AlertGrpc.TriggerAlertResponse response = await GrpcHelper.ExecuteAsync(
                 async () =>
                     await GetClient()
-                        .TriggerAlertAsync(request, cancellationToken: cancellationToken)
+                        .TriggerAlertAsync(
+                            request,
+                            deadline: DateTime.UtcNow.Add(EvaluatorCallTimeout),
+                            cancellationToken: cancellationToken
+                        )
             );
             return response.Triggered;
         }

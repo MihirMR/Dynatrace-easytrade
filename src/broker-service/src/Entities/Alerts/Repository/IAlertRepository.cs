@@ -1,9 +1,15 @@
 namespace EasyTrade.BrokerService.Entities.Alerts.Repository
 {
     /// <summary>
-    /// Persistence port for alerts, served by db-adapter. Every member reports a failed call as
-    /// <see cref="EasyTrade.BrokerService.ExceptionHandling.Exceptions.DbException"/>; a missing
-    /// alert is reported as <c>null</c> or <c>false</c>, never as an exception.
+    /// Persistence port for alerts, served by db-adapter. Only four members report db-adapter's
+    /// NotFound for a missing alert as a value: <see cref="GetAlertAsync"/> and
+    /// <see cref="UpdateEnabledAsync"/> return <c>null</c>, <see cref="DeleteAsync"/> and
+    /// <see cref="AcknowledgeAsync"/> return <c>false</c>. Every other failed call, including a
+    /// NotFound from <see cref="CreateAsync"/>, <see cref="ListAsync"/> or
+    /// <see cref="TriggerAsync"/>, cancellation, deadline expiry and a malformed reply, throws
+    /// <see cref="EasyTrade.BrokerService.ExceptionHandling.Exceptions.DbException"/>. An undefined
+    /// <see cref="AlertType"/> or <see cref="AlertDirection"/> passed to <see cref="CreateAsync"/>
+    /// throws <see cref="ArgumentOutOfRangeException"/> before any call is made.
     /// </summary>
     public interface IAlertRepository
     {
@@ -27,7 +33,10 @@ namespace EasyTrade.BrokerService.Entities.Alerts.Repository
         /// <see cref="Alert.TriggeredAt"/> descending; otherwise the order is
         /// <see cref="Alert.CreatedAt"/> descending, then <see cref="Alert.Id"/> descending.
         /// <paramref name="unacknowledgedOnly"/> keeps alerts that are not acknowledged.
-        /// <paramref name="cancellationToken"/> reaches the gRPC call.
+        /// <paramref name="cancellationToken"/> reaches the gRPC call, which is also bounded by
+        /// the per-call deadline <see cref="AlertRepository.EvaluatorCallTimeout"/>. Its expiry
+        /// is a failed call, thrown as a <c>DbException</c> while the token is not cancelled, and
+        /// so distinct from cancellation.
         /// </summary>
         Task<IReadOnlyList<Alert>> ListAsync(
             Guid? accountId,
@@ -66,7 +75,11 @@ namespace EasyTrade.BrokerService.Entities.Alerts.Repository
         /// arming has not triggered. Returns db-adapter's <c>triggered</c> flag. <c>false</c> is a
         /// normal outcome, not an error: another evaluator won, or the alert was disabled,
         /// deleted or re-armed meanwhile. <paramref name="triggerValue"/> is already rounded and
-        /// validated by the caller. <paramref name="cancellationToken"/> reaches the gRPC call.
+        /// validated by the caller. <paramref name="cancellationToken"/> reaches the gRPC call,
+        /// which is also bounded by the per-call deadline
+        /// <see cref="AlertRepository.EvaluatorCallTimeout"/>. Its expiry is a failed call,
+        /// thrown as a <c>DbException</c> while the token is not cancelled, and so distinct from
+        /// cancellation; a write db-adapter committed but answered too late stays committed.
         /// </summary>
         Task<bool> TriggerAsync(
             Guid id,

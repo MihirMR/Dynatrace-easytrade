@@ -13,8 +13,11 @@ namespace EasyTrade.BrokerService.Entities.Alerts.Repository
     public static class AlertMapper
     {
         /// <summary>
-        /// Reads an exact alert type name. Ordinal and case-sensitive, unlike
-        /// <c>Enum.TryParse</c>, which would also accept <c>"target_price"</c> or <c>"0"</c>.
+        /// Reads an exact alert type name. The switch is ordinal and case-sensitive because only
+        /// <c>TARGET_PRICE</c> and <c>PROFIT_LOSS</c> are valid on the wire and in JSON.
+        /// <c>Enum.TryParse</c> is looser: its default overload also accepts numeric text such as
+        /// <c>"0"</c> and whitespace-padded names, and its ignore-case overload accepts
+        /// <c>"target_price"</c>.
         /// </summary>
         /// <returns>Whether <paramref name="value"/> is <c>TARGET_PRICE</c> or
         /// <c>PROFIT_LOSS</c>.</returns>
@@ -89,13 +92,16 @@ namespace EasyTrade.BrokerService.Entities.Alerts.Repository
         }
 
         /// <summary>
-        /// Maps one db-adapter alert. The trigger fields are set only when the message carries
-        /// both a <c>triggered_at</c> and a non-empty <c>trigger_value</c>; otherwise both are
-        /// null, because either one missing means the current arming has not triggered.
+        /// Maps one db-adapter alert. db-adapter sets and clears the two trigger fields together:
+        /// a <c>triggered_at</c> with a non-empty <c>trigger_value</c> maps to a triggered alert,
+        /// and an unset <c>triggered_at</c> with an empty <c>trigger_value</c> maps to null
+        /// trigger fields, because the current arming has not triggered. A message with only one
+        /// of the two is a malformed reply and is rejected, never read as untriggered.
         /// </summary>
         /// <exception cref="FormatException">
-        /// An id, enum name or decimal is malformed, the threshold is empty, or
-        /// <c>created_at</c> is unset.
+        /// An id, enum name or decimal is malformed, the threshold is empty,
+        /// <c>created_at</c> is unset, or only one of <c>triggered_at</c> and a non-empty
+        /// <c>trigger_value</c> is present.
         /// </exception>
         public static Alert FromProto(AlertGrpc.AlertMessage message)
         {
@@ -111,10 +117,24 @@ namespace EasyTrade.BrokerService.Entities.Alerts.Repository
 
             DateTimeOffset? triggeredAt = null;
             decimal? triggerValue = null;
-            if (message.TriggeredAt is not null && !string.IsNullOrEmpty(message.TriggerValue))
+            bool hasTriggerValue = !string.IsNullOrEmpty(message.TriggerValue);
+            if (message.TriggeredAt is not null)
             {
+                if (!hasTriggerValue)
+                {
+                    throw new FormatException(
+                        $"Alert [{message.Id}] has triggered_at without trigger_value."
+                    );
+                }
+
                 triggeredAt = message.TriggeredAt.ToDateTimeOffset();
                 triggerValue = AlertNumber.FromWire(message.TriggerValue);
+            }
+            else if (hasTriggerValue)
+            {
+                throw new FormatException(
+                    $"Alert [{message.Id}] has trigger_value without triggered_at."
+                );
             }
 
             DateTimeOffset createdAt =

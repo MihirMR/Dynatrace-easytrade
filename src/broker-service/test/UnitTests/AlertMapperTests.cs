@@ -64,6 +64,7 @@ namespace EasyTrade.BrokerService.Test.UnitTests
             Triggered,
             Untriggered,
             TriggeredAtWithoutValue,
+            TriggerValueWithoutTriggeredAt,
             EmptyThreshold,
             InexactType,
             InexactDirection,
@@ -74,6 +75,7 @@ namespace EasyTrade.BrokerService.Test.UnitTests
         [InlineData(ProtoCase.Triggered)]
         [InlineData(ProtoCase.Untriggered)]
         [InlineData(ProtoCase.TriggeredAtWithoutValue)]
+        [InlineData(ProtoCase.TriggerValueWithoutTriggeredAt)]
         [InlineData(ProtoCase.EmptyThreshold)]
         [InlineData(ProtoCase.InexactType)]
         [InlineData(ProtoCase.InexactDirection)]
@@ -237,9 +239,13 @@ namespace EasyTrade.BrokerService.Test.UnitTests
                 case ProtoCase.Untriggered:
                     return (message, UntriggeredAlert);
                 case ProtoCase.TriggeredAtWithoutValue:
-                    // Either trigger field missing means the current arming has not triggered.
+                    // db-adapter sets and clears both trigger fields together, so a reply with
+                    // only one of them is malformed and must not read as untriggered.
                     message.TriggeredAt = Timestamp.FromDateTimeOffset(TriggerTime);
-                    return (message, UntriggeredAlert);
+                    return (message, null);
+                case ProtoCase.TriggerValueWithoutTriggeredAt:
+                    message.TriggerValue = "-3.12345678";
+                    return (message, null);
                 case ProtoCase.EmptyThreshold:
                     message.Threshold = "";
                     return (message, null);

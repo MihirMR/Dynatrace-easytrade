@@ -27,6 +27,10 @@ namespace EasyTrade.BrokerService.Test.Fakes
         private const string MessageHeader = "grpc-message";
         private const string StatusOk = "0";
 
+        // A deadline travels as its remaining budget: 1 to 8 ASCII digits, then one unit letter.
+        private const string TimeoutHeader = "grpc-timeout";
+        private const int MaxTimeoutDigits = 8;
+
         // Never completes, so a held call ends only through its cancellation token.
         private static readonly Task<HttpResponseMessage> NeverAnswered =
             new TaskCompletionSource<HttpResponseMessage>().Task;
@@ -34,6 +38,7 @@ namespace EasyTrade.BrokerService.Test.Fakes
         private readonly Lock _gate = new();
         private readonly List<string> _requestPaths = [];
         private readonly List<byte[]> _requestMessages = [];
+        private readonly List<TimeSpan?> _requestTimeouts = [];
         private int _callCount;
         private bool _observedCancellation;
         private TaskCompletionSource _callReceived = NewSignal();
@@ -79,6 +84,23 @@ namespace EasyTrade.BrokerService.Test.Fakes
                 lock (_gate)
                 {
                     return [.. _requestMessages];
+                }
+            }
+        }
+
+        /// <summary>
+        /// Deadline budget of each received call, read from its <c>grpc-timeout</c> header, which
+        /// Grpc.Net.Client sends only for a call with a deadline; <c>null</c> for a call without
+        /// one. Same order as <see cref="RequestPaths"/>. A malformed header fails the call with a
+        /// <see cref="FormatException"/> before it is recorded.
+        /// </summary>
+        public IReadOnlyList<TimeSpan?> RequestTimeouts
+        {
+            get
+            {
+                lock (_gate)
+                {
+                    return [.. _requestTimeouts];
                 }
             }
         }
@@ -149,6 +171,7 @@ namespace EasyTrade.BrokerService.Test.Fakes
                 _callCount = 0;
                 _requestPaths.Clear();
                 _requestMessages.Clear();
+                _requestTimeouts.Clear();
                 _observedCancellation = false;
                 if (_callReceived.Task.IsCompleted)
                 {
@@ -213,15 +236,60 @@ namespace EasyTrade.BrokerService.Test.Fakes
         {
             string path = request.RequestUri?.AbsolutePath ?? string.Empty;
             byte[] message = body.Length >= MessagePrefixLength ? body[MessagePrefixLength..] : [];
+            TimeSpan? timeout = ReadTimeout(request);
             TaskCompletionSource received;
             lock (_gate)
             {
                 _callCount++;
                 _requestPaths.Add(path);
                 _requestMessages.Add(message);
+                _requestTimeouts.Add(timeout);
                 received = _callReceived;
             }
             received.TrySetResult();
+        }
+
+        // Units of the gRPC wire form: H hours, M minutes, S seconds, m milliseconds,
+        // u microseconds, n nanoseconds; nanoseconds below one tick are truncated.
+        private static TimeSpan? ReadTimeout(HttpRequestMessage request)
+        {
+            if (!request.Headers.TryGetValues(TimeoutHeader, out IEnumerable<string>? values))
+            {
+                return null;
+            }
+            string[] received = [.. values];
+            string value = received.Length == 1 ? received[0] : string.Empty;
+            int digitCount = value.Length - 1;
+            if (
+                digitCount is < 1 or > MaxTimeoutDigits
+                || !long.TryParse(
+                    value.AsSpan(0, digitCount),
+                    NumberStyles.None,
+                    CultureInfo.InvariantCulture,
+                    out long amount
+                )
+            )
+            {
+                throw MalformedTimeout(received);
+            }
+            long ticks = value[digitCount] switch
+            {
+                'H' => amount * TimeSpan.TicksPerHour,
+                'M' => amount * TimeSpan.TicksPerMinute,
+                'S' => amount * TimeSpan.TicksPerSecond,
+                'm' => amount * TimeSpan.TicksPerMillisecond,
+                'u' => amount * TimeSpan.TicksPerMicrosecond,
+                'n' => amount / TimeSpan.NanosecondsPerTick,
+                _ => throw MalformedTimeout(received),
+            };
+            return TimeSpan.FromTicks(ticks);
+        }
+
+        private static FormatException MalformedTimeout(string[] received)
+        {
+            return new FormatException(
+                $"Malformed {TimeoutHeader} header [{string.Join(", ", received)}]."
+            );
         }
 
         private abstract class Reply
