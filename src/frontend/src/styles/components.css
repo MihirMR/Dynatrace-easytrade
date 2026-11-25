@@ -997,8 +997,22 @@ dialog::backdrop {
     border-bottom: none;
 }
 
-/* Keyboard focus ring for the Portfolio Insights sidebar link */
-#nav-portfolio-insights:focus-visible {
+/* Keyboard focus ring shared by every sidebar link while the Portfolio Insights link is shown */
+/* With the feature off the sidebar keeps its original rendering */
+.sidebar-nav ul:has(#nav-portfolio-insights) .nav-link:focus-visible {
     outline: 2px solid var(--border-focus);
-    outline-offset: 2px;
+    outline-offset: 0;
+}
+
+/* Mobile sidebar row while the Portfolio Insights link is shown: one-line labels in a scrolling row */
+/* With the feature off the sidebar keeps its original rendering */
+@media (max-width: 768px) {
+    .sidebar-nav ul:has(#nav-portfolio-insights) > li {
+        flex-shrink: 0;
+    }
+
+    .sidebar-nav ul:has(#nav-portfolio-insights) .nav-link {
+        white-space: nowrap;
+        scroll-margin-inline: var(--space-2);
+    }
 }

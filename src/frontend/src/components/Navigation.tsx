@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react"
+import { type FocusEvent, useEffect, useRef, useState } from "react"
 import { NavLink } from "react-router"
 import { useQueryClient } from "@tanstack/react-query"
 import {
@@ -117,6 +117,23 @@ function useInsightsAvailabilityStatus(linkShown: boolean): string | null {
     return regionMounted || linkShown ? message : null
 }
 
+/**
+ * Scrolls a sidebar link that takes keyboard focus fully into view.
+ *
+ * The browser leaves a partly visible element where it is when it takes
+ * keyboard focus, so the horizontally scrolling mobile row would show only a
+ * sliver of the focused link. Pointer focus is left alone, so a click never
+ * scrolls the link out from under the pointer. It is attached only while the
+ * Portfolio Insights link is shown, so with the feature off the sidebar keeps
+ * its original focus behaviour.
+ */
+function revealKeyboardFocusedLink(event: FocusEvent<HTMLUListElement>) {
+    const link = event.target
+    if (link instanceof HTMLElement && link.matches(":focus-visible")) {
+        link.scrollIntoView({ block: "nearest", inline: "nearest" })
+    }
+}
+
 export default function Navigation() {
     // Observed on every protected route, so the flag keeps revalidating and a
     // disable shuts the feature down wherever the user is.
@@ -128,7 +145,13 @@ export default function Navigation() {
     return (
         <nav className="sidebar">
             <div className="sidebar-nav">
-                <ul>
+                <ul
+                    onFocus={
+                        portfolioInsightsEnabled
+                            ? revealKeyboardFocusedLink
+                            : undefined
+                    }
+                >
                     <li>
                         <NavLink
                             id="nav-home"
