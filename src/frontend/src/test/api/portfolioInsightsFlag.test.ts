@@ -75,6 +75,7 @@ function spyConsole() {
         error: vi.spyOn(console, "error").mockImplementation(() => undefined),
         warn: vi.spyOn(console, "warn").mockImplementation(() => undefined),
         info: vi.spyOn(console, "info").mockImplementation(() => undefined),
+        debug: vi.spyOn(console, "debug").mockImplementation(() => undefined),
     }
 }
 
@@ -96,11 +97,14 @@ function serialise(value: unknown): string {
     return text ?? String(value)
 }
 
-/** Every argument of every console.error, warn and info call, as text. */
+/** Every argument of each console.error, warn, info and debug call, as text. */
 function loggedText(spies: ConsoleSpies): string {
-    const args: unknown[] = [spies.error, spies.warn, spies.info].flatMap(
-        (spy): unknown[] => spy.mock.calls.flat()
-    )
+    const args: unknown[] = [
+        spies.error,
+        spies.warn,
+        spies.info,
+        spies.debug,
+    ].flatMap((spy): unknown[] => spy.mock.calls.flat())
     return args.map(serialise).join("\n")
 }
 
@@ -260,21 +264,6 @@ const failures: {
         },
     },
     {
-        label: "caller signal aborted",
-        read: () => {
-            stubFetch(hangUntilAborted)
-            const caller = new AbortController()
-            const pending = getPortfolioInsightsFlag(caller.signal)
-            caller.abort()
-            return pending
-        },
-        message: READ_FAILED,
-        diagnostic: {
-            reason: "aborted",
-            error: { name: "AbortError", hasCause: false },
-        },
-    },
-    {
         label: "malformed JSON on 200",
         read: () => {
             stubFetch(respondWith(textResponse("<html>not json</html>")))
@@ -354,6 +343,107 @@ it.each(failures)(
         })
     }
 )
+
+const callerAborts: {
+    label: string
+    read: (caller: AbortController) => Promise<boolean>
+}[] = [
+    {
+        label: "aborted during the read",
+        read: (caller) => {
+            const pending = getPortfolioInsightsFlag(caller.signal)
+            caller.abort()
+            return pending
+        },
+    },
+    {
+        label: "aborted before the read",
+        read: (caller) => {
+            caller.abort()
+            return getPortfolioInsightsFlag(caller.signal)
+        },
+    },
+    {
+        label: "aborted, then the deadline passed before handling",
+        read: (caller) => {
+            vi.useFakeTimers()
+            const pending = getPortfolioInsightsFlag(caller.signal)
+            caller.abort()
+            vi.advanceTimersByTime(2000)
+            return pending
+        },
+    },
+]
+
+it.each(callerAborts)(
+    "getPortfolioInsightsFlag_callerAborted_logsDebugNotError ($label)",
+    async ({ read }) => {
+        const spies = spyConsole()
+        stubFetch(hangUntilAborted)
+
+        const enabled = await read(new AbortController())
+
+        expect({
+            enabled,
+            debug: spies.debug.mock.calls.map(
+                ([logMessage, logged]: unknown[]) => [
+                    logMessage,
+                    withErrorShape(logged),
+                ]
+            ),
+            errors: spies.error.mock.calls.length,
+        }).toEqual({
+            enabled: false,
+            debug: [
+                [
+                    READ_FAILED,
+                    expect.objectContaining({
+                        reason: "aborted",
+                        error: { name: "AbortError", hasCause: false },
+                    }),
+                ],
+            ],
+            errors: 0,
+        })
+    }
+)
+
+// The synchronous advance lets the caller abort before the rejection is
+// handled, so the caller's signal is already aborted when it is classified.
+it("getPortfolioInsightsFlag_deadlineThenCallerAbort_logsTimeoutError", async () => {
+    vi.useFakeTimers()
+    const spies = spyConsole()
+    stubFetch(hangUntilAborted)
+    const caller = new AbortController()
+
+    const pending = getPortfolioInsightsFlag(caller.signal)
+    vi.advanceTimersByTime(2000)
+    caller.abort()
+    const enabled = await pending
+
+    expect({
+        enabled,
+        errors: spies.error.mock.calls.map(
+            ([logMessage, logged]: unknown[]) => [
+                logMessage,
+                withErrorShape(logged),
+            ]
+        ),
+        debug: spies.debug.mock.calls.length,
+    }).toEqual({
+        enabled: false,
+        errors: [
+            [
+                READ_FAILED,
+                expect.objectContaining({
+                    reason: "timeout",
+                    error: { name: "AbortError", hasCause: false },
+                }),
+            ],
+        ],
+        debug: 0,
+    })
+})
 
 const untrustedResponses: { label: string; response: () => Response }[] = [
     {

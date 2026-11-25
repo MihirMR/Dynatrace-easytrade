@@ -3,6 +3,7 @@ import {
     ApiError,
     getJsonWithTimeout,
     getJsonWithTimeoutExactStatus,
+    isReadDeadlineAbort,
     patchJson,
     postJsonText,
     services,
@@ -235,6 +236,83 @@ it.each(exactStatusAbortSources)(
             name: (error as Error).name,
             pendingTimers: vi.getTimerCount(),
         }).toEqual({ name: "AbortError", pendingTimers: 0 })
+    }
+)
+
+// Rows that advance timers synchronously let a second source act before the
+// rejection is handled; only the source that aborted first may count.
+const rejectionSources: {
+    source: string
+    respond: Respond
+    run: () => Promise<unknown>
+    expected: { name: string; deadline: boolean }
+}[] = [
+    {
+        source: "deadline",
+        respond: hangUntilAborted,
+        run: async () => {
+            const pending = settle(getJsonWithTimeout(url, 2000))
+            await vi.advanceTimersByTimeAsync(2000)
+            return pending
+        },
+        expected: { name: "AbortError", deadline: true },
+    },
+    {
+        source: "caller abort",
+        respond: hangUntilAborted,
+        run: async () => {
+            const caller = new AbortController()
+            const pending = settle(getJsonWithTimeout(url, 2000, caller.signal))
+            await vi.advanceTimersByTimeAsync(100)
+            caller.abort()
+            return pending
+        },
+        expected: { name: "AbortError", deadline: false },
+    },
+    {
+        source: "deadline, then caller abort before handling",
+        respond: hangUntilAborted,
+        run: () => {
+            const caller = new AbortController()
+            const pending = settle(getJsonWithTimeout(url, 2000, caller.signal))
+            vi.advanceTimersByTime(2000)
+            caller.abort()
+            return pending
+        },
+        expected: { name: "AbortError", deadline: true },
+    },
+    {
+        source: "caller abort, then deadline before handling",
+        respond: hangUntilAborted,
+        run: () => {
+            const caller = new AbortController()
+            const pending = settle(getJsonWithTimeout(url, 2000, caller.signal))
+            caller.abort()
+            vi.advanceTimersByTime(2000)
+            return pending
+        },
+        expected: { name: "AbortError", deadline: false },
+    },
+    {
+        source: "network error",
+        respond: () => Promise.reject(new TypeError("Failed to fetch")),
+        run: () => settle(getJsonWithTimeout(url, 2000)),
+        expected: { name: "TypeError", deadline: false },
+    },
+]
+
+it.each(rejectionSources)(
+    "isReadDeadlineAbort_rejectionSource_trueOnlyWhenDeadlineAbortedFirst ($source)",
+    async ({ respond, run, expected }) => {
+        vi.useFakeTimers()
+        stubFetch(respond)
+
+        const error = await run()
+
+        expect({
+            name: (error as Error).name,
+            deadline: isReadDeadlineAbort(error),
+        }).toEqual(expected)
     }
 )
 

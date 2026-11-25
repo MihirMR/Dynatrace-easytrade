@@ -119,9 +119,10 @@ export async function getXml(
 /**
  * GET JSON, aborted after `timeoutMs` or when the optional caller `signal`
  * aborts, whichever comes first. Both paths abort one internal controller, so
- * the rejection is always the standard `AbortError`. The caller signal is
- * linked by hand because `AbortSignal.any` is missing from older browsers; its
- * listener is removed once the request settles.
+ * the rejection is always the standard `AbortError`; `isReadDeadlineAbort`
+ * tells which one aborted it. The caller signal is linked by hand because
+ * `AbortSignal.any` is missing from older browsers; its listener is removed
+ * once the request settles.
  */
 export async function getJsonWithTimeout<T>(
     url: string,
@@ -145,6 +146,16 @@ export async function getJsonWithTimeoutExactStatus<T>(
     return await readJsonWithTimeout<T>(url, timeoutMs, signal, status)
 }
 
+/** Rejections of timed reads that their own deadline aborted first. */
+const deadlineAborts = new WeakSet<object>()
+
+/** True when a timed read's own deadline, not its caller, aborted it. */
+export function isReadDeadlineAbort(error: unknown): boolean {
+    return (
+        typeof error === "object" && error !== null && deadlineAborts.has(error)
+    )
+}
+
 /** Shared timed read; a given `requiredStatus` narrows `response.ok`. */
 async function readJsonWithTimeout<T>(
     url: string,
@@ -153,7 +164,13 @@ async function readJsonWithTimeout<T>(
     requiredStatus: number | undefined
 ): Promise<T> {
     const controller = new AbortController()
-    const timer = setTimeout(() => controller.abort(), timeoutMs)
+    // Decided when the deadline fires, since the caller may also abort before
+    // the rejection is handled.
+    let deadlineAbortedFirst = false
+    const timer = setTimeout(() => {
+        deadlineAbortedFirst = !controller.signal.aborted
+        controller.abort()
+    }, timeoutMs)
     const onAbort = (): void => controller.abort()
     if (signal?.aborted) {
         controller.abort()
@@ -172,6 +189,15 @@ async function readJsonWithTimeout<T>(
             throw new ApiError(response.status, url)
         }
         return (await response.json()) as T
+    } catch (error) {
+        if (
+            deadlineAbortedFirst &&
+            typeof error === "object" &&
+            error !== null
+        ) {
+            deadlineAborts.add(error)
+        }
+        throw error
     } finally {
         clearTimeout(timer)
         signal?.removeEventListener("abort", onAbort)

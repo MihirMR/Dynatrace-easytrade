@@ -2,6 +2,7 @@ import {
     ApiError,
     getJson,
     getJsonWithTimeoutExactStatus,
+    isReadDeadlineAbort,
     put,
     services,
 } from "../http"
@@ -107,11 +108,11 @@ class FlagResponseError extends Error {
     }
 }
 
-// Every outcome is logged with a whole error object. Errors that carry no
-// upstream content are logged as thrown. A JSON parse error's message is built
-// from the response bytes, and the body is untrusted, so that error and any
-// unrecognised thrown value are replaced by a content-free FlagResponseError
-// without a cause.
+// The diagnostic logged for an exception caught during the read. Errors that
+// carry no upstream content are kept as thrown. A JSON parse error's message
+// is built from the response bytes, and the body is untrusted, so that error
+// and any unrecognised thrown value are replaced by a content-free
+// FlagResponseError without a cause.
 function describeFlagReadFailure(
     error: unknown,
     signal?: AbortSignal
@@ -120,7 +121,8 @@ function describeFlagReadFailure(
         return { reason: "status", status: error.status, error }
     }
     if (isAbortError(error)) {
-        return { reason: signal?.aborted ? "aborted" : "timeout", error }
+        const callerAborted = signal?.aborted && !isReadDeadlineAbort(error)
+        return { reason: callerAborted ? "aborted" : "timeout", error }
     }
     if (error instanceof TypeError) {
         return { reason: "network", error }
@@ -167,10 +169,20 @@ export async function getPortfolioInsightsFlag(
             signal
         )
     } catch (error) {
-        console.error(
-            "[getPortfolioInsightsFlag] flag read failed",
-            describeFlagReadFailure(error, signal)
-        )
+        const diagnostic = describeFlagReadFailure(error, signal)
+        // A read its caller cancelled has its result discarded, so it is
+        // logged at debug level; every other failure at error level.
+        if (diagnostic.reason === "aborted") {
+            console.debug(
+                "[getPortfolioInsightsFlag] flag read failed",
+                diagnostic
+            )
+        } else {
+            console.error(
+                "[getPortfolioInsightsFlag] flag read failed",
+                diagnostic
+            )
+        }
         return false
     }
     if (!isRecord(body)) {
