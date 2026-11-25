@@ -99,6 +99,31 @@ default**; Postgres is supported as an alternate backend by swapping which of th
 pairs is commented out. Schema and seed scripts for each dialect live in
 `src/db/mssql/` and `src/db/postgres/`.
 
+The [Portfolio insights](#portfolio-insights-demo-feature) feature adds an `Alerts` table,
+created by `src/db/postgres/sql-scripts/13-alerts.sql` and
+`src/db/mssql/sql-scripts/sql-alerts.sql`. See [`src/db/README.md`](src/db/README.md) for
+the script layout of both dialects.
+
+### Getting the `Alerts` table into an existing database
+
+Init scripts do not add the table to an existing database. PostgreSQL runs
+`/docker-entrypoint-initdb.d` only when its data directory is empty. MSSQL reruns its whole
+script list on every start without stopping on errors, and each rerun duplicates the seeded
+holdings. Restarting a persistent MSSQL database is therefore **not** a way to get the table.
+
+- **Compose:** neither Compose file declares a named database volume, but the PostgreSQL
+  base image keeps its data in an anonymous volume. For a fresh database run `make clean`,
+  then `make start`; with the runtime `compose.yaml`, run `docker compose down --volumes`,
+  then `docker compose up -d`. **This deletes the stack's data.**
+- **Helm:** persistence is off by default, so a new database pod starts empty. With
+  persistence enabled, `helm uninstall` leaves the StatefulSet's PVC in place, so the PVC
+  must be deleted explicitly, which destroys its data. See
+  [`helm/easytrade/README.md`](helm/easytrade/README.md).
+- **Keeping existing data:** back up the database, then apply the dialect's script once by
+  hand: `sqlcmd -I -i sql-alerts.sql` (MSSQL) or `psql -f 13-alerts.sql` (PostgreSQL). Both
+  scripts are guarded (`IF OBJECT_ID(...) IS NULL` / `CREATE TABLE IF NOT EXISTS`), so a
+  repeat apply is harmless.
+
 ## Docker compose
 
 To run the easytrade using docker you can use provided `compose.yaml`.
@@ -249,8 +274,10 @@ If you want to use easyTrade, then you will need a user. You can either:
 ## Problem patterns
 
 Currently there are 4 problem patterns supported in easyTrade (the feature flag service
-exposes 8 flags in total - the remaining ones gate frontend flag management, credit card
-meltdown, credit card memory leak and credit card validation):
+exposes 9 flags in total - the remaining ones gate frontend flag management, credit card
+meltdown, credit card memory leak and credit card validation, plus the
+`portfolio-insights-enabled` feature flag, tagged `feature` rather than a problem pattern,
+described in [Portfolio insights](#portfolio-insights-demo-feature)):
 
 1. DbNotResponding - after turning it on no new trades can be created as the database will throw an error. This problem pattern is kind of proof on concept that problem patterns work. Running it for around 20 minutes should generate a problem in dynatrace.
 
@@ -286,6 +313,126 @@ You can also manage enabled problem patterns via the easyTrade frontend.
 
 > **NOTE:** More information on the feature flag service's parameters available in [feature flag service's doc](src/feature-flag-service/README.md).
 
+## Portfolio insights (demo feature)
+
+An optional **Portfolio Insights** page shows an account's portfolio value, invested amount,
+unrealized profit/loss (P/L), allocation per instrument, largest position and a `LOW` /
+`MEDIUM` / `HIGH` concentration-risk badge. It also offers target-price and profit/loss
+alerts with in-app notifications. Everything it shows is
+**simulated demo data and not financial advice**: prices come from the existing generated
+candles, and notifications are in-app Toasts only (no email or SMS). The feature is off by
+default, and with it off the application behaves exactly as before.
+
+### Feature flag
+
+- Id `portfolio-insights-enabled`, tag `feature`. Unlike the snake_case problem-pattern ids,
+  it is hyphenated. **Disabled by default.**
+- Startup default: `ENABLE_PORTFOLIO_INSIGHTS` on `feature-flag-service`. Flag state lives
+  in memory, so a restart restores the configured startup default: `false` as shipped,
+  `true` where `ENABLE_PORTFOLIO_INSIGHTS=true` is set.
+- Runtime toggle, again with no trailing slash:
+
+  ```sh
+  curl -X PUT "http://{IP_ADDRESS}/feature-flag-service/v1/flags/portfolio-insights-enabled" \
+  -H "accept: application/json" \
+  -d '{"enabled": true}'
+  ```
+
+- A deployment with `ENABLE_MODIFY=false` locks every flag, this one included. Its state
+  then comes only from `ENABLE_PORTFOLIO_INSIGHTS` at startup.
+- The flag is **not** listed on the frontend `/feature-flags` page, which shows only
+  `problem_pattern` flags. Toggle it through the API.
+
+When a toggle takes effect:
+
+| Consumer                 | Sees the change                                                                     |
+| ------------------------ | ----------------------------------------------------------------------------------- |
+| broker-service endpoints | On the next request - the flag is read fresh on every request, with a 2 s deadline  |
+| Alert evaluation         | At the start of its next cycle                                                      |
+| Visible browser tab      | Within 15 s plus the 2 s read; at once on window focus or reconnect, and on any 403 |
+| loadgen                  | At the next visit start                                                             |
+
+While the flag is off, or `feature-flag-service` is unreachable, the feature fails closed:
+
+- every new endpoint answers HTTP 403 with `{"error":"feature_disabled"}`;
+- the navigation link is hidden, and `/insights` redirects to `/home`;
+- alert evaluation does nothing.
+
+### Endpoints
+
+The seven endpoints belong to broker-service and are reached through the reverse proxy
+under `/broker-service`, for example `http://{IP_ADDRESS}/broker-service/v1/alerts`.
+
+| Method and path                                               | Purpose                                                                            |
+| ------------------------------------------------------------- | ---------------------------------------------------------------------------------- |
+| `GET /v1/portfolio/insights/{accountId}`                      | Portfolio figures, allocations, largest position and risk level                    |
+| `POST /v1/alerts`                                             | Create an alert from `accountId`, `type`, `instrumentId`, `direction`, `threshold` |
+| `GET /v1/alerts?accountId=`                                   | List the account's alerts, newest first                                            |
+| `PATCH /v1/alerts/{id}`                                       | Enable or disable an alert with `{"enabled": bool}`; `true` re-arms it             |
+| `DELETE /v1/alerts/{id}`                                      | Delete an alert together with its notification                                     |
+| `GET /v1/alerts/notifications?accountId=&unacknowledged=true` | List triggered alerts; `unacknowledged=true` keeps only unacknowledged ones        |
+| `POST /v1/alerts/{id}/acknowledge`                            | Acknowledge the notification of the alert's current arming                         |
+
+Alert types are `TARGET_PRICE` (the threshold is a price) and `PROFIT_LOSS` (the threshold
+is the holding's P/L percentage), and directions are `ABOVE` and `BELOW`. An alert triggers
+only when the value strictly crosses its threshold, and each arming of an alert notifies
+exactly once; re-arming starts a new arming. See
+[`src/broker-service/README.md`](src/broker-service/README.md#portfolio-insights-and-alerts)
+for statuses, error bodies and the `{"results": [...]}` list envelope, and
+[`broker-service.http`](src/broker-service/broker-service.http) for runnable requests.
+
+### Configuration
+
+| Variable                            | Service                | Default | Meaning                                                                                          |
+| ----------------------------------- | ---------------------- | ------- | ------------------------------------------------------------------------------------------------ |
+| `ENABLE_PORTFOLIO_INSIGHTS`         | `feature-flag-service` | `false` | Startup value of the flag                                                                        |
+| `ALERT_EVALUATION_INTERVAL_SECONDS` | `broker-service`       | `60`    | Seconds between alert evaluation cycles; values outside 1–4294967 fall back to 60 with a warning |
+| `PORTFOLIO_INSIGHTS_ALERT_WEIGHT`   | `loadgen`              | `0`     | Weight of the opt-in `portfolio_insights_alert` visit; 0 keeps today's workload                  |
+
+All three are declared in `compose.yaml`, `compose.dev.yaml` and
+`helm/easytrade/values.yaml`, with these defaults. For a demo setup with no file edit:
+
+```bash
+# Compose: set both values for this start, or put the same two lines in .env
+ENABLE_PORTFOLIO_INSIGHTS=true PORTFOLIO_INSIGHTS_ALERT_WEIGHT=1 make start
+
+# Helm
+helm upgrade --install easytrade helm/easytrade --namespace easytrade --create-namespace \
+--set feature-flag-service.env.ENABLE_PORTFOLIO_INSIGHTS="true" \
+--set loadgen.env.PORTFOLIO_INSIGHTS_ALERT_WEIGHT="1"
+```
+
+More detail in [`src/feature-flag-service/README.md`](src/feature-flag-service/README.md),
+[`src/loadgen/README.md`](src/loadgen/README.md) and
+[`helm/easytrade/README.md`](helm/easytrade/README.md).
+
+### Database schema
+
+An existing database does not get the `Alerts` table by itself; see
+[Getting the `Alerts` table into an existing database](#getting-the-alerts-table-into-an-existing-database)
+in [Database](#database).
+
+### Walkthrough
+
+1. Enable the flag: start with `ENABLE_PORTFOLIO_INSIGHTS=true make start`, or, on a running
+   stack, send the `PUT` above with `{"enabled": true}`. The broker applies the change on its
+   next request, and a visible tab within 15 s plus the 2 s read deadline, at once on focus.
+   A restart restores the startup default, and an `ENABLE_MODIFY=false` deployment cannot
+   toggle it.
+2. Log in (for example `james_norton` / `pass_james_123`), deposit, and buy an instrument.
+3. Open **Portfolio Insights** in the sidebar. Read the figures and the risk badge.
+4. Read the instrument's current price. Before waiting, create two target-price alerts on
+   it: `ABOVE` with a threshold just below the price, and `BELOW` with a threshold just above
+   it. Whichever way the next price moves, one of the two is crossed.
+5. Within two evaluation cycles (`ALERT_EVALUATION_INTERVAL_SECONDS`, 60 s by default), a
+   Toast and a notification appear for at least one of them.
+6. Acknowledge the notification. Re-arm an alert with its "Re-arm" or "Enable" button to
+   receive a new notification on its next crossing.
+
+> **NOTE:** Cost basis is not stored; it is derived from the account's retained executed
+> trades. Quantity older than that history, such as seeded holdings, is valued at the
+> latest price and therefore shows near-zero P/L.
+
 ## EasyTrade on Dynatrace - how to configure
 
 All Dynatrace configuration required for Easytrade should be applied using [Monaco](https://github.com/Dynatrace/dynatrace-configuration-as-code). More information on how to deploy it can be found in the [`monaco` directory](./monaco).
@@ -300,6 +447,15 @@ EasyTrade application has been developed in order to showcase business events. U
 If you want to learn more about business events then we suggest looking at the information on our website: [Business event capture](https://www.dynatrace.com/support/help/platform-modules/business-analytics/ba-events-capturing). There you will find information on how to create events directly (with OpenKit, Javascript, Android and more) and indirectly with capture rules in Dynatrace.
 
 For those interested in creating capturing rules for easyTrade we suggest to have a look at the configuration exported with Monaco in this repository. Have a look at the [README](./monaco/README.md)
+
+The [Portfolio insights](#portfolio-insights-demo-feature) feature adds two business events.
+The frontend sends them directly through its existing business-event helper, so no Monaco
+capture rule is needed:
+
+- `com.easytrade.portfolio-insights.view` - once per successful page load, with
+  `accountId`, `holdingCount` and `riskLevel`.
+- `com.easytrade.alert.create` - after a successful create (201), with `accountId`,
+  `alertId`, `type`, `instrumentId`, `direction` and `threshold`.
 
 ## Body types
 
