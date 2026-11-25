@@ -1,11 +1,15 @@
+using System.Diagnostics;
+using EasyTrade.BrokerService.Helpers;
 using EasyTrade.BrokerService.Helpers.FeatureFlags;
 using EasyTrade.BrokerService.ProblemPatterns.OpenFeature.Providers;
+using EasyTrade.BrokerService.ProblemPatterns.OpenFeature.Providers.FeatureFlagService;
 using EasyTrade.BrokerService.Test.Fakes;
 using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.AspNetCore.Mvc.Abstractions;
 using Microsoft.AspNetCore.Mvc.Filters;
 using Microsoft.AspNetCore.Routing;
+using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Logging;
 using OpenFeature;
 using OpenFeature.Model;
@@ -14,17 +18,231 @@ namespace EasyTrade.BrokerService.Test.UnitTests
 {
     /// <summary>
     /// Tests of <see cref="PortfolioInsightsFeature.IsEnabledAsync"/>: the flag read outcomes,
-    /// caller cancellation, the read deadline and the Warning logged for an unreadable flag; and
-    /// of how <see cref="PortfolioInsightsFeatureGate"/> uses that read when its request is
-    /// aborted. Each feature is built over a provider instance and the gate over a fake feature,
-    /// so the process-wide OpenFeature API is never touched.
+    /// caller cancellation, the read deadline and the Warning logged for an unreadable flag; of
+    /// the token path through <see cref="PluginProvider"/> and
+    /// <see cref="FeatureFlagServiceConnector"/>, including the unchanged token-less request that
+    /// problem-pattern reads send; and of how <see cref="PortfolioInsightsFeatureGate"/> uses the
+    /// read when its request is aborted. Each feature is built over a provider instance and the
+    /// gate over a fake feature, so the process-wide OpenFeature API is never touched.
     /// </summary>
     public class PortfolioInsightsFeatureTests
     {
         private const string UnreadableWarningPrefix = "Portfolio insights flag unreadable";
 
+        // Literal rather than the constant, so the tests prove the hyphenated id reaches each hop.
+        private const string HyphenatedFlagId = "portfolio-insights-enabled";
+        private const string FlagServiceAddress = "http://flags.test";
+        private const string ExpectedFlagUri =
+            "http://flags.test/v1/flags/portfolio-insights-enabled";
+
         // Bounds every read, so a regression that hangs fails its test instead of the run.
         private static readonly TimeSpan ReadBound = TimeSpan.FromSeconds(10);
+
+        // Lower bound of a read ended by the 2 s deadline, allowing for timer granularity.
+        private static readonly TimeSpan DeadlineLowerBound = TimeSpan.FromSeconds(1.9);
+
+        [Theory]
+        [InlineData(SwitchableFlagMode.Enabled, true, 0)]
+        [InlineData(SwitchableFlagMode.Disabled, false, 0)]
+        [InlineData(SwitchableFlagMode.ReturnNull, false, 0)]
+        [InlineData(SwitchableFlagMode.ThrowHttpRequest, false, 1)]
+        [InlineData(SwitchableFlagMode.ThrowJson, false, 1)]
+        public async Task IsEnabled_ProviderOutcome_ShouldResolve(
+            SwitchableFlagMode mode,
+            bool expectedEnabled,
+            int expectedUnreadableWarnings
+        )
+        {
+            // Arrange
+            FeatureUnderTest subject = BuildFeature(mode);
+
+            // Act
+            bool enabled = await subject
+                .Feature.IsEnabledAsync(CancellationToken.None)
+                .WaitAsync(ReadBound);
+
+            // Assert
+            Assert.Equal(
+                (expectedEnabled, expectedUnreadableWarnings),
+                (enabled, UnreadableWarnings(subject.Logger.Sink).Count())
+            );
+        }
+
+        [Fact]
+        public async Task IsEnabled_Deadline_ShouldCancelConnectorTokenAndReturnFalse()
+        {
+            // Arrange
+            SwitchableFeatureFlagServiceConnector connector = new(mode: SwitchableFlagMode.Hang);
+            FinishSignallingConnector observed = new(connector);
+            RecordingLogSink sink = new();
+            PortfolioInsightsFeature feature = new(
+                new PluginProvider(observed),
+                new RecordingLogger<PortfolioInsightsFeature>(sink)
+            );
+            Stopwatch stopwatch = Stopwatch.StartNew();
+
+            // Act
+            bool enabled = await feature
+                .IsEnabledAsync(CancellationToken.None)
+                .WaitAsync(ReadBound);
+            stopwatch.Stop();
+            // The feature can return before the hung connector call has unwound, so the
+            // connector's record is read only once that call has finished.
+            await observed.CallFinished.WaitAsync(ReadBound);
+
+            // Assert
+            Assert.Equal(
+                new DeadlineRead(
+                    Enabled: false,
+                    WaitedForDeadline: true,
+                    ConnectorTokenCancelled: true,
+                    WarningReasons: "timeout"
+                ),
+                new DeadlineRead(
+                    enabled,
+                    stopwatch.Elapsed >= DeadlineLowerBound,
+                    connector.ObservedCancellation,
+                    string.Join(
+                        ",",
+                        UnreadableWarnings(sink).Select(entry => entry.GetField("reason"))
+                    )
+                )
+            );
+        }
+
+        [Fact]
+        public async Task IsEnabled_CallerCancelled_ShouldThrowOperationCanceled()
+        {
+            // Arrange
+            FeatureUnderTest subject = BuildFeature(SwitchableFlagMode.Hang);
+            using CancellationTokenSource caller = new();
+            // The hung connector call has started by the time the read's task is returned.
+            Task<bool> read = subject.Feature.IsEnabledAsync(caller.Token);
+
+            // Act
+            caller.Cancel();
+
+            // Assert
+            await Assert.ThrowsAnyAsync<OperationCanceledException>(
+                () => read.WaitAsync(ReadBound)
+            );
+        }
+
+        [Fact]
+        public async Task IsEnabled_CallerCancelledDuringRead_ShouldLogNoWarning()
+        {
+            // Arrange
+            FeatureUnderTest subject = BuildFeature(SwitchableFlagMode.Hang);
+            using CancellationTokenSource caller = new();
+            Task<bool> read = subject.Feature.IsEnabledAsync(caller.Token);
+
+            // Act
+            caller.Cancel();
+            _ = await Record.ExceptionAsync(() => read.WaitAsync(ReadBound));
+
+            // Assert
+            Assert.Empty(subject.Logger.Sink.ByLevel(LogLevel.Warning));
+        }
+
+        [Fact]
+        public async Task IsEnabled_CalledTwice_ShouldReadProviderTwice()
+        {
+            // Arrange
+            FeatureUnderTest subject = BuildFeature(SwitchableFlagMode.Enabled);
+
+            // Act
+            _ = await subject.Feature.IsEnabledAsync(CancellationToken.None).WaitAsync(ReadBound);
+            _ = await subject.Feature.IsEnabledAsync(CancellationToken.None).WaitAsync(ReadBound);
+
+            // Assert
+            Assert.Equal(2, subject.Connector.CallCount);
+        }
+
+        [Theory]
+        [InlineData(SwitchableFlagMode.Enabled, true)]
+        [InlineData(SwitchableFlagMode.Disabled, false)]
+        public async Task ResolveBooleanValue_HyphenatedFlag_ShouldReturnFlagState(
+            SwitchableFlagMode mode,
+            bool expected
+        )
+        {
+            // Arrange
+            SwitchableFeatureFlagServiceConnector connector = new(mode: mode);
+
+            // Act
+            ResolutionDetails<bool> details = await new PluginProvider(
+                connector
+            ).ResolveBooleanValueAsync(
+                Constants.PortfolioInsightsEnabled,
+                false,
+                null,
+                CancellationToken.None
+            );
+
+            // Assert
+            Assert.Equal(expected, details.Value);
+            Assert.Equal(HyphenatedFlagId, Assert.Single(connector.RequestedIds));
+        }
+
+        [Fact]
+        public async Task GetFlag_HyphenatedId_ShouldRequestFlagPath()
+        {
+            // Arrange
+            RecordingHttpClientFactory factory = new();
+            FeatureFlagServiceConnector connector = BuildConnector(factory);
+
+            // Act
+            _ = await connector.GetFlag(Constants.PortfolioInsightsEnabled, CancellationToken.None);
+
+            // Assert
+            Assert.Collection(
+                factory.Handler.Requests,
+                request => Assert.Equal(ExpectedFlagUri, request.RequestUri?.AbsoluteUri)
+            );
+        }
+
+        [Fact]
+        public async Task GetFlag_WithoutToken_ShouldSendUnchangedRequest()
+        {
+            // Arrange
+            RecordingHttpClientFactory factory = new();
+            FeatureFlagServiceConnector connector = BuildConnector(factory);
+            (HttpMethod, string?, string) expected = (HttpMethod.Get, ExpectedFlagUri, "");
+
+            // Act
+            _ = await connector.GetFlag(Constants.PortfolioInsightsEnabled);
+
+            // Assert
+            Assert.Collection(
+                factory.Handler.Requests,
+                request =>
+                    Assert.Equal(
+                        expected,
+                        (
+                            request.Method,
+                            request.RequestUri?.AbsoluteUri,
+                            string.Join(",", request.Headers.Keys)
+                        )
+                    )
+            );
+        }
+
+        [Fact]
+        public async Task GetFlag_WithoutToken_ShouldReturnFlagFromBody()
+        {
+            // Arrange
+            FeatureFlagServiceConnector connector = BuildConnector(
+                new RecordingHttpClientFactory()
+            );
+
+            // Act
+            Flag? flag = await connector.GetFlag(Constants.PortfolioInsightsEnabled);
+
+            // Assert
+            // The handler's default body carries the hyphenated id with Enabled set to true.
+            Flag read = Assert.IsType<Flag>(flag);
+            Assert.Equal((HyphenatedFlagId, true), (read.Id, read.Enabled));
+        }
 
         [Fact]
         public async Task IsEnabled_CallerCancelledWhileProviderSucceeds_ShouldThrowCanceled()
@@ -70,14 +288,16 @@ namespace EasyTrade.BrokerService.Test.UnitTests
         )
         {
             // Arrange
-            RecordingLogSink sink = new();
-            PortfolioInsightsFeature feature = BuildUnreadableFeature(mode, sink);
+            FeatureUnderTest subject = BuildFeature(mode);
 
             // Act
-            _ = await feature.IsEnabledAsync(CancellationToken.None).WaitAsync(ReadBound);
+            _ = await subject.Feature.IsEnabledAsync(CancellationToken.None).WaitAsync(ReadBound);
 
             // Assert
-            Assert.Collection(UnreadableWarnings(sink), entry => Assert.Null(entry.Exception));
+            Assert.Collection(
+                UnreadableWarnings(subject.Logger.Sink),
+                entry => Assert.Null(entry.Exception)
+            );
         }
 
         [Theory]
@@ -89,15 +309,14 @@ namespace EasyTrade.BrokerService.Test.UnitTests
         )
         {
             // Arrange
-            RecordingLogSink sink = new();
-            PortfolioInsightsFeature feature = BuildUnreadableFeature(mode, sink);
+            FeatureUnderTest subject = BuildFeature(mode);
 
             // Act
-            _ = await feature.IsEnabledAsync(CancellationToken.None).WaitAsync(ReadBound);
+            _ = await subject.Feature.IsEnabledAsync(CancellationToken.None).WaitAsync(ReadBound);
 
             // Assert
             Assert.Collection(
-                UnreadableWarnings(sink),
+                UnreadableWarnings(subject.Logger.Sink),
                 entry => Assert.Equal(expectedReason, entry.GetField("reason"))
             );
         }
@@ -172,15 +391,36 @@ namespace EasyTrade.BrokerService.Test.UnitTests
             Assert.Null(run.Result);
         }
 
-        // The production PluginProvider over a connector that fails in the given mode.
-        private static PortfolioInsightsFeature BuildUnreadableFeature(
-            SwitchableFlagMode mode,
-            RecordingLogSink sink
+        // The feature over the production PluginProvider and a connector in the given mode.
+        private static FeatureUnderTest BuildFeature(SwitchableFlagMode mode)
+        {
+            SwitchableFeatureFlagServiceConnector connector = new(mode: mode);
+            RecordingLogger<PortfolioInsightsFeature> logger = new();
+            return new FeatureUnderTest(
+                new PortfolioInsightsFeature(new PluginProvider(connector), logger),
+                connector,
+                logger
+            );
+        }
+
+        // The production connector over the recording factory, addressed by in-memory
+        // configuration rather than an environment variable.
+        private static FeatureFlagServiceConnector BuildConnector(
+            RecordingHttpClientFactory factory
         )
         {
-            return new PortfolioInsightsFeature(
-                new PluginProvider(new SwitchableFeatureFlagServiceConnector(mode: mode)),
-                new RecordingLogger<PortfolioInsightsFeature>(sink)
+            IConfiguration configuration = new ConfigurationBuilder()
+                .AddInMemoryCollection(
+                    new Dictionary<string, string?>
+                    {
+                        [Constants.FeatureFlagServiceAddress] = FlagServiceAddress,
+                    }
+                )
+                .Build();
+            return new FeatureFlagServiceConnector(
+                configuration,
+                factory,
+                new RecordingLogger<FeatureFlagServiceConnector>()
             );
         }
 
@@ -352,6 +592,55 @@ namespace EasyTrade.BrokerService.Test.UnitTests
                 return _answer.Task.WaitAsync(cancellationToken);
             }
         }
+
+        /// <summary>
+        /// Passes every call to <paramref name="inner"/> and signals once its first call has
+        /// finished, so a test reads the inner connector's record only after that call unwound.
+        /// </summary>
+        private sealed class FinishSignallingConnector(IFeatureFlagServiceConnector inner)
+            : IFeatureFlagServiceConnector
+        {
+            private readonly TaskCompletionSource _callFinished = new(
+                TaskCreationOptions.RunContinuationsAsynchronously
+            );
+
+            public Task CallFinished => _callFinished.Task;
+
+            public Task<Flag?> GetFlag(string id)
+            {
+                return GetFlag(id, CancellationToken.None);
+            }
+
+            public async Task<Flag?> GetFlag(string id, CancellationToken cancellationToken)
+            {
+                try
+                {
+                    return await inner.GetFlag(id, cancellationToken);
+                }
+                finally
+                {
+                    _callFinished.TrySetResult();
+                }
+            }
+        }
+
+        /// <summary>A feature over the production provider, its connector and its logger.</summary>
+        private sealed record FeatureUnderTest(
+            PortfolioInsightsFeature Feature,
+            SwitchableFeatureFlagServiceConnector Connector,
+            RecordingLogger<PortfolioInsightsFeature> Logger
+        );
+
+        /// <summary>
+        /// What a read ended by the deadline showed, compared whole so one assertion reports
+        /// every part that differs.
+        /// </summary>
+        private sealed record DeadlineRead(
+            bool Enabled,
+            bool WaitedForDeadline,
+            bool ConnectorTokenCancelled,
+            string WarningReasons
+        );
 
         /// <summary>How the gate ended for a request aborted during its flag read.</summary>
         private sealed record AbortedGateRun(

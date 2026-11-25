@@ -1,31 +1,63 @@
 using System.Threading.Channels;
 using EasyTrade.BrokerService.Entities.Alerts;
 using EasyTrade.BrokerService.Entities.Alerts.Service;
+using EasyTrade.BrokerService.Entities.Balances;
 using EasyTrade.BrokerService.Entities.Instruments;
 using EasyTrade.BrokerService.Entities.Portfolio.DTO;
 using EasyTrade.BrokerService.Entities.Portfolio.Service;
 using EasyTrade.BrokerService.Entities.Prices;
 using EasyTrade.BrokerService.Entities.Prices.ServiceConnector;
 using EasyTrade.BrokerService.Entities.Trades;
+using EasyTrade.BrokerService.ExceptionHandling.Exceptions;
 using EasyTrade.BrokerService.Helpers.FeatureFlags;
 using EasyTrade.BrokerService.Helpers.Metrics;
 using EasyTrade.BrokerService.Test.Fakes;
 using Microsoft.Extensions.DependencyInjection;
-// System.Diagnostics.Metrics also declares an Instrument type, so only the factory is imported.
+using Microsoft.Extensions.Logging;
+// System.Diagnostics.Metrics also declares an Instrument type, so only the types used are imported.
 using IMeterFactory = System.Diagnostics.Metrics.IMeterFactory;
+using MeterListener = System.Diagnostics.Metrics.MeterListener;
 
 namespace EasyTrade.BrokerService.Test.UnitTests
 {
     /// <summary>
     /// Cycle tests of <see cref="AlertEvaluationService"/>, each driving
-    /// <see cref="AlertEvaluationService.RunCycleAsync"/>. The concurrency case checks the bound on
-    /// concurrent work and the reuse of per-cycle data through the real
-    /// <see cref="PortfolioInsightsService"/> positions path. Every positions load is held until
-    /// the test releases it, one at a time in arrival order, so the loads in flight are observed
-    /// at each step without waiting on time.
+    /// <see cref="AlertEvaluationService.RunCycleAsync"/> over the in-memory alert store, the
+    /// existing repository and pricing fakes, and the real <see cref="PortfolioInsightsService"/>
+    /// positions path. They cover the strict crossing rule, one notification per arming under
+    /// repetition, racing evaluators and a stale re-arm snapshot, the armed selection, skips,
+    /// per-alert and cycle failures, cancellation, the trigger write with its metrics, and the
+    /// named log fields. Racing cycles are ordered with barriers and completion sources, and every
+    /// wait is bounded. The concurrency case checks the bound on concurrent work: every positions
+    /// load is held until the test releases it, one at a time in arrival order, so the loads in
+    /// flight are observed at each step without waiting on time.
     /// </summary>
     public class AlertEvaluationTests
     {
+        private const string CycleFinishedPrefix = "Alert evaluation cycle finished";
+        private const string CycleFailedPrefix = "Alert evaluation cycle failed";
+        private const string AlertUnit = "{alert}";
+        private const string SecondsUnit = "s";
+        private const string ReasonNoHolding = "no_holding";
+        private const string ReasonNoPrice = "no_price";
+        private const string ReasonException = "exception";
+        private const string ReasonOutOfRange = "trigger_value_out_of_range";
+
+        // A TARGET_PRICE alert compares the selected close with this threshold; CrossingClose is
+        // one step above it, so an ABOVE alert on it is crossed.
+        private const decimal PriceThreshold = 10m;
+        private const decimal CrossingClose = 10.00000001m;
+
+        // The held position is 10 units bought at 100, a cost basis of 1000, so a PROFIT_LOSS
+        // alert observes a P/L % of exactly close - 100 against this threshold.
+        private const decimal PnlThreshold = 5m;
+        private const decimal HeldQuantity = 10m;
+        private const decimal HeldEntryPrice = 100m;
+
+        // 21 integer digits: it crosses any lower threshold, but its rounded value lies outside
+        // the trigger-value domain.
+        private const decimal OutOfRangeClose = 100_000_000_000_000_000_000m;
+
         // The plan fixes the evaluator's per-cycle bound on concurrent work at eight. It is
         // stated here rather than read from the evaluator, so a changed bound fails the test.
         private const int AccountBound = 8;
@@ -47,6 +79,803 @@ namespace EasyTrade.BrokerService.Test.UnitTests
 
         // Bounds every wait, so a broken evaluator fails the test instead of hanging it.
         private static readonly TimeSpan WaitBound = TimeSpan.FromSeconds(10);
+
+        // The one listing an evaluation cycle makes: the armed alerts of every account.
+        private static readonly AlertListCall ArmedListing = new(
+            AccountId: null,
+            ArmedOnly: true,
+            TriggeredOnly: false,
+            UnacknowledgedOnly: false
+        );
+
+        public enum SelectionScenario
+        {
+            FlagOff,
+            NoArmedAlert,
+            DisabledAlert,
+            TargetPriceWithoutHolding,
+        }
+
+        public enum AlertFailureScenario
+        {
+            TriggerThrows,
+            PositionsThrow,
+            TriggerValueOutOfRange,
+        }
+
+        public enum CycleFailureScenario
+        {
+            ListThrows,
+            PricesThrow,
+            PricesEmpty,
+        }
+
+        public enum CancellationScenario
+        {
+            AfterCommittedTrigger,
+            DuringDbCall,
+        }
+
+        /// <summary>
+        /// Type, direction, close and the trigger value the row stores, or null when it must not
+        /// trigger. Each type's threshold is observed at it and one step either side: ABOVE
+        /// triggers only one step above, BELOW only one step below. A PROFIT_LOSS close c
+        /// observes c - 100 against 5. The last row crosses by less than one step and stores the
+        /// rounded value, exactly 10.
+        /// </summary>
+        public static TheoryData<AlertType, AlertDirection, decimal, decimal?> CrossingRows =>
+            new()
+            {
+                { AlertType.TARGET_PRICE, AlertDirection.ABOVE, 10m, null },
+                { AlertType.TARGET_PRICE, AlertDirection.ABOVE, 10.00000001m, 10.00000001m },
+                { AlertType.TARGET_PRICE, AlertDirection.ABOVE, 9.99999999m, null },
+                { AlertType.TARGET_PRICE, AlertDirection.BELOW, 10m, null },
+                { AlertType.TARGET_PRICE, AlertDirection.BELOW, 10.00000001m, null },
+                { AlertType.TARGET_PRICE, AlertDirection.BELOW, 9.99999999m, 9.99999999m },
+                { AlertType.PROFIT_LOSS, AlertDirection.ABOVE, 105m, null },
+                { AlertType.PROFIT_LOSS, AlertDirection.ABOVE, 105.00000001m, 5.00000001m },
+                { AlertType.PROFIT_LOSS, AlertDirection.ABOVE, 104.99999999m, null },
+                { AlertType.PROFIT_LOSS, AlertDirection.BELOW, 105m, null },
+                { AlertType.PROFIT_LOSS, AlertDirection.BELOW, 105.00000001m, null },
+                { AlertType.PROFIT_LOSS, AlertDirection.BELOW, 104.99999999m, 4.99999999m },
+                { AlertType.TARGET_PRICE, AlertDirection.ABOVE, 10.000000001m, 10m },
+            };
+
+        [Theory]
+        [MemberData(nameof(CrossingRows))]
+        public async Task RunCycle_AlertCondition_ShouldTriggerOnlyWhenStrictlyCrossed(
+            AlertType type,
+            AlertDirection direction,
+            decimal close,
+            decimal? expectedTriggerValue
+        )
+        {
+            // Arrange
+            using CycleHarness harness = new();
+            harness.AddCandle(harness.InstrumentA, close);
+            decimal threshold = PriceThreshold;
+            if (type == AlertType.PROFIT_LOSS)
+            {
+                harness.HoldTenBoughtAtHundred(harness.InstrumentA);
+                threshold = PnlThreshold;
+            }
+            Alert alert = harness.SeedAlert(type, direction, harness.InstrumentA, threshold);
+            AlertEvaluationService evaluator = harness.BuildEvaluator();
+
+            // Act
+            AlertEvaluationResult result = await harness.RunAsync(evaluator);
+
+            // Assert
+            Alert? row = harness.Alerts.Get(alert.Id);
+            Assert.Equal(
+                new ConditionEffects(
+                    Triggered: expectedTriggerValue is null ? 0 : 1,
+                    RowTriggered: expectedTriggerValue is not null,
+                    StoredTriggerValue: expectedTriggerValue
+                ),
+                new ConditionEffects(
+                    result.Triggered,
+                    row?.TriggeredAt is not null,
+                    row?.TriggerValue
+                )
+            );
+        }
+
+        [Fact]
+        public async Task RunCycle_SamePriceEvaluatedTwice_ShouldTriggerOnce()
+        {
+            // Arrange
+            using CycleHarness harness = new();
+            harness.AddCandle(harness.InstrumentA, CrossingClose);
+            Alert alert = harness.SeedTargetPriceAlert(harness.InstrumentA);
+            AlertEvaluationService evaluator = harness.BuildEvaluator();
+
+            // Act: the second cycle sees the same, unchanged price.
+            AlertEvaluationResult first = await harness.RunAsync(evaluator);
+            DateTimeOffset? triggeredAtAfterFirst = harness.Alerts.Get(alert.Id)?.TriggeredAt;
+            AlertEvaluationResult second = await harness.RunAsync(evaluator);
+            DateTimeOffset? triggeredAtAfterSecond = harness.Alerts.Get(alert.Id)?.TriggeredAt;
+
+            // Assert
+            Assert.Equal(
+                new RepeatEffects(
+                    FirstTriggered: 1,
+                    SecondAlertCount: 0,
+                    SecondTriggered: 0,
+                    TriggeredAtSet: true,
+                    TriggeredAtUnchanged: true
+                ),
+                new RepeatEffects(
+                    first.Triggered,
+                    second.AlertCount,
+                    second.Triggered,
+                    triggeredAtAfterFirst is not null,
+                    triggeredAtAfterSecond == triggeredAtAfterFirst
+                )
+            );
+        }
+
+        [Fact]
+        public async Task RunCycle_TwoConcurrentEvaluators_ShouldTriggerOnce()
+        {
+            // Arrange: each listing waits until both evaluators hold the armed snapshot, so both
+            // reach the conditional write for the same arming.
+            using CycleHarness harness = new();
+            harness.AddCandle(harness.InstrumentA, CrossingClose);
+            harness.SeedTargetPriceAlert(harness.InstrumentA);
+            AlertEvaluationService first = harness.BuildEvaluator();
+            AlertEvaluationService second = harness.BuildEvaluator();
+            using Barrier listed = new(2);
+            harness.Alerts.BeforeListReturns = (_, _) =>
+                Task.Run(() => SignalAndWaitBounded(listed));
+
+            // Act
+            Task<AlertEvaluationResult> firstCycle = Task.Run(
+                () => first.RunCycleAsync(CancellationToken.None)
+            );
+            Task<AlertEvaluationResult> secondCycle = Task.Run(
+                () => second.RunCycleAsync(CancellationToken.None)
+            );
+            AlertEvaluationResult[] results = await Task.WhenAll(firstCycle, secondCycle)
+                .WaitAsync(WaitBound);
+
+            // Assert
+            IReadOnlyList<AlertTriggerCall> writes = harness.Alerts.TriggerCalls;
+            Assert.Equal(
+                new RaceEffects(CombinedTriggered: 1, TriggerWrites: 2, SuccessfulWrites: 1),
+                new RaceEffects(
+                    results.Sum(result => result.Triggered),
+                    writes.Count,
+                    writes.Count(write => write.Result == true)
+                )
+            );
+        }
+
+        [Fact]
+        public async Task RunCycle_StaleSnapshotAfterRearm_ShouldNotTrigger()
+        {
+            // Arrange: listing 1 (cycle A) and listing 2 (cycle B) both hold the revision-1
+            // snapshot before either triggers; B then waits until the test has re-armed the
+            // alert. Listing 3, the fresh cycle's, passes straight through.
+            using CycleHarness harness = new();
+            harness.AddCandle(harness.InstrumentA, CrossingClose);
+            Alert alert = harness.SeedTargetPriceAlert(harness.InstrumentA);
+            AlertEvaluationService cycleAEvaluator = harness.BuildEvaluator();
+            AlertEvaluationService cycleBEvaluator = harness.BuildEvaluator();
+            AlertEvaluationService freshEvaluator = harness.BuildEvaluator();
+            using Barrier listed = new(3);
+            TaskCompletionSource firstListEntered = new(
+                TaskCreationOptions.RunContinuationsAsynchronously
+            );
+            TaskCompletionSource releaseB = new(TaskCreationOptions.RunContinuationsAsynchronously);
+            harness.Alerts.BeforeListReturns = async (ordinal, _) =>
+            {
+                if (ordinal == 1)
+                {
+                    firstListEntered.TrySetResult();
+                    await Task.Run(() => SignalAndWaitBounded(listed));
+                }
+                else if (ordinal == 2)
+                {
+                    await Task.Run(() => SignalAndWaitBounded(listed));
+                    await releaseB.Task.WaitAsync(WaitBound);
+                }
+            };
+
+            // Act
+            Task<AlertEvaluationResult> cycleA = Task.Run(
+                () => cycleAEvaluator.RunCycleAsync(CancellationToken.None)
+            );
+            await firstListEntered.Task.WaitAsync(WaitBound);
+            Task<AlertEvaluationResult> cycleB = Task.Run(
+                () => cycleBEvaluator.RunCycleAsync(CancellationToken.None)
+            );
+            await Task.Run(() => SignalAndWaitBounded(listed)).WaitAsync(WaitBound);
+            AlertEvaluationResult resultA = await cycleA.WaitAsync(WaitBound);
+            Alert? rearmed = await harness.Alerts.UpdateEnabledAsync(alert.Id, true);
+            releaseB.TrySetResult();
+            AlertEvaluationResult resultB = await cycleB.WaitAsync(WaitBound);
+            AlertEvaluationResult resultC = await harness.RunAsync(freshEvaluator);
+
+            // Assert
+            Assert.Equal(
+                new StaleEffects(
+                    FirstTriggered: 1,
+                    RearmedRevision: 2,
+                    RearmedTriggerCleared: true,
+                    StaleTriggered: 0,
+                    FreshTriggered: 1,
+                    TriggerWrites: "rev 1 True, rev 1 False, rev 2 True"
+                ),
+                new StaleEffects(
+                    resultA.Triggered,
+                    rearmed?.ArmingRevision,
+                    rearmed is { TriggeredAt: null, TriggerValue: null },
+                    resultB.Triggered,
+                    resultC.Triggered,
+                    DescribeWrites(harness.Alerts.TriggerCalls)
+                )
+            );
+        }
+
+        [Theory]
+        [InlineData(SelectionScenario.FlagOff)]
+        [InlineData(SelectionScenario.NoArmedAlert)]
+        [InlineData(SelectionScenario.DisabledAlert)]
+        [InlineData(SelectionScenario.TargetPriceWithoutHolding)]
+        public async Task RunCycle_Selection_ShouldEvaluateOnlyArmed(SelectionScenario scenario)
+        {
+            // Arrange: every row's price crosses its alert, and the account holds nothing.
+            using CycleHarness harness = new();
+            harness.AddCandle(harness.InstrumentA, CrossingClose);
+            Alert seeded = scenario switch
+            {
+                SelectionScenario.NoArmedAlert => harness.SeedAlert(
+                    AlertType.TARGET_PRICE,
+                    AlertDirection.ABOVE,
+                    harness.InstrumentA,
+                    PriceThreshold,
+                    triggeredAt: FakeAlertRepository.BaseTime,
+                    triggerValue: CrossingClose
+                ),
+                SelectionScenario.DisabledAlert => harness.SeedAlert(
+                    AlertType.TARGET_PRICE,
+                    AlertDirection.ABOVE,
+                    harness.InstrumentA,
+                    PriceThreshold,
+                    enabled: false
+                ),
+                _ => harness.SeedTargetPriceAlert(harness.InstrumentA),
+            };
+            AlertEvaluationService evaluator = harness.BuildEvaluator(
+                flagEnabled: scenario != SelectionScenario.FlagOff
+            );
+
+            // Act
+            AlertEvaluationResult result = await harness.RunAsync(evaluator);
+
+            // Assert
+            string completedOnly = PortfolioInsightsMetrics.EvaluationDurationName;
+            SelectionEffects expected = scenario switch
+            {
+                SelectionScenario.FlagOff => new SelectionEffects(
+                    AlertEvaluationOutcome.FlagDisabled,
+                    AlertCount: 0,
+                    Triggered: 0,
+                    FlagReads: 1,
+                    ListCalls: 0,
+                    FirstListing: null,
+                    PriceFetches: 0,
+                    TriggerWrites: 0,
+                    RowUnchanged: true,
+                    MeasuredInstruments: string.Empty
+                ),
+                SelectionScenario.NoArmedAlert or SelectionScenario.DisabledAlert =>
+                    new SelectionEffects(
+                        AlertEvaluationOutcome.Completed,
+                        AlertCount: 0,
+                        Triggered: 0,
+                        FlagReads: 1,
+                        ListCalls: 1,
+                        FirstListing: ArmedListing,
+                        PriceFetches: 0,
+                        TriggerWrites: 0,
+                        RowUnchanged: true,
+                        MeasuredInstruments: completedOnly
+                    ),
+                SelectionScenario.TargetPriceWithoutHolding => new SelectionEffects(
+                    AlertEvaluationOutcome.Completed,
+                    AlertCount: 1,
+                    Triggered: 1,
+                    FlagReads: 1,
+                    ListCalls: 1,
+                    FirstListing: ArmedListing,
+                    PriceFetches: 1,
+                    TriggerWrites: 1,
+                    RowUnchanged: false,
+                    MeasuredInstruments: Join(
+                        [completedOnly, PortfolioInsightsMetrics.TriggeredName]
+                    )
+                ),
+                _ => throw new ArgumentOutOfRangeException(nameof(scenario), scenario, null),
+            };
+            IReadOnlyList<AlertListCall> listings = harness.Alerts.ListCalls;
+            Assert.Equal(
+                expected,
+                new SelectionEffects(
+                    result.Outcome,
+                    result.AlertCount,
+                    result.Triggered,
+                    harness.FlagReads,
+                    listings.Count,
+                    listings.FirstOrDefault(),
+                    harness.PriceCalls.LatestPriceFetches,
+                    harness.Alerts.TriggerCalls.Count,
+                    harness.Alerts.Get(seeded.Id) == seeded,
+                    harness.Measurements.MeasuredInstruments()
+                )
+            );
+        }
+
+        [Theory]
+        [InlineData(ReasonNoHolding)]
+        [InlineData(ReasonNoPrice)]
+        public async Task RunCycle_SkipReason_ShouldSkipWithoutFailure(string reason)
+        {
+            // Arrange
+            using CycleHarness harness = new();
+            harness.AddCandle(harness.InstrumentA, CrossingClose);
+            Alert alert;
+            if (reason == ReasonNoHolding)
+            {
+                // The account holds A only; B is priced but not held.
+                harness.HoldTenBoughtAtHundred(harness.InstrumentA);
+                harness.AddCandle(harness.InstrumentB, CrossingClose);
+                alert = harness.SeedAlert(
+                    AlertType.PROFIT_LOSS,
+                    AlertDirection.ABOVE,
+                    harness.InstrumentB,
+                    PnlThreshold
+                );
+            }
+            else
+            {
+                // The price list is not empty, but only A has a candle.
+                alert = harness.SeedTargetPriceAlert(harness.InstrumentB);
+            }
+            AlertEvaluationService evaluator = harness.BuildEvaluator();
+
+            // Act
+            AlertEvaluationResult result = await harness.RunAsync(evaluator);
+
+            // Assert
+            LogEntry[] warnings =
+            [
+                .. harness.EvaluatorLogs.Where(entry => entry.Level == LogLevel.Warning),
+            ];
+            Assert.Equal(
+                new SkipEffects(
+                    AlertEvaluationOutcome.Completed,
+                    Skipped: 1,
+                    Failed: 0,
+                    Triggered: 0,
+                    FailedMeasurements: 0,
+                    Warnings: 1,
+                    WarningAlertId: alert.Id,
+                    WarningReason: reason
+                ),
+                new SkipEffects(
+                    result.Outcome,
+                    result.Skipped,
+                    result.Failed,
+                    result.Triggered,
+                    harness.Measurements.Count(PortfolioInsightsMetrics.EvaluationFailedName),
+                    warnings.Length,
+                    warnings.FirstOrDefault()?.GetField("alertId"),
+                    warnings.FirstOrDefault()?.GetField("reason")
+                )
+            );
+        }
+
+        [Theory]
+        [InlineData(AlertFailureScenario.TriggerThrows)]
+        [InlineData(AlertFailureScenario.PositionsThrow)]
+        [InlineData(AlertFailureScenario.TriggerValueOutOfRange)]
+        public async Task RunCycle_AlertFailure_ShouldCountAndContinue(
+            AlertFailureScenario scenario
+        )
+        {
+            // Arrange: every row also has one crossed TARGET_PRICE alert on A that must still
+            // trigger.
+            using CycleHarness harness = new();
+            harness.AddCandle(harness.InstrumentA, CrossingClose);
+            harness.SeedTargetPriceAlert(harness.InstrumentA);
+            IPortfolioInsightsService? insights = null;
+            switch (scenario)
+            {
+                case AlertFailureScenario.TriggerThrows:
+                    harness.AddCandle(harness.InstrumentB, CrossingClose);
+                    harness.SeedTargetPriceAlert(harness.InstrumentB);
+                    harness.Alerts.ThrowOnNext(
+                        FakeAlertRepositoryMethod.Trigger,
+                        new DbException("x")
+                    );
+                    break;
+                case AlertFailureScenario.PositionsThrow:
+                    harness.AddCandle(harness.InstrumentB, CrossingClose);
+                    harness.SeedAlert(
+                        AlertType.PROFIT_LOSS,
+                        AlertDirection.ABOVE,
+                        harness.InstrumentA,
+                        PnlThreshold
+                    );
+                    harness.SeedAlert(
+                        AlertType.PROFIT_LOSS,
+                        AlertDirection.ABOVE,
+                        harness.InstrumentB,
+                        PnlThreshold
+                    );
+                    Mock<IPortfolioInsightsService> positions = new(MockBehavior.Strict);
+                    positions
+                        .Setup(service =>
+                            service.GetHoldingPositionsAsync(
+                                harness.AccountId,
+                                It.IsAny<IReadOnlyDictionary<Guid, Price>>()
+                            )
+                        )
+                        .ThrowsAsync(new DbException("positions unavailable"));
+                    insights = positions.Object;
+                    break;
+                case AlertFailureScenario.TriggerValueOutOfRange:
+                    harness.AddCandle(harness.InstrumentB, OutOfRangeClose);
+                    harness.SeedAlert(
+                        AlertType.TARGET_PRICE,
+                        AlertDirection.ABOVE,
+                        harness.InstrumentB,
+                        1m
+                    );
+                    break;
+                default:
+                    throw new ArgumentOutOfRangeException(nameof(scenario), scenario, null);
+            }
+            AlertEvaluationService evaluator = harness.BuildEvaluator(insights: insights);
+
+            // Act
+            AlertEvaluationResult result = await harness.RunAsync(evaluator);
+
+            // Assert: the failed counter adds one per failed alert, tagged with its type.
+            FailureEffects expected = scenario switch
+            {
+                AlertFailureScenario.TriggerThrows => new FailureEffects(
+                    AlertEvaluationOutcome.Completed,
+                    Triggered: 1,
+                    Failed: 1,
+                    FailedMetricSum: 1,
+                    FailedMetricTypes: nameof(AlertType.TARGET_PRICE),
+                    FailedMetricUnits: AlertUnit,
+                    FailureReasons: ReasonException
+                ),
+                AlertFailureScenario.PositionsThrow => new FailureEffects(
+                    AlertEvaluationOutcome.Completed,
+                    Triggered: 1,
+                    Failed: 2,
+                    FailedMetricSum: 2,
+                    FailedMetricTypes: Join(
+                        [nameof(AlertType.PROFIT_LOSS), nameof(AlertType.PROFIT_LOSS)]
+                    ),
+                    FailedMetricUnits: AlertUnit,
+                    FailureReasons: Join([ReasonException, ReasonException])
+                ),
+                AlertFailureScenario.TriggerValueOutOfRange => new FailureEffects(
+                    AlertEvaluationOutcome.Completed,
+                    Triggered: 1,
+                    Failed: 1,
+                    FailedMetricSum: 1,
+                    FailedMetricTypes: nameof(AlertType.TARGET_PRICE),
+                    FailedMetricUnits: AlertUnit,
+                    FailureReasons: ReasonOutOfRange
+                ),
+                _ => throw new ArgumentOutOfRangeException(nameof(scenario), scenario, null),
+            };
+            string failedName = PortfolioInsightsMetrics.EvaluationFailedName;
+            Assert.Equal(
+                expected,
+                new FailureEffects(
+                    result.Outcome,
+                    result.Triggered,
+                    result.Failed,
+                    harness.Measurements.Sum(failedName),
+                    harness.Measurements.TagValues(
+                        failedName,
+                        PortfolioInsightsMetrics.AlertTypeTag
+                    ),
+                    harness.Measurements.Units(failedName),
+                    harness.AlertFailureReasons()
+                )
+            );
+        }
+
+        [Theory]
+        [InlineData(CycleFailureScenario.ListThrows, 0, "list_failed")]
+        [InlineData(CycleFailureScenario.PricesThrow, 1, "prices_failed")]
+        [InlineData(CycleFailureScenario.PricesEmpty, 1, "prices_empty")]
+        public async Task RunCycle_CycleFailure_ShouldReturnFailedOutcome(
+            CycleFailureScenario scenario,
+            int expectedAlertCount,
+            string expectedReason
+        )
+        {
+            // Arrange: one armed alert that a priced cycle would trigger.
+            using CycleHarness harness = new();
+            harness.SeedTargetPriceAlert(harness.InstrumentA);
+            IPriceServiceConnector? prices = null;
+            switch (scenario)
+            {
+                case CycleFailureScenario.ListThrows:
+                    harness.AddCandle(harness.InstrumentA, CrossingClose);
+                    harness.Alerts.ThrowOnNext(
+                        FakeAlertRepositoryMethod.List,
+                        new DbException("list unavailable")
+                    );
+                    break;
+                case CycleFailureScenario.PricesThrow:
+                    Mock<IPriceServiceConnector> failing = new(MockBehavior.Strict);
+                    failing
+                        .Setup(connector => connector.GetLatestPrices())
+                        .ThrowsAsync(new HttpRequestException("pricing unreachable"));
+                    prices = failing.Object;
+                    break;
+                case CycleFailureScenario.PricesEmpty:
+                    // No candle is added, as pricing answers a non-200 with an empty list.
+                    break;
+                default:
+                    throw new ArgumentOutOfRangeException(nameof(scenario), scenario, null);
+            }
+            AlertEvaluationService evaluator = harness.BuildEvaluator(prices: prices);
+
+            // Act
+            AlertEvaluationResult result = await harness.RunAsync(evaluator);
+
+            // Assert
+            string durationName = PortfolioInsightsMetrics.EvaluationDurationName;
+            Assert.Equal(
+                new CycleFailureEffects(
+                    AlertEvaluationOutcome.Failed,
+                    AlertCount: expectedAlertCount,
+                    Triggered: 0,
+                    Failed: 0,
+                    TriggerWrites: 0,
+                    DurationMeasurements: 1,
+                    DurationOutcomes: PortfolioInsightsMetrics.OutcomeFailed,
+                    DurationUnits: SecondsUnit,
+                    FailedMeasurements: 0,
+                    CycleFailureReason: expectedReason
+                ),
+                new CycleFailureEffects(
+                    result.Outcome,
+                    result.AlertCount,
+                    result.Triggered,
+                    result.Failed,
+                    harness.Alerts.TriggerCalls.Count,
+                    harness.Measurements.Count(durationName),
+                    harness.Measurements.TagValues(
+                        durationName,
+                        PortfolioInsightsMetrics.CycleOutcomeTag
+                    ),
+                    harness.Measurements.Units(durationName),
+                    harness.Measurements.Count(PortfolioInsightsMetrics.EvaluationFailedName),
+                    harness.FirstLineStartingWith(CycleFailedPrefix)?.GetField("reason")
+                )
+            );
+        }
+
+        [Theory]
+        [InlineData(CancellationScenario.AfterCommittedTrigger)]
+        [InlineData(CancellationScenario.DuringDbCall)]
+        public async Task RunCycle_Cancelled_ShouldNotCountFailure(CancellationScenario scenario)
+        {
+            // Arrange
+            using CycleHarness harness = new();
+            using CancellationTokenSource shutdown = new();
+            harness.AddCandle(harness.InstrumentA, CrossingClose);
+            if (scenario == CancellationScenario.AfterCommittedTrigger)
+            {
+                // Shutdown lands once a trigger is committed; that write still returns true.
+                for (int index = 0; index < 3; index++)
+                {
+                    harness.SeedTargetPriceAlert(harness.InstrumentA);
+                }
+                harness.Alerts.AfterTrigger = (_, triggered, _) =>
+                {
+                    if (triggered)
+                    {
+                        shutdown.Cancel();
+                    }
+                    return Task.CompletedTask;
+                };
+            }
+            else
+            {
+                // Shutdown lands inside the listing, which the fake then fails with a
+                // DbException wrapping the OperationCanceledException, as GrpcHelper reports a
+                // cancelled gRPC call.
+                harness.SeedTargetPriceAlert(harness.InstrumentA);
+                harness.Alerts.BeforeListReturns = (_, token) =>
+                {
+                    shutdown.Cancel();
+                    token.ThrowIfCancellationRequested();
+                    return Task.CompletedTask;
+                };
+            }
+            AlertEvaluationService evaluator = harness.BuildEvaluator();
+
+            // Act
+            AlertEvaluationResult result = await harness.RunAsync(evaluator, shutdown.Token);
+
+            // Assert: every committed trigger is counted, in the result and the metric.
+            int committed = harness.Alerts.TriggerCalls.Count(write => write.Result == true);
+            Assert.Equal(
+                new CancellationEffects(
+                    AlertEvaluationOutcome.Cancelled,
+                    HasCommittedTrigger: scenario == CancellationScenario.AfterCommittedTrigger,
+                    ResultCountsCommitted: true,
+                    MetricCountsCommitted: true,
+                    Failed: 0,
+                    FailedMeasurements: 0,
+                    DurationMeasurements: 0,
+                    SummaryLines: 0,
+                    CycleFailureLines: 0
+                ),
+                new CancellationEffects(
+                    result.Outcome,
+                    committed >= 1,
+                    result.Triggered == committed,
+                    harness.Measurements.Sum(PortfolioInsightsMetrics.TriggeredName) == committed,
+                    result.Failed,
+                    harness.Measurements.Count(PortfolioInsightsMetrics.EvaluationFailedName),
+                    harness.Measurements.Count(PortfolioInsightsMetrics.EvaluationDurationName),
+                    harness.LinesStartingWith(CycleFinishedPrefix),
+                    harness.LinesStartingWith(CycleFailedPrefix)
+                )
+            );
+        }
+
+        [Theory]
+        [InlineData(AlertType.TARGET_PRICE, "TARGET_PRICE")]
+        [InlineData(AlertType.PROFIT_LOSS, "PROFIT_LOSS")]
+        public async Task RunCycle_Triggered_ShouldPassRoundedValueAndRecordMetrics(
+            AlertType type,
+            string expectedTypeTag
+        )
+        {
+            // Arrange: the observed value has a ninth fractional digit, and the alert is on its
+            // third arming, so the write must carry the listed revision.
+            using CycleHarness harness = new();
+            decimal threshold = PriceThreshold;
+            decimal expectedTriggerValue = 10.12345679m;
+            if (type == AlertType.PROFIT_LOSS)
+            {
+                harness.HoldTenBoughtAtHundred(harness.InstrumentA);
+                harness.AddCandle(harness.InstrumentA, 105.123456789m);
+                threshold = PnlThreshold;
+                expectedTriggerValue = 5.12345679m;
+            }
+            else
+            {
+                harness.AddCandle(harness.InstrumentA, 10.123456789m);
+            }
+            Alert alert = harness.SeedAlert(
+                type,
+                AlertDirection.ABOVE,
+                harness.InstrumentA,
+                threshold,
+                armingRevision: 3
+            );
+            AlertEvaluationService evaluator = harness.BuildEvaluator();
+
+            // Act
+            AlertEvaluationResult result = await harness.RunAsync(evaluator);
+
+            // Assert
+            string triggeredName = PortfolioInsightsMetrics.TriggeredName;
+            string durationName = PortfolioInsightsMetrics.EvaluationDurationName;
+            IReadOnlyList<AlertTriggerCall> writes = harness.Alerts.TriggerCalls;
+            Assert.Equal(
+                new TriggeredEffects(
+                    AlertEvaluationOutcome.Completed,
+                    TriggerWrites: 1,
+                    Write: new AlertTriggerCall(alert.Id, 3, expectedTriggerValue, true),
+                    TriggeredMeasurements: 1,
+                    TriggeredSum: 1,
+                    TriggeredTypes: expectedTypeTag,
+                    TriggeredUnits: AlertUnit,
+                    DurationMeasurements: 1,
+                    DurationOutcomes: PortfolioInsightsMetrics.OutcomeCompleted,
+                    DurationUnits: SecondsUnit
+                ),
+                new TriggeredEffects(
+                    result.Outcome,
+                    writes.Count,
+                    writes.FirstOrDefault(),
+                    harness.Measurements.Count(triggeredName),
+                    harness.Measurements.Sum(triggeredName),
+                    harness.Measurements.TagValues(
+                        triggeredName,
+                        PortfolioInsightsMetrics.AlertTypeTag
+                    ),
+                    harness.Measurements.Units(triggeredName),
+                    harness.Measurements.Count(durationName),
+                    harness.Measurements.TagValues(
+                        durationName,
+                        PortfolioInsightsMetrics.CycleOutcomeTag
+                    ),
+                    harness.Measurements.Units(durationName)
+                )
+            );
+        }
+
+        [Fact]
+        public async Task RunCycle_Completed_ShouldLogNamedSummaryAndTriggerFields()
+        {
+            // Arrange: three crossed alerts on A, two out-of-range alerts on B and one alert on
+            // an unpriced instrument. Every count differs, so a field bound to the wrong
+            // placeholder fails.
+            using CycleHarness harness = new();
+            harness.AddCandle(harness.InstrumentA, CrossingClose);
+            harness.AddCandle(harness.InstrumentB, OutOfRangeClose);
+            Alert logged = harness.SeedTargetPriceAlert(harness.InstrumentA);
+            harness.SeedTargetPriceAlert(harness.InstrumentA);
+            harness.SeedTargetPriceAlert(harness.InstrumentA);
+            for (int index = 0; index < 2; index++)
+            {
+                harness.SeedAlert(
+                    AlertType.TARGET_PRICE,
+                    AlertDirection.ABOVE,
+                    harness.InstrumentB,
+                    1m
+                );
+            }
+            harness.SeedTargetPriceAlert(Guid.NewGuid());
+            AlertEvaluationService evaluator = harness.BuildEvaluator();
+
+            // Act
+            await harness.RunAsync(evaluator);
+
+            // Assert
+            LogEntry? summary = harness.FirstLineStartingWith(CycleFinishedPrefix);
+            LogEntry? trigger = harness.EvaluatorLogs.FirstOrDefault(entry =>
+                entry.HasField("triggerValue") && Equals(entry.GetField("alertId"), logged.Id)
+            );
+            Assert.Equal(
+                new LoggedFields(
+                    SummaryLines: 1,
+                    Summary: new SummaryFields(
+                        LogLevel.Information,
+                        Outcome: PortfolioInsightsMetrics.OutcomeCompleted,
+                        AlertCount: 6,
+                        TriggeredCount: 3,
+                        FailedCount: 2,
+                        SkippedCount: 1,
+                        HasDurationMs: true
+                    ),
+                    Trigger: new TriggerFields(
+                        LogLevel.Information,
+                        AlertId: logged.Id,
+                        AccountId: harness.AccountId,
+                        Type: "TARGET_PRICE",
+                        Direction: "ABOVE",
+                        Threshold: PriceThreshold,
+                        TriggerValue: CrossingClose,
+                        ArmingRevision: 1
+                    )
+                ),
+                new LoggedFields(
+                    harness.LinesStartingWith(CycleFinishedPrefix),
+                    SummaryFields.Of(summary),
+                    TriggerFields.Of(trigger)
+                )
+            );
+        }
 
         [Fact]
         public async Task RunCycle_ManyProfitLossAccounts_ShouldLoadEachOnceAtMostEightAtATime()
@@ -104,6 +933,199 @@ namespace EasyTrade.BrokerService.Test.UnitTests
                 CycleCompletedWhileLoadHeld: false
             );
             Assert.Equal(expected, harness.Collect(result, completedWhileLoadHeld));
+        }
+
+        // Signals the barrier and waits for every party, failing rather than blocking past the
+        // bound.
+        private static void SignalAndWaitBounded(Barrier barrier)
+        {
+            if (!barrier.SignalAndWait(WaitBound))
+            {
+                throw new TimeoutException(
+                    $"Not all {barrier.ParticipantCount} barrier parties arrived in {WaitBound}."
+                );
+            }
+        }
+
+        // Each trigger write as its revision and decision, in the order the store recorded them.
+        private static string DescribeWrites(IReadOnlyList<AlertTriggerCall> writes)
+        {
+            return string.Join(
+                ", ",
+                writes.Select(write => $"rev {write.ArmingRevision} {write.Result}")
+            );
+        }
+
+        // Sorted, so values recorded by parallel workers compare independently of their order.
+        private static string Join(IEnumerable<string?> values)
+        {
+            return string.Join(", ", values.Order(StringComparer.Ordinal));
+        }
+
+        private sealed record ConditionEffects(
+            int Triggered,
+            bool RowTriggered,
+            decimal? StoredTriggerValue
+        );
+
+        private sealed record RepeatEffects(
+            int FirstTriggered,
+            int SecondAlertCount,
+            int SecondTriggered,
+            bool TriggeredAtSet,
+            bool TriggeredAtUnchanged
+        );
+
+        private sealed record RaceEffects(
+            int CombinedTriggered,
+            int TriggerWrites,
+            int SuccessfulWrites
+        );
+
+        private sealed record StaleEffects(
+            int FirstTriggered,
+            int? RearmedRevision,
+            bool RearmedTriggerCleared,
+            int StaleTriggered,
+            int FreshTriggered,
+            string TriggerWrites
+        );
+
+        private sealed record SelectionEffects(
+            AlertEvaluationOutcome Outcome,
+            int AlertCount,
+            int Triggered,
+            int FlagReads,
+            int ListCalls,
+            AlertListCall? FirstListing,
+            int PriceFetches,
+            int TriggerWrites,
+            bool RowUnchanged,
+            string MeasuredInstruments
+        );
+
+        private sealed record SkipEffects(
+            AlertEvaluationOutcome Outcome,
+            int Skipped,
+            int Failed,
+            int Triggered,
+            int FailedMeasurements,
+            int Warnings,
+            object? WarningAlertId,
+            object? WarningReason
+        );
+
+        private sealed record FailureEffects(
+            AlertEvaluationOutcome Outcome,
+            int Triggered,
+            int Failed,
+            double FailedMetricSum,
+            string FailedMetricTypes,
+            string FailedMetricUnits,
+            string FailureReasons
+        );
+
+        private sealed record CycleFailureEffects(
+            AlertEvaluationOutcome Outcome,
+            int AlertCount,
+            int Triggered,
+            int Failed,
+            int TriggerWrites,
+            int DurationMeasurements,
+            string DurationOutcomes,
+            string DurationUnits,
+            int FailedMeasurements,
+            object? CycleFailureReason
+        );
+
+        private sealed record CancellationEffects(
+            AlertEvaluationOutcome Outcome,
+            bool HasCommittedTrigger,
+            bool ResultCountsCommitted,
+            bool MetricCountsCommitted,
+            int Failed,
+            int FailedMeasurements,
+            int DurationMeasurements,
+            int SummaryLines,
+            int CycleFailureLines
+        );
+
+        private sealed record TriggeredEffects(
+            AlertEvaluationOutcome Outcome,
+            int TriggerWrites,
+            AlertTriggerCall? Write,
+            int TriggeredMeasurements,
+            double TriggeredSum,
+            string TriggeredTypes,
+            string TriggeredUnits,
+            int DurationMeasurements,
+            string DurationOutcomes,
+            string DurationUnits
+        );
+
+        private sealed record LoggedFields(
+            int SummaryLines,
+            SummaryFields? Summary,
+            TriggerFields? Trigger
+        );
+
+        /// <summary>
+        /// The named fields of the cycle summary line; values stay boxed as logged, so a field
+        /// logged with another type compares unequal.
+        /// </summary>
+        private sealed record SummaryFields(
+            LogLevel Level,
+            object? Outcome,
+            object? AlertCount,
+            object? TriggeredCount,
+            object? FailedCount,
+            object? SkippedCount,
+            bool HasDurationMs
+        )
+        {
+            public static SummaryFields? Of(LogEntry? entry)
+            {
+                return entry is null
+                    ? null
+                    : new SummaryFields(
+                        entry.Level,
+                        entry.GetField("outcome"),
+                        entry.GetField("alertCount"),
+                        entry.GetField("triggeredCount"),
+                        entry.GetField("failedCount"),
+                        entry.GetField("skippedCount"),
+                        entry.GetField("durationMs") is long durationMs && durationMs >= 0
+                    );
+            }
+        }
+
+        /// <summary>The named fields of one trigger line, boxed as logged.</summary>
+        private sealed record TriggerFields(
+            LogLevel Level,
+            object? AlertId,
+            object? AccountId,
+            object? Type,
+            object? Direction,
+            object? Threshold,
+            object? TriggerValue,
+            object? ArmingRevision
+        )
+        {
+            public static TriggerFields? Of(LogEntry? entry)
+            {
+                return entry is null
+                    ? null
+                    : new TriggerFields(
+                        entry.Level,
+                        entry.GetField("alertId"),
+                        entry.GetField("accountId"),
+                        entry.GetField("type"),
+                        entry.GetField("direction"),
+                        entry.GetField("threshold"),
+                        entry.GetField("triggerValue"),
+                        entry.GetField("armingRevision")
+                    );
+            }
         }
 
         /// <summary>
@@ -489,6 +1511,314 @@ namespace EasyTrade.BrokerService.Test.UnitTests
                         && ReferenceEquals(price, candle)
                     );
             }
+        }
+
+        /// <summary>
+        /// One account with a balance and two instruments, A and B, over the existing in-memory
+        /// repository and pricing fakes. Every candle carries <see cref="Time"/>, so the fake
+        /// latest-price fetch returns them all. Evaluators built here share one alert store, one
+        /// meter factory and one log sink.
+        /// </summary>
+        private sealed class CycleHarness : IDisposable
+        {
+            private readonly ServiceProvider _provider = new ServiceCollection()
+                .AddMetrics()
+                .BuildServiceProvider();
+            private readonly FakeBalanceRepository _balances = new();
+            private readonly FakeInstrumentRepository _instruments = new();
+            private readonly FakeTradeRepository _trades = new();
+            private readonly FakePriceServiceConnector _prices = new();
+            private readonly PortfolioInsightsMetrics _metrics;
+            private int _flagReads;
+
+            public CycleHarness()
+            {
+                IMeterFactory meterFactory = _provider.GetRequiredService<IMeterFactory>();
+                Measurements = new MetricCapture(meterFactory);
+                _metrics = new PortfolioInsightsMetrics(meterFactory);
+                PriceCalls = new CountingPriceServiceConnector(_prices);
+                _balances.AddBalance(new Balance(AccountId, 10_000m));
+            }
+
+            public Guid AccountId { get; } = Guid.NewGuid();
+
+            public Guid InstrumentA { get; } = Guid.NewGuid();
+
+            public Guid InstrumentB { get; } = Guid.NewGuid();
+
+            public FakeAlertRepository Alerts { get; } = new();
+
+            /// <summary>The default pricing of the evaluators built here; counts fetches.</summary>
+            public CountingPriceServiceConnector PriceCalls { get; }
+
+            public MetricCapture Measurements { get; }
+
+            public RecordingLogSink Logs { get; } = new();
+
+            /// <summary>Flag reads made by every evaluator built here.</summary>
+            public int FlagReads => Volatile.Read(ref _flagReads);
+
+            public IReadOnlyList<LogEntry> EvaluatorLogs =>
+                Logs.ByCategory<AlertEvaluationService>();
+
+            /// <summary>
+            /// An evaluator over the shared store, metrics and log sink. Pricing defaults to
+            /// <see cref="PriceCalls"/>, and positions to the real
+            /// <see cref="PortfolioInsightsService"/> over the harness fakes and that pricing.
+            /// </summary>
+            public AlertEvaluationService BuildEvaluator(
+                bool flagEnabled = true,
+                IPriceServiceConnector? prices = null,
+                IPortfolioInsightsService? insights = null
+            )
+            {
+                IPriceServiceConnector pricing = prices ?? PriceCalls;
+                Mock<IPortfolioInsightsFeature> feature = new(MockBehavior.Strict);
+                feature
+                    .Setup(flag => flag.IsEnabledAsync(It.IsAny<CancellationToken>()))
+                    .Returns(() =>
+                    {
+                        Interlocked.Increment(ref _flagReads);
+                        return Task.FromResult(flagEnabled);
+                    });
+                IPortfolioInsightsService positions =
+                    insights
+                    ?? new PortfolioInsightsService(
+                        _balances,
+                        _instruments,
+                        _trades,
+                        pricing,
+                        _metrics,
+                        new RecordingLogger<PortfolioInsightsService>(Logs)
+                    );
+                return new AlertEvaluationService(
+                    Alerts,
+                    pricing,
+                    positions,
+                    feature.Object,
+                    _metrics,
+                    new RecordingLogger<AlertEvaluationService>(Logs)
+                );
+            }
+
+            public void AddCandle(Guid instrumentId, decimal close)
+            {
+                _prices.AddPrice(new Price(instrumentId, Time, close, close, close, close));
+            }
+
+            /// <summary>Holds 10 units of the instrument from one executed buy at 100.</summary>
+            public void HoldTenBoughtAtHundred(Guid instrumentId)
+            {
+                _instruments.AddOwned(
+                    new OwnedInstrument(AccountId, instrumentId, HeldQuantity, Time)
+                );
+                _trades.Add(
+                    new Trade(
+                        AccountId,
+                        instrumentId,
+                        "buy",
+                        HeldQuantity,
+                        HeldEntryPrice,
+                        Time,
+                        Time,
+                        tradeClosed: true,
+                        transactionHappened: true,
+                        "Instant buy done."
+                    )
+                );
+            }
+
+            /// <summary>Seeds an alert of the account, armed unless told otherwise.</summary>
+            public Alert SeedAlert(
+                AlertType type,
+                AlertDirection direction,
+                Guid instrumentId,
+                decimal threshold,
+                bool enabled = true,
+                int armingRevision = 1,
+                DateTimeOffset? triggeredAt = null,
+                decimal? triggerValue = null
+            )
+            {
+                Alert alert = new(
+                    Guid.NewGuid(),
+                    AccountId,
+                    instrumentId,
+                    type,
+                    direction,
+                    threshold,
+                    Enabled: enabled,
+                    ArmingRevision: armingRevision,
+                    TriggeredAt: triggeredAt,
+                    TriggerValue: triggerValue,
+                    Acknowledged: false,
+                    CreatedAt: Time
+                );
+                Alerts.Seed(alert);
+                return alert;
+            }
+
+            /// <summary>
+            /// An armed TARGET_PRICE alert ABOVE <see cref="PriceThreshold"/>, which a candle at
+            /// <see cref="CrossingClose"/> crosses.
+            /// </summary>
+            public Alert SeedTargetPriceAlert(Guid instrumentId)
+            {
+                return SeedAlert(
+                    AlertType.TARGET_PRICE,
+                    AlertDirection.ABOVE,
+                    instrumentId,
+                    PriceThreshold
+                );
+            }
+
+            public Task<AlertEvaluationResult> RunAsync(
+                AlertEvaluationService evaluator,
+                CancellationToken cancellationToken = default
+            )
+            {
+                return evaluator.RunCycleAsync(cancellationToken).WaitAsync(WaitBound);
+            }
+
+            public LogEntry? FirstLineStartingWith(string prefix)
+            {
+                return EvaluatorLogs.FirstOrDefault(entry =>
+                    entry.Message.StartsWith(prefix, StringComparison.Ordinal)
+                );
+            }
+
+            public int LinesStartingWith(string prefix)
+            {
+                return EvaluatorLogs.Count(entry =>
+                    entry.Message.StartsWith(prefix, StringComparison.Ordinal)
+                );
+            }
+
+            /// <summary>
+            /// The reason of every per-alert failure line, sorted. Only those lines carry an
+            /// alert id; the cycle failure line does not.
+            /// </summary>
+            public string AlertFailureReasons()
+            {
+                return Join(
+                    EvaluatorLogs
+                        .Where(entry => entry.Level == LogLevel.Error && entry.HasField("alertId"))
+                        .Select(entry => entry.GetField("reason")?.ToString())
+                );
+            }
+
+            public void Dispose()
+            {
+                Measurements.Dispose();
+                _provider.Dispose();
+            }
+        }
+
+        /// <summary>
+        /// Captures every measurement of the instruments one meter factory created, with its
+        /// instrument name, unit and tags, so tests running in parallel never see each other's
+        /// measurements. Parallel workers record at once, so every access takes the lock.
+        /// </summary>
+        private sealed class MetricCapture : IDisposable
+        {
+            private readonly Lock _lock = new();
+            private readonly List<CapturedMeasurement> _measurements = [];
+            private readonly MeterListener _listener = new();
+
+            public MetricCapture(IMeterFactory meterFactory)
+            {
+                _listener.InstrumentPublished = (instrument, listener) =>
+                {
+                    if (ReferenceEquals(instrument.Meter.Scope, meterFactory))
+                    {
+                        listener.EnableMeasurementEvents(instrument);
+                    }
+                };
+                _listener.SetMeasurementEventCallback<long>(
+                    (instrument, value, tags, _) =>
+                        Record(instrument.Name, instrument.Unit, value, tags)
+                );
+                _listener.SetMeasurementEventCallback<double>(
+                    (instrument, value, tags, _) =>
+                        Record(instrument.Name, instrument.Unit, value, tags)
+                );
+                _listener.Start();
+            }
+
+            public int Count(string instrumentName)
+            {
+                return Of(instrumentName).Length;
+            }
+
+            public double Sum(string instrumentName)
+            {
+                return Of(instrumentName).Sum(measurement => measurement.Value);
+            }
+
+            /// <summary>The tag <paramref name="key"/> of every measurement, sorted.</summary>
+            public string TagValues(string instrumentName, string key)
+            {
+                return Join(
+                    Of(instrumentName)
+                        .Select(measurement => measurement.Tags.GetValueOrDefault(key)?.ToString())
+                );
+            }
+
+            /// <summary>The distinct units the instrument's measurements carried.</summary>
+            public string Units(string instrumentName)
+            {
+                return Join(Of(instrumentName).Select(measurement => measurement.Unit).Distinct());
+            }
+
+            /// <summary>The distinct names of every instrument that recorded anything.</summary>
+            public string MeasuredInstruments()
+            {
+                lock (_lock)
+                {
+                    return Join(_measurements.Select(measurement => measurement.Name).Distinct());
+                }
+            }
+
+            public void Dispose()
+            {
+                _listener.Dispose();
+            }
+
+            private CapturedMeasurement[] Of(string instrumentName)
+            {
+                lock (_lock)
+                {
+                    return
+                    [
+                        .. _measurements.Where(measurement => measurement.Name == instrumentName),
+                    ];
+                }
+            }
+
+            private void Record(
+                string name,
+                string? unit,
+                double value,
+                ReadOnlySpan<KeyValuePair<string, object?>> tags
+            )
+            {
+                Dictionary<string, object?> copied = new();
+                foreach (KeyValuePair<string, object?> tag in tags)
+                {
+                    copied[tag.Key] = tag.Value;
+                }
+                lock (_lock)
+                {
+                    _measurements.Add(new CapturedMeasurement(name, unit, value, copied));
+                }
+            }
+
+            private sealed record CapturedMeasurement(
+                string Name,
+                string? Unit,
+                double Value,
+                IReadOnlyDictionary<string, object?> Tags
+            );
         }
     }
 }
