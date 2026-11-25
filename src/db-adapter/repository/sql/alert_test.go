@@ -4,9 +4,12 @@ import (
 	"bytes"
 	"context"
 	dbsql "database/sql"
+	"database/sql/driver"
 	"errors"
 	"flag"
 	"fmt"
+	"io"
+	stdlog "log"
 	"net"
 	"runtime"
 	"slices"
@@ -19,9 +22,13 @@ import (
 	"github.com/dynatrace/easytrade/dbadapter/db"
 	pb "github.com/dynatrace/easytrade/dbadapter/proto"
 	"github.com/dynatrace/easytrade/dbadapter/repository"
+	"github.com/dynatrace/easytrade/dbadapter/server"
 	"github.com/google/uuid"
 	log "github.com/sirupsen/logrus"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/types/known/wrapperspb"
 	"gorm.io/driver/postgres"
 	"gorm.io/driver/sqlserver"
 	"gorm.io/gorm"
@@ -1053,6 +1060,268 @@ func TestAlertRepository_updateEnabledConcurrent_returnsOwnSnapshot(t *testing.T
 	}
 }
 
+// alertUUIDSpelling rewrites a canonical UUID as other text that contains it
+type alertUUIDSpelling struct {
+	name  string
+	spell func(id string) string
+}
+
+var (
+	// The spellings AlertService accepts besides the canonical one. A dialect's UUID type does not
+	// parse every one of them, so the handler must bind the canonical form for the statement to run
+	alertServerUUIDSpellings = []alertUUIDSpelling{
+		{"urn", func(id string) string { return "urn:uuid:" + id }},
+		{"upperURN", func(id string) string { return "URN:UUID:" + strings.ToUpper(id) }},
+		{"braces", func(id string) string { return "{" + id + "}" }},
+		{"hexDigits", func(id string) string { return strings.ReplaceAll(id, "-", "") }},
+		{"upperCase", strings.ToUpper},
+	}
+	// Text AlertService must refuse although it contains a valid id. uuid.Parse alone accepts the
+	// 38-byte forms, because it ignores their outer two characters
+	alertServerMalformedUUIDs = []alertUUIDSpelling{
+		{"letterWrapped", func(id string) string { return "x" + id + "y" }},
+		{"parenthesised", func(id string) string { return "(" + id + ")" }},
+		{"unbalancedBraces", func(id string) string { return "{" + id + ")" }},
+		{"badURNPrefix", func(id string) string { return "urn:uuix:" + id }},
+	}
+)
+
+// The real handler over the real backend: every accepted spelling of an alert or account id reaches
+// the row its canonical form names, on the configured dialect
+func TestAlertServer_alternateUUIDSpelling_intendedRowSelected(t *testing.T) {
+	repo := alertTestBackend(t).Alert()
+	srv := server.NewAlertServer(repo)
+	ctx := context.Background()
+
+	// Each call gets a fresh armed alert, sets its state through the repository with canonical ids,
+	// calls one RPC with spelled ids and checks that the RPC acted on that alert, or for CreateAlert
+	// that the row it stored carries the canonical ids
+	rpcs := []struct {
+		name string
+		call func(t *testing.T, alert *pb.AlertMessage, spell func(string) string)
+	}{
+		{"CreateAlert", func(t *testing.T, _ *pb.AlertMessage, spell func(string) string) {
+			req := &pb.CreateAlertRequest{
+				AccountId:    spell(testOwnerAccountID),
+				Type:         repository.AlertTypeTargetPrice,
+				InstrumentId: spell(testInstrumentID),
+				Direction:    repository.AlertDirectionAbove,
+				Threshold:    thresholdDomainMax,
+			}
+
+			created, err := srv.CreateAlert(ctx, req)
+
+			if err != nil {
+				t.Fatalf("CreateAlert(%v): %v", req, err)
+			}
+			deleteAlertAtCleanup(t, repo, created.Id)
+			got := getTestAlert(t, repo, created.Id)
+			if got.AccountId != testOwnerAccountID || got.InstrumentId != testInstrumentID || !proto.Equal(created, got) {
+				t.Errorf("CreateAlert(%v) = %v with the row %v, want account %s and instrument %s",
+					req, created, got, testOwnerAccountID, testInstrumentID)
+			}
+		}},
+		{"GetAlert", func(t *testing.T, alert *pb.AlertMessage, spell func(string) string) {
+			id := spell(alert.Id)
+
+			got, err := srv.GetAlert(ctx, &pb.AlertIdRequest{Id: id})
+
+			if err != nil || !proto.Equal(got, alert) {
+				t.Errorf("GetAlert(%q) = (%v, %v), want (%v, nil)", id, got, err, alert)
+			}
+		}},
+		{"ListAlerts", func(t *testing.T, alert *pb.AlertMessage, spell func(string) string) {
+			req := &pb.ListAlertsRequest{AccountId: spell(testOwnerAccountID)}
+
+			resp, err := srv.ListAlerts(ctx, req)
+
+			if err != nil {
+				t.Fatalf("ListAlerts(%v): %v", req, err)
+			}
+			// Other rows of the owner account may share the table, so only this alert's presence and
+			// the absence of every other account's rows are checked
+			own := []string{}
+			foreign := 0
+			for _, listed := range resp.Alerts {
+				if listed.Id == alert.Id {
+					own = append(own, listed.Id)
+				}
+				if listed.AccountId != testOwnerAccountID {
+					foreign++
+				}
+			}
+			if want := []string{alert.Id}; !slices.Equal(own, want) || foreign != 0 {
+				t.Errorf("ListAlerts(%v) listed own ids %v and %d other accounts' alerts, want %v and none",
+					req, own, foreign, want)
+			}
+		}},
+		{"UpdateAlertEnabledFalse", func(t *testing.T, alert *pb.AlertMessage, spell func(string) string) {
+			req := &pb.UpdateAlertEnabledRequest{Id: spell(alert.Id), Enabled: wrapperspb.Bool(false)}
+			want := cloneAlert(alert)
+			want.Enabled = false
+
+			snapshot, err := srv.UpdateAlertEnabled(ctx, req)
+
+			if err != nil || !proto.Equal(snapshot, want) {
+				t.Errorf("UpdateAlertEnabled(%v) = (%v, %v), want (%v, nil)", req, snapshot, err, want)
+			}
+		}},
+		{"UpdateAlertEnabledTrue", func(t *testing.T, alert *pb.AlertMessage, spell func(string) string) {
+			// Triggered, then disabled: re-arming clears the trigger and moves to the next revision
+			mustTrigger(t, repo, alert.Id, alert.ArmingRevision, "5")
+			mustUpdateEnabled(t, repo, alert.Id, false)
+			req := &pb.UpdateAlertEnabledRequest{Id: spell(alert.Id), Enabled: wrapperspb.Bool(true)}
+			want := cloneAlert(alert)
+			want.ArmingRevision = alert.ArmingRevision + 1
+
+			snapshot, err := srv.UpdateAlertEnabled(ctx, req)
+
+			if err != nil || !proto.Equal(snapshot, want) {
+				t.Errorf("UpdateAlertEnabled(%v) = (%v, %v), want (%v, nil)", req, snapshot, err, want)
+			}
+		}},
+		{"TriggerAlert", func(t *testing.T, alert *pb.AlertMessage, spell func(string) string) {
+			req := &pb.TriggerAlertRequest{Id: spell(alert.Id), ArmingRevision: alert.ArmingRevision, TriggerValue: "5"}
+
+			resp, err := srv.TriggerAlert(ctx, req)
+
+			got := getTestAlert(t, repo, alert.Id)
+			if err != nil || !resp.GetTriggered() || got.TriggeredAt == nil || got.TriggerValue != "5" {
+				t.Errorf("TriggerAlert(%v) = (%v, %v) with the row %v, want triggered with 5", req, resp, err, got)
+			}
+		}},
+		{"AcknowledgeAlert", func(t *testing.T, alert *pb.AlertMessage, spell func(string) string) {
+			mustTrigger(t, repo, alert.Id, alert.ArmingRevision, "5")
+			id := spell(alert.Id)
+
+			resp, err := srv.AcknowledgeAlert(ctx, &pb.AlertIdRequest{Id: id})
+
+			got := getTestAlert(t, repo, alert.Id)
+			if err != nil || resp.GetAffected() != 1 || !got.Acknowledged {
+				t.Errorf("AcknowledgeAlert(%q) = (%v, %v) with the row %v, want affected 1 and the row acknowledged",
+					id, resp, err, got)
+			}
+		}},
+		{"DeleteAlert", func(t *testing.T, alert *pb.AlertMessage, spell func(string) string) {
+			id := spell(alert.Id)
+
+			resp, err := srv.DeleteAlert(ctx, &pb.AlertIdRequest{Id: id})
+
+			_, getErr := repo.GetByID(ctx, alert.Id)
+			if err != nil || resp.GetAffected() != 1 || !errors.Is(getErr, repository.ErrNotFound) {
+				t.Errorf("DeleteAlert(%q) = (%v, %v) with GetByID error %v, want affected 1 and ErrNotFound",
+					id, resp, err, getErr)
+			}
+		}},
+	}
+	for _, spelling := range alertServerUUIDSpellings {
+		for _, rpc := range rpcs {
+			t.Run(spelling.name+"/"+rpc.name, func(t *testing.T) {
+				rpc.call(t, createArmedTestAlert(t, repo), spelling.spell)
+			})
+		}
+	}
+}
+
+// Malformed id text is refused before any statement runs, so it neither fails in the driver nor
+// reaches the row its inner 36 characters name
+func TestAlertServer_malformedUUID_invalidArgumentRowUnchanged(t *testing.T) {
+	repo := alertTestBackend(t).Alert()
+	srv := server.NewAlertServer(repo)
+	ctx := context.Background()
+
+	// triggered sets up the state in which the call, had it reached the row, would change it
+	rpcs := []struct {
+		name      string
+		triggered bool
+		call      func(alert *pb.AlertMessage, spell func(string) string) error
+	}{
+		{"GetAlert", false, func(alert *pb.AlertMessage, spell func(string) string) error {
+			_, err := srv.GetAlert(ctx, &pb.AlertIdRequest{Id: spell(alert.Id)})
+			return err
+		}},
+		{"ListAlerts", false, func(_ *pb.AlertMessage, spell func(string) string) error {
+			_, err := srv.ListAlerts(ctx, &pb.ListAlertsRequest{AccountId: spell(testOwnerAccountID)})
+			return err
+		}},
+		{"UpdateAlertEnabledFalse", false, func(alert *pb.AlertMessage, spell func(string) string) error {
+			_, err := srv.UpdateAlertEnabled(ctx, &pb.UpdateAlertEnabledRequest{Id: spell(alert.Id), Enabled: wrapperspb.Bool(false)})
+			return err
+		}},
+		{"UpdateAlertEnabledTrue", true, func(alert *pb.AlertMessage, spell func(string) string) error {
+			_, err := srv.UpdateAlertEnabled(ctx, &pb.UpdateAlertEnabledRequest{Id: spell(alert.Id), Enabled: wrapperspb.Bool(true)})
+			return err
+		}},
+		{"TriggerAlert", false, func(alert *pb.AlertMessage, spell func(string) string) error {
+			_, err := srv.TriggerAlert(ctx, &pb.TriggerAlertRequest{Id: spell(alert.Id), ArmingRevision: alert.ArmingRevision, TriggerValue: "5"})
+			return err
+		}},
+		{"AcknowledgeAlert", true, func(alert *pb.AlertMessage, spell func(string) string) error {
+			_, err := srv.AcknowledgeAlert(ctx, &pb.AlertIdRequest{Id: spell(alert.Id)})
+			return err
+		}},
+		{"DeleteAlert", false, func(alert *pb.AlertMessage, spell func(string) string) error {
+			_, err := srv.DeleteAlert(ctx, &pb.AlertIdRequest{Id: spell(alert.Id)})
+			return err
+		}},
+	}
+	for _, malformed := range alertServerMalformedUUIDs {
+		for _, rpc := range rpcs {
+			t.Run(malformed.name+"/"+rpc.name, func(t *testing.T) {
+				alert := createArmedTestAlert(t, repo)
+				if rpc.triggered {
+					mustTrigger(t, repo, alert.Id, alert.ArmingRevision, "5")
+				}
+				before := getTestAlert(t, repo, alert.Id)
+
+				err := rpc.call(alert, malformed.spell)
+
+				after, getErr := repo.GetByID(ctx, alert.Id)
+				if status.Code(err) != codes.InvalidArgument || getErr != nil || !proto.Equal(after, before) {
+					t.Errorf("%s with a %s id = %v with the row (%v, %v), want InvalidArgument and the row unchanged from %v",
+						rpc.name, malformed.name, err, after, getErr, before)
+				}
+			})
+		}
+	}
+
+	// CreateAlert binds the ids it parses, so a malformed id it accepted would store a row
+	createFields := []struct {
+		name string
+		set  func(req *pb.CreateAlertRequest, spell func(string) string)
+	}{
+		{"account_id", func(req *pb.CreateAlertRequest, spell func(string) string) {
+			req.AccountId = spell(req.AccountId)
+		}},
+		{"instrument_id", func(req *pb.CreateAlertRequest, spell func(string) string) {
+			req.InstrumentId = spell(req.InstrumentId)
+		}},
+	}
+	for _, malformed := range alertServerMalformedUUIDs {
+		for _, field := range createFields {
+			t.Run(malformed.name+"/CreateAlert/"+field.name, func(t *testing.T) {
+				req := &pb.CreateAlertRequest{
+					AccountId:    testOwnerAccountID,
+					Type:         repository.AlertTypeTargetPrice,
+					InstrumentId: testInstrumentID,
+					Direction:    repository.AlertDirectionAbove,
+					Threshold:    thresholdDomainMax,
+				}
+				field.set(req, malformed.spell)
+
+				created, err := srv.CreateAlert(ctx, req)
+
+				if err == nil {
+					deleteAlertAtCleanup(t, repo, created.GetId())
+				}
+				if status.Code(err) != codes.InvalidArgument {
+					t.Errorf("CreateAlert(%v) = (%v, %v), want InvalidArgument", req, created, err)
+				}
+			})
+		}
+	}
+}
+
 func TestDecimalTextScan_driverSource_normalized(t *testing.T) {
 	cases := []struct {
 		name string
@@ -1115,6 +1384,275 @@ func TestDecimalTextValue_validity_textOrNil(t *testing.T) {
 			}
 		})
 	}
+}
+
+// safeAlertSecret stands for the connection and schema details a driver error can carry
+const safeAlertSecret = "user=postgres database=TradeManagement"
+
+// safeAlertSQLStateError has the shape of a pgx PgError
+type safeAlertSQLStateError struct{ code string }
+
+func (e safeAlertSQLStateError) Error() string {
+	return `ERROR: violates foreign key constraint "FK_Alerts_Accounts" (` + safeAlertSecret + `) (SQLSTATE ` + e.code + `)`
+}
+
+func (e safeAlertSQLStateError) SQLState() string { return e.code }
+
+// safeAlertSQLServerError has the shape of a go-mssqldb Error
+type safeAlertSQLServerError struct{ number int32 }
+
+func (e safeAlertSQLServerError) Error() string {
+	return fmt.Sprintf(`mssql: conflicted with the FOREIGN KEY constraint "FK_Alerts_Accounts" (%s) (%d)`, safeAlertSecret, e.number)
+}
+
+func (e safeAlertSQLServerError) SQLErrorNumber() int32 { return e.number }
+
+// safeAlertDialError is a refused connection as pgx reports it, naming the user and database
+func safeAlertDialError() error {
+	refused := &net.OpError{Op: "dial", Net: "tcp", Err: errors.New("connect: connection refused")}
+	return fmt.Errorf("failed to connect to `%s`: %w", safeAlertSecret, refused)
+}
+
+// sameSafeAlertError compares classifications by class and sentinels by identity, so a sentinel
+// still wrapped in the original error does not match
+func sameSafeAlertError(got, want error) bool {
+	w, ok := want.(*alertStorageError)
+	if !ok {
+		return got == want
+	}
+	g, ok := got.(*alertStorageError)
+	return ok && g.class == w.class
+}
+
+func TestSafeAlertError_errorKind_classifiedWithoutDetails(t *testing.T) {
+	classified := &alertStorageError{class: "SQLSTATE 08006"}
+	cases := []struct {
+		name string
+		err  error
+		want error
+	}{
+		{"nil", nil, nil},
+		{"repositoryNotFound", fmt.Errorf("lookup: %w", repository.ErrNotFound), repository.ErrNotFound},
+		{"recordNotFound", fmt.Errorf("first: %w", gorm.ErrRecordNotFound), gorm.ErrRecordNotFound},
+		{"canceled", fmt.Errorf("%s: %w", safeAlertSecret, context.Canceled), context.Canceled},
+		{"deadlineExceeded", fmt.Errorf("%s: %w", safeAlertSecret, context.DeadlineExceeded), context.DeadlineExceeded},
+		{"postgresError", fmt.Errorf("create: %w", safeAlertSQLStateError{code: "23503"}), &alertStorageError{class: "SQLSTATE 23503"}},
+		{"postgresErrorLetters", fmt.Errorf("create: %w", safeAlertSQLStateError{code: "P0001"}), &alertStorageError{class: "SQLSTATE P0001"}},
+		// A code outside the SQLSTATE form is not echoed, whatever the server sent
+		{"postgresErrorControlCharacter", fmt.Errorf("create: %w", safeAlertSQLStateError{code: "23\n03"}), &alertStorageError{class: "unclassified"}},
+		{"postgresErrorInjectedLine", fmt.Errorf("create: %w", safeAlertSQLStateError{code: "x\r\nFAKE LOG LINE"}), &alertStorageError{class: "unclassified"}},
+		{"postgresErrorLowercase", fmt.Errorf("create: %w", safeAlertSQLStateError{code: "2350a"}), &alertStorageError{class: "unclassified"}},
+		{"postgresErrorFourCharacters", fmt.Errorf("create: %w", safeAlertSQLStateError{code: "2350"}), &alertStorageError{class: "unclassified"}},
+		{"postgresErrorSixCharacters", fmt.Errorf("create: %w", safeAlertSQLStateError{code: "235030"}), &alertStorageError{class: "unclassified"}},
+		{"postgresErrorEmpty", fmt.Errorf("create: %w", safeAlertSQLStateError{code: ""}), &alertStorageError{class: "unclassified"}},
+		{"sqlServerError", fmt.Errorf("create: %w", safeAlertSQLServerError{number: 547}), &alertStorageError{class: "SQL Server error 547"}},
+		{"dialFailure", safeAlertDialError(), &alertStorageError{class: "connection failure"}},
+		{"badConnection", fmt.Errorf("%s: %w", safeAlertSecret, driver.ErrBadConn), &alertStorageError{class: "connection failure"}},
+		{"connectionDone", fmt.Errorf("%s: %w", safeAlertSecret, dbsql.ErrConnDone), &alertStorageError{class: "connection failure"}},
+		{"alreadyClassified", fmt.Errorf("acknowledge: %w", classified), classified},
+		{"other", errors.New("unexpected reply for " + safeAlertSecret), &alertStorageError{class: "unclassified"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := safeAlertError(tc.err)
+
+			if !sameSafeAlertError(got, tc.want) || (got != nil && strings.Contains(got.Error(), safeAlertSecret)) {
+				t.Errorf("safeAlertError(%v) = %#v, want %#v without %q", tc.err, got, tc.want, safeAlertSecret)
+			}
+		})
+	}
+}
+
+// Callers can still branch on the driver's code, as the dialect matchers above do, while the text
+// that reaches a log line or a status stays the classification
+func TestSafeAlertError_driverError_codeReachableTextWithheld(t *testing.T) {
+	cases := []struct {
+		name    string
+		err     error
+		matches func(error) bool
+	}{
+		{"postgresError", fmt.Errorf("create: %w", safeAlertSQLStateError{code: "23503"}), func(err error) bool {
+			var pgErr pgDriverError
+			return errors.As(err, &pgErr) && pgErr.SQLState() == "23503"
+		}},
+		{"sqlServerError", fmt.Errorf("create: %w", safeAlertSQLServerError{number: 547}), func(err error) bool {
+			var mssqlErr mssqlDriverError
+			return errors.As(err, &mssqlErr) && mssqlErr.SQLErrorNumber() == 547
+		}},
+		{"dialFailure", safeAlertDialError(), func(err error) bool {
+			var opErr *net.OpError
+			return errors.As(err, &opErr)
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := safeAlertError(tc.err)
+
+			if !tc.matches(got) || strings.Contains(got.Error(), safeAlertSecret) || strings.Contains(fmt.Sprintf("%+v", got), safeAlertSecret) {
+				t.Errorf("safeAlertError(%v) = %q, want the driver error reachable and the text without %q", tc.err, got, safeAlertSecret)
+			}
+		})
+	}
+}
+
+// safeAlertRecordingLogger records the level it is set to and every error Trace receives
+type safeAlertRecordingLogger struct {
+	logger.Interface
+	level  logger.LogLevel
+	traced *[]error
+}
+
+func (l safeAlertRecordingLogger) LogMode(level logger.LogLevel) logger.Interface {
+	l.level = level
+	return l
+}
+
+func (l safeAlertRecordingLogger) Trace(_ context.Context, _ time.Time, _ func() (string, int64), err error) {
+	*l.traced = append(*l.traced, err)
+}
+
+func TestAlertLogger_trace_safeErrorPassedOn(t *testing.T) {
+	cases := []struct {
+		name string
+		err  error
+		want error
+	}{
+		{"success", nil, nil},
+		// Kept, so a logger set to IgnoreRecordNotFoundError still recognises it
+		{"recordNotFound", gorm.ErrRecordNotFound, gorm.ErrRecordNotFound},
+		{"driverError", safeAlertDialError(), &alertStorageError{class: "connection failure"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var traced []error
+			l := alertLogger{Interface: safeAlertRecordingLogger{Interface: logger.Discard, traced: &traced}}
+
+			l.Trace(context.Background(), time.Now(), func() (string, int64) { return "SELECT 1", 0 }, tc.err)
+
+			if len(traced) != 1 || !sameSafeAlertError(traced[0], tc.want) {
+				t.Errorf("wrapped logger traced %v, want [%v]", traced, tc.want)
+			}
+		})
+	}
+}
+
+func TestAlertLogger_logMode_wrapperKept(t *testing.T) {
+	l := alertLogger{Interface: safeAlertRecordingLogger{Interface: logger.Discard, traced: new([]error)}}
+
+	got := l.LogMode(logger.Info)
+
+	wrapper, ok := got.(alertLogger)
+	if !ok {
+		t.Fatalf("LogMode returned %T, want alertLogger", got)
+	}
+	if inner, ok := wrapper.Interface.(safeAlertRecordingLogger); !ok || inner.level != logger.Info {
+		t.Errorf("LogMode wraps %#v, want the recording logger at level Info", wrapper.Interface)
+	}
+}
+
+func TestAlertLogger_paramsFilter_wrappedSettingKept(t *testing.T) {
+	params := []any{testOwnerAccountID, true}
+	cases := []struct {
+		name    string
+		wrapped logger.Interface
+		want    []any
+	}{
+		{"parameterizedQueries", logger.New(stdlog.New(io.Discard, "", 0), logger.Config{ParameterizedQueries: true}), nil},
+		{"inlineParameters", logger.New(stdlog.New(io.Discard, "", 0), logger.Config{}), params},
+		// The embedded interface alone hides the wrapped logger's ParamsFilter
+		{"noFilter", struct{ logger.Interface }{logger.Discard}, params},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			sql, got := alertLogger{Interface: tc.wrapped}.ParamsFilter(context.Background(), "SELECT ?, ?", params...)
+
+			if sql != "SELECT ?, ?" || !slices.Equal(got, tc.want) {
+				t.Errorf("ParamsFilter = (%q, %v), want (%q, %v)", sql, got, "SELECT ?, ?", tc.want)
+			}
+		})
+	}
+}
+
+// The pgx driver names the user, database and socket path when a connection fails. Through the real
+// driver and GORM's own logger, no alert method's error and no log line may carry them
+func TestNewAlertRepository_unreachableDatabase_noConnectionDetails(t *testing.T) {
+	// A host that is an absolute path makes pgx dial the Unix socket <host>/.s.PGSQL.5432. Nothing
+	// creates one in a fresh test directory, so every dial fails at once, and no other process can
+	// take the address between setup and dial as it can a freed TCP port
+	socketDir := t.TempDir()
+	if runtime.GOOS == "windows" {
+		// pgx takes only an upper-case drive for a path; Windows ignores the drive letter's case
+		socketDir = strings.ToUpper(socketDir[:1]) + socketDir[1:]
+	}
+	// A quoted keyword value unescapes backslashes, so the path's backslashes and quotes are escaped
+	host := strings.NewReplacer(`\`, `\\`, `'`, `\'`).Replace(socketDir)
+	var logs bytes.Buffer
+	db, err := gorm.Open(postgres.Open("host='"+host+"' user=alertuser password=secretpw dbname=alertdb sslmode=disable connect_timeout=5"), &gorm.Config{
+		NamingStrategy:       dbNamer{},
+		DisableAutomaticPing: true,
+		Logger:               logger.New(stdlog.New(&logs, "", 0), logger.Config{LogLevel: logger.Warn}),
+	})
+	if err != nil {
+		t.Fatalf("gorm.Open: %v", err)
+	}
+	sqlDB, err := db.DB()
+	if err != nil {
+		t.Fatalf("DB: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := sqlDB.Close(); err != nil {
+			t.Errorf("Close: %v", err)
+		}
+	})
+	repo := NewAlertRepository(db)
+	ctx := context.Background()
+	id := uuid.NewString()
+	secrets := []string{"alertuser", "alertdb", "secretpw", socketDir}
+	carriesSecret := func(text string) bool {
+		return slices.ContainsFunc(secrets, func(secret string) bool { return strings.Contains(text, secret) })
+	}
+	calls := []struct {
+		name string
+		call func() error
+	}{
+		{"Create", func() error {
+			_, err := repo.Create(ctx, &pb.CreateAlertRequest{
+				AccountId:    testOwnerAccountID,
+				Type:         repository.AlertTypeTargetPrice,
+				InstrumentId: testInstrumentID,
+				Direction:    repository.AlertDirectionAbove,
+				Threshold:    "1.5",
+			})
+			return err
+		}},
+		{"List", func() error {
+			_, err := repo.List(ctx, &pb.ListAlertsRequest{AccountId: testOwnerAccountID, TriggeredOnly: true})
+			return err
+		}},
+		{"GetByID", func() error { _, err := repo.GetByID(ctx, id); return err }},
+		{"UpdateEnabled", func() error { _, err := repo.UpdateEnabled(ctx, id, true); return err }},
+		{"Delete", func() error { _, err := repo.Delete(ctx, id); return err }},
+		{"Trigger", func() error { _, err := repo.Trigger(ctx, id, 1, "1.5"); return err }},
+		{"Acknowledge", func() error { _, err := repo.Acknowledge(ctx, id); return err }},
+	}
+	for _, tc := range calls {
+		t.Run(tc.name, func(t *testing.T) {
+			err := tc.call()
+
+			// connect_timeout ends a slow attempt with the bare deadline error instead
+			connectionFailure := &alertStorageError{class: "connection failure"}
+			if !sameSafeAlertError(err, connectionFailure) && !sameSafeAlertError(err, context.DeadlineExceeded) || carriesSecret(err.Error()) {
+				t.Errorf("%s error = %#v, want %v", tc.name, err, connectionFailure)
+			}
+		})
+	}
+	t.Run("log", func(t *testing.T) {
+		got := logs.String()
+
+		if !strings.Contains(got, "alert storage failure: connection failure") || carriesSecret(got) {
+			t.Errorf("GORM log = %q, want the connection failure class and none of %q", got, secrets)
+		}
+	})
 }
 
 // leakMarker is the password in the connection strings below, so a test can tell whether any output

@@ -1,6 +1,8 @@
 import "@testing-library/jest-dom/vitest"
 import {
+    ApiError,
     getJsonWithTimeout,
+    getJsonWithTimeoutExactStatus,
     patchJson,
     postJsonText,
     services,
@@ -139,6 +141,102 @@ it("getJsonWithTimeout_noSignal_sendsAcceptHeaderOnly", async () => {
         headers: { Accept: "application/json" },
     })
 })
+
+it.each([201, 202, 203, 206])(
+    "getJsonWithTimeout_anyOkStatus_resolvesBody (%i)",
+    async (status) => {
+        stubFetch(() => Promise.resolve(jsonResponse({ version: "1" }, status)))
+
+        const value = await getJsonWithTimeout(url, 2000)
+
+        expect(value).toEqual({ version: "1" })
+    }
+)
+
+it.each([201, 202, 203, 206, 404])(
+    "getJsonWithTimeoutExactStatus_otherStatus_rejectsApiErrorBeforeBodyRead (%i)",
+    async (status) => {
+        const response = jsonResponse(
+            { id: "portfolio-insights-enabled", enabled: true },
+            status
+        )
+        stubFetch(() => Promise.resolve(response))
+
+        const error = await settle(
+            getJsonWithTimeoutExactStatus(url, 2000, 200)
+        )
+
+        expect({
+            isApiError: error instanceof ApiError,
+            status: error instanceof ApiError ? error.status : undefined,
+            bodyRead: response.bodyUsed,
+        }).toEqual({ isApiError: true, status, bodyRead: false })
+    }
+)
+
+it.each([200, 203])(
+    "getJsonWithTimeoutExactStatus_matchingStatus_resolvesBody (%i)",
+    async (status) => {
+        stubFetch(() => Promise.resolve(jsonResponse({ version: "1" }, status)))
+
+        const value = await getJsonWithTimeoutExactStatus(url, 2000, status)
+
+        expect(value).toEqual({ version: "1" })
+    }
+)
+
+const exactStatusAbortSources: {
+    source: string
+    run: () => Promise<unknown>
+}[] = [
+    {
+        source: "deadline",
+        run: async () => {
+            const pending = settle(
+                getJsonWithTimeoutExactStatus(url, 2000, 200)
+            )
+            await vi.advanceTimersByTimeAsync(2000)
+            return pending
+        },
+    },
+    {
+        source: "pre-aborted signal",
+        run: () => {
+            const caller = new AbortController()
+            caller.abort()
+            return settle(
+                getJsonWithTimeoutExactStatus(url, 2000, 200, caller.signal)
+            )
+        },
+    },
+    {
+        source: "signal aborted mid-request",
+        run: async () => {
+            const caller = new AbortController()
+            const pending = settle(
+                getJsonWithTimeoutExactStatus(url, 2000, 200, caller.signal)
+            )
+            await vi.advanceTimersByTimeAsync(100)
+            caller.abort()
+            return pending
+        },
+    },
+]
+
+it.each(exactStatusAbortSources)(
+    "getJsonWithTimeoutExactStatus_abortSource_rejectsAbortErrorWithoutPendingTimer ($source)",
+    async ({ run }) => {
+        vi.useFakeTimers()
+        stubFetch(hangUntilAborted)
+
+        const error = await run()
+
+        expect({
+            name: (error as Error).name,
+            pendingTimers: vi.getTimerCount(),
+        }).toEqual({ name: "AbortError", pendingTimers: 0 })
+    }
+)
 
 const writeHelpers: {
     helper: string

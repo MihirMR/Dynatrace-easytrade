@@ -128,6 +128,30 @@ export async function getJsonWithTimeout<T>(
     timeoutMs: number,
     signal?: AbortSignal
 ): Promise<T> {
+    return await readJsonWithTimeout<T>(url, timeoutMs, signal, undefined)
+}
+
+/**
+ * GET JSON with the same deadline and caller-signal handling as
+ * `getJsonWithTimeout`, but any status other than `status`, 2xx included,
+ * rejects with `ApiError` before the body is read.
+ */
+export async function getJsonWithTimeoutExactStatus<T>(
+    url: string,
+    timeoutMs: number,
+    status: number,
+    signal?: AbortSignal
+): Promise<T> {
+    return await readJsonWithTimeout<T>(url, timeoutMs, signal, status)
+}
+
+/** Shared timed read; a given `requiredStatus` narrows `response.ok`. */
+async function readJsonWithTimeout<T>(
+    url: string,
+    timeoutMs: number,
+    signal: AbortSignal | undefined,
+    requiredStatus: number | undefined
+): Promise<T> {
     const controller = new AbortController()
     const timer = setTimeout(() => controller.abort(), timeoutMs)
     const onAbort = (): void => controller.abort()
@@ -141,6 +165,12 @@ export async function getJsonWithTimeout<T>(
             headers: { Accept: "application/json" },
             signal: controller.signal,
         })
+        if (
+            requiredStatus !== undefined &&
+            response.status !== requiredStatus
+        ) {
+            throw new ApiError(response.status, url)
+        }
         return (await response.json()) as T
     } finally {
         clearTimeout(timer)
