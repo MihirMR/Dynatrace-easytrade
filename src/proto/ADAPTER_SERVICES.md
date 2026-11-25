@@ -10,5 +10,8 @@
 | **TradeService** | 1. CreateTrade 2. UpdateTrade 3. GetOpenTrades 4. GetExpiredTrades [Get expired open trades] 5. GetAccountTrades [Get all trades for a specific account with optional filters] 6. DeleteTradesOlderThan | broker-service, background-service |
 | **CreditCardOrderService** | 1. CreateCreditCardOrder 2. GetShippingAddressByOrderId 3. GetStatusListByAccountId [Get all order statuses by timestamp DESC] 4. GetLastOrderStatusByAccountId 5. GetLastOrderStatusByOrderId 6. GetOrdersToManufacture 7. InsertNewStatus 8. InsertNewCreditCard 9. UpdateOrderShippingId 10. DeleteOrdersByAccountId 11. ExistsByAccountId | credit-card-order-service |
 | **PricingService** | 1. GetLatestPrices 2. GetLatestPriceForInstrument 3. GetPricesForInstrument 4. GetPricesForInstrumentsAscByTimestamp [Get prices for multiple instruments in one request, at/after a given timestamp] 5. InsertPricesBatch 6. DeletePricesOlderThan | pricing-service, background-service |
+| **AlertService** | 1. CreateAlert 2. ListAlerts 3. GetAlert 4. UpdateAlertEnabled 5. DeleteAlert 6. TriggerAlert [conditional write: only when enabled, untriggered and at the given arming revision] 7. AcknowledgeAlert | broker-service |
+
+> Alert persistence belongs to the Portfolio Insights demo feature. See [Portfolio insights (demo feature)](../../README.md#portfolio-insights-demo-feature) in the root README for the feature flag, environment variables, the database-recreate note and the demo walkthrough.
 
 ---
