@@ -1,5 +1,7 @@
 import type { DepositRequest, WithdrawRequest } from "../creditCard"
 import type { QuickTransactionRequest } from "../transaction"
+import type { RiskLevel } from "../portfolioInsights"
+import type { AlertType, AlertDirection } from "../alerts"
 
 export class BizEvents {
     private static sendBizEvent(type: string, body: unknown): void {
@@ -81,5 +83,24 @@ export class BizEvents {
             status: "error",
             message,
         })
+    }
+
+    static portfolioInsightsView(body: {
+        accountId: string
+        holdingCount: number
+        riskLevel: RiskLevel | null
+    }): void {
+        this.sendBizEvent("com.easytrade.portfolio-insights.view", body)
+    }
+
+    static alertCreate(body: {
+        accountId: string
+        alertId: string
+        type: AlertType
+        instrumentId: string
+        direction: AlertDirection
+        threshold: number
+    }): void {
+        this.sendBizEvent("com.easytrade.alert.create", body)
     }
 }
