@@ -15,4 +15,5 @@ func Register(grpcServer *grpc.Server, backend repository.DBBackend) {
 	pb.RegisterPricingServiceServer(grpcServer, NewPricingServer(backend.Pricing()))
 	pb.RegisterProductServiceServer(grpcServer, NewProductServer(backend.Product()))
 	pb.RegisterTradeServiceServer(grpcServer, NewTradeServer(backend.Trade()))
+	pb.RegisterAlertServiceServer(grpcServer, NewAlertServer(backend.Alert()))
 }
