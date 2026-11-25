@@ -28,7 +28,11 @@ namespace EasyTrade.BrokerService.Test.Fakes
     /// <param name="Id">Alert id passed by the caller.</param>
     /// <param name="ArmingRevision">Arming revision passed by the caller.</param>
     /// <param name="TriggerValue">Trigger value passed by the caller.</param>
-    /// <param name="Result">The <c>triggered</c> flag; <c>null</c> when the call threw.</param>
+    /// <param name="Result">
+    /// The store's decision, recorded before <see cref="FakeAlertRepository.AfterTrigger"/> runs,
+    /// so a throwing hook leaves it intact. <c>null</c> when the call failed before deciding: an
+    /// injected exception or an already-cancelled token.
+    /// </param>
     public sealed record AlertTriggerCall(
         Guid Id,
         int ArmingRevision,
@@ -101,8 +105,10 @@ namespace EasyTrade.BrokerService.Test.Fakes
         }
 
         /// <summary>
-        /// Awaited by every <see cref="TriggerAsync"/> that did not throw, after its write is
-        /// committed and before it returns, with the alert id, the result and the caller's token.
+        /// Awaited by every <see cref="TriggerAsync"/> that reaches the store's decision, outside
+        /// the lock and before it returns, with the alert id, the result and the caller's token.
+        /// It runs after the committed write for <c>true</c> and after a miss that wrote nothing
+        /// for <c>false</c>, but not when the call failed before deciding.
         /// </summary>
         public Func<Guid, bool, CancellationToken, Task>? AfterTrigger
         {
@@ -141,7 +147,7 @@ namespace EasyTrade.BrokerService.Test.Fakes
 
         /// <summary>
         /// Every <see cref="TriggerAsync"/> call since the last reset, in the order the store
-        /// decided them.
+        /// recorded them under its lock, including calls that failed before deciding.
         /// </summary>
         public IReadOnlyList<AlertTriggerCall> TriggerCalls
         {

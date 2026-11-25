@@ -9,9 +9,16 @@ using EasyTrade.BrokerService.Helpers.Metrics;
 namespace EasyTrade.BrokerService.Entities.Alerts.Service
 {
     /// <summary>
-    /// Runs one alert evaluation cycle over the armed alerts of every account: one flag read, one
-    /// armed-alert listing and one latest-price fetch per cycle, then one conditional trigger
-    /// write per crossed alert. Whether a crossing notifies is decided by that write alone.
+    /// Runs one alert evaluation cycle over the armed alerts of every account. One flag read
+    /// starts the cycle; when the flag is off or unreadable nothing is listed or priced and no
+    /// metric is recorded (<see cref="AlertEvaluationOutcome.FlagDisabled"/>). Otherwise the
+    /// armed alerts are listed once: a failed listing ends the cycle
+    /// <see cref="AlertEvaluationOutcome.Failed"/> and an empty armed set ends it
+    /// <see cref="AlertEvaluationOutcome.Completed"/>, both without pricing. Otherwise the latest
+    /// prices are fetched once, and a failed or empty fetch ends the cycle
+    /// <see cref="AlertEvaluationOutcome.Failed"/> with no alert evaluated. Otherwise every armed
+    /// alert is evaluated, and each crossing is recorded by one conditional trigger write, which
+    /// alone decides whether it notifies.
     /// </summary>
     public class AlertEvaluationService(
         IAlertRepository alertRepository,
@@ -59,30 +66,30 @@ namespace EasyTrade.BrokerService.Entities.Alerts.Service
             "Alert evaluation cycle cancelled: alerts [{alertCount}] "
             + "triggered [{triggeredCount}]";
 
+        // Serializes every log record this class emits. The console provider writes one record
+        // in several separate writes (prefix, message, padding, terminator), so records that
+        // parallel workers emit at once would interleave and split lines. Static, because the
+        // console is process-wide and evaluator instances can run at the same time. Only log
+        // emission is held under it, never evaluation, db-adapter calls or metrics.
+        private static readonly Lock LogGate = new();
+
         /// <inheritdoc/>
         public async Task<AlertEvaluationResult> RunCycleAsync(CancellationToken cancellationToken)
         {
-            bool enabled;
             try
             {
-                enabled = await feature.IsEnabledAsync(cancellationToken);
+                bool enabled = await feature.IsEnabledAsync(cancellationToken);
+                // A call that returns normally does not report a shutdown it overlapped, so the
+                // token is checked after it and before every outcome below is decided.
+                cancellationToken.ThrowIfCancellationRequested();
+                if (!enabled)
+                {
+                    return FlagDisabled(cancellationToken);
+                }
             }
             catch (Exception) when (cancellationToken.IsCancellationRequested)
             {
                 return Cancelled(0, new CycleCounters());
-            }
-
-            if (!enabled)
-            {
-                logger.LogDebug(FlagDisabledMessage);
-                return new AlertEvaluationResult(
-                    AlertEvaluationOutcome.FlagDisabled,
-                    0,
-                    0,
-                    0,
-                    0,
-                    TimeSpan.Zero
-                );
             }
 
             Stopwatch stopwatch = Stopwatch.StartNew();
@@ -93,17 +100,26 @@ namespace EasyTrade.BrokerService.Entities.Alerts.Service
                 IReadOnlyList<Alert>? armed = await ListArmedAsync(cancellationToken);
                 if (armed is null)
                 {
-                    return Finish(AlertEvaluationOutcome.Failed, alertCount, counters, stopwatch);
+                    return Finish(
+                        AlertEvaluationOutcome.Failed,
+                        alertCount,
+                        counters,
+                        stopwatch,
+                        cancellationToken
+                    );
                 }
 
+                // Counted first, so a cycle cancelled here still reports the alerts it listed.
                 alertCount = armed.Count;
+                cancellationToken.ThrowIfCancellationRequested();
                 if (alertCount == 0)
                 {
                     return Finish(
                         AlertEvaluationOutcome.Completed,
                         alertCount,
                         counters,
-                        stopwatch
+                        stopwatch,
+                        cancellationToken
                     );
                 }
 
@@ -112,7 +128,13 @@ namespace EasyTrade.BrokerService.Entities.Alerts.Service
                 );
                 if (selected is null)
                 {
-                    return Finish(AlertEvaluationOutcome.Failed, alertCount, counters, stopwatch);
+                    return Finish(
+                        AlertEvaluationOutcome.Failed,
+                        alertCount,
+                        counters,
+                        stopwatch,
+                        cancellationToken
+                    );
                 }
 
                 // The cycle's own token goes to every call, not the loop's linked token, so the
@@ -127,7 +149,13 @@ namespace EasyTrade.BrokerService.Entities.Alerts.Service
                     (item, _) => EvaluateItemAsync(item, selected, counters, cancellationToken)
                 );
 
-                return Finish(AlertEvaluationOutcome.Completed, alertCount, counters, stopwatch);
+                return Finish(
+                    AlertEvaluationOutcome.Completed,
+                    alertCount,
+                    counters,
+                    stopwatch,
+                    cancellationToken
+                );
             }
             // Filtered on the token, not on the exception type: GrpcHelper wraps a cancelled
             // gRPC call in DbException, and Parallel.ForEachAsync throws
@@ -168,6 +196,9 @@ namespace EasyTrade.BrokerService.Entities.Alerts.Service
             try
             {
                 IEnumerable<Price> prices = await priceServiceConnector.GetLatestPrices();
+                // The price fetch takes no token, so cancellation is checked once it returns and
+                // before the list is read; the filter below lets that cancellation through.
+                cancellationToken.ThrowIfCancellationRequested();
                 // Inside the try so a price list that cannot be read counts as a failed fetch.
                 selected = LatestPriceSelector.Select(prices);
             }
@@ -177,7 +208,7 @@ namespace EasyTrade.BrokerService.Entities.Alerts.Service
                 return null;
             }
 
-            // The price fetch takes no token, so cancellation is checked once it returns.
+            // Checked again, because a shutdown can arrive while the list is being read.
             cancellationToken.ThrowIfCancellationRequested();
 
             // Pricing answers a non-200 response with an empty list.
@@ -232,6 +263,9 @@ namespace EasyTrade.BrokerService.Entities.Alerts.Service
                 return;
             }
 
+            // The positions read takes no token, so it never starts once the cycle is cancelled,
+            // and the token is checked again when it returns.
+            cancellationToken.ThrowIfCancellationRequested();
             IReadOnlyList<HoldingPosition> positions;
             try
             {
@@ -245,6 +279,9 @@ namespace EasyTrade.BrokerService.Entities.Alerts.Service
             {
                 foreach (Alert alert in item.Alerts)
                 {
+                    // The filter is tested once, so a shutdown during this loop is checked here
+                    // and stops it before the next alert, as on the normal path.
+                    cancellationToken.ThrowIfCancellationRequested();
                     RecordFailure(alert, ReasonException, exception, counters);
                 }
                 return;
@@ -360,30 +397,48 @@ namespace EasyTrade.BrokerService.Entities.Alerts.Service
                 return;
             }
 
-            // Log calls with value-type arguments are guarded by IsEnabled so the arguments are
-            // boxed only when the level is on (CA1873); the rendered text is unchanged.
-            if (logger.IsEnabled(LogLevel.Information))
-            {
-                logger.LogInformation(
-                    TriggeredTemplate,
-                    alert.Id,
-                    alert.AccountId,
-                    AlertMapper.ToName(alert.Type),
-                    AlertMapper.ToName(alert.Direction),
-                    alert.Threshold,
-                    rounded,
-                    alert.ArmingRevision
-                );
-            }
+            // Counted the moment the write reports the trigger, before any logging, so a slow or
+            // failing log provider can neither delay nor drop the count.
             metrics.AddTriggered(alert.Type);
             counters.AddTriggered();
+
+            try
+            {
+                // Log calls with value-type arguments are guarded by IsEnabled so the arguments
+                // are boxed only when the level is on (CA1873); the rendered text is unchanged.
+                if (logger.IsEnabled(LogLevel.Information))
+                {
+                    lock (LogGate)
+                    {
+                        logger.LogInformation(
+                            TriggeredTemplate,
+                            alert.Id,
+                            alert.AccountId,
+                            AlertMapper.ToName(alert.Type),
+                            AlertMapper.ToName(alert.Direction),
+                            alert.Threshold,
+                            rounded,
+                            alert.ArmingRevision
+                        );
+                    }
+                }
+            }
+            catch (Exception) when (!cancellationToken.IsCancellationRequested)
+            {
+                // The trigger is committed and counted, so a failing log provider is a
+                // diagnostics fault, not a per-alert evaluation failure: it is not passed on to
+                // the per-alert failure path and adds nothing to the failed counter.
+            }
         }
 
         private void Skip(Alert alert, string reason, CycleCounters counters)
         {
             if (logger.IsEnabled(LogLevel.Warning))
             {
-                logger.LogWarning(SkippedTemplate, alert.Id, alert.AccountId, reason);
+                lock (LogGate)
+                {
+                    logger.LogWarning(SkippedTemplate, alert.Id, alert.AccountId, reason);
+                }
             }
             counters.AddSkipped();
         }
@@ -397,7 +452,16 @@ namespace EasyTrade.BrokerService.Entities.Alerts.Service
         {
             if (logger.IsEnabled(LogLevel.Error))
             {
-                logger.LogError(exception, AlertFailedTemplate, alert.Id, alert.AccountId, reason);
+                lock (LogGate)
+                {
+                    logger.LogError(
+                        exception,
+                        AlertFailedTemplate,
+                        alert.Id,
+                        alert.AccountId,
+                        reason
+                    );
+                }
             }
             metrics.AddFailed(alert.Type);
             counters.AddFailed();
@@ -405,14 +469,43 @@ namespace EasyTrade.BrokerService.Entities.Alerts.Service
 
         private void LogCycleFailure(string reason, Exception? exception)
         {
-            logger.LogError(exception, CycleFailedTemplate, reason);
+            lock (LogGate)
+            {
+                logger.LogError(exception, CycleFailedTemplate, reason);
+            }
         }
 
+        // The outcome is decided after the gate wait and the enablement check, so a shutdown
+        // during either throws to the cycle's cancellation catch and ends it Cancelled.
+        private AlertEvaluationResult FlagDisabled(CancellationToken cancellationToken)
+        {
+            lock (LogGate)
+            {
+                bool enabled = logger.IsEnabled(LogLevel.Debug);
+                cancellationToken.ThrowIfCancellationRequested();
+                if (enabled)
+                {
+                    logger.LogDebug(FlagDisabledMessage);
+                }
+            }
+            return new AlertEvaluationResult(
+                AlertEvaluationOutcome.FlagDisabled,
+                0,
+                0,
+                0,
+                0,
+                TimeSpan.Zero
+            );
+        }
+
+        // Decided under the gate as in FlagDisabled, so a cycle cancelled during the wait or the
+        // enablement check logs no summary and records no duration.
         private AlertEvaluationResult Finish(
             AlertEvaluationOutcome outcome,
             int alertCount,
             CycleCounters counters,
-            Stopwatch stopwatch
+            Stopwatch stopwatch,
+            CancellationToken cancellationToken
         )
         {
             stopwatch.Stop();
@@ -423,17 +516,27 @@ namespace EasyTrade.BrokerService.Entities.Alerts.Service
             int triggered = counters.Triggered;
             int failed = counters.Failed;
             int skipped = counters.Skipped;
-            if (logger.IsEnabled(LogLevel.Information))
+            lock (LogGate)
             {
-                logger.LogInformation(
-                    CycleFinishedTemplate,
-                    alertCount,
-                    triggered,
-                    failed,
-                    skipped,
-                    outcomeName,
-                    stopwatch.ElapsedMilliseconds
-                );
+                // Checked in both branches so the log call stays directly under its IsEnabled
+                // guard, which keeps its value-type arguments unboxed while the level is off.
+                if (logger.IsEnabled(LogLevel.Information))
+                {
+                    cancellationToken.ThrowIfCancellationRequested();
+                    logger.LogInformation(
+                        CycleFinishedTemplate,
+                        alertCount,
+                        triggered,
+                        failed,
+                        skipped,
+                        outcomeName,
+                        stopwatch.ElapsedMilliseconds
+                    );
+                }
+                else
+                {
+                    cancellationToken.ThrowIfCancellationRequested();
+                }
             }
             metrics.RecordEvaluationDuration(stopwatch.Elapsed, outcomeName);
             return new AlertEvaluationResult(
@@ -452,7 +555,10 @@ namespace EasyTrade.BrokerService.Entities.Alerts.Service
             int triggered = counters.Triggered;
             if (logger.IsEnabled(LogLevel.Debug))
             {
-                logger.LogDebug(CycleCancelledTemplate, alertCount, triggered);
+                lock (LogGate)
+                {
+                    logger.LogDebug(CycleCancelledTemplate, alertCount, triggered);
+                }
             }
             return new AlertEvaluationResult(
                 AlertEvaluationOutcome.Cancelled,
