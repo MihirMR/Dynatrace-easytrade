@@ -119,17 +119,26 @@ namespace EasyTrade.BrokerService.Entities.Portfolio.Service
         }
 
         // Materialised inside the try, so a lazily evaluated sequence that fails while being
-        // enumerated is reported as unavailable pricing too.
+        // enumerated is reported as unavailable pricing too. A malformed response can deserialize
+        // to a null candle despite the annotation; it is rejected after the try, so the error is
+        // not wrapped twice and never reaches the selector.
         private async Task<List<Price>> FetchLatestPricesAsync()
         {
+            List<Price> prices;
             try
             {
-                return [.. await priceServiceConnector.GetLatestPrices()];
+                prices = [.. await priceServiceConnector.GetLatestPrices()];
             }
             catch (Exception exception)
             {
                 throw new PricingUnavailableException(PricesUnavailableMessage, exception);
             }
+
+            if (prices.Exists(price => price is null))
+            {
+                throw new PricingUnavailableException(PricesUnavailableMessage);
+            }
+            return prices;
         }
 
         private PortfolioInsightsDTO Complete(

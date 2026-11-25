@@ -37,6 +37,25 @@ afterEach(() => {
     Object.assign(process.env, savedEnv)
 })
 
+function setWeightEnvironment(variables: Record<string, string>) {
+    for (const name of [
+        ...EXISTING_WEIGHT_VARIABLES,
+        PORTFOLIO_WEIGHT_VARIABLE,
+    ]) {
+        delete process.env[name]
+    }
+    process.env.EASYTRADE_URL = "http://easytrade.test"
+    Object.assign(process.env, variables)
+}
+
+function isPortfolioWeightError(reason: string) {
+    return (error: unknown) =>
+        error instanceof Error &&
+        error.constructor.name === "ConfigError" &&
+        error.message.includes(`[${PORTFOLIO_WEIGHT_VARIABLE}]`) &&
+        error.message.includes(reason)
+}
+
 test("getConfig_portfolioWeightUnset_defaultsZero", () => {
     assert.equal(getConfig().regularVisitsWeights.portfolio_insights_alert, 0)
 })
@@ -82,4 +101,122 @@ test("getConfig_portfolioWeightZero_keepsExistingWeights", () => {
             ],
         }
     )
+})
+
+test("getConfig_portfolioWeightNonFinite_throwsConfigError", async (t) => {
+    for (const weight of ["Infinity", "-Infinity", "1e400"]) {
+        await t.test(weight, () => {
+            setWeightEnvironment({ [PORTFOLIO_WEIGHT_VARIABLE]: weight })
+
+            assert.throws(
+                () => getConfig(),
+                isPortfolioWeightError("is not a finite number")
+            )
+        })
+    }
+})
+
+test("getConfig_portfolioWeightUnsafeCount_throwsConfigError", async (t) => {
+    for (const weight of ["1e16", "1e300", "1e-16", "1e-320"]) {
+        await t.test(weight, () => {
+            setWeightEnvironment({ [PORTFOLIO_WEIGHT_VARIABLE]: weight })
+
+            assert.throws(
+                () => getConfig(),
+                isPortfolioWeightError("above Number.MAX_SAFE_INTEGER")
+            )
+        })
+    }
+})
+
+test("getConfig_portfolioWeightNonPositive_returnsValue", async (t) => {
+    for (const weight of ["0", "-1", "-1e300"]) {
+        await t.test(weight, () => {
+            setWeightEnvironment({ [PORTFOLIO_WEIGHT_VARIABLE]: weight })
+
+            assert.equal(
+                getConfig().regularVisitsWeights.portfolio_insights_alert,
+                Number(weight)
+            )
+        })
+    }
+})
+
+test("getConfig_portfolioWeightSafeBoundary_returnsValue", async (t) => {
+    for (const weight of ["9007199254740991", "1e-15"]) {
+        await t.test(weight, () => {
+            setWeightEnvironment({ [PORTFOLIO_WEIGHT_VARIABLE]: weight })
+
+            assert.equal(
+                getConfig().regularVisitsWeights.portfolio_insights_alert,
+                Number(weight)
+            )
+        })
+    }
+})
+
+test("getConfig_portfolioWeightRescalesExistingCounts_throwsConfigError", async (t) => {
+    const rows: { name: string; variables: Record<string, string> }[] = [
+        {
+            name: "existing weight 2^53, portfolio weight 1e-320",
+            variables: {
+                DEPOSIT_AND_BUY_SUCCESS_WEIGHT: "9007199254740992",
+                [PORTFOLIO_WEIGHT_VARIABLE]: "1e-320",
+            },
+        },
+        {
+            name: "existing weight 2^53, portfolio weight 0.5",
+            variables: {
+                DEPOSIT_AND_BUY_SUCCESS_WEIGHT: "9007199254740992",
+                [PORTFOLIO_WEIGHT_VARIABLE]: "0.5",
+            },
+        },
+    ]
+    for (const row of rows) {
+        await t.test(row.name, () => {
+            setWeightEnvironment(row.variables)
+
+            assert.throws(
+                () => getConfig(),
+                isPortfolioWeightError("above Number.MAX_SAFE_INTEGER")
+            )
+        })
+    }
+})
+
+test("getConfig_existingCountsUnchanged_acceptsPortfolioWeight", async (t) => {
+    const rows: {
+        name: string
+        variables: Record<string, string>
+        expected: number
+    }[] = [
+        {
+            name: "existing weight 1e300, portfolio weight 1",
+            variables: {
+                DEPOSIT_AND_BUY_SUCCESS_WEIGHT: "1e300",
+                [PORTFOLIO_WEIGHT_VARIABLE]: "1",
+            },
+            expected: 1,
+        },
+        {
+            name: "every existing weight 0, portfolio weight 1e300",
+            variables: {
+                ...Object.fromEntries(
+                    EXISTING_WEIGHT_VARIABLES.map((name) => [name, "0"])
+                ),
+                [PORTFOLIO_WEIGHT_VARIABLE]: "1e300",
+            },
+            expected: 1e300,
+        },
+    ]
+    for (const row of rows) {
+        await t.test(row.name, () => {
+            setWeightEnvironment(row.variables)
+
+            assert.equal(
+                getConfig().regularVisitsWeights.portfolio_insights_alert,
+                row.expected
+            )
+        })
+    }
 })

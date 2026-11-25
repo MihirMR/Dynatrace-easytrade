@@ -29,7 +29,8 @@ namespace EasyTrade.BrokerService.Entities.Portfolio.Service
 
         /// <summary>
         /// Values the positive-quantity holdings of one account at prices the caller has
-        /// already selected, so an evaluation cycle fetches prices once for every account.
+        /// already selected, so an evaluation cycle shares one latest-price fetch across all
+        /// of its accounts.
         /// </summary>
         /// <param name="accountId">The account whose holdings are valued.</param>
         /// <param name="selectedPrices">

@@ -90,59 +90,7 @@ namespace EasyTrade.BrokerService.Entities.Portfolio.Service
         {
             ArgumentNullException.ThrowIfNull(instrumentTrades);
 
-            List<Trade> executed =
-            [
-                .. instrumentTrades
-                    .Where(IsExecuted)
-                    .OrderBy(trade => trade.TimestampOpen)
-                    .ThenBy(trade => trade.Id),
-            ];
-
-            decimal bought = 0;
-            decimal sold = 0;
-            foreach (Trade trade in executed)
-            {
-                if (IsBuy(trade))
-                {
-                    bought += trade.Quantity;
-                }
-                else
-                {
-                    sold += trade.Quantity;
-                }
-            }
-
-            decimal units = Math.Max(0, quantity - bought + sold);
-            decimal cost = units * latestPrice;
-            foreach (Trade trade in executed)
-            {
-                if (IsBuy(trade))
-                {
-                    units += trade.Quantity;
-                    cost += trade.Quantity * trade.EntryPrice;
-                }
-                else if (units > 0)
-                {
-                    // Selling the whole lot zeroes the cost directly, leaving no decimal residue.
-                    if (trade.Quantity >= units)
-                    {
-                        units = 0;
-                        cost = 0;
-                    }
-                    else
-                    {
-                        cost -= (cost / units) * trade.Quantity;
-                        units -= trade.Quantity;
-                    }
-                }
-            }
-
-            if (units <= 0)
-            {
-                return quantity * latestPrice;
-            }
-
-            return units == quantity ? cost : (cost / units) * quantity;
+            return ReplayCostBasis(quantity, latestPrice, PrepareReplay(instrumentTrades));
         }
 
         /// <summary>
@@ -180,8 +128,14 @@ namespace EasyTrade.BrokerService.Entities.Portfolio.Service
 
         /// <summary>
         /// Values each positive-quantity holding at its selected candle's close and costs it from
-        /// its own executed trades. A holding without a candle is valued at a price of 0.
+        /// its instrument's executed trades. A holding without a candle is valued at a price of 0.
         /// </summary>
+        /// <remarks>
+        /// Holdings are selected first, so with no positive holding <paramref name="trades"/> is
+        /// never enumerated. Otherwise it is read once, and each instrument's executed trades are
+        /// filtered and ordered once, so duplicate rows of one instrument share them while each
+        /// row is costed with its own quantity.
+        /// </remarks>
         /// <param name="holdings">The account's owned-instrument rows.</param>
         /// <param name="names">Instrument names by id; a missing name becomes empty.</param>
         /// <param name="trades">The account's trades of every instrument.</param>
@@ -201,9 +155,16 @@ namespace EasyTrade.BrokerService.Entities.Portfolio.Service
             ArgumentNullException.ThrowIfNull(trades);
             ArgumentNullException.ThrowIfNull(selectedPrices);
 
+            IReadOnlyList<OwnedInstrument> selected = SelectHoldings(holdings);
+            if (selected.Count == 0)
+            {
+                return [];
+            }
+
             ILookup<Guid, Trade> tradesByInstrument = trades.ToLookup(trade => trade.InstrumentId);
+            Dictionary<Guid, ReplayTrades> replays = new();
             List<HoldingPosition> positions = [];
-            foreach (OwnedInstrument holding in SelectHoldings(holdings))
+            foreach (OwnedInstrument holding in selected)
             {
                 Guid instrumentId = holding.InstrumentId;
                 string name = names.TryGetValue(instrumentId, out string? knownName)
@@ -218,12 +179,14 @@ namespace EasyTrade.BrokerService.Entities.Portfolio.Service
                     hasPrice = true;
                 }
 
+                if (!replays.TryGetValue(instrumentId, out ReplayTrades? replay))
+                {
+                    replay = PrepareReplay(tradesByInstrument[instrumentId]);
+                    replays.Add(instrumentId, replay);
+                }
+
                 decimal value = holding.Quantity * latestPrice;
-                decimal costBasis = CalculateCostBasis(
-                    holding.Quantity,
-                    latestPrice,
-                    tradesByInstrument[instrumentId]
-                );
+                decimal costBasis = ReplayCostBasis(holding.Quantity, latestPrice, replay);
                 positions.Add(
                     new HoldingPosition(
                         instrumentId,
@@ -244,6 +207,9 @@ namespace EasyTrade.BrokerService.Entities.Portfolio.Service
         /// Aggregates positions into the insights result: totals, allocations ordered by value
         /// descending then by the lowercase instrument id string ordinally, the largest position
         /// and its risk level. Nothing is rounded, and every division is guarded against zero.
+        /// The largest position is the first allocation; when the total value is 0, every
+        /// percent is 0 and the largest is the allocation with the ordinally lowest instrument
+        /// id string, so its risk level is <see cref="RiskLow"/>.
         /// </summary>
         /// <param name="positions">The account's positions; empty for no holdings.</param>
         /// <returns>
@@ -277,7 +243,16 @@ namespace EasyTrade.BrokerService.Entities.Portfolio.Service
                     ),
             ];
 
-            AllocationDTO? largestPosition = allocations.Count == 0 ? null : allocations[0];
+            // Value order already gives equal values to the lowest id. A zero total makes every
+            // share 0, so the lowest id is the largest whatever the signed values are.
+            AllocationDTO? largestPosition =
+                allocations.Count == 0 ? null
+                : totalValue == 0
+                    ? allocations.MinBy(
+                        allocation => allocation.InstrumentId.ToString(),
+                        StringComparer.Ordinal
+                    )
+                : allocations[0];
             string? riskLevel = largestPosition is null
                 ? null
                 : RiskLevelFor(largestPosition.Percent);
@@ -306,5 +281,82 @@ namespace EasyTrade.BrokerService.Entities.Portfolio.Service
         {
             return trade.Direction is BuyDirection or LongBuyDirection;
         }
+
+        // Keeps one instrument's executed trades in replay order and sums them in that order, so
+        // every holding row of the instrument replays the same prepared trades.
+        private static ReplayTrades PrepareReplay(IEnumerable<Trade> instrumentTrades)
+        {
+            List<Trade> executed =
+            [
+                .. instrumentTrades
+                    .Where(IsExecuted)
+                    .OrderBy(trade => trade.TimestampOpen)
+                    .ThenBy(trade => trade.Id),
+            ];
+
+            decimal bought = 0;
+            decimal sold = 0;
+            foreach (Trade trade in executed)
+            {
+                if (IsBuy(trade))
+                {
+                    bought += trade.Quantity;
+                }
+                else
+                {
+                    sold += trade.Quantity;
+                }
+            }
+
+            return new ReplayTrades(executed, bought, sold);
+        }
+
+        // The average-cost replay of CalculateCostBasis over prepared trades: an opening lot of
+        // the quantity the trades do not explain, costed at the latest price, then each trade.
+        private static decimal ReplayCostBasis(
+            decimal quantity,
+            decimal latestPrice,
+            ReplayTrades replay
+        )
+        {
+            decimal units = Math.Max(0, quantity - replay.Bought + replay.Sold);
+            decimal cost = units * latestPrice;
+            foreach (Trade trade in replay.Executed)
+            {
+                if (IsBuy(trade))
+                {
+                    units += trade.Quantity;
+                    cost += trade.Quantity * trade.EntryPrice;
+                }
+                else if (units > 0)
+                {
+                    // Selling the whole lot zeroes the cost directly, leaving no decimal residue.
+                    if (trade.Quantity >= units)
+                    {
+                        units = 0;
+                        cost = 0;
+                    }
+                    else
+                    {
+                        cost -= (cost / units) * trade.Quantity;
+                        units -= trade.Quantity;
+                    }
+                }
+            }
+
+            if (units <= 0)
+            {
+                return quantity * latestPrice;
+            }
+
+            return units == quantity ? cost : (cost / units) * quantity;
+        }
+
+        // One instrument's executed trades in replay order, with the bought and sold totals.
+        private sealed record ReplayTrades(
+            IReadOnlyList<Trade> Executed,
+            decimal Bought,
+            decimal Sold
+        );
     }
 }

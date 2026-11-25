@@ -19,6 +19,7 @@ namespace EasyTrade.BrokerService.Test.UnitTests
             NewerTimestampWins,
             TiedTimestampGreaterClose,
             TiedTimestampAndCloseGreaterOpen,
+            FullTieKeepsFirst,
             Empty,
         }
 
@@ -26,6 +27,7 @@ namespace EasyTrade.BrokerService.Test.UnitTests
         [InlineData(SelectorCase.NewerTimestampWins)]
         [InlineData(SelectorCase.TiedTimestampGreaterClose)]
         [InlineData(SelectorCase.TiedTimestampAndCloseGreaterOpen)]
+        [InlineData(SelectorCase.FullTieKeepsFirst)]
         [InlineData(SelectorCase.Empty)]
         public void Select_Candles_ShouldApplyTieRule(SelectorCase selectorCase)
         {
@@ -43,8 +45,22 @@ namespace EasyTrade.BrokerService.Test.UnitTests
             }
         }
 
-        // Every non-empty case holds two instruments whose candles arrive in opposite orders, so
-        // each instrument gets its own winner and the winner does not depend on input order.
+        [Fact]
+        public void Select_NullCandles_ShouldThrowArgumentNullException()
+        {
+            // Arrange
+            IEnumerable<Price> candles = null!;
+
+            // Act & Assert
+            Assert.Throws<ArgumentNullException>(
+                "prices",
+                () => LatestPriceSelector.Select(candles)
+            );
+        }
+
+        // Every non-empty case holds two instruments. Where the rule ranks the candles, they arrive
+        // in opposite orders, so each instrument gets its own winner and the winner does not depend
+        // on input order. In the full tie nothing ranks them, so the first candle encountered wins.
         private static (Price[] Candles, Price[] Winners) BuildCase(SelectorCase selectorCase)
         {
             switch (selectorCase)
@@ -83,6 +99,18 @@ namespace EasyTrade.BrokerService.Test.UnitTests
                     return (
                         [firstLowOpen, firstHighOpen, secondHighOpen, secondLowOpen],
                         [firstHighOpen, secondHighOpen]
+                    );
+                }
+                case SelectorCase.FullTieKeepsFirst:
+                {
+                    // Distinct instances with equal timestamp, open and close.
+                    Price firstEarlier = Candle(FirstInstrumentId, Time, open: 4, close: 6);
+                    Price firstLater = Candle(FirstInstrumentId, Time, open: 4, close: 6);
+                    Price secondEarlier = Candle(SecondInstrumentId, Time, open: 4, close: 6);
+                    Price secondLater = Candle(SecondInstrumentId, Time, open: 4, close: 6);
+                    return (
+                        [firstEarlier, firstLater, secondEarlier, secondLater],
+                        [firstEarlier, secondEarlier]
                     );
                 }
                 case SelectorCase.Empty:
