@@ -22,3 +22,9 @@ service that fronts Postgres, MSSQL, or any other dialect its backend supports. 
 offers, generates price candles, and drives credit-card manufacture and delivery, while
 **loadgen** drives the public HTTP endpoints. A dedicated **feature-flag-service** holds
 the switches that turn each problem pattern on and off.
+It also holds the switch for **Portfolio Insights**, a simulated demo feature:
+**broker-service** computes portfolio figures and evaluates price and profit/loss alerts,
+and the frontend shows them on an `/insights` page. It is not financial advice. Its flag,
+`portfolio-insights-enabled`, is off by default.
+
+See [Portfolio insights (demo feature)](../README.md#portfolio-insights-demo-feature) for the walkthrough, flag, variables and endpoints.
