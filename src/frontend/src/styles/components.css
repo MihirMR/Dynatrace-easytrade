@@ -996,3 +996,9 @@ dialog::backdrop {
 .alert-notification:last-child {
     border-bottom: none;
 }
+
+/* Keyboard focus ring for the Portfolio Insights sidebar link */
+#nav-portfolio-insights:focus-visible {
+    outline: 2px solid var(--border-focus);
+    outline-offset: 2px;
+}
