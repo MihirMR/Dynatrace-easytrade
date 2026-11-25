@@ -14,37 +14,66 @@ const EXISTING_WEIGHT_VARIABLES = [
     "SELL_AND_WITHDRAW_SUCCESS_WEIGHT",
 ]
 const PORTFOLIO_WEIGHT_VARIABLE = "PORTFOLIO_INSIGHTS_ALERT_WEIGHT"
+const OTHER_CONFIG_VARIABLES = [
+    "CONCURRENCY",
+    "BROWSERS",
+    "BROWSER_TTL_MINUTES",
+    "LOG_LEVEL",
+    "RARE_VISITS_INTERVAL_MINUTES",
+    "HEADLESS_MODE",
+    "DEPOSIT_MIN_VALUE",
+    "DEPOSIT_MAX_VALUE",
+    "ASSET_SELL_RATIO",
+    "WITHDRAW_MIN_VALUE",
+    "TRANSACTION_MIN_DURATION",
+    "TRANSACTION_MAX_DURATION",
+    "EASYTRADE_URL",
+    "LOAD_TYPE",
+    "RATE_LIMIT_LEARN_TIME_FACTOR",
+    "NYSE_OFFHOURS_LOAD_FACTOR",
+    "RATE_LIMIT_TIMEFRAME_MINUTES",
+]
+/**
+ * Every variable getConfig() reads. Each test and subtest saves and resets all
+ * of them, so an inherited value cannot change its outcome, and restores only
+ * these afterwards. Saves are stacked because the hooks also run per subtest.
+ */
+const CONFIG_VARIABLES = [
+    ...OTHER_CONFIG_VARIABLES,
+    ...EXISTING_WEIGHT_VARIABLES,
+    PORTFOLIO_WEIGHT_VARIABLE,
+]
 
-let savedEnv: NodeJS.ProcessEnv = {}
+const savedEnvironments: Map<string, string | undefined>[] = []
 
-beforeEach(() => {
-    savedEnv = { ...process.env }
-    for (const name of [
-        ...EXISTING_WEIGHT_VARIABLES,
-        PORTFOLIO_WEIGHT_VARIABLE,
-    ]) {
+function resetConfigEnvironment() {
+    for (const name of CONFIG_VARIABLES) {
         delete process.env[name]
     }
     process.env.EASYTRADE_URL = "http://easytrade.test"
+}
+
+beforeEach(() => {
+    const savedEnv = new Map<string, string | undefined>()
+    for (const name of CONFIG_VARIABLES) {
+        savedEnv.set(name, process.env[name])
+    }
+    savedEnvironments.push(savedEnv)
+    resetConfigEnvironment()
 })
 
 afterEach(() => {
-    for (const name of Object.keys(process.env)) {
-        if (!(name in savedEnv)) {
+    for (const [name, value] of savedEnvironments.pop() ?? []) {
+        if (value === undefined) {
             delete process.env[name]
+        } else {
+            process.env[name] = value
         }
     }
-    Object.assign(process.env, savedEnv)
 })
 
 function setWeightEnvironment(variables: Record<string, string>) {
-    for (const name of [
-        ...EXISTING_WEIGHT_VARIABLES,
-        PORTFOLIO_WEIGHT_VARIABLE,
-    ]) {
-        delete process.env[name]
-    }
-    process.env.EASYTRADE_URL = "http://easytrade.test"
+    resetConfigEnvironment()
     Object.assign(process.env, variables)
 }
 
