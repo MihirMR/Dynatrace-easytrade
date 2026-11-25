@@ -258,6 +258,7 @@ test("run_flagOff_skipsBeforeGotoPage", async () => {
             pageCalls: [],
             requests: [FLAG_REQUEST],
             messages: [
+                "debug: Flag [portfolio-insights-enabled] is disabled",
                 "info: Flag [portfolio-insights-enabled] is off, skipping portfolio insights visit",
             ],
         }

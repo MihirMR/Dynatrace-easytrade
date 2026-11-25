@@ -21,6 +21,8 @@ const INSTRUMENT_ID = "3d0c7c9a-0f6e-4b8e-a7a1-2b6f1c9d8e70"
 const DELETE_OWN = `DELETE http://easytrade.test/broker-service/v1/alerts/${OWN_ID}`
 const UNREADABLE =
     "warn: Flag [portfolio-insights-enabled] unreadable, treating as disabled"
+const INVALID =
+    "warn: Flag [portfolio-insights-enabled] response invalid, treating as disabled"
 
 const OPTION_KEY =
     selectors.portfolioInsightsPage_alertInstrumentOption.toString()
@@ -42,10 +44,13 @@ const SUBMITTED_FORM = [
 ]
 const CREATED_OWN = `info: Created alert [${OWN_ID}] threshold [${MARKER}]`
 
+const pageError = new Error("Execution context was destroyed")
+const readError = new Error("Node is detached from document")
+
 type LogRecord = {
     level: string
     message: string
-    reason: unknown
+    body: unknown
     error: unknown
 }
 
@@ -56,7 +61,7 @@ function recordingLogger(): { logger: Logger; records: LogRecord[] } {
         records.push({
             level: info.level,
             message: String(info.message),
-            reason: info.reason,
+            body: info.body,
             error: info.error,
         })
         return info
@@ -133,6 +138,10 @@ type FakePage = {
     options?: { emptyPolls: number; values: string[] }
     /** selector key whose click fails */
     failingClick?: string
+    /** selector key whose input fails */
+    failingInput?: string
+    /** selector key -> property reads that fail before it answers */
+    failingReads?: Record<string, number>
 }
 
 type PageCall = { action: string; target: string; value?: string }
@@ -197,6 +206,12 @@ class FakePageActions implements IPageActions {
         propertyName: string
     ): Promise<Type> {
         const key = this.record("getProperty", selector, propertyName)
+        if (
+            this.count("getProperty", key) <=
+            (this.page.failingReads?.[key] ?? 0)
+        ) {
+            throw readError
+        }
         const properties = this.page.properties?.[key]
         if (properties === undefined || !(propertyName in properties)) {
             return unexpected(`getProperty ${propertyName} of ${key}`)
@@ -208,12 +223,15 @@ class FakePageActions implements IPageActions {
     async click(selector: ISelector): Promise<void> {
         const key = this.record("click", selector)
         if (key === this.page.failingClick) {
-            throw new Error("Execution context was destroyed")
+            throw pageError
         }
     }
 
     async input(selector: ISelector, value: string): Promise<void> {
-        this.record("input", selector, value)
+        const key = this.record("input", selector, value)
+        if (key === this.page.failingInput) {
+            throw pageError
+        }
     }
 
     async selectOption(selector: ISelector, option: string): Promise<void> {
@@ -314,6 +332,8 @@ function ownAlertPage(overrides: FakePage = {}): FakePage {
             ...overrides.properties,
         },
         failingClick: overrides.failingClick,
+        failingInput: overrides.failingInput,
+        failingReads: overrides.failingReads,
     }
 }
 
@@ -351,7 +371,20 @@ type FlagRow = {
     respond: (call: FetchCall) => Promise<Response>
     /** drives the mocked clock while the read is pending */
     whilePending?: (t: TestContext, call: FetchCall) => void
-    expected: { enabled: boolean; messages: string[]; reasons: unknown[] }
+    expected: { enabled: boolean; messages: string[]; meta: string[] }
+}
+
+/** What a log entry carries beside its message: the error, the body or none. */
+function describeMeta(record: LogRecord): string {
+    if (record.error !== undefined) {
+        return record.error instanceof Error
+            ? `error ${record.error.name}`
+            : `not an error object: ${String(record.error)}`
+    }
+    if (record.body !== undefined) {
+        return `body ${JSON.stringify(record.body)}`
+    }
+    return "none"
 }
 
 const networkError = new TypeError("fetch failed")
@@ -366,21 +399,27 @@ const flagRows: FlagRow[] = [
                 isModifiable: true,
                 tag: "feature",
             }),
-        expected: { enabled: true, messages: [], reasons: [] },
+        expected: { enabled: true, messages: [], meta: [] },
     },
     {
         name: "enabled false -> false",
         respond: () =>
             jsonResponse({ id: "portfolio-insights-enabled", enabled: false }),
-        expected: { enabled: false, messages: [], reasons: [] },
+        expected: {
+            enabled: false,
+            messages: ["debug: Flag [portfolio-insights-enabled] is disabled"],
+            meta: ["none"],
+        },
     },
     {
         name: "404 -> false, logged",
         respond: () => statusResponse(404),
         expected: {
             enabled: false,
-            messages: [UNREADABLE],
-            reasons: ["status"],
+            messages: [
+                "warn: Flag [portfolio-insights-enabled] read returned status [404], treating as disabled",
+            ],
+            meta: ["none"],
         },
     },
     {
@@ -389,7 +428,7 @@ const flagRows: FlagRow[] = [
         expected: {
             enabled: false,
             messages: [UNREADABLE],
-            reasons: ["error"],
+            meta: ["error TypeError"],
         },
     },
     {
@@ -398,8 +437,8 @@ const flagRows: FlagRow[] = [
             jsonResponse({ id: "portfolio-insights-enabled", enabled: "true" }),
         expected: {
             enabled: false,
-            messages: [UNREADABLE],
-            reasons: ["invalid_response"],
+            messages: [INVALID],
+            meta: ['body {"id":"portfolio-insights-enabled","enabled":"true"}'],
         },
     },
     {
@@ -408,8 +447,8 @@ const flagRows: FlagRow[] = [
             jsonResponse({ id: "portfolio_insights_enabled", enabled: true }),
         expected: {
             enabled: false,
-            messages: [UNREADABLE],
-            reasons: ["invalid_response"],
+            messages: [INVALID],
+            meta: ['body {"id":"portfolio_insights_enabled","enabled":true}'],
         },
     },
     {
@@ -419,7 +458,7 @@ const flagRows: FlagRow[] = [
         expected: {
             enabled: false,
             messages: [UNREADABLE],
-            reasons: ["error"],
+            meta: ["error SyntaxError"],
         },
     },
     {
@@ -433,7 +472,7 @@ const flagRows: FlagRow[] = [
         expected: {
             enabled: false,
             messages: [UNREADABLE],
-            reasons: ["timeout"],
+            meta: ["error AbortError"],
         },
     },
 ]
@@ -460,7 +499,7 @@ test("isPortfolioInsightsEnabled_response_mapsToBoolean", async (t) => {
                     messages: records.map(
                         (record) => `${record.level}: ${record.message}`
                     ),
-                    reasons: records.map((record) => record.reason),
+                    meta: records.map(describeMeta),
                 },
                 row.expected
             )
@@ -523,8 +562,6 @@ type AlertRow = {
         errors: string[]
     }
 }
-
-const pageError = new Error("Execution context was destroyed")
 
 const alertRows: AlertRow[] = [
     {
@@ -650,6 +687,23 @@ const alertRows: AlertRow[] = [
         },
     },
     {
+        name: "a created-id read that fails is retried, then confirmed",
+        page: ownAlertPage({ failingReads: { [createdKey(MARKER)]: 1 } }),
+        expected: {
+            outcome: { kind: "deleted", id: OWN_ID, via: "ui" },
+            form: SUBMITTED_FORM,
+            clicks: [SUBMIT_KEY, rowDeleteKey(OWN_ID)],
+            optionPolls: 1,
+            requests: [],
+            messages: [
+                `debug: Created alert output for threshold [${MARKER}] unreadable, retrying`,
+                CREATED_OWN,
+                `info: Deleted alert [${OWN_ID}] via ui`,
+            ],
+            errors: ["Error: Node is detached from document"],
+        },
+    },
+    {
         name: "a UI delete not confirmed before unmount is followed by an API DELETE (204)",
         page: ownAlertPage({
             present: { [deletedKey(OWN_ID)]: Number.POSITIVE_INFINITY },
@@ -704,7 +758,7 @@ const alertRows: AlertRow[] = [
         }),
         respond: () => statusResponse(status),
         expected: {
-            outcome: { kind: "left_in_place", id: OWN_ID, status },
+            outcome: { kind: "left_in_place", id: OWN_ID, status: `${status}` },
             form: SUBMITTED_FORM,
             clicks: [SUBMIT_KEY, rowDeleteKey(OWN_ID)],
             optionPolls: 1,
@@ -786,6 +840,22 @@ const alertRows: AlertRow[] = [
                 `warn: Create unconfirmed threshold [${MARKER}], outcome unknown`,
             ],
             errors: ["Error: Execution context was destroyed"],
+        },
+    },
+    {
+        name: "a page error before the submit propagates without an unknown-outcome line",
+        page: ownAlertPage({
+            failingInput:
+                selectors.portfolioInsightsPage_alertThreshold.toString(),
+        }),
+        rejects: pageError,
+        expected: {
+            form: SUBMITTED_FORM,
+            clicks: [],
+            optionPolls: 1,
+            requests: [],
+            messages: [],
+            errors: [],
         },
     },
     {

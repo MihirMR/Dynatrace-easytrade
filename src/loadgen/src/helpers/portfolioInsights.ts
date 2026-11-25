@@ -1,6 +1,10 @@
-import { createLoggerOptions } from "@demoability/loadgen-core/lib/logger"
-import { IPageActions } from "@demoability/loadgen-core/lib/pageActions"
-import { ISelector } from "@demoability/loadgen-core/lib/selectors"
+// The package root, as every loadgen helper imports loadgen-core (Guardrails:
+// follow the service's existing conventions), not its lib/ subpaths.
+import {
+    IPageActions,
+    ISelector,
+    createLoggerOptions,
+} from "@demoability/loadgen-core"
 import { Logger, createLogger } from "winston"
 import { selectors } from "../selectors"
 import { gotoPageWithNavBar } from "./common"
@@ -11,18 +15,14 @@ export const FLAG_PATH =
 export const ALERTS_API_PATH = "/broker-service/v1/alerts/"
 export const MAX_PRESENCE_CHECKS = 20
 
+/** `status` is the HTTP status as text, or `timeout` / `error`. */
 export type OwnedAlertOutcome =
     | { kind: "not_submitted" }
     | { kind: "unconfirmed"; marker: string }
     | { kind: "deleted"; id: string; via: "ui" | "api" }
     | { kind: "absent"; id: string }
-    | {
-          kind: "left_in_place"
-          id: string
-          status: number | "timeout" | "error"
-      }
+    | { kind: "left_in_place"; id: string; status: string }
 
-const FLAG_UNREADABLE_MESSAGE = `Flag [${PORTFOLIO_INSIGHTS_FLAG_ID}] unreadable, treating as disabled`
 const MARKER_PREFIX = "1000000."
 const MARKER_RANDOM_DIGITS = 7
 const UUID_PATTERN =
@@ -45,15 +45,19 @@ function isFlagResponse(value: unknown): value is FlagResponse {
 }
 
 /**
- * Reads the portfolio-insights-enabled flag once, fail-closed.
- * Only a 200 carrying this flag's id and a boolean `enabled` counts as an
- * answer; every other outcome, the deadline abort included, is logged and
- * read as disabled.
+ * Reads the portfolio-insights-enabled flag once, fail-closed: only a 200
+ * whose body carries this flag's id and a boolean `enabled` counts as an
+ * answer.
+ *
+ * This is the one place loadgen turns an error into a value instead of
+ * propagating it (the documented exception to .claude/rules/typescript.md):
+ * the feature defines an unreachable flag service as disabled, so every other
+ * outcome, the deadline abort included, is logged in full and read as false.
  *
  * @param url EasyTrade base url
  * @param fetchFn fetch implementation
  * @param timeoutMs abort deadline of the whole read
- * @param logger logger receiving the unreadable outcomes
+ * @param logger logger receiving the read's outcomes
  */
 export async function isPortfolioInsightsEnabled(
     url: URL,
@@ -62,38 +66,50 @@ export async function isPortfolioInsightsEnabled(
     logger: Logger = fallbackLogger
 ): Promise<boolean> {
     const controller = new AbortController()
+    // Armed before the first await, through the global setTimeout looked up at
+    // call time, so a mocked clock drives the deadline.
     const deadline = setTimeout(() => controller.abort(), timeoutMs)
     try {
         const response = await fetchFn(new URL(FLAG_PATH, url), {
+            method: "GET",
             signal: controller.signal,
+            headers: { accept: "application/json" },
         })
         if (response.status !== 200) {
-            logger.warn(FLAG_UNREADABLE_MESSAGE, {
-                reason: "status",
-                status: response.status,
-            })
+            logger.warn(
+                `Flag [portfolio-insights-enabled] read returned status [${response.status}], treating as disabled`
+            )
             return false
         }
         const body: unknown = await response.json()
         if (!isFlagResponse(body)) {
-            logger.warn(FLAG_UNREADABLE_MESSAGE, {
-                reason: "invalid_response",
-                body,
-            })
+            logger.warn(
+                "Flag [portfolio-insights-enabled] response invalid, treating as disabled",
+                { body }
+            )
             return false
+        }
+        if (!body.enabled) {
+            logger.debug("Flag [portfolio-insights-enabled] is disabled")
         }
         return body.enabled
     } catch (error) {
-        logger.warn(FLAG_UNREADABLE_MESSAGE, {
-            reason: controller.signal.aborted ? "timeout" : "error",
-            error,
-        })
+        logger.warn(
+            "Flag [portfolio-insights-enabled] unreadable, treating as disabled",
+            { error }
+        )
         return false
     } finally {
         clearTimeout(deadline)
     }
 }
 
+/**
+ * Assumes user is logged in on any protected page.
+ * Endpoint Portfolio Insights page (/insights).
+ *
+ * @param pageActions
+ */
 export async function gotoPortfolioInsightsPage(
     pageActions: IPageActions
 ): Promise<void> {
@@ -104,10 +120,13 @@ export async function gotoPortfolioInsightsPage(
 }
 
 /**
- * Assumes starting point on the portfolio insights page.
+ * Assumes starting point Portfolio Insights page.
+ * Endpoint Portfolio Insights page.
+ *
  * Creates one alert, confirms its id from the created-id output and deletes
  * only that id: through its own row, or through the broker REST API when the
- * UI deletion is not confirmed.
+ * UI deletion is not confirmed. It never touches an alert it did not create,
+ * so visits sharing one preset user cannot disturb each other.
  *
  * @param pageActions
  * @param url EasyTrade base url
@@ -135,11 +154,14 @@ export async function createAndDeleteOwnedAlert(
     }
 
     const marker = createMarker(random)
+    await fillAlertForm(pageActions, instrumentId, marker)
     let id: string | undefined
     try {
-        await submitAlert(pageActions, instrumentId, marker)
-        id = await confirmCreatedAlert(pageActions, marker)
+        await pageActions.click(selectors.portfolioInsightsPage_alertSubmit)
+        id = await readCreatedAlertId(pageActions, marker, logger)
     } catch (error) {
+        // From the submit click on, the alert may exist, so the marker is
+        // logged for an operator to find it; the error still fails the visit.
         logger.warn(unconfirmedMessage(marker), { error })
         throw error
     }
@@ -243,7 +265,7 @@ function createMarker(random: () => number): string {
     return `${MARKER_PREFIX}${digits}${randomDigit(random, 1)}`
 }
 
-async function submitAlert(
+async function fillAlertForm(
     pageActions: IPageActions,
     instrumentId: string,
     marker: string
@@ -268,22 +290,43 @@ async function submitAlert(
         marker
     )
     await pageActions.shortDelay()
-    await pageActions.click(selectors.portfolioInsightsPage_alertSubmit)
 }
 
 /**
- * Returns the id carried by the created-id output of this marker, read from
- * its value and, failing that, from its value attribute; undefined when the
- * output never appears or carries no UUID.
+ * Polls the created-id output of this marker within the presence budget and
+ * returns the id it carries; undefined when it never shows a UUID. A read
+ * that throws, or yields no UUID, counts as not yet confirmed.
  */
-async function confirmCreatedAlert(
+async function readCreatedAlertId(
     pageActions: IPageActions,
-    marker: string
+    marker: string,
+    logger: Logger
 ): Promise<string | undefined> {
     const output = selectors.portfolioInsightsPage_createdAlert(marker)
-    if (!(await waitForPresence(pageActions, output))) {
-        return undefined
-    }
+    return await pollBounded(pageActions, async () => {
+        if (!(await pageActions.isSelectorPresent(output))) {
+            return undefined
+        }
+        try {
+            return await readAlertId(pageActions, output)
+        } catch (error) {
+            logger.debug(
+                `Created alert output for threshold [${marker}] unreadable, retrying`,
+                { error }
+            )
+            return undefined
+        }
+    })
+}
+
+/**
+ * Reads the id from the output's value and, failing that, from its value
+ * attribute.
+ */
+async function readAlertId(
+    pageActions: IPageActions,
+    output: ISelector
+): Promise<string | undefined> {
     const value = await pageActions.getProperty<unknown>(output, "value")
     if (typeof value === "string" && UUID_PATTERN.test(value.trim())) {
         return value.trim()
@@ -350,8 +393,9 @@ async function deleteThroughApi(
             logger.info(`Alert [${id}] already absent`)
             return { kind: "absent", id }
         }
-        logger.warn(`Alert [${id}] left in place: ${response.status}`)
-        return { kind: "left_in_place", id, status: response.status }
+        const status = String(response.status)
+        logger.warn(`Alert [${id}] left in place: ${status}`)
+        return { kind: "left_in_place", id, status }
     } catch (error) {
         const status = controller.signal.aborted ? "timeout" : "error"
         logger.warn(`Alert [${id}] left in place: ${status}`, { error })
