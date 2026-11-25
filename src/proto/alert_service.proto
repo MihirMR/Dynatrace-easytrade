@@ -72,6 +72,7 @@ message TriggerAlertResponse {
 service AlertService {
   // Insert an armed alert (enabled = true, arming_revision = 1, acknowledged = false)
   // The database generates the id and the adapter stamps created_at
+  // NotFound when account_id or instrument_id names no row
   rpc CreateAlert(CreateAlertRequest) returns (AlertMessage) {}
 
   // Get alerts filtered as flagged, ordered by created_at DESC, id DESC (triggered_at DESC with triggered_only)

@@ -809,9 +809,10 @@ func TestAlertStatus_repositoryError_mappedStatus(t *testing.T) {
 		{"nil", nil, codes.OK, ""},
 		{"statusKept", invalid, codes.InvalidArgument, "id is not a valid UUID"},
 		{"notFound", fmt.Errorf("trigger: %w", repository.ErrNotFound), codes.NotFound, "not found"},
+		{"referenceNotFound", fmt.Errorf("%w: %s", repository.ErrAlertReferenceNotFound, testSecret), codes.NotFound, "account or instrument not found"},
 		{"canceled", fmt.Errorf("query: %w", context.Canceled), codes.Canceled, context.Canceled.Error()},
 		{"deadlineExceeded", fmt.Errorf("query: %w", context.DeadlineExceeded), codes.DeadlineExceeded, context.DeadlineExceeded.Error()},
-		{"storageFailure", errors.New("alert storage failure: SQLSTATE 23503"), codes.Internal, "alert storage failure"},
+		{"storageFailure", errors.New("alert storage failure: SQLSTATE 08006"), codes.Internal, "alert storage failure"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -824,21 +825,56 @@ func TestAlertStatus_repositoryError_mappedStatus(t *testing.T) {
 	}
 }
 
-// Only a storage failure is logged, once, with the error the repository returned
-func TestAlertStatus_storageFailure_loggedOnce(t *testing.T) {
-	std := log.StandardLogger()
-	hook := new(logtest.Hook)
-	previous := std.ReplaceHooks(log.LevelHooks{})
-	std.AddHook(hook)
-	t.Cleanup(func() { std.ReplaceHooks(previous) })
-	storageErr := errors.New("alert storage failure: connection failure")
-
-	for _, err := range []error{storageErr, repository.ErrNotFound, context.Canceled, status.Error(codes.NotFound, "not found")} {
-		_ = alertStatus(err)
+// A storage failure is logged once as an error and an unknown account or instrument once as a
+// warning, each with the error the repository returned; no other outcome is logged
+func TestAlertStatus_repositoryError_loggedOnceAtLevel(t *testing.T) {
+	type logEntry struct {
+		level log.Level
+		msg   string
+		err   any
 	}
+	storageErr := errors.New("alert storage failure: connection failure")
+	referenceErr := fmt.Errorf("%w: SQLSTATE 23503", repository.ErrAlertReferenceNotFound)
+	cases := []struct {
+		name string
+		err  error
+		want []logEntry
+	}{
+		{"storageFailure", storageErr, []logEntry{{log.ErrorLevel, "Alert storage call failed", storageErr}}},
+		{"referenceNotFound", referenceErr, []logEntry{{log.WarnLevel, "Alert references an unknown account or instrument", referenceErr}}},
+		{"notFound", repository.ErrNotFound, nil},
+		{"canceled", context.Canceled, nil},
+		{"statusKept", status.Error(codes.NotFound, "not found"), nil},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			std := log.StandardLogger()
+			hook := new(logtest.Hook)
+			previous := std.ReplaceHooks(log.LevelHooks{})
+			std.AddHook(hook)
+			t.Cleanup(func() { std.ReplaceHooks(previous) })
 
-	entries := hook.AllEntries()
-	if len(entries) != 1 || entries[0].Level != log.ErrorLevel || entries[0].Message != "Alert storage call failed" || entries[0].Data[log.ErrorKey] != storageErr {
-		t.Errorf("logged %d entries %v, want one Error entry for %v", len(entries), entries, storageErr)
+			_ = alertStatus(tc.err)
+
+			var got []logEntry
+			for _, entry := range hook.AllEntries() {
+				got = append(got, logEntry{entry.Level, entry.Message, entry.Data[log.ErrorKey]})
+			}
+			if !slices.Equal(got, tc.want) {
+				t.Errorf("alertStatus(%v) logged %v, want %v", tc.err, got, tc.want)
+			}
+		})
+	}
+}
+
+// An account or instrument id that names no row reaches the caller as NotFound with a fixed message
+func TestCreateAlert_unknownReference_notFoundWithoutDetails(t *testing.T) {
+	referenceErr := fmt.Errorf("%w: %s", repository.ErrAlertReferenceNotFound, testSecret)
+	srv := NewAlertServer(&fakeAlertRepository{err: referenceErr})
+
+	_, err := srv.CreateAlert(t.Context(), createRequest(func(*pb.CreateAlertRequest) {}))
+
+	if st := status.Convert(err); st.Code() != codes.NotFound || st.Message() != "account or instrument not found" {
+		t.Errorf("CreateAlert with an unknown reference = %v %q, want NotFound %q", st.Code(), st.Message(), "account or instrument not found")
 	}
 }

@@ -437,6 +437,78 @@ func TestAlertRepository_decimalBoundaries_roundTripExact(t *testing.T) {
 	}
 }
 
+// The RPC pattern accepts "-0" for PROFIT_LOSS and the adapter binds it unchanged; the reply to Create
+// and every later read must both give the canonical "0"
+func TestAlertRepository_createNegativeZeroThreshold_canonicalZero(t *testing.T) {
+	repo := alertTestBackend(t).Alert()
+
+	created := createTestAlert(t, repo, repository.AlertTypeProfitLoss, repository.AlertDirectionBelow, "-0")
+
+	read := getTestAlert(t, repo, created.Id)
+	if created.Threshold != "0" || read.Threshold != "0" {
+		t.Errorf("Threshold from Create %q and GetByID %q, want both %q", created.Threshold, read.Threshold, "0")
+	}
+}
+
+// utcInstant reports whether got is want's instant, to the nanosecond, in the UTC location itself
+func utcInstant(got, want time.Time) bool { return got.Location() == time.UTC && got.Equal(want) }
+
+// pgx gives a scanned timestamptz the process zone, time.Local, and go-mssqldb gives a datetimeoffset
+// its stored offset. Both are made non-UTC here, so only the alert read path can return UTC. Setting
+// time.Local is why this test must not run in parallel with another
+func TestAlertRepository_readInNonUTCZone_timestampsUTC(t *testing.T) {
+	repo := alertTestBackend(t).Alert()
+	session := repo.(*AlertRepository).db
+	ctx := context.Background()
+	processLocal := time.Local
+	time.Local = time.FixedZone("UTC+05:30", 5*60*60+30*60)
+	t.Cleanup(func() { time.Local = processLocal })
+
+	alert := createArmedTestAlert(t, repo)
+	wantCreatedAt := alert.CreatedAt.AsTime()
+	// The trigger statement with a known instant in a third zone, at the microseconds both columns hold
+	wantTriggeredAt := time.Date(2025, time.March, 30, 1, 2, 3, 456789000, time.FixedZone("UTC-03:30", -(3*60*60+30*60)))
+	res := session.WithContext(ctx).Exec(alertTriggerSQL,
+		wantTriggeredAt, decimalText{Text: "5", Valid: true}, false, alert.Id, alert.ArmingRevision, true)
+	if res.Error != nil || res.RowsAffected != 1 {
+		t.Fatalf("trigger at %v = (%d rows, %v), want (1 row, nil)", wantTriggeredAt, res.RowsAffected, res.Error)
+	}
+
+	byID := func() *gorm.DB { return session.WithContext(ctx).Where(q(repository.ColID)+" = ?", alert.Id) }
+	model := func(a *Alert) *Alert { return a }
+	reads := []struct {
+		name string
+		read func() (*Alert, error)
+	}{
+		// GetByID and UpdateEnabled's in-transaction snapshot read one row through First
+		{"first", func() (*Alert, error) { return firstOptional(byID(), model) }},
+		// List reads its rows through Find
+		{"find", func() (*Alert, error) {
+			alerts, err := findAndMapAll(byID(), model)
+			if err != nil {
+				return nil, err
+			}
+			if len(alerts) != 1 {
+				return nil, fmt.Errorf("found %d rows, want 1", len(alerts))
+			}
+			return alerts[0], nil
+		}},
+	}
+	for _, tc := range reads {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := tc.read()
+			if err != nil {
+				t.Fatalf("reading alert %s: %v", alert.Id, err)
+			}
+
+			if !utcInstant(got.CreatedAt, wantCreatedAt) || got.TriggeredAt == nil || !utcInstant(*got.TriggeredAt, wantTriggeredAt) {
+				t.Errorf("read CreatedAt %v and TriggeredAt %v, want %v and %v, both in UTC",
+					got.CreatedAt, got.TriggeredAt, wantCreatedAt.UTC(), wantTriggeredAt.UTC())
+			}
+		})
+	}
+}
+
 func TestAlertRepository_list_newestFirst(t *testing.T) {
 	repo := alertTestBackend(t).Alert()
 
@@ -752,6 +824,119 @@ func TestAlertRepository_inexactEnum_rejectedByCheck(t *testing.T) {
 	}
 }
 
+// insertRawAlertValues inserts, as insertRawAlert does, an alert on the seeded owner account and
+// instrument with a plain INSERT and deletes it by id when the test ends. It also binds Threshold,
+// TriggerValue, CreatedAt and TriggeredAt, each exactly as values gives it: text reaches the
+// column's own input conversion, as a direct SQL write's literal does, so only the table's types and
+// constraints judge values such as NaN and infinity.
+func insertRawAlertValues(t *testing.T, b *sqlBackend, id string, values map[string]any) error {
+	t.Helper()
+	deleteAlertAtCleanup(t, b.Alert(), id)
+	columns := []string{
+		repository.ColID, repository.ColAccountID, repository.ColType, repository.ColInstrumentID,
+		repository.ColDirection, repository.ColEnabled, repository.ColArmingRevision, repository.ColAcknowledged,
+	}
+	args := []any{
+		id, testOwnerAccountID, repository.AlertTypeTargetPrice, testInstrumentID,
+		repository.AlertDirectionAbove, true, 1, false,
+	}
+	for _, column := range []string{
+		repository.ColThreshold, repository.ColTriggerValue, repository.ColCreatedAt, repository.ColTriggeredAt,
+	} {
+		value, ok := values[column]
+		if !ok {
+			t.Fatalf("insertRawAlertValues: no value for %s", column)
+		}
+		columns = append(columns, column)
+		args = append(args, value)
+	}
+	quoted := make([]string, len(columns))
+	placeholders := make([]string, len(columns))
+	for i, column := range columns {
+		quoted[i] = q(column)
+		placeholders[i] = "?"
+	}
+	insertSQL := "INSERT INTO " + q(repository.TableAlerts) + " (" + strings.Join(quoted, ", ") + ")" +
+		" VALUES (" + strings.Join(placeholders, ", ") + ")"
+	return b.gormDB.WithContext(context.Background()).Exec(insertSQL, args...).Error
+}
+
+// PostgreSQL's numeric admits NaN and its timestamptz admits infinity and -infinity, which SQL
+// Server's DECIMAL and datetimeoffset refuse. A direct write of one must fail on both dialects, so
+// neither stores a value outside the one domain the adapter and the broker read
+func TestAlertRepository_nonFiniteValue_rejectedByDatabase(t *testing.T) {
+	b := alertTestBackend(t)
+	// ISO 8601 with microseconds, which timestamptz and datetimeoffset(6) both parse from text
+	const timestampLayout = "2006-01-02T15:04:05.000000Z07:00"
+	createdAt := alertNow()
+	triggeredAt := createdAt.Add(time.Second)
+	// Every value is bound as text, as a direct SQL write sends it. Each case below replaces exactly
+	// one of these finite values, so its rejection is that value's alone
+	finite := func() map[string]any {
+		return map[string]any{
+			repository.ColThreshold:    "1",
+			repository.ColTriggerValue: "5",
+			repository.ColCreatedAt:    createdAt.Format(timestampLayout),
+			repository.ColTriggeredAt:  triggeredAt.Format(timestampLayout),
+		}
+	}
+
+	t.Run("finiteValuesControl", func(t *testing.T) {
+		id := uuid.New().String()
+
+		if err := insertRawAlertValues(t, b, id, finite()); err != nil {
+			t.Fatalf("insert of finite values: %v", err)
+		}
+		got := getTestAlert(t, b.Alert(), id)
+		if got.Threshold != "1" || got.TriggerValue != "5" ||
+			!got.CreatedAt.AsTime().Equal(createdAt) || !got.TriggeredAt.AsTime().Equal(triggeredAt) {
+			t.Errorf("stored Threshold %q TriggerValue %q CreatedAt %v TriggeredAt %v, want %q %q %v %v",
+				got.Threshold, got.TriggerValue, got.CreatedAt.AsTime(), got.TriggeredAt.AsTime(),
+				"1", "5", createdAt, triggeredAt)
+		}
+	})
+
+	// PostgreSQL refuses each value through its column's CHECK. SQL Server refuses the text while
+	// converting it to the column's type, before any CHECK runs
+	rejected := []struct {
+		column      string
+		value       string
+		mssqlNumber int32
+		mssqlText   string
+	}{
+		{repository.ColThreshold, "NaN", 8114, "to numeric"},
+		{repository.ColTriggerValue, "NaN", 8114, "to numeric"},
+		{repository.ColCreatedAt, "infinity", 241, "date and/or time"},
+		{repository.ColTriggeredAt, "-infinity", 241, "date and/or time"},
+	}
+	for _, tc := range rejected {
+		t.Run(tc.column+"_"+tc.value, func(t *testing.T) {
+			values := finite()
+			values[tc.column] = tc.value
+			id := uuid.New().String()
+
+			err := insertRawAlertValues(t, b, id, values)
+
+			check := checkViolation(tc.column)
+			want := dialectError{
+				name:         fmt.Sprintf("%s or SQL Server conversion error %d", check.name, tc.mssqlNumber),
+				pgStates:     check.pgStates,
+				pgText:       check.pgText,
+				mssqlNumbers: []int32{tc.mssqlNumber},
+				mssqlText:    []string{tc.mssqlText},
+			}
+			if !want.matches(err) {
+				t.Errorf("insert of %s %q: err = %v, want the %s", tc.column, tc.value, err, want.name)
+			}
+			var stored int64
+			countSQL := "SELECT COUNT(*) FROM " + q(repository.TableAlerts) + " WHERE " + q(repository.ColID) + " = ?"
+			if err := b.gormDB.WithContext(context.Background()).Raw(countSQL, id).Scan(&stored).Error; err != nil || stored != 0 {
+				t.Errorf("rows with id %s after the rejected insert = (%d, %v), want (0, nil)", id, stored, err)
+			}
+		})
+	}
+}
+
 func TestAlertRepository_cancelledContext_errorPropagated(t *testing.T) {
 	repo := alertTestBackend(t).Alert()
 
@@ -829,28 +1014,178 @@ func TestAlertRepository_cancelledContext_errorPropagated(t *testing.T) {
 	}
 }
 
-func TestAlertRepository_createUnknownAccount_foreignKeyViolation(t *testing.T) {
-	repo := alertTestBackend(t).Alert()
-	ctx := context.Background()
-	accountID := uuid.New().String()
+// unknownAlertReferences are well-formed create requests whose account or instrument id names no row,
+// each with the foreign key that refuses it
+var unknownAlertReferences = []struct {
+	name       string
+	req        *pb.CreateAlertRequest
+	constraint string
+}{
+	{"unknownAccount", unknownReferenceRequest(uuid.NewString(), testInstrumentID), "FK_Alerts_Accounts"},
+	{"unknownInstrument", unknownReferenceRequest(testOwnerAccountID, uuid.NewString()), "FK_Alerts_Instruments"},
+	{"nilUUIDAccount", unknownReferenceRequest(uuid.Nil.String(), testInstrumentID), "FK_Alerts_Accounts"},
+}
 
-	alert, err := repo.Create(ctx, &pb.CreateAlertRequest{
+func unknownReferenceRequest(accountID, instrumentID string) *pb.CreateAlertRequest {
+	return &pb.CreateAlertRequest{
 		AccountId:    accountID,
 		Type:         repository.AlertTypeTargetPrice,
-		InstrumentId: testInstrumentID,
+		InstrumentId: instrumentID,
 		Direction:    repository.AlertDirectionAbove,
 		Threshold:    "1",
-	})
+	}
+}
 
-	if alert != nil {
-		deleteAlertAtCleanup(t, repo, alert.Id)
-		t.Errorf("Create(unknown account) returned %v, want nil", alert)
+// storedWithReferences lists the alerts of req's account that carry req's instrument
+func storedWithReferences(t *testing.T, repo repository.AlertRepository, req *pb.CreateAlertRequest) []*pb.AlertMessage {
+	t.Helper()
+	alerts, err := repo.List(context.Background(), &pb.ListAlertsRequest{AccountId: req.AccountId})
+	if err != nil {
+		t.Fatalf("List(%s): %v", req.AccountId, err)
 	}
-	if want := foreignKeyViolation("FK_Alerts_Accounts"); !want.matches(err) {
-		t.Errorf("Create(unknown account): err = %v, want the %s", err, want.name)
+	var stored []*pb.AlertMessage
+	for _, alert := range alerts {
+		if alert.InstrumentId == req.InstrumentId {
+			stored = append(stored, alert)
+		}
 	}
-	if stored, err := repo.List(ctx, &pb.ListAlertsRequest{AccountId: accountID}); err != nil || len(stored) != 0 {
-		t.Errorf("List(unknown account) = (%v, %v), want no rows", stored, err)
+	return stored
+}
+
+// The foreign key refuses the row; the error matches ErrAlertReferenceNotFound, keeps the driver's
+// violation reachable and prints neither the constraint nor any other driver text
+func TestAlertRepository_createUnknownReference_referenceNotFound(t *testing.T) {
+	repo := alertTestBackend(t).Alert()
+	for _, ref := range unknownAlertReferences {
+		t.Run(ref.name, func(t *testing.T) {
+			alert, err := repo.Create(context.Background(), ref.req)
+
+			if alert != nil {
+				deleteAlertAtCleanup(t, repo, alert.Id)
+				t.Errorf("Create(%s) returned %v, want nil", ref.name, alert)
+			}
+			want := foreignKeyViolation(ref.constraint)
+			if !errors.Is(err, repository.ErrAlertReferenceNotFound) || !want.matches(err) || strings.Contains(err.Error(), ref.constraint) {
+				t.Errorf("Create(%s): err = %v, want ErrAlertReferenceNotFound with the %s reachable and unprinted", ref.name, err, want.name)
+			}
+			if stored := storedWithReferences(t, repo, ref.req); len(stored) != 0 {
+				t.Errorf("Create(%s) stored %v, want no row", ref.name, stored)
+			}
+		})
+	}
+}
+
+// The real handler over the real backend: an account or instrument that names no row is NotFound
+// with a fixed message, and nothing is stored
+func TestAlertServer_createUnknownReference_notFound(t *testing.T) {
+	repo := alertTestBackend(t).Alert()
+	srv := server.NewAlertServer(repo)
+	for _, ref := range unknownAlertReferences {
+		t.Run(ref.name, func(t *testing.T) {
+			created, err := srv.CreateAlert(context.Background(), ref.req)
+
+			if created != nil {
+				deleteAlertAtCleanup(t, repo, created.Id)
+			}
+			if st := status.Convert(err); st.Code() != codes.NotFound || st.Message() != "account or instrument not found" {
+				t.Errorf("CreateAlert(%s) = %v %q, want NotFound %q", ref.name, st.Code(), st.Message(), "account or instrument not found")
+			}
+			if stored := storedWithReferences(t, repo, ref.req); len(stored) != 0 {
+				t.Errorf("CreateAlert(%s) stored %v, want no row", ref.name, stored)
+			}
+		})
+	}
+}
+
+// mssqlMessageError adds the message go-mssqldb's Error gives beside its number
+type mssqlMessageError interface {
+	mssqlDriverError
+	SQLErrorMessage() string
+}
+
+// The fixed wording of SQL Server's English message for error 547; no other language uses it
+const mssqlEnglishConflictWording = "statement conflicted with the"
+
+// setLanguageSQL is SET LANGUAGE with the name as a Unicode literal, its quotes doubled
+func setLanguageSQL(language string) string {
+	return "SET LANGUAGE N'" + strings.ReplaceAll(language, "'", "''") + "'"
+}
+
+// inSessionLanguage runs fn on one pooled SQL Server connection set to language, then gives the
+// connection back in the language it had. Both SET LANGUAGE statements carry no parameters, so
+// go-mssqldb sends each as a plain batch and the setting holds for the session; inside
+// sp_executesql it would end with the call. A connection whose language cannot be restored is
+// discarded instead of returned to the pool, where the other tests expect English messages
+func inSessionLanguage(t *testing.T, b *sqlBackend, language string, fn func(session *gorm.DB)) {
+	t.Helper()
+	err := b.gormDB.WithContext(context.Background()).Connection(func(tx *gorm.DB) error {
+		// Every statement through session gets a fresh statement on the pinned connection
+		session := tx.Session(&gorm.Session{NewDB: true})
+		var original string
+		if err := session.Raw("SELECT @@LANGUAGE").Scan(&original).Error; err != nil {
+			return fmt.Errorf("reading the session language: %w", err)
+		}
+		defer func() {
+			if err := session.Exec(setLanguageSQL(original)).Error; err != nil {
+				t.Errorf("restoring session language %s: %v; discarding the connection", original, err)
+				if conn, ok := tx.Statement.ConnPool.(*dbsql.Conn); ok {
+					// ErrBadConn from Raw makes database/sql close the connection rather than pool it
+					_ = conn.Raw(func(any) error { return driver.ErrBadConn })
+				}
+			}
+		}()
+		if err := session.Exec(setLanguageSQL(language)).Error; err != nil {
+			return fmt.Errorf("setting session language %s: %w", language, err)
+		}
+		var current string
+		if err := session.Raw("SELECT @@LANGUAGE").Scan(&current).Error; err != nil || current != language {
+			return fmt.Errorf("session language after setting %s = (%q, %v), want %q", language, current, err, language)
+		}
+		fn(session)
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("on a connection in session language %s: %v", language, err)
+	}
+}
+
+// SQL Server words error 547 in the session language, and a foreign-key conflict is still an unknown
+// reference in every one. Each language delimits the constraint name differently: German quotes it,
+// Dutch leaves it bare and Hungarian uses „”
+func TestAlertRepository_createUnknownReferenceLocalizedSession_referenceNotFound(t *testing.T) {
+	b := alertTestBackend(t)
+	if dialect := b.gormDB.Dialector.Name(); dialect != "sqlserver" {
+		t.Skipf("%s reports every foreign-key violation as SQLSTATE 23503 whatever lc_messages says; only SQL Server's error 547 needs its message to tell a foreign key from a CHECK", dialect)
+	}
+	for _, language := range []string{"Deutsch", "Nederlands", "magyar"} {
+		t.Run(language, func(t *testing.T) {
+			inSessionLanguage(t, b, language, func(session *gorm.DB) {
+				repo := NewAlertRepository(session)
+				for _, ref := range unknownAlertReferences {
+					t.Run(ref.name, func(t *testing.T) {
+						alert, err := repo.Create(context.Background(), ref.req)
+
+						if alert != nil {
+							deleteAlertAtCleanup(t, b.Alert(), alert.Id)
+							t.Errorf("Create(%s) returned %v, want nil", ref.name, alert)
+						}
+						// The driver's own message proves the session's wording is not English
+						var driverErr mssqlMessageError
+						if !errors.As(err, &driverErr) || driverErr.SQLErrorNumber() != 547 ||
+							!strings.Contains(driverErr.SQLErrorMessage(), ref.constraint) ||
+							strings.Contains(driverErr.SQLErrorMessage(), mssqlEnglishConflictWording) {
+							t.Fatalf("Create(%s): err = %v, want SQL Server error 547 naming %s in %s wording", ref.name, err, ref.constraint, language)
+						}
+						if !errors.Is(err, repository.ErrAlertReferenceNotFound) || strings.Contains(err.Error(), ref.constraint) {
+							t.Errorf("Create(%s): err = %q, want ErrAlertReferenceNotFound without the constraint name", ref.name, err)
+						}
+						if stored := storedWithReferences(t, b.Alert(), ref.req); len(stored) != 0 {
+							t.Errorf("Create(%s) stored %v, want no row", ref.name, stored)
+						}
+					})
+				}
+			})
+		})
 	}
 }
 
@@ -1386,6 +1721,76 @@ func TestDecimalTextValue_validity_textOrNil(t *testing.T) {
 	}
 }
 
+func TestAlertToProto_decimalText_canonicalWireForm(t *testing.T) {
+	cases := []struct {
+		name string
+		text string
+		want string
+	}{
+		// The one accepted spelling that is not canonical: both RPC patterns admit it, a read gives "0"
+		{"acceptedNegativeZero", "-0", "0"},
+		{"zero", "0", "0"},
+		{"fraction", "1.5", "1.5"},
+		{"negativeFraction", "-0.5", "-0.5"},
+		{"smallestStep", "0.00000001", "0.00000001"},
+		{"negativeTenIntegerDigits", "-9999999999.99999999", "-9999999999.99999999"},
+		{"twentyIntegerDigits", "99999999999999999999.99999999", "99999999999999999999.99999999"},
+	}
+	for _, tc := range cases {
+		t.Run("threshold/"+tc.name, func(t *testing.T) {
+			// The model Create builds from the request and replies from
+			created := alertCreateFromProto(&pb.CreateAlertRequest{
+				AccountId:    testOwnerAccountID,
+				Type:         repository.AlertTypeProfitLoss,
+				InstrumentId: testInstrumentID,
+				Direction:    repository.AlertDirectionBelow,
+				Threshold:    tc.text,
+			}, alertNow())
+
+			if got := created.toProto().Threshold; got != tc.want {
+				t.Errorf("toProto().Threshold for request threshold %q = %q, want %q", tc.text, got, tc.want)
+			}
+		})
+		t.Run("triggerValue/"+tc.name, func(t *testing.T) {
+			triggered := &Alert{TriggerValue: decimalText{Text: tc.text, Valid: true}}
+
+			if got := triggered.toProto().TriggerValue; got != tc.want {
+				t.Errorf("toProto().TriggerValue for %q = %q, want %q", tc.text, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestAlertAfterFind_driverLocation_utcSameInstant(t *testing.T) {
+	// The locations the drivers scan into: a fixed offset (go-mssqldb) and the process zone (pgx)
+	createdAt := time.Date(2025, time.March, 30, 6, 32, 3, 123456000, time.FixedZone("UTC+05:30", 5*60*60+30*60))
+	triggeredAt := time.Date(2025, time.March, 29, 21, 32, 3, 456789000, time.Local)
+	cases := []struct {
+		name        string
+		triggeredAt *time.Time
+	}{
+		{"triggered", &triggeredAt},
+		{"notTriggered", nil},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			alert := &Alert{CreatedAt: createdAt, TriggeredAt: tc.triggeredAt}
+
+			if err := alert.AfterFind(nil); err != nil {
+				t.Fatalf("AfterFind: %v", err)
+			}
+			triggeredMatches := alert.TriggeredAt == nil
+			if tc.triggeredAt != nil {
+				triggeredMatches = alert.TriggeredAt != nil && utcInstant(*alert.TriggeredAt, *tc.triggeredAt)
+			}
+			if !utcInstant(alert.CreatedAt, createdAt) || !triggeredMatches {
+				t.Errorf("after AfterFind CreatedAt %v and TriggeredAt %v, want %v and %v, each in UTC",
+					alert.CreatedAt, alert.TriggeredAt, createdAt, tc.triggeredAt)
+			}
+		})
+	}
+}
+
 // safeAlertSecret stands for the connection and schema details a driver error can carry
 const safeAlertSecret = "user=postgres database=TradeManagement"
 
@@ -1398,14 +1803,43 @@ func (e safeAlertSQLStateError) Error() string {
 
 func (e safeAlertSQLStateError) SQLState() string { return e.code }
 
+// SQL Server's messages for error 547, which it reports for both kinds of constraint conflict
+const (
+	safeAlertForeignKeyMessage = `The INSERT statement conflicted with the FOREIGN KEY constraint "FK_Alerts_Accounts". The conflict occurred in database "TradeManagement", table "dbo.Accounts", column 'Id'.`
+	safeAlertCheckMessage      = `The INSERT statement conflicted with the CHECK constraint "CK__Alerts__Type__3A81B327". The conflict occurred in database "TradeManagement", table "dbo.Alerts", column 'Type'.`
+	// Another table's foreign key, which no alert statement can conflict with
+	safeAlertOtherForeignKeyMessage = `The INSERT statement conflicted with the FOREIGN KEY constraint "FK_Trades_Accounts". The conflict occurred in database "TradeManagement", table "dbo.Accounts", column 'Id'.`
+	// The same conflicts as SQL Server words them in a German or Dutch session. German quotes the
+	// constraint name and Dutch leaves it bare
+	safeAlertGermanAccountForeignKeyMessage    = `Die INSERT-Anweisung steht in Konflikt mit der FOREIGN KEY-Einschränkung "FK_Alerts_Accounts". Der Konflikt trat in der TradeManagement-Datenbank, Tabelle "dbo.Accounts", column 'Id' auf.`
+	safeAlertGermanInstrumentForeignKeyMessage = `Die INSERT-Anweisung steht in Konflikt mit der FOREIGN KEY-Einschränkung "FK_Alerts_Instruments". Der Konflikt trat in der TradeManagement-Datenbank, Tabelle "dbo.Instruments", column 'Id' auf.`
+	safeAlertDutchInstrumentForeignKeyMessage  = `De instructie INSERT is strijdig met de FOREIGN KEY-beperking FK_Alerts_Instruments. Het conflict is opgetreden in database TradeManagement, tabel dbo.Instruments, column 'Id'.`
+	safeAlertGermanCheckMessage                = `Die INSERT-Anweisung steht in Konflikt mit der CHECK-Einschränkung "CK__Alerts__Type__03F0984C". Der Konflikt trat in der TradeManagement-Datenbank, Tabelle "dbo.Alerts", column 'Type' auf.`
+	safeAlertGermanOtherForeignKeyMessage      = `Die INSERT-Anweisung steht in Konflikt mit der FOREIGN KEY-Einschränkung "FK_Trades_Accounts". Der Konflikt trat in der TradeManagement-Datenbank, Tabelle "dbo.Accounts", column 'Id' auf.`
+)
+
 // safeAlertSQLServerError has the shape of a go-mssqldb Error
-type safeAlertSQLServerError struct{ number int32 }
+type safeAlertSQLServerError struct {
+	number  int32
+	message string
+}
 
 func (e safeAlertSQLServerError) Error() string {
-	return fmt.Sprintf(`mssql: conflicted with the FOREIGN KEY constraint "FK_Alerts_Accounts" (%s) (%d)`, safeAlertSecret, e.number)
+	return fmt.Sprintf(`mssql: %s (%s) (%d)`, e.message, safeAlertSecret, e.number)
 }
 
 func (e safeAlertSQLServerError) SQLErrorNumber() int32 { return e.number }
+
+func (e safeAlertSQLServerError) SQLErrorMessage() string { return e.message }
+
+// safeAlertSQLServerNumberError reports a SQL Server error number without the message
+type safeAlertSQLServerNumberError struct{ number int32 }
+
+func (e safeAlertSQLServerNumberError) Error() string {
+	return fmt.Sprintf(`mssql: (%s) (%d)`, safeAlertSecret, e.number)
+}
+
+func (e safeAlertSQLServerNumberError) SQLErrorNumber() int32 { return e.number }
 
 // safeAlertDialError is a refused connection as pgx reports it, naming the user and database
 func safeAlertDialError() error {
@@ -1413,15 +1847,15 @@ func safeAlertDialError() error {
 	return fmt.Errorf("failed to connect to `%s`: %w", safeAlertSecret, refused)
 }
 
-// sameSafeAlertError compares classifications by class and sentinels by identity, so a sentinel
-// still wrapped in the original error does not match
+// sameSafeAlertError compares classifications by class and the sentinel they stand for, and sentinels
+// by identity, so a sentinel still wrapped in the original error does not match
 func sameSafeAlertError(got, want error) bool {
 	w, ok := want.(*alertStorageError)
 	if !ok {
 		return got == want
 	}
 	g, ok := got.(*alertStorageError)
-	return ok && g.class == w.class
+	return ok && g.class == w.class && g.sentinel == w.sentinel
 }
 
 func TestSafeAlertError_errorKind_classifiedWithoutDetails(t *testing.T) {
@@ -1436,7 +1870,7 @@ func TestSafeAlertError_errorKind_classifiedWithoutDetails(t *testing.T) {
 		{"recordNotFound", fmt.Errorf("first: %w", gorm.ErrRecordNotFound), gorm.ErrRecordNotFound},
 		{"canceled", fmt.Errorf("%s: %w", safeAlertSecret, context.Canceled), context.Canceled},
 		{"deadlineExceeded", fmt.Errorf("%s: %w", safeAlertSecret, context.DeadlineExceeded), context.DeadlineExceeded},
-		{"postgresError", fmt.Errorf("create: %w", safeAlertSQLStateError{code: "23503"}), &alertStorageError{class: "SQLSTATE 23503"}},
+		{"postgresError", fmt.Errorf("create: %w", safeAlertSQLStateError{code: "23503"}), &alertStorageError{class: "SQLSTATE 23503", sentinel: repository.ErrAlertReferenceNotFound}},
 		{"postgresErrorLetters", fmt.Errorf("create: %w", safeAlertSQLStateError{code: "P0001"}), &alertStorageError{class: "SQLSTATE P0001"}},
 		// A code outside the SQLSTATE form is not echoed, whatever the server sent
 		{"postgresErrorControlCharacter", fmt.Errorf("create: %w", safeAlertSQLStateError{code: "23\n03"}), &alertStorageError{class: "unclassified"}},
@@ -1445,7 +1879,7 @@ func TestSafeAlertError_errorKind_classifiedWithoutDetails(t *testing.T) {
 		{"postgresErrorFourCharacters", fmt.Errorf("create: %w", safeAlertSQLStateError{code: "2350"}), &alertStorageError{class: "unclassified"}},
 		{"postgresErrorSixCharacters", fmt.Errorf("create: %w", safeAlertSQLStateError{code: "235030"}), &alertStorageError{class: "unclassified"}},
 		{"postgresErrorEmpty", fmt.Errorf("create: %w", safeAlertSQLStateError{code: ""}), &alertStorageError{class: "unclassified"}},
-		{"sqlServerError", fmt.Errorf("create: %w", safeAlertSQLServerError{number: 547}), &alertStorageError{class: "SQL Server error 547"}},
+		{"sqlServerError", fmt.Errorf("create: %w", safeAlertSQLServerError{number: 547, message: safeAlertForeignKeyMessage}), &alertStorageError{class: "SQL Server error 547", sentinel: repository.ErrAlertReferenceNotFound}},
 		{"dialFailure", safeAlertDialError(), &alertStorageError{class: "connection failure"}},
 		{"badConnection", fmt.Errorf("%s: %w", safeAlertSecret, driver.ErrBadConn), &alertStorageError{class: "connection failure"}},
 		{"connectionDone", fmt.Errorf("%s: %w", safeAlertSecret, dbsql.ErrConnDone), &alertStorageError{class: "connection failure"}},
@@ -1475,7 +1909,7 @@ func TestSafeAlertError_driverError_codeReachableTextWithheld(t *testing.T) {
 			var pgErr pgDriverError
 			return errors.As(err, &pgErr) && pgErr.SQLState() == "23503"
 		}},
-		{"sqlServerError", fmt.Errorf("create: %w", safeAlertSQLServerError{number: 547}), func(err error) bool {
+		{"sqlServerError", fmt.Errorf("create: %w", safeAlertSQLServerError{number: 547, message: safeAlertForeignKeyMessage}), func(err error) bool {
 			var mssqlErr mssqlDriverError
 			return errors.As(err, &mssqlErr) && mssqlErr.SQLErrorNumber() == 547
 		}},
@@ -1490,6 +1924,43 @@ func TestSafeAlertError_driverError_codeReachableTextWithheld(t *testing.T) {
 
 			if !tc.matches(got) || strings.Contains(got.Error(), safeAlertSecret) || strings.Contains(fmt.Sprintf("%+v", got), safeAlertSecret) {
 				t.Errorf("safeAlertError(%v) = %q, want the driver error reachable and the text without %q", tc.err, got, safeAlertSecret)
+			}
+		})
+	}
+}
+
+// Only a foreign-key violation, an account or instrument that names no row, matches
+// ErrAlertReferenceNotFound and prints as it. SQL Server reports CHECK conflicts under the same number
+// and words both in the session language, so a 547 matches only when it names an Alerts foreign key,
+// in any language. A CHECK violation, another table's foreign key or an error without a message stays
+// a storage failure
+func TestSafeAlertError_constraintViolation_referenceSentinelOnlyForForeignKey(t *testing.T) {
+	cases := []struct {
+		name          string
+		err           error
+		wantReference bool
+		wantText      string
+	}{
+		{"postgresForeignKey", fmt.Errorf("create: %w", safeAlertSQLStateError{code: "23503"}), true, "account or instrument not found: SQLSTATE 23503"},
+		{"postgresCheck", fmt.Errorf("create: %w", safeAlertSQLStateError{code: "23514"}), false, "alert storage failure: SQLSTATE 23514"},
+		{"sqlServerForeignKey", fmt.Errorf("create: %w", safeAlertSQLServerError{number: 547, message: safeAlertForeignKeyMessage}), true, "account or instrument not found: SQL Server error 547"},
+		{"sqlServerCheck", fmt.Errorf("create: %w", safeAlertSQLServerError{number: 547, message: safeAlertCheckMessage}), false, "alert storage failure: SQL Server error 547"},
+		{"sqlServerOtherTableForeignKey", fmt.Errorf("create: %w", safeAlertSQLServerError{number: 547, message: safeAlertOtherForeignKeyMessage}), false, "alert storage failure: SQL Server error 547"},
+		{"sqlServerGermanAccountForeignKey", fmt.Errorf("create: %w", safeAlertSQLServerError{number: 547, message: safeAlertGermanAccountForeignKeyMessage}), true, "account or instrument not found: SQL Server error 547"},
+		{"sqlServerGermanInstrumentForeignKey", fmt.Errorf("create: %w", safeAlertSQLServerError{number: 547, message: safeAlertGermanInstrumentForeignKeyMessage}), true, "account or instrument not found: SQL Server error 547"},
+		{"sqlServerDutchUnquotedForeignKey", fmt.Errorf("create: %w", safeAlertSQLServerError{number: 547, message: safeAlertDutchInstrumentForeignKeyMessage}), true, "account or instrument not found: SQL Server error 547"},
+		{"sqlServerGermanCheck", fmt.Errorf("create: %w", safeAlertSQLServerError{number: 547, message: safeAlertGermanCheckMessage}), false, "alert storage failure: SQL Server error 547"},
+		{"sqlServerGermanOtherTableForeignKey", fmt.Errorf("create: %w", safeAlertSQLServerError{number: 547, message: safeAlertGermanOtherForeignKeyMessage}), false, "alert storage failure: SQL Server error 547"},
+		{"sqlServerOtherNumber", fmt.Errorf("create: %w", safeAlertSQLServerError{number: 2627, message: safeAlertForeignKeyMessage}), false, "alert storage failure: SQL Server error 2627"},
+		{"sqlServerWithoutMessage", fmt.Errorf("create: %w", safeAlertSQLServerNumberError{number: 547}), false, "alert storage failure: SQL Server error 547"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := safeAlertError(tc.err)
+
+			if errors.Is(got, repository.ErrAlertReferenceNotFound) != tc.wantReference || errors.Is(got, repository.ErrNotFound) || got.Error() != tc.wantText {
+				t.Errorf("safeAlertError(%v) = %q (reference %t), want %q (reference %t)",
+					tc.err, got, errors.Is(got, repository.ErrAlertReferenceNotFound), tc.wantText, tc.wantReference)
 			}
 		})
 	}
@@ -1534,6 +2005,49 @@ func TestAlertLogger_trace_safeErrorPassedOn(t *testing.T) {
 			}
 		})
 	}
+}
+
+// An unknown account or instrument is the caller's mistake: GORM's own logger prints the statement as
+// a warning with the classification and nothing at its error-only level, and never the driver text
+func TestAlertLogger_trace_referenceNotFoundLoggedBelowError(t *testing.T) {
+	const statement = `INSERT INTO "Alerts" ("AccountId") VALUES ('0f0f0f0f-1111-4222-8333-444444444444')`
+	referenceErr := fmt.Errorf("create: %w", safeAlertSQLStateError{code: "23503"})
+	cases := []struct {
+		name  string
+		level logger.LogLevel
+		rows  int64
+		// The fragments the output holds in order; none means no output
+		want []string
+	}{
+		{"warnLevel", logger.Warn, 0, []string{"[warn] account or instrument not found: SQLSTATE 23503\n[", "ms] [rows:0] " + statement + "\n"}},
+		{"warnLevelUnknownRows", logger.Warn, -1, []string{"[warn] account or instrument not found: SQLSTATE 23503\n[", "ms] [rows:-] " + statement + "\n"}},
+		{"errorLevel", logger.Error, 0, nil},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var out bytes.Buffer
+			l := alertLogger{Interface: logger.New(stdlog.New(&out, "", 0), logger.Config{LogLevel: tc.level})}
+
+			l.Trace(context.Background(), time.Now(), func() (string, int64) { return statement, tc.rows }, referenceErr)
+
+			got := out.String()
+			if (tc.want == nil && got != "") || !containsInOrder(got, tc.want) || strings.Contains(got, safeAlertSecret) {
+				t.Errorf("GORM logger at level %d printed %q, want %q in order without %q", tc.level, got, tc.want, safeAlertSecret)
+			}
+		})
+	}
+}
+
+// containsInOrder reports whether s holds every fragment, each after the one before it
+func containsInOrder(s string, fragments []string) bool {
+	for _, fragment := range fragments {
+		_, after, found := strings.Cut(s, fragment)
+		if !found {
+			return false
+		}
+		s = after
+	}
+	return true
 }
 
 func TestAlertLogger_logMode_wrapperKept(t *testing.T) {

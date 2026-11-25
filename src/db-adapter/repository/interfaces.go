@@ -2,6 +2,7 @@ package repository
 
 import (
 	"context"
+	"errors"
 	"time"
 
 	pb "github.com/dynatrace/easytrade/dbadapter/proto"
@@ -88,8 +89,13 @@ type TradeRepository interface {
 	DeleteOlderThan(ctx context.Context, date time.Time) (int32, error)
 }
 
+// ErrAlertReferenceNotFound is the database's refusal of an alert whose account or instrument id
+// names no row, as its foreign keys report it
+var ErrAlertReferenceNotFound = errors.New("account or instrument not found")
+
 type AlertRepository interface {
-	// Create inserts an armed alert: enabled, arming revision 1, not acknowledged, no trigger
+	// Create inserts an armed alert: enabled, arming revision 1, not acknowledged, no trigger. It
+	// returns ErrAlertReferenceNotFound when the account or instrument id names no row
 	Create(ctx context.Context, req *pb.CreateAlertRequest) (*pb.AlertMessage, error)
 	// List returns all accounts' alerts when req.AccountId is empty; ArmedOnly, TriggeredOnly
 	// and UnacknowledgedOnly combine with AND

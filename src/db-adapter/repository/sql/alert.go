@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"slices"
 	"strings"
 	"time"
 
@@ -18,8 +19,8 @@ import (
 	"gorm.io/gorm/logger"
 )
 
-// Enabled, ArmingRevision and Acknowledged carry no gorm default tag on purpose: GORM leaves a
-// zero-valued field with a default out of the INSERT, so false and 0 would never be written.
+// Enabled, ArmingRevision and Acknowledged carry no gorm default tags, so GORM writes the fields as
+// they are and the adapter sends its initial values (true, 1, false) explicitly in the INSERT.
 // CreatedAt is stamped by the adapter clock, never by GORM.
 type Alert struct {
 	Id             *uuid.UUID `gorm:"primaryKey;default:(-)"`
@@ -37,6 +38,18 @@ type Alert struct {
 }
 
 func (Alert) TableName() string { return repository.TableAlerts }
+
+// AfterFind gives every Alert read, through First or Find, the UTC location the adapter writes in:
+// pgx scans timestamptz into time.Local and go-mssqldb scans datetimeoffset into its stored offset.
+// The instant and its microseconds are unchanged, and a nil TriggeredAt stays nil
+func (src *Alert) AfterFind(*gorm.DB) error {
+	src.CreatedAt = src.CreatedAt.UTC()
+	if src.TriggeredAt != nil {
+		triggeredAt := src.TriggeredAt.UTC()
+		src.TriggeredAt = &triggeredAt
+	}
+	return nil
+}
 
 // Every value, booleans included, is a bound parameter: a boolean literal is valid on only one of
 // the two dialects
@@ -195,18 +208,43 @@ func (repo *AlertRepository) Acknowledge(ctx context.Context, id string) (int32,
 // alertStorageError is how a failed alert statement is reported and logged. Driver errors can carry
 // the database user, database name, host and constraint names, so Error gives only their
 // classification. The driver error stays reachable through errors.Is and errors.As for a caller that
-// branches on its code, and never appears in the text a log line or a status prints
+// branches on its code, and never appears in the text a log line or a status prints. A failure that
+// stands for a repository sentinel matches it through errors.Is and is reported as that sentinel
 type alertStorageError struct {
 	class string
-	cause error
+	// sentinel is the repository error the failure stands for, or nil for a storage failure
+	sentinel error
+	cause    error
 }
 
-func (e *alertStorageError) Error() string { return "alert storage failure: " + e.class }
+func (e *alertStorageError) Error() string {
+	if e.sentinel != nil {
+		return e.sentinel.Error() + ": " + e.class
+	}
+	return "alert storage failure: " + e.class
+}
 
 func (e *alertStorageError) Unwrap() error { return e.cause }
 
+func (e *alertStorageError) Is(target error) bool { return e.sentinel != nil && target == e.sentinel }
+
+const (
+	// PostgreSQL's foreign_key_violation
+	pgForeignKeyViolation = "23503"
+	// SQL Server reports CHECK and FOREIGN KEY conflicts under one number
+	mssqlConstraintConflict = 547
+)
+
+// alertForeignKeys names the Alerts table's two foreign keys. SQL Server words error 547 in the
+// session language but inserts the constraint name unchanged in every language, so the name, never
+// the wording, tells a foreign-key conflict from a CHECK conflict: the table's CHECK constraints are
+// unnamed, and SQL Server names them CK__Alerts__...
+var alertForeignKeys = []string{"FK_Alerts_Accounts", "FK_Alerts_Instruments"}
+
 // safeAlertError keeps the sentinels callers branch on and replaces any other error with its class:
-// a SQLSTATE (pgx), a SQL Server error number (go-mssqldb), a connection failure or unclassified
+// a SQLSTATE (pgx), a SQL Server error number (go-mssqldb), a connection failure or unclassified. A
+// foreign-key violation, an account or instrument id that names no row, also matches
+// ErrAlertReferenceNotFound
 func safeAlertError(err error) error {
 	var (
 		safe   *alertStorageError
@@ -241,9 +279,21 @@ func safeAlertError(err error) error {
 				return &alertStorageError{class: "unclassified", cause: err}
 			}
 		}
+		if code == pgForeignKeyViolation {
+			return &alertStorageError{class: "SQLSTATE " + code, sentinel: repository.ErrAlertReferenceNotFound, cause: err}
+		}
 		return &alertStorageError{class: "SQLSTATE " + code, cause: err}
 	case errors.As(err, &msErr):
-		return &alertStorageError{class: fmt.Sprintf("SQL Server error %d", msErr.SQLErrorNumber()), cause: err}
+		number := msErr.SQLErrorNumber()
+		class := fmt.Sprintf("SQL Server error %d", number)
+		// go-mssqldb's Error also gives the message. A 547 naming one of the Alerts foreign keys is a
+		// reference to no row, whatever the session language; any other 547, or one without a
+		// message, keeps the generic class
+		if msg, ok := msErr.(interface{ SQLErrorMessage() string }); ok && number == mssqlConstraintConflict &&
+			slices.ContainsFunc(alertForeignKeys, func(name string) bool { return strings.Contains(msg.SQLErrorMessage(), name) }) {
+			return &alertStorageError{class: class, sentinel: repository.ErrAlertReferenceNotFound, cause: err}
+		}
+		return &alertStorageError{class: class, cause: err}
 	case errors.As(err, &netErr), errors.Is(err, driver.ErrBadConn), errors.Is(err, dbsql.ErrConnDone):
 		return &alertStorageError{class: "connection failure", cause: err}
 	default:
@@ -253,7 +303,9 @@ func safeAlertError(err error) error {
 
 // alertLogger passes each alert statement's error to the shared GORM logger as safeAlertError's
 // classification. The statement text, duration and row count are logged as before; GORM reports
-// Trace below as the caller, so the statement text identifies the call
+// Trace below as the caller, so the statement text identifies the call. An unknown account or
+// instrument is the caller's mistake, not a storage failure, so its statement is logged as a warning
+// in GORM's trace layout instead of as an error
 type alertLogger struct{ logger.Interface }
 
 var (
@@ -266,7 +318,18 @@ func (l alertLogger) LogMode(level logger.LogLevel) logger.Interface {
 }
 
 func (l alertLogger) Trace(ctx context.Context, begin time.Time, fc func() (string, int64), err error) {
-	l.Interface.Trace(ctx, begin, fc, safeAlertError(err))
+	safe := safeAlertError(err)
+	if !errors.Is(safe, repository.ErrAlertReferenceNotFound) {
+		l.Interface.Trace(ctx, begin, fc, safe)
+		return
+	}
+	sql, rows := fc()
+	// GORM prints an unknown row count as "-"
+	var shownRows any = rows
+	if rows == -1 {
+		shownRows = "-"
+	}
+	l.Interface.Warn(ctx, "%v\n[%.3fms] [rows:%v] %s", safe, float64(time.Since(begin).Nanoseconds())/1e6, shownRows, sql)
 }
 
 // ParamsFilter keeps the shared logger's parameter setting, which the embedded interface would hide
@@ -294,6 +357,8 @@ func alertCreateFromProto(req *pb.CreateAlertRequest, createdAt time.Time) *Aler
 	}
 }
 
+// Create replies from the request's text, which the RPC pattern accepts as "-0", while a read scans
+// the column back; normalising both decimals here gives every reply the canonical text a read gives
 func (src *Alert) toProto() *pb.AlertMessage {
 	msg := &pb.AlertMessage{
 		Id:             uuidString(src.Id),
@@ -301,7 +366,7 @@ func (src *Alert) toProto() *pb.AlertMessage {
 		Type:           src.Type,
 		InstrumentId:   uuidString(src.InstrumentId),
 		Direction:      src.Direction,
-		Threshold:      src.Threshold.Text,
+		Threshold:      normalizeDecimalText(src.Threshold.Text),
 		Enabled:        src.Enabled,
 		ArmingRevision: src.ArmingRevision,
 		Acknowledged:   src.Acknowledged,
@@ -311,7 +376,7 @@ func (src *Alert) toProto() *pb.AlertMessage {
 		msg.TriggeredAt = timestamppb.New(*src.TriggeredAt)
 	}
 	if src.TriggerValue.Valid {
-		msg.TriggerValue = src.TriggerValue.Text
+		msg.TriggerValue = normalizeDecimalText(src.TriggerValue.Text)
 	}
 	return msg
 }
@@ -329,7 +394,7 @@ var (
 	_ dbsql.Scanner = (*decimalText)(nil)
 )
 
-// Value sends the validated, normalised text unchanged; the database converts it to DECIMAL exactly
+// Value sends the validated text unchanged, "-0" included; the database converts it to DECIMAL exactly
 func (d decimalText) Value() (driver.Value, error) {
 	if !d.Valid {
 		return nil, nil

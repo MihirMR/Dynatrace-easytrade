@@ -162,7 +162,8 @@ func alertReply[M any](msg M, err error) (M, error) {
 
 // alertStatus keeps a status already chosen (fetchOrNotFound's NotFound) and maps the repository's
 // errors to codes with fixed messages, so no storage detail reaches the caller. The repository has
-// already reduced a storage failure to its safe classification, which is logged here once
+// already reduced a storage failure to its safe classification, which is logged here once. An
+// unknown account or instrument is the caller's mistake and is logged once as a warning
 func alertStatus(err error) error {
 	if err == nil {
 		return nil
@@ -173,6 +174,9 @@ func alertStatus(err error) error {
 	switch {
 	case errors.Is(err, repository.ErrNotFound):
 		return errNotFound()
+	case errors.Is(err, repository.ErrAlertReferenceNotFound):
+		log.WithError(err).Warn("Alert references an unknown account or instrument")
+		return status.Error(codes.NotFound, "account or instrument not found")
 	case errors.Is(err, context.Canceled):
 		return status.Error(codes.Canceled, context.Canceled.Error())
 	case errors.Is(err, context.DeadlineExceeded):
