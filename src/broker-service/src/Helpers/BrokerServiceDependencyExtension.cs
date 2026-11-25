@@ -1,4 +1,7 @@
-﻿using EasyTrade.BrokerService.Entities.Balances.Repository;
+﻿using EasyTrade.BrokerService.Entities.Alerts.Repository;
+using EasyTrade.BrokerService.Entities.Alerts.Scheduler;
+using EasyTrade.BrokerService.Entities.Alerts.Service;
+using EasyTrade.BrokerService.Entities.Balances.Repository;
 using EasyTrade.BrokerService.Entities.Balances.Service;
 using EasyTrade.BrokerService.Entities.Instruments.Repository;
 using EasyTrade.BrokerService.Entities.Instruments.Service;
@@ -9,6 +12,8 @@ using EasyTrade.BrokerService.Entities.Trades.Notification;
 using EasyTrade.BrokerService.Entities.Trades.Repository;
 using EasyTrade.BrokerService.Entities.Trades.Scheduler;
 using EasyTrade.BrokerService.Entities.Trades.Service;
+using EasyTrade.BrokerService.Helpers.FeatureFlags;
+using EasyTrade.BrokerService.Helpers.Metrics;
 using EasyTrade.BrokerService.Middleware.CreditCardValidation;
 using EasyTrade.BrokerService.ProblemPatterns.OpenFeature;
 using EasyTrade.BrokerService.ProblemPatterns.OpenFeature.Providers;
@@ -33,6 +38,7 @@ public static class BrokerServiceDependencyExtension
             .AddTradesDependency()
             .AddPortfolioDependency()
             .AddProblemPatternsDependency()
+            .AddPortfolioInsightsDependency()
             .AddMiddlewareDependency();
         return services;
     }
@@ -79,6 +85,23 @@ public static class BrokerServiceDependencyExtension
 
     private static IServiceCollection AddPortfolioDependency(this IServiceCollection services) =>
         services.AddTransient<IPortfolioService, PortfolioService>();
+
+    private static IServiceCollection AddPortfolioInsightsDependency(
+        this IServiceCollection services
+    )
+    {
+        services
+            .AddTransient<IAlertRepository, AlertRepository>()
+            .AddTransient<IPortfolioInsightsService, PortfolioInsightsService>()
+            .AddTransient<IAlertService, AlertService>()
+            .AddTransient<IAlertEvaluationService, AlertEvaluationService>()
+            .AddTransient<PortfolioInsightsFeatureGate>()
+            .AddSingleton<IPortfolioInsightsFeature, PortfolioInsightsFeature>()
+            .AddSingleton<PortfolioInsightsMetrics>()
+            .AddHostedService<AlertEvaluationSchedulerService>();
+
+        return services;
+    }
 
     private static IServiceCollection AddMiddlewareDependency(this IServiceCollection services) =>
         services
