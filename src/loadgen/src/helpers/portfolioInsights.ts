@@ -1,10 +1,6 @@
-// The package root, as every loadgen helper imports loadgen-core (Guardrails:
-// follow the service's existing conventions), not its lib/ subpaths.
-import {
-    IPageActions,
-    ISelector,
-    createLoggerOptions,
-} from "@demoability/loadgen-core"
+import { createLoggerOptions } from "@demoability/loadgen-core/lib/logger"
+import { IPageActions } from "@demoability/loadgen-core/lib/pageActions"
+import { ISelector } from "@demoability/loadgen-core/lib/selectors"
 import { Logger, createLogger } from "winston"
 import { selectors } from "../selectors"
 import { gotoPageWithNavBar } from "./common"

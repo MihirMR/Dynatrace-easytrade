@@ -317,3 +317,33 @@ test("run_flagOn_runsLoginLifecycleLogoutInOrder", async () => {
         }
     )
 })
+
+// The provider constructs the visit with three arguments, so the run must
+// fall back to the global fetch and Math.random captured at construction.
+test("constructor_depsOmitted_usesGlobalFetchAndMathRandom", async (t) => {
+    const page = new RecordingPageActions()
+    const { fetchFn, requests } = flagFetch(true)
+    t.mock.method(globalThis, "fetch", fetchFn)
+    t.mock.method(Math, "random", () => 0.5)
+    const { logger } = recordingLogger()
+    const visit = new PortfolioInsightsAlertVisit(
+        "portfolio_insights_alert",
+        BASE_URL,
+        USER
+    )
+
+    await visit.run(page, logger)
+
+    assert.deepEqual(
+        {
+            requests,
+            threshold: page.calls.filter((call) =>
+                call.startsWith("input alert-threshold-input")
+            ),
+        },
+        {
+            requests: [FLAG_REQUEST],
+            threshold: [`input alert-threshold-input=${MARKER}`],
+        }
+    )
+})

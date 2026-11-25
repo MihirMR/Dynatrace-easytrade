@@ -19,8 +19,8 @@ export class PortfolioInsightsAlertVisit implements IVisit {
     readonly visitName: VisitName
     readonly url: URL
     readonly user: User
-    private readonly fetchFn?: typeof fetch
-    private readonly random?: () => number
+    private readonly fetchFn: typeof fetch
+    private readonly random: () => number
 
     constructor(
         visitName: VisitName,
@@ -31,8 +31,8 @@ export class PortfolioInsightsAlertVisit implements IVisit {
         this.visitName = visitName
         this.url = url
         this.user = user
-        this.fetchFn = deps.fetchFn
-        this.random = deps.random
+        this.fetchFn = deps.fetchFn ?? fetch
+        this.random = deps.random ?? Math.random
     }
 
     getName(): string {
@@ -52,7 +52,7 @@ export class PortfolioInsightsAlertVisit implements IVisit {
         const enabled = await isPortfolioInsightsEnabled(
             this.url,
             this.fetchFn,
-            undefined,
+            2000,
             logger
         )
         if (!enabled) {

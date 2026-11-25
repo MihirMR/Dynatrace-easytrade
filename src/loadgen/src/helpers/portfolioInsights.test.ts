@@ -27,6 +27,7 @@ const INVALID =
 const OPTION_KEY =
     selectors.portfolioInsightsPage_alertInstrumentOption.toString()
 const SUBMIT_KEY = selectors.portfolioInsightsPage_alertSubmit.toString()
+const THRESHOLD_KEY = selectors.portfolioInsightsPage_alertThreshold.toString()
 const createdKey = (marker: string): string =>
     selectors.portfolioInsightsPage_createdAlert(marker).toString()
 const deletedKey = (id: string): string =>
@@ -36,16 +37,49 @@ const rowKey = (id: string): string =>
 const rowDeleteKey = (id: string): string =>
     selectors.portfolioInsightsPage_alertRowDelete(id).toString()
 
-const SUBMITTED_FORM = [
-    `${selectors.portfolioInsightsPage_alertType}=TARGET_PRICE`,
-    `${selectors.portfolioInsightsPage_alertInstrument}=${INSTRUMENT_ID}`,
-    `${selectors.portfolioInsightsPage_alertDirection}=ABOVE`,
-    `${selectors.portfolioInsightsPage_alertThreshold}=${MARKER}`,
-]
+/** Entries of the ordered page trace that steps() builds. */
+const clickStep = (key: string): string => `click ${key}`
+const checkStep = (key: string, times: number): string =>
+    `check ${key} x${times}`
+const findOptionsStep = (times: number): string =>
+    `find ${OPTION_KEY} x${times}`
+
+/** The form as the helper fills it for a marker, up to the submit click. */
+function submitSteps(marker: string): string[] {
+    return [
+        `select ${selectors.portfolioInsightsPage_alertType} = TARGET_PRICE`,
+        `select ${selectors.portfolioInsightsPage_alertInstrument} = ${INSTRUMENT_ID}`,
+        `select ${selectors.portfolioInsightsPage_alertDirection} = ABOVE`,
+        `input ${THRESHOLD_KEY} = ${marker}`,
+        clickStep(SUBMIT_KEY),
+    ]
+}
+
+const SUBMIT_STEPS = [findOptionsStep(1), ...submitSteps(MARKER)]
 const CREATED_OWN = `info: Created alert [${OWN_ID}] threshold [${MARKER}]`
 
 const pageError = new Error("Execution context was destroyed")
 const readError = new Error("Node is detached from document")
+const networkError = new TypeError("fetch failed")
+
+/**
+ * Names the error objects this suite throws, so a log entry is checked to carry
+ * the very object rather than a copy of its message.
+ */
+const knownErrors = new Map<unknown, string>([
+    [pageError, "pageError"],
+    [readError, "readError"],
+    [networkError, "networkError"],
+])
+
+function describeError(error: unknown): string {
+    return (
+        knownErrors.get(error) ??
+        (error instanceof Error
+            ? error.name
+            : `not an error object: ${String(error)}`)
+    )
+}
 
 type LogRecord = {
     level: string
@@ -79,8 +113,14 @@ type FetchCall = { url: string; method: string; signal?: AbortSignal }
 function recordingFetch(respond: (call: FetchCall) => Promise<Response>): {
     fetchFn: typeof fetch
     calls: FetchCall[]
+    /** resolves with the first request as soon as it is sent */
+    firstCall: Promise<FetchCall>
 } {
     const calls: FetchCall[] = []
+    let sent: (call: FetchCall) => void = () => undefined
+    const firstCall = new Promise<FetchCall>((resolve) => {
+        sent = resolve
+    })
     const fetchFn: typeof fetch = async (input, init) => {
         const call: FetchCall = {
             url: input instanceof Request ? input.url : String(input),
@@ -88,9 +128,26 @@ function recordingFetch(respond: (call: FetchCall) => Promise<Response>): {
             signal: init?.signal ?? undefined,
         }
         calls.push(call)
+        sent(call)
         return await respond(call)
     }
-    return { fetchFn, calls }
+    return { fetchFn, calls, firstCall }
+}
+
+/**
+ * Resolves with the first request once it is sent, or with undefined when the
+ * call under test settles without sending one, so a test drives the mocked
+ * clock only while a request is really pending.
+ */
+async function requestSent(
+    firstCall: Promise<FetchCall>,
+    pending: Promise<unknown>
+): Promise<FetchCall | undefined> {
+    const settled = pending.then(
+        () => undefined,
+        () => undefined
+    )
+    return await Promise.race([firstCall, settled])
 }
 
 function untilAborted(call: FetchCall): Promise<Response> {
@@ -317,18 +374,21 @@ class FakePageActions implements IPageActions {
     }
 }
 
-/** A page whose options, own created output, own row and deleted output appear at once. */
-function ownAlertPage(overrides: FakePage = {}): FakePage {
+/**
+ * A page whose options, the created output of the marker, the own row and the
+ * deleted output appear at once.
+ */
+function ownAlertPage(overrides: FakePage = {}, marker = MARKER): FakePage {
     return {
         options: { emptyPolls: 0, values: [INSTRUMENT_ID] },
         present: {
-            [createdKey(MARKER)]: 0,
+            [createdKey(marker)]: 0,
             [rowKey(OWN_ID)]: 0,
             [deletedKey(OWN_ID)]: 0,
             ...overrides.present,
         },
         properties: {
-            [createdKey(MARKER)]: { value: OWN_ID },
+            [createdKey(marker)]: { value: OWN_ID },
             ...overrides.properties,
         },
         failingClick: overrides.failingClick,
@@ -337,32 +397,57 @@ function ownAlertPage(overrides: FakePage = {}): FakePage {
     }
 }
 
+const STEP_VERBS = new Map<string, string>([
+    ["getAllHandles", "find"],
+    ["isSelectorPresent", "check"],
+    ["selectOption", "select"],
+    ["input", "input"],
+    ["click", "click"],
+])
+const POLL_VERBS = new Set(["find", "check"])
+
+/**
+ * The page interactions in call order, without delays and property reads.
+ * Consecutive polls of one selector collapse into one entry with their count,
+ * so the trace shows both the order of the steps and every poll budget.
+ */
+function steps(calls: PageCall[]): string[] {
+    const entries: { text: string; poll: boolean; times: number }[] = []
+    for (const call of calls) {
+        const verb = STEP_VERBS.get(call.action)
+        if (verb === undefined) {
+            continue
+        }
+        const text =
+            call.value === undefined
+                ? `${verb} ${call.target}`
+                : `${verb} ${call.target} = ${call.value}`
+        const poll = POLL_VERBS.has(verb)
+        const last = entries.at(-1)
+        if (poll && last !== undefined && last.text === text) {
+            last.times++
+        } else {
+            entries.push({ text, poll, times: 1 })
+        }
+    }
+    return entries.map((entry) =>
+        entry.poll ? `${entry.text} x${entry.times}` : entry.text
+    )
+}
+
 function observed(
     page: FakePageActions,
     fetches: FetchCall[],
     records: LogRecord[]
 ) {
     return {
-        form: page.calls
-            .filter(
-                (call) =>
-                    call.action === "selectOption" || call.action === "input"
-            )
-            .map((call) => `${call.target}=${call.value}`),
-        clicks: page.calls
-            .filter((call) => call.action === "click")
-            .map((call) => call.target),
-        optionPolls: page.count("getAllHandles", OPTION_KEY),
+        steps: steps(page.calls),
         requests: fetches.map((call) => `${call.method} ${call.url}`),
         messages: records.map((record) => `${record.level}: ${record.message}`),
         errors: records
             .map((record) => record.error)
             .filter((error) => error !== undefined)
-            .map((error) =>
-                error instanceof Error
-                    ? `${error.name}: ${error.message}`
-                    : `not an error object: ${String(error)}`
-            ),
+            .map(describeError),
     }
 }
 
@@ -377,9 +462,7 @@ type FlagRow = {
 /** What a log entry carries beside its message: the error, the body or none. */
 function describeMeta(record: LogRecord): string {
     if (record.error !== undefined) {
-        return record.error instanceof Error
-            ? `error ${record.error.name}`
-            : `not an error object: ${String(record.error)}`
+        return `error ${describeError(record.error)}`
     }
     if (record.body !== undefined) {
         return `body ${JSON.stringify(record.body)}`
@@ -387,11 +470,9 @@ function describeMeta(record: LogRecord): string {
     return "none"
 }
 
-const networkError = new TypeError("fetch failed")
-
 const flagRows: FlagRow[] = [
     {
-        name: "enabled true -> true",
+        name: "enabledTrue_true",
         respond: () =>
             jsonResponse({
                 id: "portfolio-insights-enabled",
@@ -402,7 +483,7 @@ const flagRows: FlagRow[] = [
         expected: { enabled: true, messages: [], meta: [] },
     },
     {
-        name: "enabled false -> false",
+        name: "enabledFalse_false",
         respond: () =>
             jsonResponse({ id: "portfolio-insights-enabled", enabled: false }),
         expected: {
@@ -412,7 +493,7 @@ const flagRows: FlagRow[] = [
         },
     },
     {
-        name: "404 -> false, logged",
+        name: "status404_false",
         respond: () => statusResponse(404),
         expected: {
             enabled: false,
@@ -423,16 +504,16 @@ const flagRows: FlagRow[] = [
         },
     },
     {
-        name: "network error -> false, logged",
+        name: "networkError_false",
         respond: () => Promise.reject(networkError),
         expected: {
             enabled: false,
             messages: [UNREADABLE],
-            meta: ["error TypeError"],
+            meta: ["error networkError"],
         },
     },
     {
-        name: "non-boolean enabled -> false, logged",
+        name: "nonBooleanEnabled_false",
         respond: () =>
             jsonResponse({ id: "portfolio-insights-enabled", enabled: "true" }),
         expected: {
@@ -442,7 +523,7 @@ const flagRows: FlagRow[] = [
         },
     },
     {
-        name: "another id -> false, logged",
+        name: "otherId_false",
         respond: () =>
             jsonResponse({ id: "portfolio_insights_enabled", enabled: true }),
         expected: {
@@ -452,7 +533,7 @@ const flagRows: FlagRow[] = [
         },
     },
     {
-        name: "unparsable body -> false, logged",
+        name: "invalidJson_false",
         respond: () =>
             Promise.resolve(new Response("<html></html>", { status: 200 })),
         expected: {
@@ -462,7 +543,7 @@ const flagRows: FlagRow[] = [
         },
     },
     {
-        name: "hung read aborted at 2 s -> false, logged",
+        name: "hungRead_abortedAt2s_false",
         respond: untilAborted,
         whilePending: (t, call) => {
             t.mock.timers.tick(1999)
@@ -481,7 +562,7 @@ test("isPortfolioInsightsEnabled_response_mapsToBoolean", async (t) => {
     for (const row of flagRows) {
         await t.test(row.name, async (st) => {
             st.mock.timers.enable({ apis: ["setTimeout"] })
-            const { fetchFn, calls } = recordingFetch(row.respond)
+            const { fetchFn, firstCall } = recordingFetch(row.respond)
             const { logger, records } = recordingLogger()
 
             const pending = isPortfolioInsightsEnabled(
@@ -490,7 +571,12 @@ test("isPortfolioInsightsEnabled_response_mapsToBoolean", async (t) => {
                 undefined,
                 logger
             )
-            row.whilePending?.(st, calls[0])
+            if (row.whilePending !== undefined) {
+                const call = await requestSent(firstCall, pending)
+                if (call !== undefined) {
+                    row.whilePending(st, call)
+                }
+            }
             const enabled = await pending
 
             assert.deepEqual(
@@ -521,10 +607,19 @@ test("isPortfolioInsightsEnabled_request_usesHyphenatedPath", async (t) => {
         logger
     )
 
+    // The base url's own path is replaced, its origin kept, and the read is
+    // abortable so the deadline can end it.
     assert.deepEqual(
-        calls.map((call) => `${call.method} ${call.url}`),
+        calls.map((call) => ({
+            request: `${call.method} ${call.url}`,
+            abortable: call.signal instanceof AbortSignal,
+        })),
         [
-            "GET http://easytrade.test:8080/feature-flag-service/v1/flags/portfolio-insights-enabled",
+            {
+                request:
+                    "GET http://easytrade.test:8080/feature-flag-service/v1/flags/portfolio-insights-enabled",
+                abortable: true,
+            },
         ]
     )
 })
@@ -554,60 +649,80 @@ type AlertRow = {
     rejects?: Error
     expected: {
         outcome?: OwnedAlertOutcome
-        form: string[]
-        clicks: string[]
-        optionPolls: number
+        /** the ordered page trace of steps() */
+        steps: string[]
         requests: string[]
         messages: string[]
         errors: string[]
     }
 }
 
+/** The own alert's row is found and deleted, and the deletion confirmed. */
+const UI_DELETE_STEPS = [
+    checkStep(rowKey(OWN_ID), 1),
+    clickStep(rowDeleteKey(OWN_ID)),
+    checkStep(deletedKey(OWN_ID), 1),
+]
+const CONFIRMED_STEPS = [...SUBMIT_STEPS, checkStep(createdKey(MARKER), 1)]
+/** Created and deleted through its row; the deleted-id output never shows. */
+const UI_DELETE_UNCONFIRMED_STEPS = [
+    ...CONFIRMED_STEPS,
+    checkStep(rowKey(OWN_ID), 1),
+    clickStep(rowDeleteKey(OWN_ID)),
+    checkStep(deletedKey(OWN_ID), 20),
+]
+const DELETED_VIA_UI = [CREATED_OWN, `info: Deleted alert [${OWN_ID}] via ui`]
+const UNCONFIRMED = `warn: Create unconfirmed threshold [${MARKER}], outcome unknown`
+
 const alertRows: AlertRow[] = [
     {
-        name: "success clicks only the own row and confirms by the deleted-id output",
+        name: "success_deletedViaUi",
         page: ownAlertPage({ present: { [rowKey(STALE_ID)]: 0 } }),
         expected: {
             outcome: { kind: "deleted", id: OWN_ID, via: "ui" },
-            form: SUBMITTED_FORM,
-            clicks: [SUBMIT_KEY, rowDeleteKey(OWN_ID)],
-            optionPolls: 1,
+            steps: [...CONFIRMED_STEPS, ...UI_DELETE_STEPS],
             requests: [],
-            messages: [CREATED_OWN, `info: Deleted alert [${OWN_ID}] via ui`],
+            messages: DELETED_VIA_UI,
             errors: [],
         },
     },
     {
-        name: "a late row is waited for, then deleted",
+        name: "lateRow_waitedThenDeleted",
         page: ownAlertPage({ present: { [rowKey(OWN_ID)]: 3 } }),
         expected: {
             outcome: { kind: "deleted", id: OWN_ID, via: "ui" },
-            form: SUBMITTED_FORM,
-            clicks: [SUBMIT_KEY, rowDeleteKey(OWN_ID)],
-            optionPolls: 1,
+            steps: [
+                ...CONFIRMED_STEPS,
+                checkStep(rowKey(OWN_ID), 4),
+                clickStep(rowDeleteKey(OWN_ID)),
+                checkStep(deletedKey(OWN_ID), 1),
+            ],
             requests: [],
-            messages: [CREATED_OWN, `info: Deleted alert [${OWN_ID}] via ui`],
+            messages: DELETED_VIA_UI,
             errors: [],
         },
     },
     {
-        name: "late instrument options are waited for",
+        name: "lateOptions_waitedThenSubmitted",
         page: {
             ...ownAlertPage(),
             options: { emptyPolls: 4, values: [INSTRUMENT_ID, "other"] },
         },
         expected: {
             outcome: { kind: "deleted", id: OWN_ID, via: "ui" },
-            form: SUBMITTED_FORM,
-            clicks: [SUBMIT_KEY, rowDeleteKey(OWN_ID)],
-            optionPolls: 5,
+            steps: [
+                findOptionsStep(5),
+                ...submitSteps(MARKER),
+                checkStep(createdKey(MARKER), 1),
+                ...UI_DELETE_STEPS,
+            ],
             requests: [],
-            messages: [CREATED_OWN, `info: Deleted alert [${OWN_ID}] via ui`],
+            messages: DELETED_VIA_UI,
             errors: [],
         },
     },
     {
-        name: "a stale created output with another marker is ignored",
+        name: "staleCreatedOutputThenOwn_ownDeletedViaUi",
         page: ownAlertPage({
             present: {
                 [createdKey(STALE_MARKER)]: 0,
@@ -619,33 +734,50 @@ const alertRows: AlertRow[] = [
         }),
         expected: {
             outcome: { kind: "deleted", id: OWN_ID, via: "ui" },
-            form: SUBMITTED_FORM,
-            clicks: [SUBMIT_KEY, rowDeleteKey(OWN_ID)],
-            optionPolls: 1,
+            steps: [
+                ...SUBMIT_STEPS,
+                checkStep(createdKey(MARKER), 3),
+                ...UI_DELETE_STEPS,
+            ],
             requests: [],
-            messages: [CREATED_OWN, `info: Deleted alert [${OWN_ID}] via ui`],
+            messages: DELETED_VIA_UI,
             errors: [],
         },
     },
     {
-        name: "a create never confirmed logs outcome unknown and deletes nothing",
+        name: "staleCreatedOutput_unconfirmed",
+        page: ownAlertPage({
+            present: {
+                [createdKey(STALE_MARKER)]: 0,
+                [createdKey(MARKER)]: Number.POSITIVE_INFINITY,
+                [rowKey(STALE_ID)]: 0,
+                [deletedKey(STALE_ID)]: 0,
+            },
+            properties: { [createdKey(STALE_MARKER)]: { value: STALE_ID } },
+        }),
+        expected: {
+            outcome: { kind: "unconfirmed", marker: MARKER },
+            steps: [...SUBMIT_STEPS, checkStep(createdKey(MARKER), 20)],
+            requests: [],
+            messages: [UNCONFIRMED],
+            errors: [],
+        },
+    },
+    {
+        name: "createNeverConfirmed_logsOutcomeUnknownNoDelete",
         page: ownAlertPage({
             present: { [createdKey(MARKER)]: Number.POSITIVE_INFINITY },
         }),
         expected: {
             outcome: { kind: "unconfirmed", marker: MARKER },
-            form: SUBMITTED_FORM,
-            clicks: [SUBMIT_KEY],
-            optionPolls: 1,
+            steps: [...SUBMIT_STEPS, checkStep(createdKey(MARKER), 20)],
             requests: [],
-            messages: [
-                `warn: Create unconfirmed threshold [${MARKER}], outcome unknown`,
-            ],
+            messages: [UNCONFIRMED],
             errors: [],
         },
     },
     {
-        name: "a created output without an id logs outcome unknown and deletes nothing",
+        name: "createdOutputWithoutId_unconfirmed",
         page: ownAlertPage({
             properties: {
                 [createdKey(MARKER)]: {
@@ -656,18 +788,14 @@ const alertRows: AlertRow[] = [
         }),
         expected: {
             outcome: { kind: "unconfirmed", marker: MARKER },
-            form: SUBMITTED_FORM,
-            clicks: [SUBMIT_KEY],
-            optionPolls: 1,
+            steps: [...SUBMIT_STEPS, checkStep(createdKey(MARKER), 20)],
             requests: [],
-            messages: [
-                `warn: Create unconfirmed threshold [${MARKER}], outcome unknown`,
-            ],
+            messages: [UNCONFIRMED],
             errors: [],
         },
     },
     {
-        name: "an id held only in the value attribute is read from outerHTML",
+        name: "valuePropertyNotUuid_readsOuterHtml",
         page: ownAlertPage({
             properties: {
                 [createdKey(MARKER)]: {
@@ -678,90 +806,81 @@ const alertRows: AlertRow[] = [
         }),
         expected: {
             outcome: { kind: "deleted", id: OWN_ID, via: "ui" },
-            form: SUBMITTED_FORM,
-            clicks: [SUBMIT_KEY, rowDeleteKey(OWN_ID)],
-            optionPolls: 1,
+            steps: [...CONFIRMED_STEPS, ...UI_DELETE_STEPS],
             requests: [],
-            messages: [CREATED_OWN, `info: Deleted alert [${OWN_ID}] via ui`],
+            messages: DELETED_VIA_UI,
             errors: [],
         },
     },
     {
-        name: "a created-id read that fails is retried, then confirmed",
+        name: "createdReadThrows_retriedThenConfirmed",
         page: ownAlertPage({ failingReads: { [createdKey(MARKER)]: 1 } }),
         expected: {
             outcome: { kind: "deleted", id: OWN_ID, via: "ui" },
-            form: SUBMITTED_FORM,
-            clicks: [SUBMIT_KEY, rowDeleteKey(OWN_ID)],
-            optionPolls: 1,
+            steps: [
+                ...SUBMIT_STEPS,
+                checkStep(createdKey(MARKER), 2),
+                ...UI_DELETE_STEPS,
+            ],
             requests: [],
             messages: [
                 `debug: Created alert output for threshold [${MARKER}] unreadable, retrying`,
-                CREATED_OWN,
-                `info: Deleted alert [${OWN_ID}] via ui`,
+                ...DELETED_VIA_UI,
             ],
-            errors: ["Error: Node is detached from document"],
+            errors: ["readError"],
         },
     },
     {
-        name: "a UI delete not confirmed before unmount is followed by an API DELETE (204)",
+        name: "uiDeleteUnconfirmed_apiDelete204_deletedViaApi",
         page: ownAlertPage({
             present: { [deletedKey(OWN_ID)]: Number.POSITIVE_INFINITY },
         }),
         respond: () => statusResponse(204),
         expected: {
             outcome: { kind: "deleted", id: OWN_ID, via: "api" },
-            form: SUBMITTED_FORM,
-            clicks: [SUBMIT_KEY, rowDeleteKey(OWN_ID)],
-            optionPolls: 1,
+            steps: UI_DELETE_UNCONFIRMED_STEPS,
             requests: [DELETE_OWN],
             messages: [CREATED_OWN, `info: Deleted alert [${OWN_ID}] via api`],
             errors: [],
         },
     },
     {
-        name: "a row never listed is deleted through the API without a click",
+        name: "rowNeverAppears_apiDelete",
         page: ownAlertPage({
             present: { [rowKey(OWN_ID)]: Number.POSITIVE_INFINITY },
         }),
         respond: () => statusResponse(204),
         expected: {
             outcome: { kind: "deleted", id: OWN_ID, via: "api" },
-            form: SUBMITTED_FORM,
-            clicks: [SUBMIT_KEY],
-            optionPolls: 1,
+            steps: [...CONFIRMED_STEPS, checkStep(rowKey(OWN_ID), 20)],
             requests: [DELETE_OWN],
             messages: [CREATED_OWN, `info: Deleted alert [${OWN_ID}] via api`],
             errors: [],
         },
     },
     {
-        name: "API 404 -> already absent",
+        name: "api404_absent",
         page: ownAlertPage({
             present: { [deletedKey(OWN_ID)]: Number.POSITIVE_INFINITY },
         }),
         respond: () => statusResponse(404),
         expected: {
             outcome: { kind: "absent", id: OWN_ID },
-            form: SUBMITTED_FORM,
-            clicks: [SUBMIT_KEY, rowDeleteKey(OWN_ID)],
-            optionPolls: 1,
+            steps: UI_DELETE_UNCONFIRMED_STEPS,
             requests: [DELETE_OWN],
             messages: [CREATED_OWN, `info: Alert [${OWN_ID}] already absent`],
             errors: [],
         },
     },
     ...[403, 500].map((status): AlertRow => ({
-        name: `API ${status} -> left in place, logged`,
+        name: `api${status}_leftInPlace`,
         page: ownAlertPage({
             present: { [deletedKey(OWN_ID)]: Number.POSITIVE_INFINITY },
         }),
         respond: () => statusResponse(status),
         expected: {
             outcome: { kind: "left_in_place", id: OWN_ID, status: `${status}` },
-            form: SUBMITTED_FORM,
-            clicks: [SUBMIT_KEY, rowDeleteKey(OWN_ID)],
-            optionPolls: 1,
+            steps: UI_DELETE_UNCONFIRMED_STEPS,
             requests: [DELETE_OWN],
             messages: [
                 CREATED_OWN,
@@ -771,26 +890,24 @@ const alertRows: AlertRow[] = [
         },
     })),
     {
-        name: "an API DELETE that fails -> left in place, logged with the error",
+        name: "apiNetworkError_leftInPlaceError",
         page: ownAlertPage({
             present: { [deletedKey(OWN_ID)]: Number.POSITIVE_INFINITY },
         }),
         respond: () => Promise.reject(networkError),
         expected: {
             outcome: { kind: "left_in_place", id: OWN_ID, status: "error" },
-            form: SUBMITTED_FORM,
-            clicks: [SUBMIT_KEY, rowDeleteKey(OWN_ID)],
-            optionPolls: 1,
+            steps: UI_DELETE_UNCONFIRMED_STEPS,
             requests: [DELETE_OWN],
             messages: [
                 CREATED_OWN,
                 `warn: Alert [${OWN_ID}] left in place: error`,
             ],
-            errors: ["TypeError: fetch failed"],
+            errors: ["networkError"],
         },
     },
     {
-        name: "an API DELETE that hangs is aborted at 5 s and logged",
+        name: "apiHang_abortedAt5s_leftInPlaceTimeout",
         page: ownAlertPage({
             present: { [deletedKey(OWN_ID)]: Number.POSITIVE_INFINITY },
         }),
@@ -802,64 +919,55 @@ const alertRows: AlertRow[] = [
         },
         expected: {
             outcome: { kind: "left_in_place", id: OWN_ID, status: "timeout" },
-            form: SUBMITTED_FORM,
-            clicks: [SUBMIT_KEY, rowDeleteKey(OWN_ID)],
-            optionPolls: 1,
+            steps: UI_DELETE_UNCONFIRMED_STEPS,
             requests: [DELETE_OWN],
             messages: [
                 CREATED_OWN,
                 `warn: Alert [${OWN_ID}] left in place: timeout`,
             ],
-            errors: ["AbortError: This operation was aborted"],
+            errors: ["AbortError"],
         },
     },
     {
-        name: "a page error after the create deletes through the API and propagates",
+        name: "rowDeleteClickThrows_apiDeleteAndRejects",
         page: ownAlertPage({ failingClick: rowDeleteKey(OWN_ID) }),
         respond: () => statusResponse(204),
         rejects: pageError,
         expected: {
-            form: SUBMITTED_FORM,
-            clicks: [SUBMIT_KEY, rowDeleteKey(OWN_ID)],
-            optionPolls: 1,
+            steps: [
+                ...CONFIRMED_STEPS,
+                checkStep(rowKey(OWN_ID), 1),
+                clickStep(rowDeleteKey(OWN_ID)),
+            ],
             requests: [DELETE_OWN],
             messages: [CREATED_OWN, `info: Deleted alert [${OWN_ID}] via api`],
             errors: [],
         },
     },
     {
-        name: "a page error during the submit logs outcome unknown and propagates",
+        name: "submitClickThrows_logsOutcomeUnknownAndRejects",
         page: ownAlertPage({ failingClick: SUBMIT_KEY }),
         rejects: pageError,
         expected: {
-            form: SUBMITTED_FORM,
-            clicks: [SUBMIT_KEY],
-            optionPolls: 1,
+            steps: SUBMIT_STEPS,
             requests: [],
-            messages: [
-                `warn: Create unconfirmed threshold [${MARKER}], outcome unknown`,
-            ],
-            errors: ["Error: Execution context was destroyed"],
+            messages: [UNCONFIRMED],
+            errors: ["pageError"],
         },
     },
     {
-        name: "a page error before the submit propagates without an unknown-outcome line",
-        page: ownAlertPage({
-            failingInput:
-                selectors.portfolioInsightsPage_alertThreshold.toString(),
-        }),
+        name: "formInputThrows_rejectsWithoutOutcomeLine",
+        page: ownAlertPage({ failingInput: THRESHOLD_KEY }),
         rejects: pageError,
         expected: {
-            form: SUBMITTED_FORM,
-            clicks: [],
-            optionPolls: 1,
+            steps: SUBMIT_STEPS.slice(0, -1),
             requests: [],
             messages: [],
             errors: [],
         },
     },
     {
-        name: "options that never load stop after 20 polls",
+        name: "optionsNeverLoad_notSubmitted",
         page: {
             options: {
                 emptyPolls: Number.POSITIVE_INFINITY,
@@ -868,9 +976,7 @@ const alertRows: AlertRow[] = [
         },
         expected: {
             outcome: { kind: "not_submitted" },
-            form: [],
-            clicks: [],
-            optionPolls: 20,
+            steps: [findOptionsStep(20)],
             requests: [],
             messages: [
                 "warn: Alert instrument options did not load, no alert created",
@@ -884,29 +990,21 @@ test("createAndDeleteOwnedAlert_scenario_outcome", async (t) => {
     for (const row of alertRows) {
         await t.test(row.name, async (st) => {
             st.mock.timers.enable({ apis: ["setTimeout"] })
-            let deletePending: (call: FetchCall) => void = () => undefined
-            const deleteCalled = new Promise<FetchCall>((resolve) => {
-                deletePending = resolve
-            })
-            const { fetchFn, calls } = recordingFetch((call) => {
-                deletePending(call)
-                return row.respond === undefined
+            const { fetchFn, calls, firstCall } = recordingFetch((call) =>
+                row.respond === undefined
                     ? Promise.reject(new Error("Unexpected request"))
                     : row.respond(call)
-            })
+            )
             const { logger, records } = recordingLogger()
             const page = new FakePageActions(row.page)
 
+            // random 0.5 yields MARKER, 1000000.55555555.
             const pending = createAndDeleteOwnedAlert(page, BASE_URL, logger, {
                 fetchFn,
                 random: () => 0.5,
             })
             if (row.whileDeletePending !== undefined) {
-                const settled = pending.then(
-                    () => undefined,
-                    () => undefined
-                )
-                const call = await Promise.race([deleteCalled, settled])
+                const call = await requestSent(firstCall, pending)
                 if (call !== undefined) {
                     row.whileDeletePending(st, call)
                 }
@@ -915,7 +1013,8 @@ test("createAndDeleteOwnedAlert_scenario_outcome", async (t) => {
             if (row.rejects === undefined) {
                 outcome = await pending
             } else {
-                await assert.rejects(pending, row.rejects)
+                const thrown = row.rejects
+                await assert.rejects(pending, (error) => error === thrown)
             }
 
             assert.deepEqual(
@@ -927,27 +1026,49 @@ test("createAndDeleteOwnedAlert_scenario_outcome", async (t) => {
 })
 
 test("createAndDeleteOwnedAlert_randomBounds_submitsNormalisedMarker", async (t) => {
+    // Each marker is `1000000.` and 8 digits whose last one is non-zero, the
+    // normalised threshold form; random 1 is clamped to the highest digits.
     const rows = [
-        { random: 0, marker: "1000000.00000001" },
-        { random: 0.999999, marker: "1000000.99999999" },
-        { random: 1, marker: "1000000.99999999" },
+        { name: "random0_lowestMarker", random: 0, marker: "1000000.00000001" },
+        {
+            name: "random0999_highestMarker",
+            random: 0.999,
+            marker: "1000000.99999999",
+        },
+        {
+            name: "random1_clampedToHighestMarker",
+            random: 1,
+            marker: "1000000.99999999",
+        },
     ]
     for (const row of rows) {
-        await t.test(`random ${row.random} -> ${row.marker}`, async () => {
-            const page = new FakePageActions({
-                options: { emptyPolls: 0, values: [INSTRUMENT_ID] },
-            })
+        await t.test(row.name, async () => {
+            // Only the created output of the expected marker exists, so the
+            // alert is confirmed only when the typed text is that marker.
+            const page = new FakePageActions(ownAlertPage({}, row.marker))
+            const { fetchFn } = recordingFetch(() =>
+                Promise.reject(new Error("Unexpected request"))
+            )
             const { logger } = recordingLogger()
 
-            await createAndDeleteOwnedAlert(page, BASE_URL, logger, {
-                random: () => row.random,
-            })
+            const outcome = await createAndDeleteOwnedAlert(
+                page,
+                BASE_URL,
+                logger,
+                { fetchFn, random: () => row.random }
+            )
 
             assert.deepEqual(
-                page.calls
-                    .filter((call) => call.action === "input")
-                    .map((call) => call.value),
-                [row.marker]
+                {
+                    typed: page.calls
+                        .filter((call) => call.action === "input")
+                        .map((call) => call.value),
+                    outcome,
+                },
+                {
+                    typed: [row.marker],
+                    outcome: { kind: "deleted", id: OWN_ID, via: "ui" },
+                }
             )
         })
     }
