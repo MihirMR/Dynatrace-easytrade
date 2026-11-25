@@ -5,9 +5,15 @@ import {
     DepositIcon,
     WithdrawIcon,
     AddCardIcon,
+    InsightsIcon,
 } from "./icons"
+import { usePortfolioInsightsFlag } from "../hooks/useFeatureFlags"
 
 export default function Navigation() {
+    // Observed on every protected route, so the flag keeps revalidating and a
+    // disable shuts the feature down wherever the user is.
+    const portfolioInsightsEnabled = usePortfolioInsightsFlag()
+
     return (
         <nav className="sidebar">
             <div className="sidebar-nav">
@@ -72,6 +78,20 @@ export default function Navigation() {
                             Credit Card
                         </NavLink>
                     </li>
+                    {portfolioInsightsEnabled && (
+                        <li>
+                            <NavLink
+                                id="nav-portfolio-insights"
+                                to="/insights"
+                                className={({ isActive }) =>
+                                    "nav-link" + (isActive ? " active" : "")
+                                }
+                            >
+                                <InsightsIcon />
+                                Portfolio Insights
+                            </NavLink>
+                        </li>
+                    )}
                 </ul>
             </div>
         </nav>
