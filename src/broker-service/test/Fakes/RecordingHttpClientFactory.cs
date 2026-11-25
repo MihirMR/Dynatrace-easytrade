@@ -20,7 +20,10 @@ namespace EasyTrade.BrokerService.Test.Fakes
     /// <param name="RequestUri">Absolute URI, resolved against the client's base address.</param>
     /// <param name="Headers">
     /// Request and content headers keyed case-insensitively, copied on arrival so later changes
-    /// to the request cannot alter the record.
+    /// to the request cannot alter the record. Each read of
+    /// <see cref="RecordingHttpMessageHandler.Requests"/> returns its own copies of the
+    /// dictionary and its value arrays, so editing one cannot change the handler's record or a
+    /// later read.
     /// </param>
     /// <param name="TokenCanBeCanceled">
     /// Whether the token the handler received could be cancelled; see the remarks.
@@ -84,7 +87,10 @@ namespace EasyTrade.BrokerService.Test.Fakes
 
         /// <summary>
         /// Requests recorded since creation, <see cref="Clear"/> or <see cref="Reset"/>, in
-        /// arrival order. A held request is listed as soon as it arrives.
+        /// arrival order. A held request is listed as soon as it arrives. Each read returns its
+        /// own copies of every record's header dictionary and value arrays, so editing one cannot
+        /// change the handler's record or a later read. Records from separate reads therefore
+        /// differ under record equality; compare their fields instead.
         /// </summary>
         public IReadOnlyList<RecordedHttpRequest> Requests
         {
@@ -92,7 +98,7 @@ namespace EasyTrade.BrokerService.Test.Fakes
             {
                 lock (_gate)
                 {
-                    return [.. _requests];
+                    return [.. _requests.Select(WithOwnHeaders)];
                 }
             }
         }
@@ -267,6 +273,21 @@ namespace EasyTrade.BrokerService.Test.Fakes
                 AddHeaders(headers, request.Content.Headers);
             }
             return headers;
+        }
+
+        // Stored records never leave the handler, which keeps MarkCancelled's reference lookup
+        // valid; a read gets a copy whose headers no caller can write back into the store.
+        private static RecordedHttpRequest WithOwnHeaders(RecordedHttpRequest stored)
+        {
+            Dictionary<string, string[]> headers = new(
+                stored.Headers.Count,
+                StringComparer.OrdinalIgnoreCase
+            );
+            foreach (KeyValuePair<string, string[]> header in stored.Headers)
+            {
+                headers.Add(header.Key, [.. header.Value]);
+            }
+            return stored with { Headers = headers };
         }
 
         private static void AddHeaders(

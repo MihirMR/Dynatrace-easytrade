@@ -5,11 +5,13 @@ import (
 	"context"
 	dbsql "database/sql"
 	"database/sql/driver"
+	"encoding/binary"
 	"errors"
 	"flag"
 	"fmt"
 	"io"
 	stdlog "log"
+	"math/rand/v2"
 	"net"
 	"runtime"
 	"slices"
@@ -24,6 +26,9 @@ import (
 	"github.com/dynatrace/easytrade/dbadapter/repository"
 	"github.com/dynatrace/easytrade/dbadapter/server"
 	"github.com/google/uuid"
+	// Already required, through gorm.io/driver/sqlserver, at the version go.mod pins: importing it adds
+	// no dependency
+	mssql "github.com/microsoft/go-mssqldb"
 	log "github.com/sirupsen/logrus"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -36,7 +41,9 @@ import (
 )
 
 // The real-database cases opt in through a test-binary flag rather than an environment variable, so
-// no test-only setting needs a place in the deployment manifests. They reuse DB_TYPE and DB_URL:
+// no test-only setting needs a place in the deployment manifests. They reuse DB_TYPE and DB_URL.
+// Every case that connects through alertTestBackend, the AlertServer handler over the real backend
+// included, is named TestAlertRepository_*, so this command runs them all:
 //
 //	go test ./repository/sql/ -run TestAlertRepository -args -integration
 var integration = flag.Bool("integration", false, "run alert repository tests against the database in DB_TYPE/DB_URL")
@@ -70,7 +77,7 @@ func alertTestBackend(t *testing.T) *sqlBackend {
 		t.Skip("needs -integration and DB_TYPE/DB_URL")
 	}
 	alertBackendOnce.Do(func() {
-		alertBackend, alertBackendErr = connectAlertTestBackend(config.Load().Database)
+		alertBackend, alertBackendErr = connectAlertTestBackend(context.Background(), config.Load().Database)
 	})
 	// With the flag set, a missing or unreachable database fails the run instead of skipping it. The
 	// error names the setting or the stage that failed and never carries DB_URL or a parser message
@@ -80,9 +87,10 @@ func alertTestBackend(t *testing.T) *sqlBackend {
 	return alertBackend
 }
 
-// connectAlertTestBackend validates the settings, then connects through the backend for DB_TYPE. Its
-// errors name a setting or a stage, never the DB_URL value
-func connectAlertTestBackend(cfg config.DatabaseConfig) (*sqlBackend, error) {
+// connectAlertTestBackend validates the settings, connects to the DB_URL database and builds the backend
+// for DB_TYPE over that connection. The wait for the database ends at DB_CONNECT_TIMEOUT or when ctx
+// ends, whichever comes first. Its errors name a setting or a stage, never the DB_URL value
+func connectAlertTestBackend(ctx context.Context, cfg config.DatabaseConfig) (*sqlBackend, error) {
 	if cfg.Url == "" {
 		return nil, errors.New("DB_URL is not set")
 	}
@@ -91,25 +99,30 @@ func connectAlertTestBackend(cfg config.DatabaseConfig) (*sqlBackend, error) {
 	if cfg.RetryInterval <= 0 {
 		return nil, fmt.Errorf("DB_RETRY_INTERVAL must be a positive duration, got %s", cfg.RetryInterval)
 	}
-	// Each probe is the dialector NewPostgresBackend or NewMSSQLBackend builds from DB_URL, and onPool
-	// is the same driver over the pool that probe opens
-	var probe gorm.Dialector
+	// Each pool is opened from the connection string NewPostgresBackend or NewMSSQLBackend opens, by the
+	// same driver, and onPool is the same dialector over that pool. ready is one readiness attempt
+	// against that database, which ends when its context ends
+	var pool *dbsql.DB
+	var ready func(context.Context) error
 	var onPool func(*dbsql.DB) gorm.Dialector
+	var err error
 	switch cfg.Type {
 	case "postgres":
-		probe = postgres.Open(cfg.Url)
+		pool, err = openAlertTestPool(cfg.Type, postgres.Open(cfg.Url))
+		// pgx's default context watcher ends a connect or a ping when its context ends, by moving the
+		// socket's deadline to that moment
+		ready = func(ctx context.Context) error { return pool.PingContext(ctx) }
 		onPool = func(pool *dbsql.DB) gorm.Dialector { return postgres.New(postgres.Config{Conn: pool}) }
 	case "mssql":
-		probe = sqlserver.Open(withGuidConversion(cfg.Url))
+		pool, ready, err = openMSSQLAlertTestPool(withGuidConversion(cfg.Url))
 		onPool = func(pool *dbsql.DB) gorm.Dialector { return sqlserver.New(sqlserver.Config{Conn: pool}) }
 	default:
 		return nil, fmt.Errorf("unsupported DB_TYPE %q", cfg.Type)
 	}
-	pool, err := openAlertTestPool(cfg.Type, probe)
 	if err != nil {
 		return nil, err
 	}
-	sb, err := connectAlertTestPool(cfg, pool, onPool(pool))
+	sb, err := connectAlertTestPool(ctx, cfg, ready, onPool(pool))
 	if err != nil {
 		err = fmt.Errorf("connecting with DB_TYPE=%s within DB_CONNECT_TIMEOUT=%s: %w", cfg.Type, cfg.ConnectTimeout, err)
 		if closeErr := pool.Close(); closeErr != nil {
@@ -120,13 +133,19 @@ func connectAlertTestBackend(cfg config.DatabaseConfig) (*sqlBackend, error) {
 	return sb, nil
 }
 
+// invalidDBURLError reports a DB_URL its driver's parser rejected. A parser error can echo the
+// connection string and its password: pgx redacts on a best-effort basis and go-mssqldb repeats
+// rejected values, so the error reports neither
+func invalidDBURLError(dbType string) error {
+	return fmt.Errorf("checking DB_URL for DB_TYPE=%s: the connection string is invalid (value and parser message withheld: either can contain the password)", dbType)
+}
+
 // openAlertTestPool parses DB_URL, the only time it is parsed, through the probe dialector into a pool,
-// without connecting or logging. A parser error can echo the connection string and its password: pgx
-// redacts on a best-effort basis and go-mssqldb repeats rejected values, so the error reports neither
+// without connecting or logging
 func openAlertTestPool(dbType string, probe gorm.Dialector) (*dbsql.DB, error) {
 	opened, err := gorm.Open(probe, &gorm.Config{Logger: logger.Discard, DisableAutomaticPing: true})
 	if err != nil {
-		return nil, fmt.Errorf("checking DB_URL for DB_TYPE=%s: the connection string is invalid (value and parser message withheld: either can contain the password)", dbType)
+		return nil, invalidDBURLError(dbType)
 	}
 	pool, err := opened.DB()
 	if err != nil {
@@ -135,22 +154,148 @@ func openAlertTestPool(dbType string, probe gorm.Dialector) (*dbsql.DB, error) {
 	return pool, nil
 }
 
-// connectAlertTestPool waits until pool answers a ping, then builds through newBackend the backend
-// NewPostgresBackend or NewMSSQLBackend builds, with their dialector over the pool DB_URL was parsed
-// into once. No attempt parses DB_URL again, so db.Connect's retry log and error carry connection
-// failures only. The wait comes first because gorm.Open, inside newBackend, closes the pool when its
-// own ping fails
-func connectAlertTestPool(cfg config.DatabaseConfig, pool *dbsql.DB, dialector gorm.Dialector) (*sqlBackend, error) {
-	if _, err := db.Connect(context.Background(), db.ConnectOptions{
-		Timeout:       cfg.ConnectTimeout,
-		RetryInterval: cfg.RetryInterval,
-	}, func() (struct{}, error) { return struct{}{}, pool.Ping() }); err != nil {
-		return nil, err
+// openMSSQLAlertTestPool parses DB_URL, the only time it is parsed, with the parser and driver instance
+// sqlserver.Open's pool uses, into a pool whose connection attempts end with their context, without
+// connecting or logging. It returns with the pool the readiness attempt over the same connector
+func openMSSQLAlertTestPool(dsn string) (*dbsql.DB, func(context.Context) error, error) {
+	connector, err := mssql.NewConnector(dsn)
+	if err != nil {
+		return nil, nil, invalidDBURLError("mssql")
 	}
-	backend, err := newBackend(cfg, dialector)
+	// go-mssqldb's default dialer, with the driver's default keep-alive; a keepAlive in DB_URL only
+	// paces probes on an idle connection and is not applied
+	connector.Dialer = &attemptDialer{Dialer: net.Dialer{KeepAlive: 30 * time.Second}}
+	bound := attemptBoundConnector{connector}
+	return dbsql.OpenDB(bound), bound.ready, nil
+}
+
+// attemptBoundConnector is a go-mssqldb connector, dialing through attemptDialer, whose connection
+// attempts end when their context ends, as pgx attempts do. go-mssqldb uses the context for dialing
+// only, so an attempt that a server accepts and never answers blocks in the pre-login handshake past
+// DB_CONNECT_TIMEOUT and past cancellation. A connection already made outlives its context
+type attemptBoundConnector struct{ driver.Connector }
+
+func (c attemptBoundConnector) Connect(ctx context.Context) (driver.Conn, error) {
+	attempt := &attemptConns{}
+	stop := context.AfterFunc(ctx, attempt.closeAll)
+	conn, err := c.Connector.Connect(context.WithValue(ctx, attemptConnsKey{}, attempt))
+	if stop() {
+		return conn, err
+	}
+	// ctx ended during the attempt, and closeAll closes every connection the attempt dialed
+	if err != nil {
+		return nil, fmt.Errorf("%w: %w", ctx.Err(), err)
+	}
+	// closeAll closes the session's socket, so its close error carries nothing
+	_ = conn.Close()
+	return nil, ctx.Err()
+}
+
+// ready is one readiness attempt: it opens a session, pings it and closes it, and closes the session's
+// socket as soon as ctx ends, the ping included. go-mssqldb answers a query whose context ends by
+// sending ATTENTION and waiting up to its cancelDrainTimeout, 5 s, for the server to confirm, so a
+// server that completes the login and then stops answering would hold a ping past ctx on a socket
+// that outlived its Connect. A closed socket fails that wait at once. The session is opened for the
+// attempt and never taken from the pool, so the attempt tracks its socket
+func (c attemptBoundConnector) ready(ctx context.Context) error {
+	attempt := &attemptConns{}
+	stop := context.AfterFunc(ctx, attempt.closeAll)
+	defer stop()
+	// The attempt keeps no connection: every socket it dialed is closed when it returns, including that
+	// of a session whose Connect failed after dialing
+	defer attempt.closeAll()
+	ctx = context.WithValue(ctx, attemptConnsKey{}, attempt)
+	conn, err := c.Connector.Connect(ctx)
+	if err != nil {
+		return err
+	}
+	// The ping decides the attempt, and closeAll closes the socket in any case, so the close error
+	// carries nothing
+	defer func() { _ = conn.Close() }()
+	pinger, ok := conn.(driver.Pinger)
+	if !ok {
+		return fmt.Errorf("a go-mssqldb session is a %T, which does not answer pings", conn)
+	}
+	return pinger.Ping(ctx)
+}
+
+// attemptConnsKey is the context key under which attemptBoundConnector hands each connection attempt's
+// *attemptConns to attemptDialer
+type attemptConnsKey struct{}
+
+// attemptConns holds the connections one connection attempt dialed. closeAll closes them, and add
+// closes every connection the attempt dials after that
+type attemptConns struct {
+	mu     sync.Mutex
+	conns  []net.Conn
+	closed bool
+}
+
+// add records conn, or closes it once closeAll has run. A close error carries nothing: it can only
+// report a socket already closed
+func (a *attemptConns) add(conn net.Conn) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.closed {
+		_ = conn.Close()
+		return
+	}
+	a.conns = append(a.conns, conn)
+}
+
+// closeAll ends the attempt by closing its connections, which fails the driver's blocked read or write
+func (a *attemptConns) closeAll() {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.closed = true
+	for _, conn := range a.conns {
+		_ = conn.Close()
+	}
+}
+
+// attemptDialer dials as its net.Dialer does and records each connection in the attempt that dialed it
+type attemptDialer struct{ net.Dialer }
+
+func (d *attemptDialer) DialContext(ctx context.Context, network, addr string) (net.Conn, error) {
+	conn, err := d.Dialer.DialContext(ctx, network, addr)
 	if err != nil {
 		return nil, err
 	}
+	if attempt, ok := ctx.Value(attemptConnsKey{}).(*attemptConns); ok {
+		attempt.add(conn)
+	}
+	return conn, nil
+}
+
+// connectAlertTestPool waits until a ready attempt succeeds, then builds the backend NewPostgresBackend
+// or NewMSSQLBackend builds: newSQLBackend over GORM, with dialector on the pool DB_URL was parsed into
+// once and the backend's naming strategy. No attempt parses DB_URL again, so db.Connect's retry log and
+// error carry connection failures only. db.Connect checks its deadline only between attempts, so every
+// attempt runs under, and ends with, one shared deadline: DB_CONNECT_TIMEOUT from the start of the
+// wait, or the end of ctx if that comes sooner. GORM's automatic ping takes no context, so it is
+// disabled: the bounded wait has already reached the database
+func connectAlertTestPool(ctx context.Context, cfg config.DatabaseConfig, ready func(context.Context) error, dialector gorm.Dialector) (*sqlBackend, error) {
+	ctx, cancel := context.WithTimeout(ctx, cfg.ConnectTimeout)
+	defer cancel()
+	if _, err := db.Connect(ctx, db.ConnectOptions{
+		Timeout:       cfg.ConnectTimeout,
+		RetryInterval: cfg.RetryInterval,
+	}, func() (struct{}, error) {
+		err := ready(ctx)
+		// pgx's database/sql ping reports every failure, the end of its context included, as
+		// driver.ErrBadConn, so an attempt that failed once ctx ended carries ctx's error itself
+		if err != nil && ctx.Err() != nil && !errors.Is(err, ctx.Err()) {
+			err = fmt.Errorf("%w: %w", ctx.Err(), err)
+		}
+		return struct{}{}, err
+	}); err != nil {
+		return nil, err
+	}
+	gormDB, err := gorm.Open(dialector, &gorm.Config{NamingStrategy: dbNamer{}, DisableAutomaticPing: true})
+	if err != nil {
+		return nil, fmt.Errorf("building the backend for DB_TYPE=%s: %w", cfg.Type, err)
+	}
+	backend := newSQLBackend(gormDB)
 	sb, ok := backend.(*sqlBackend)
 	if !ok {
 		return nil, fmt.Errorf("DB_TYPE %q gave a %T backend, not *sqlBackend", cfg.Type, backend)
@@ -534,16 +679,69 @@ func TestAlertRepository_list_newestFirst(t *testing.T) {
 	}
 }
 
+// createOtherAccountArmedTestAlert creates, as createArmedTestAlert does, an armed TARGET_PRICE ABOVE
+// alert at the threshold domain maximum, but on the seeded account james_norton, and deletes it by id
+// when the test ends. Only the owner account has the same fixed id on both dialects, so the other
+// account's id is read through the adapter's account repository
+func createOtherAccountArmedTestAlert(t *testing.T, b *sqlBackend) *pb.AlertMessage {
+	t.Helper()
+	other, err := b.Account().GetByUsername(context.Background(), "james_norton")
+	if err != nil {
+		t.Fatalf("GetByUsername(james_norton): %v", err)
+	}
+	if other.Id == testOwnerAccountID {
+		t.Fatalf("seeded account james_norton has the owner account id %s, want a second account", other.Id)
+	}
+	alert, err := b.Alert().Create(context.Background(), &pb.CreateAlertRequest{
+		AccountId:    other.Id,
+		Type:         repository.AlertTypeTargetPrice,
+		InstrumentId: testInstrumentID,
+		Direction:    repository.AlertDirectionAbove,
+		Threshold:    thresholdDomainMax,
+	})
+	if err != nil {
+		t.Fatalf("Create on account %s: %v", other.Id, err)
+	}
+	deleteAlertAtCleanup(t, b.Alert(), alert.Id)
+	return alert
+}
+
+// insertArmedTestAlertCreatedAt inserts through insertRawAlertValues an armed TARGET_PRICE ABOVE alert
+// at the threshold domain maximum on the owner account, with a CreatedAt no repository call can set,
+// and returns the row as read back. insertRawAlertValues deletes it by id when the test ends
+func insertArmedTestAlertCreatedAt(t *testing.T, b *sqlBackend, createdAt time.Time) *pb.AlertMessage {
+	t.Helper()
+	id := uuid.New().String()
+	if err := insertRawAlertValues(t, b, id, map[string]any{
+		repository.ColThreshold:    thresholdDomainMax,
+		repository.ColTriggerValue: nil,
+		repository.ColCreatedAt:    createdAt,
+		repository.ColTriggeredAt:  nil,
+	}); err != nil {
+		t.Fatalf("insert alert %s created at %v: %v", id, createdAt, err)
+	}
+	alert := getTestAlert(t, b.Alert(), id)
+	if !alert.CreatedAt.AsTime().Equal(createdAt) {
+		t.Fatalf("alert %s CreatedAt read back as %v, want %v", id, alert.CreatedAt.AsTime(), createdAt)
+	}
+	return alert
+}
+
 func TestAlertRepository_listFilters_apply(t *testing.T) {
-	repo := alertTestBackend(t).Alert()
+	b := alertTestBackend(t)
+	repo := b.Alert()
 	ctx := context.Background()
 
 	armed := createArmedTestAlert(t, repo)
-	triggered := createArmedTestAlert(t, repo)
-	acknowledged := createArmedTestAlert(t, repo)
+	// triggered and acknowledged are created one second apart, acknowledged the later, both before
+	// either trigger, and are then triggered in the opposite order, acknowledged first. Their
+	// CreatedAt DESC order is therefore acknowledged, triggered and their TriggeredAt DESC order
+	// triggered, acknowledged, with no tie in either for the Id tie-break to decide
+	triggeredCreatedAt := alertNow().Add(-2 * time.Second)
+	triggered := insertArmedTestAlertCreatedAt(t, b, triggeredCreatedAt)
+	acknowledged := insertArmedTestAlertCreatedAt(t, b, triggeredCreatedAt.Add(time.Second))
 	disabled := createArmedTestAlert(t, repo)
-	// acknowledged was created after triggered but triggers first, so the triggered-only order (by
-	// TriggeredAt) is the reverse of the creation order
+	otherAccountArmed := createOtherAccountArmedTestAlert(t, b)
 	mustTrigger(t, repo, acknowledged.Id, 1, "5")
 	awaitAdapterClockAfter(getTestAlert(t, repo, acknowledged.Id).TriggeredAt.AsTime())
 	mustTrigger(t, repo, triggered.Id, 1, "6")
@@ -551,7 +749,8 @@ func TestAlertRepository_listFilters_apply(t *testing.T) {
 		t.Fatalf("Acknowledge(%s) = (%d, %v), want (1, nil)", acknowledged.Id, n, err)
 	}
 	mustUpdateEnabled(t, repo, disabled.Id, false)
-	all := []string{armed.Id, triggered.Id, acknowledged.Id, disabled.Id}
+	owner := []string{armed.Id, triggered.Id, acknowledged.Id, disabled.Id}
+	own := append(slices.Clone(owner), otherAccountArmed.Id)
 
 	sets := []struct {
 		name string
@@ -559,6 +758,8 @@ func TestAlertRepository_listFilters_apply(t *testing.T) {
 		want []string
 	}{
 		{"armedOnly", &pb.ListAlertsRequest{AccountId: testOwnerAccountID, ArmedOnly: true}, []string{armed.Id}},
+		// The evaluator's read: an empty account id lists the armed alerts of every account
+		{"armedOnlyAllAccounts", &pb.ListAlertsRequest{ArmedOnly: true}, []string{armed.Id, otherAccountArmed.Id}},
 		{
 			"triggeredUnacknowledged",
 			&pb.ListAlertsRequest{AccountId: testOwnerAccountID, TriggeredOnly: true, UnacknowledgedOnly: true},
@@ -569,13 +770,14 @@ func TestAlertRepository_listFilters_apply(t *testing.T) {
 			&pb.ListAlertsRequest{AccountId: testOwnerAccountID, UnacknowledgedOnly: true},
 			[]string{armed.Id, triggered.Id, disabled.Id},
 		},
-		{"account", &pb.ListAlertsRequest{AccountId: testOwnerAccountID}, all},
-		{"allAccounts", &pb.ListAlertsRequest{}, all},
-		{"otherAccount", &pb.ListAlertsRequest{AccountId: uuid.New().String()}, []string{}},
+		{"account", &pb.ListAlertsRequest{AccountId: testOwnerAccountID}, owner},
+		{"allAccounts", &pb.ListAlertsRequest{}, own},
+		{"otherAccount", &pb.ListAlertsRequest{AccountId: otherAccountArmed.AccountId}, []string{otherAccountArmed.Id}},
+		{"unknownAccount", &pb.ListAlertsRequest{AccountId: uuid.New().String()}, []string{}},
 	}
 	for _, tc := range sets {
 		t.Run(tc.name, func(t *testing.T) {
-			got := listOwnAlertIDs(t, repo, tc.req, all...)
+			got := listOwnAlertIDs(t, repo, tc.req, own...)
 
 			if !slices.Equal(sortedIDs(got...), sortedIDs(tc.want...)) {
 				t.Errorf("List(%v) own ids = %v, want %v", tc.req, got, tc.want)
@@ -583,10 +785,22 @@ func TestAlertRepository_listFilters_apply(t *testing.T) {
 		})
 	}
 
+	// The control for the next case: the default CreatedAt DESC order lists acknowledged first, so a
+	// triggered-only list left in that order fails the next case
+	t.Run("accountNewestCreatedFirst", func(t *testing.T) {
+		req := &pb.ListAlertsRequest{AccountId: testOwnerAccountID}
+
+		got := listOwnAlertIDs(t, repo, req, triggered.Id, acknowledged.Id)
+
+		if want := []string{acknowledged.Id, triggered.Id}; !slices.Equal(got, want) {
+			t.Errorf("List(%v) own ids = %v, want %v", req, got, want)
+		}
+	})
+
 	t.Run("triggeredOnlyNewestTriggerFirst", func(t *testing.T) {
 		req := &pb.ListAlertsRequest{AccountId: testOwnerAccountID, TriggeredOnly: true}
 
-		got := listOwnAlertIDs(t, repo, req, all...)
+		got := listOwnAlertIDs(t, repo, req, own...)
 
 		if want := []string{triggered.Id, acknowledged.Id}; !slices.Equal(got, want) {
 			t.Errorf("List(%v) own ids = %v, want %v", req, got, want)
@@ -625,33 +839,43 @@ func TestAlertRepository_triggerDisabled_notTriggered(t *testing.T) {
 	}
 }
 
-func TestAlertRepository_updateEnabled_appliesRules(t *testing.T) {
-	repo := alertTestBackend(t).Alert()
+// createAcknowledgedTriggerTestAlert creates an armed alert, triggers it at revision 1 with 12.5,
+// acknowledges it and returns the row as read back. Each caller gets its own row, so a case that
+// changes it leaves every other case's starting state intact
+func createAcknowledgedTriggerTestAlert(t *testing.T, repo repository.AlertRepository) *pb.AlertMessage {
+	t.Helper()
 	alert := createArmedTestAlert(t, repo)
 	mustTrigger(t, repo, alert.Id, 1, "12.5")
 	if n, err := repo.Acknowledge(context.Background(), alert.Id); err != nil || n != 1 {
-		t.Fatalf("Acknowledge = (%d, %v), want (1, nil)", n, err)
+		t.Fatalf("Acknowledge(%s) = (%d, %v), want (1, nil)", alert.Id, n, err)
 	}
 	notified := getTestAlert(t, repo, alert.Id)
-	if notified.TriggeredAt == nil || notified.TriggerValue != "12.5" || !notified.Acknowledged || notified.ArmingRevision != 1 {
-		t.Fatalf("setup row = %v, want an acknowledged trigger of 12.5 at revision 1", notified)
+	if !notified.Enabled || notified.TriggeredAt == nil || notified.TriggerValue != "12.5" || !notified.Acknowledged || notified.ArmingRevision != 1 {
+		t.Fatalf("setup row = %v, want an enabled, acknowledged trigger of 12.5 at revision 1", notified)
 	}
+	return notified
+}
+
+func TestAlertRepository_updateEnabled_appliesRules(t *testing.T) {
+	repo := alertTestBackend(t).Alert()
 
 	t.Run("disableKeepsTriggerData", func(t *testing.T) {
+		notified := createAcknowledgedTriggerTestAlert(t, repo)
 		want := cloneAlert(notified)
 		want.Enabled = false
 
-		snapshot := mustUpdateEnabled(t, repo, alert.Id, false)
+		snapshot := mustUpdateEnabled(t, repo, notified.Id, false)
 
 		if !proto.Equal(snapshot, want) {
 			t.Errorf("UpdateEnabled(false) = %v, want %v", snapshot, want)
 		}
-		if got := getTestAlert(t, repo, alert.Id); !proto.Equal(snapshot, got) {
+		if got := getTestAlert(t, repo, notified.Id); !proto.Equal(snapshot, got) {
 			t.Errorf("UpdateEnabled(false) snapshot %v differs from the row %v", snapshot, got)
 		}
 	})
 
 	t.Run("enableRearmsWithNextRevision", func(t *testing.T) {
+		notified := createAcknowledgedTriggerTestAlert(t, repo)
 		want := cloneAlert(notified)
 		want.Enabled = true
 		want.TriggeredAt = nil
@@ -659,12 +883,12 @@ func TestAlertRepository_updateEnabled_appliesRules(t *testing.T) {
 		want.Acknowledged = false
 		want.ArmingRevision = 2
 
-		snapshot := mustUpdateEnabled(t, repo, alert.Id, true)
+		snapshot := mustUpdateEnabled(t, repo, notified.Id, true)
 
 		if !proto.Equal(snapshot, want) {
 			t.Errorf("UpdateEnabled(true) = %v, want %v", snapshot, want)
 		}
-		if got := getTestAlert(t, repo, alert.Id); !proto.Equal(snapshot, got) {
+		if got := getTestAlert(t, repo, notified.Id); !proto.Equal(snapshot, got) {
 			t.Errorf("UpdateEnabled(true) snapshot %v differs from the row %v", snapshot, got)
 		}
 	})
@@ -1075,9 +1299,9 @@ func TestAlertRepository_createUnknownReference_referenceNotFound(t *testing.T) 
 	}
 }
 
-// The real handler over the real backend: an account or instrument that names no row is NotFound
-// with a fixed message, and nothing is stored
-func TestAlertServer_createUnknownReference_notFound(t *testing.T) {
+// The alert repository driven through the real AlertServer handler: an account or instrument that
+// names no row is NotFound with a fixed message, and nothing is stored
+func TestAlertRepository_serverCreateUnknownReference_notFound(t *testing.T) {
 	repo := alertTestBackend(t).Alert()
 	srv := server.NewAlertServer(repo)
 	for _, ref := range unknownAlertReferences {
@@ -1403,7 +1627,9 @@ type alertUUIDSpelling struct {
 
 var (
 	// The spellings AlertService accepts besides the canonical one. A dialect's UUID type does not
-	// parse every one of them, so the handler must bind the canonical form for the statement to run
+	// parse every one of them, so the canonical form must be bound for the statement to run: the
+	// handler canonicalises an alert id or a listed account id before passing it on, and the
+	// repository binds a create's account and instrument ids as it parses them
 	alertServerUUIDSpellings = []alertUUIDSpelling{
 		{"urn", func(id string) string { return "urn:uuid:" + id }},
 		{"upperURN", func(id string) string { return "URN:UUID:" + strings.ToUpper(id) }},
@@ -1421,9 +1647,9 @@ var (
 	}
 )
 
-// The real handler over the real backend: every accepted spelling of an alert or account id reaches
-// the row its canonical form names, on the configured dialect
-func TestAlertServer_alternateUUIDSpelling_intendedRowSelected(t *testing.T) {
+// The alert repository driven through the real AlertServer handler: every accepted spelling of an
+// alert or account id reaches the row its canonical form names, on the configured dialect
+func TestAlertRepository_serverAlternateUUIDSpelling_intendedRowSelected(t *testing.T) {
 	repo := alertTestBackend(t).Alert()
 	srv := server.NewAlertServer(repo)
 	ctx := context.Background()
@@ -1558,9 +1784,44 @@ func TestAlertServer_alternateUUIDSpelling_intendedRowSelected(t *testing.T) {
 	}
 }
 
-// Malformed id text is refused before any statement runs, so it neither fails in the driver nor
-// reaches the row its inner 36 characters name
-func TestAlertServer_malformedUUID_invalidArgumentRowUnchanged(t *testing.T) {
+// markedAlerts lists the owner account's alerts on the seeded instrument whose threshold is marker. It
+// returns the error rather than ending the test, so a cleanup can report it and go on
+func markedAlerts(repo repository.AlertRepository, marker string) ([]*pb.AlertMessage, error) {
+	alerts, err := repo.List(context.Background(), &pb.ListAlertsRequest{AccountId: testOwnerAccountID})
+	if err != nil {
+		return nil, err
+	}
+	var marked []*pb.AlertMessage
+	for _, alert := range alerts {
+		if alert.InstrumentId == testInstrumentID && alert.Threshold == marker {
+			marked = append(marked, alert)
+		}
+	}
+	return marked, nil
+}
+
+// deleteMarkedAlertsAtCleanup deletes by id, when the test ends, every alert markedAlerts then finds
+// for marker, whatever the test's calls returned; a row already absent is clean
+func deleteMarkedAlertsAtCleanup(t *testing.T, repo repository.AlertRepository, marker string) {
+	t.Helper()
+	t.Cleanup(func() {
+		marked, err := markedAlerts(repo, marker)
+		if err != nil {
+			t.Errorf("cleanup List(%s): %v", testOwnerAccountID, err)
+			return
+		}
+		for _, alert := range marked {
+			if _, err := repo.Delete(context.Background(), alert.Id); err != nil && !errors.Is(err, repository.ErrNotFound) {
+				t.Errorf("cleanup Delete(%s): %v", alert.Id, err)
+			}
+		}
+	})
+}
+
+// The alert repository driven through the real AlertServer handler: malformed id text is refused
+// before any statement runs, so it neither fails in the driver nor reaches the row its inner 36
+// characters name
+func TestAlertRepository_serverMalformedUUID_invalidArgumentRowUnchanged(t *testing.T) {
 	repo := alertTestBackend(t).Alert()
 	srv := server.NewAlertServer(repo)
 	ctx := context.Background()
@@ -1620,7 +1881,11 @@ func TestAlertServer_malformedUUID_invalidArgumentRowUnchanged(t *testing.T) {
 		}
 	}
 
-	// CreateAlert binds the ids it parses, so a malformed id it accepted would store a row
+	// CreateAlert only validates both ids and passes the request on as sent; the repository parses and
+	// binds them. uuid.Parse reads a 38-byte form by its inner 36 characters, so a malformed id the
+	// handler let through would store a row on the owner account and seeded instrument. Each case
+	// therefore owns a distinct threshold, reads storage for it before and after the call, and deletes
+	// every row carrying it whatever the call returned
 	createFields := []struct {
 		name string
 		set  func(req *pb.CreateAlertRequest, spell func(string) string)
@@ -1632,25 +1897,44 @@ func TestAlertServer_malformedUUID_invalidArgumentRowUnchanged(t *testing.T) {
 			req.InstrumentId = spell(req.InstrumentId)
 		}},
 	}
+	// The thresholds sit just under thresholdDomainMax, so a stray trigger stays as unlikely, and are
+	// normalised, so the handler's threshold check passes them. Their eight fractional digits count up
+	// from a random start and skip a trailing zero, so no two cases, nor most likely a concurrent run,
+	// share one
+	markerSeq := rand.Uint32N(9_000_000)
+	nextMarker := func() string {
+		if markerSeq++; markerSeq%10 == 0 {
+			markerSeq++
+		}
+		return fmt.Sprintf("9999999999.9%07d", markerSeq)
+	}
 	for _, malformed := range alertServerMalformedUUIDs {
 		for _, field := range createFields {
+			marker := nextMarker()
 			t.Run(malformed.name+"/CreateAlert/"+field.name, func(t *testing.T) {
 				req := &pb.CreateAlertRequest{
 					AccountId:    testOwnerAccountID,
 					Type:         repository.AlertTypeTargetPrice,
 					InstrumentId: testInstrumentID,
 					Direction:    repository.AlertDirectionAbove,
-					Threshold:    thresholdDomainMax,
+					Threshold:    marker,
 				}
 				field.set(req, malformed.spell)
+				before, err := markedAlerts(repo, marker)
+				if err != nil || len(before) != 0 {
+					t.Fatalf("before CreateAlert, the threshold %s marks (%v, %v), want no row", marker, before, err)
+				}
+				deleteMarkedAlertsAtCleanup(t, repo, marker)
 
 				created, err := srv.CreateAlert(ctx, req)
 
-				if err == nil {
-					deleteAlertAtCleanup(t, repo, created.GetId())
+				if created != nil {
+					deleteAlertAtCleanup(t, repo, created.Id)
 				}
-				if status.Code(err) != codes.InvalidArgument {
-					t.Errorf("CreateAlert(%v) = (%v, %v), want InvalidArgument", req, created, err)
+				after, listErr := markedAlerts(repo, marker)
+				if status.Code(err) != codes.InvalidArgument || listErr != nil || len(after) != 0 {
+					t.Errorf("CreateAlert(%v) = (%v, %v) with the rows (%v, %v) carrying its threshold, want InvalidArgument and no row",
+						req, created, err, after, listErr)
 				}
 			})
 		}
@@ -2090,6 +2374,9 @@ func TestAlertLogger_paramsFilter_wrappedSettingKept(t *testing.T) {
 // The pgx driver names the user, database and socket path when a connection fails. Through the real
 // driver and GORM's own logger, no alert method's error and no log line may carry them
 func TestNewAlertRepository_unreachableDatabase_noConnectionDetails(t *testing.T) {
+	// pgx merges ambient PG* defaults into the connection string below, and an inherited PGSERVICE
+	// makes it read a service file, so they are blanked before it is built
+	clearPostgresEnv(t)
 	// A host that is an absolute path makes pgx dial the Unix socket <host>/.s.PGSQL.5432. Nothing
 	// creates one in a fresh test directory, so every dial fails at once, and no other process can
 	// take the address between setup and dial as it can a freed TCP port
@@ -2199,10 +2486,17 @@ func clearPostgresEnv(t *testing.T) {
 	}
 }
 
-// closingDatabaseURLs returns, per DB_TYPE, a well-formed connection string with leakMarker as its
-// password, aimed at a loopback listener that closes every connection it accepts. Connecting fails
-// during the handshake at once, with no closed port or timeout to wait on
-func closingDatabaseURLs(t *testing.T) map[string]string {
+// leakMarkedDatabaseURLs returns, per DB_TYPE, a well-formed connection string to addr with leakMarker
+// as its password
+func leakMarkedDatabaseURLs(addr string) map[string]string {
+	return map[string]string{
+		"postgres": "postgres://postgres:" + leakMarker + "@" + addr + "/TradeManagement?sslmode=disable",
+		"mssql":    "sqlserver://sa:" + leakMarker + "@" + addr + "?database=TradeManagement&encrypt=disable",
+	}
+}
+
+// listenOnLoopback opens a listener on a free loopback port and closes it when the test ends
+func listenOnLoopback(t *testing.T) net.Listener {
 	t.Helper()
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -2213,20 +2507,315 @@ func closingDatabaseURLs(t *testing.T) map[string]string {
 			t.Errorf("close loopback listener: %v", err)
 		}
 	})
+	return listener
+}
+
+// closingDatabaseURLs returns leakMarkedDatabaseURLs aimed at a loopback listener that closes every
+// connection it accepts, and a channel that holds a value once the listener has accepted one.
+// Connecting fails during the handshake at once, with no closed port or timeout to wait on
+func closingDatabaseURLs(t *testing.T) (map[string]string, <-chan struct{}) {
+	t.Helper()
+	listener := listenOnLoopback(t)
+	accepted := make(chan struct{}, 1)
 	go func() {
 		for {
 			conn, err := listener.Accept()
 			if err != nil {
 				return
 			}
+			// Signalled before the close, so a client that has seen the close finds the signal
+			select {
+			case accepted <- struct{}{}:
+			default:
+			}
 			_ = conn.Close()
 		}
 	}()
-	addr := listener.Addr().String()
-	return map[string]string{
-		"postgres": "postgres://postgres:" + leakMarker + "@" + addr + "/TradeManagement?sslmode=disable",
-		"mssql":    "sqlserver://sa:" + leakMarker + "@" + addr + "?database=TradeManagement&encrypt=disable",
+	return leakMarkedDatabaseURLs(listener.Addr().String()), accepted
+}
+
+// heldConnection is a connection holdingDatabaseURLs' listener accepted and holds. closed is closed once
+// the client has closed the connection
+type heldConnection struct{ closed <-chan struct{} }
+
+// holdingDatabaseURLs returns leakMarkedDatabaseURLs aimed at a loopback listener that accepts every
+// connection and never answers it, and a channel that receives each connection once the client's first
+// handshake bytes have arrived. A connection attempt then waits for a reply that never comes
+func holdingDatabaseURLs(t *testing.T) (map[string]string, <-chan heldConnection) {
+	t.Helper()
+	listener := listenOnLoopback(t)
+	arrived := make(chan heldConnection)
+	done := make(chan struct{})
+	// Registered after the listener's cleanup, so it runs first: it ends every handler and closes the
+	// connections the clients left open
+	t.Cleanup(func() { close(done) })
+	go func() {
+		for {
+			conn, err := listener.Accept()
+			if err != nil {
+				return
+			}
+			go holdConnection(conn, arrived, done)
+		}
+	}()
+	return leakMarkedDatabaseURLs(listener.Addr().String()), arrived
+}
+
+// holdConnection reads conn's first bytes, hands it on to arrived and then reads it to its end without
+// writing. The server side closes conn only once done is closed, so before that its end is the
+// client's close
+func holdConnection(conn net.Conn, arrived chan<- heldConnection, done <-chan struct{}) {
+	go func() {
+		<-done
+		_ = conn.Close()
+	}()
+	if _, err := io.ReadFull(conn, make([]byte, 1)); err != nil {
+		return
 	}
+	closed := make(chan struct{})
+	go func() {
+		defer close(closed)
+		_, _ = io.Copy(io.Discard, conn)
+	}()
+	select {
+	case arrived <- heldConnection{closed: closed}:
+	case <-done:
+	}
+}
+
+// queryHoldingServers serve, per DB_TYPE, one connection queryHoldingDatabaseURL's listener accepted
+var queryHoldingServers = map[string]func(conn net.Conn, arrived chan<- heldConnection, done <-chan struct{}){
+	"postgres": holdPostgresQuery,
+	"mssql":    holdMSSQLQuery,
+}
+
+// queryHoldingDatabaseURL returns the dbType connection string of leakMarkedDatabaseURLs aimed at a
+// loopback listener that completes the handshake of every connection it accepts, as that dialect's
+// server does with no encryption and no password check, and never answers the first query. It also
+// returns a channel that receives each connection once that query has arrived. A readiness attempt
+// then logs in and waits for an answer that never comes
+func queryHoldingDatabaseURL(t *testing.T, dbType string) (string, <-chan heldConnection) {
+	t.Helper()
+	serve, ok := queryHoldingServers[dbType]
+	if !ok {
+		t.Fatalf("no query-holding server for DB_TYPE %q", dbType)
+	}
+	listener := listenOnLoopback(t)
+	arrived := make(chan heldConnection)
+	done := make(chan struct{})
+	// Registered after the listener's cleanup, so it runs first: it ends every handler and closes the
+	// connections the clients left open
+	t.Cleanup(func() { close(done) })
+	go func() {
+		for {
+			conn, err := listener.Accept()
+			if err != nil {
+				return
+			}
+			go serve(conn, arrived, done)
+		}
+	}()
+	return leakMarkedDatabaseURLs(listener.Addr().String())[dbType], arrived
+}
+
+// closeWhenDone closes conn once done is closed, and ends with it every read on conn
+func closeWhenDone(conn net.Conn, done <-chan struct{}) {
+	go func() {
+		<-done
+		_ = conn.Close()
+	}()
+}
+
+// handOnHeld runs read, which reads a held connection until the client closes it or done is closed, and
+// hands the connection on to arrived with a closed channel that is closed once read returns
+func handOnHeld(arrived chan<- heldConnection, done <-chan struct{}, read func()) {
+	closed := make(chan struct{})
+	go func() {
+		defer close(closed)
+		read()
+	}()
+	select {
+	case arrived <- heldConnection{closed: closed}:
+	case <-done:
+	}
+}
+
+// readPostgresMessage reads one frontend message that follows the startup packet, a type byte and an
+// Int32 length that counts itself, and returns its type
+func readPostgresMessage(r io.Reader) (byte, error) {
+	var header [5]byte
+	if _, err := io.ReadFull(r, header[:]); err != nil {
+		return 0, err
+	}
+	length := binary.BigEndian.Uint32(header[1:])
+	if length < 4 {
+		return 0, fmt.Errorf("frontend message %q has length %d, shorter than its length field", header[0], length)
+	}
+	if _, err := io.CopyN(io.Discard, r, int64(length)-4); err != nil {
+		return 0, err
+	}
+	return header[0], nil
+}
+
+// holdPostgresQuery serves conn as a PostgreSQL server that trusts every user. It answers a
+// StartupMessage with AuthenticationOk, BackendKeyData and ReadyForQuery, and hands conn on to arrived
+// once the first Query has arrived, which it never answers. As the server does, it closes a connection
+// that carries a CancelRequest once it has read the request, and closes its side of conn when the
+// client sends Terminate, so the connection then ends with the client's own close
+func holdPostgresQuery(conn net.Conn, arrived chan<- heldConnection, done <-chan struct{}) {
+	closeWhenDone(conn, done)
+	// The startup packet: an Int32 length that counts itself, then an Int32 code whose high 16 bits are
+	// the protocol's major version, 3, in a StartupMessage, and 1234 in a CancelRequest
+	var startup [8]byte
+	if _, err := io.ReadFull(conn, startup[:]); err != nil {
+		return
+	}
+	length := binary.BigEndian.Uint32(startup[:4])
+	if length < uint32(len(startup)) {
+		_ = conn.Close()
+		return
+	}
+	if _, err := io.CopyN(io.Discard, conn, int64(length)-int64(len(startup))); err != nil {
+		return
+	}
+	// Any other code is a CancelRequest: with sslmode=disable the client sends no SSLRequest
+	if binary.BigEndian.Uint32(startup[4:])>>16 != 3 {
+		_ = conn.Close()
+		return
+	}
+	if _, err := conn.Write([]byte{
+		'R', 0, 0, 0, 8, 0, 0, 0, 0, // AuthenticationOk
+		'K', 0, 0, 0, 12, 0, 0, 0, 1, 0, 0, 0, 1, // BackendKeyData: process id 1, secret key 1
+		'Z', 0, 0, 0, 5, 'I', // ReadyForQuery, idle
+	}); err != nil {
+		return
+	}
+	if typ, err := readPostgresMessage(conn); err != nil || typ != 'Q' {
+		_ = conn.Close()
+		return
+	}
+	handOnHeld(arrived, done, func() {
+		for {
+			typ, err := readPostgresMessage(conn)
+			if err != nil {
+				return
+			}
+			if half, ok := conn.(interface{ CloseWrite() error }); ok && typ == 'X' {
+				_ = half.CloseWrite()
+			}
+		}
+	})
+}
+
+// TDS packet types and the status bit that ends a message, as go-mssqldb's tds.go and buf.go define them
+const (
+	tdsSQLBatch     = 1
+	tdsReply        = 4
+	tdsLogin7       = 16
+	tdsPrelogin     = 18
+	tdsEndOfMessage = 0x01
+)
+
+// readTDSMessage reads one TDS message, its packets up to the one whose status ends the message, and
+// returns its type. Each packet starts with an 8-byte header: the type, the status and the packet's
+// big-endian length, header included
+func readTDSMessage(r io.Reader) (byte, error) {
+	for {
+		var header [8]byte
+		if _, err := io.ReadFull(r, header[:]); err != nil {
+			return 0, err
+		}
+		length := binary.BigEndian.Uint16(header[2:4])
+		if int(length) < len(header) {
+			return 0, fmt.Errorf("TDS packet of type %d has length %d, shorter than its header", header[0], length)
+		}
+		if _, err := io.CopyN(io.Discard, r, int64(length)-int64(len(header))); err != nil {
+			return 0, err
+		}
+		if header[1]&tdsEndOfMessage != 0 {
+			return header[0], nil
+		}
+	}
+}
+
+// writeTDSMessage writes payload as a TDS message of type typ in one packet, packet number 1
+func writeTDSMessage(w io.Writer, typ byte, payload []byte) error {
+	packet := []byte{typ, tdsEndOfMessage, 0, 0, 0, 0, 1, 0}
+	binary.BigEndian.PutUint16(packet[2:4], uint16(len(packet)+len(payload)))
+	_, err := w.Write(append(packet, payload...))
+	return err
+}
+
+// holdMSSQLQuery serves conn as a SQL Server that offers no encryption and accepts every login, with
+// the byte layout go-mssqldb's readPrelogin, parseLoginAck and parseDone read. It answers PRELOGIN
+// with ENCRYPTION set to ENCRYPT_NOT_SUP and LOGIN7 with a LOGINACK and a final DONE, and hands conn
+// on to arrived once the first SQL batch has arrived. It never answers that batch, or the ATTENTION
+// that cancels it
+func holdMSSQLQuery(conn net.Conn, arrived chan<- heldConnection, done <-chan struct{}) {
+	closeWhenDone(conn, done)
+	if typ, err := readTDSMessage(conn); err != nil || typ != tdsPrelogin {
+		_ = conn.Close()
+		return
+	}
+	// One option, ENCRYPTION at offset 6 with length 1, the terminator, then ENCRYPT_NOT_SUP
+	if err := writeTDSMessage(conn, tdsReply, []byte{0x01, 0x00, 0x06, 0x00, 0x01, 0xFF, 0x02}); err != nil {
+		return
+	}
+	if typ, err := readTDSMessage(conn); err != nil || typ != tdsLogin7 {
+		_ = conn.Close()
+		return
+	}
+	if err := writeTDSMessage(conn, tdsReply, []byte{
+		// LOGINACK, little-endian length 10: interface SQL_TSQL, big-endian TDS version 7.4, an empty
+		// program name and big-endian program version 0
+		0xAD, 10, 0, 1, 0x74, 0x00, 0x00, 0x04, 0, 0, 0, 0, 0,
+		// DONE, little-endian: status final, current command 0, 64-bit row count 0
+		0xFD, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+	}); err != nil {
+		return
+	}
+	if typ, err := readTDSMessage(conn); err != nil || typ != tdsSQLBatch {
+		_ = conn.Close()
+		return
+	}
+	handOnHeld(arrived, done, func() { _, _ = io.Copy(io.Discard, conn) })
+}
+
+// mssqlCancelDrainTimeout is go-mssqldb v1.11.2's cancelDrainTimeout (token.go): how long a query whose
+// context has ended waits, after sending ATTENTION, for the server to confirm the cancellation
+const mssqlCancelDrainTimeout = 5 * time.Second
+
+// failedAttemptHook is a logrus hook that hands on the error of the first connection attempt db.Connect
+// logs as failed
+type failedAttemptHook chan error
+
+func (failedAttemptHook) Levels() []log.Level { return log.AllLevels }
+
+func (h failedAttemptHook) Fire(entry *log.Entry) error {
+	if err, ok := entry.Data[log.ErrorKey].(error); ok {
+		select {
+		case h <- err:
+		default:
+		}
+	}
+	return nil
+}
+
+// awaitFailedAttempt returns a channel that receives the error of the first connection attempt
+// db.Connect logs as failed, through a hook on the standard logger until the test ends
+func awaitFailedAttempt(t *testing.T) <-chan error {
+	t.Helper()
+	attempts := make(failedAttemptHook, 1)
+	logger := log.StandardLogger()
+	previous := logger.ReplaceHooks(log.LevelHooks{})
+	hooks := log.LevelHooks{}
+	for level, levelHooks := range previous {
+		hooks[level] = slices.Clone(levelHooks)
+	}
+	hooks.Add(attempts)
+	logger.ReplaceHooks(hooks)
+	t.Cleanup(func() { logger.ReplaceHooks(previous) })
+	return attempts
 }
 
 func TestConnectAlertTestBackend_malformedURL_errorWithholdsURL(t *testing.T) {
@@ -2251,7 +2840,7 @@ func TestConnectAlertTestBackend_malformedURL_errorWithholdsURL(t *testing.T) {
 			connectorLog := captureConnectorLog(t)
 
 			// A zero DB_CONNECT_TIMEOUT would end db.Connect after one attempt if the check let the URL through
-			_, err := connectAlertTestBackend(config.DatabaseConfig{Type: tc.dbType, Url: tc.url, RetryInterval: time.Hour})
+			_, err := connectAlertTestBackend(context.Background(), config.DatabaseConfig{Type: tc.dbType, Url: tc.url, RetryInterval: time.Hour})
 
 			if err == nil || !strings.Contains(err.Error(), "DB_URL") {
 				t.Fatalf("connectAlertTestBackend = %v, want an error naming DB_URL", err)
@@ -2267,7 +2856,7 @@ func TestConnectAlertTestBackend_malformedURL_errorWithholdsURL(t *testing.T) {
 
 func TestConnectAlertTestBackend_nonpositiveRetryInterval_errorNamesSetting(t *testing.T) {
 	clearPostgresEnv(t)
-	urls := closingDatabaseURLs(t)
+	urls, _ := closingDatabaseURLs(t)
 	cases := []struct {
 		name     string
 		dbType   string
@@ -2281,7 +2870,7 @@ func TestConnectAlertTestBackend_nonpositiveRetryInterval_errorNamesSetting(t *t
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			// Reaching time.NewTicker would panic and end the test binary instead of returning
-			_, err := connectAlertTestBackend(config.DatabaseConfig{Type: tc.dbType, Url: urls[tc.dbType], RetryInterval: tc.interval})
+			_, err := connectAlertTestBackend(context.Background(), config.DatabaseConfig{Type: tc.dbType, Url: urls[tc.dbType], RetryInterval: tc.interval})
 
 			if err == nil || !strings.Contains(err.Error(), "DB_RETRY_INTERVAL") {
 				t.Errorf("connectAlertTestBackend(RetryInterval %s) = %v, want an error naming DB_RETRY_INTERVAL", tc.interval, err)
@@ -2292,20 +2881,120 @@ func TestConnectAlertTestBackend_nonpositiveRetryInterval_errorNamesSetting(t *t
 
 func TestConnectAlertTestBackend_unreachableDatabase_errorNamesConnectStage(t *testing.T) {
 	clearPostgresEnv(t)
-	urls := closingDatabaseURLs(t)
 	for _, dbType := range []string{"postgres", "mssql"} {
 		t.Run(dbType, func(t *testing.T) {
+			urls, accepted := closingDatabaseURLs(t)
 			connectorLog := captureConnectorLog(t)
+			failedAttempt := awaitFailedAttempt(t)
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			result := make(chan error, 1)
 
-			// A zero DB_CONNECT_TIMEOUT ends db.Connect after its first attempt
-			_, err := connectAlertTestBackend(config.DatabaseConfig{Type: dbType, Url: urls[dbType], RetryInterval: time.Hour})
+			// Neither the deadline nor a retry comes during the test, so the first attempt runs to the
+			// driver's own failure at the listener, and the wait ends when ctx is cancelled after it
+			go func() {
+				_, err := connectAlertTestBackend(ctx, config.DatabaseConfig{Type: dbType, Url: urls[dbType], ConnectTimeout: time.Hour, RetryInterval: time.Hour})
+				result <- err
+			}()
+			var attemptErr error
+			select {
+			case attemptErr = <-failedAttempt:
+			case err := <-result:
+				t.Fatalf("connectAlertTestBackend = %v before any connection attempt failed", err)
+			}
+			cancel()
+			err := <-result
 
+			select {
+			case <-accepted:
+			default:
+				t.Errorf("first attempt failed with %v before reaching the listener", attemptErr)
+			}
+			if errors.Is(attemptErr, context.Canceled) || errors.Is(attemptErr, context.DeadlineExceeded) {
+				t.Errorf("first attempt failed with %v, want the driver's handshake failure, not the end of its context", attemptErr)
+			}
 			if err == nil || !strings.Contains(err.Error(), "DB_CONNECT_TIMEOUT") {
 				t.Fatalf("connectAlertTestBackend = %v, want an error naming the DB_CONNECT_TIMEOUT stage", err)
 			}
 			if strings.Contains(err.Error(), leakMarker) || strings.Contains(connectorLog.String(), leakMarker) {
 				t.Errorf("error %q or connector log %q repeats the password", err, connectorLog)
 			}
+		})
+	}
+}
+
+func TestConnectAlertTestBackend_attemptBlocked_cancellationEndsAttempt(t *testing.T) {
+	clearPostgresEnv(t)
+	for _, dbType := range []string{"postgres", "mssql"} {
+		t.Run(dbType, func(t *testing.T) {
+			urls, arrived := holdingDatabaseURLs(t)
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			result := make(chan error, 1)
+
+			// Neither the deadline nor a retry comes during the test, so only cancelling ctx can end the
+			// attempt the listener holds
+			go func() {
+				_, err := connectAlertTestBackend(ctx, config.DatabaseConfig{Type: dbType, Url: urls[dbType], ConnectTimeout: time.Hour, RetryInterval: time.Hour})
+				result <- err
+			}()
+			var held heldConnection
+			select {
+			case held = <-arrived:
+			case err := <-result:
+				t.Fatalf("connectAlertTestBackend = %v before its attempt reached the listener", err)
+			}
+			cancel()
+			err := <-result
+
+			if err == nil || !strings.Contains(err.Error(), "DB_CONNECT_TIMEOUT") || !errors.Is(err, context.Canceled) {
+				t.Errorf("connectAlertTestBackend = %v, want an error naming the DB_CONNECT_TIMEOUT stage that wraps context.Canceled", err)
+			}
+			// Returns once the client has closed the held connection; the go test timeout bounds a client
+			// that never does
+			<-held.closed
+		})
+	}
+}
+
+func TestConnectAlertTestBackend_readinessQueryBlocked_cancellationEndsAttempt(t *testing.T) {
+	clearPostgresEnv(t)
+	for _, dbType := range []string{"postgres", "mssql"} {
+		t.Run(dbType, func(t *testing.T) {
+			url, arrived := queryHoldingDatabaseURL(t, dbType)
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			result := make(chan error, 1)
+
+			// Neither the deadline nor a retry comes during the test, so only cancelling ctx can end the
+			// readiness query the listener holds after the login
+			go func() {
+				_, err := connectAlertTestBackend(ctx, config.DatabaseConfig{Type: dbType, Url: url, ConnectTimeout: time.Hour, RetryInterval: time.Hour})
+				result <- err
+			}()
+			var held heldConnection
+			select {
+			case held = <-arrived:
+			case err := <-result:
+				t.Fatalf("connectAlertTestBackend = %v before its readiness query reached the listener", err)
+			}
+			cancelled := time.Now()
+			cancel()
+			err := <-result
+			returned := time.Since(cancelled)
+
+			if err == nil || !strings.Contains(err.Error(), "DB_CONNECT_TIMEOUT") || !errors.Is(err, context.Canceled) {
+				t.Errorf("connectAlertTestBackend = %v, want an error naming the DB_CONNECT_TIMEOUT stage that wraps context.Canceled", err)
+			}
+			// The server never confirms a cancellation, so a query left to go-mssqldb's own cancellation
+			// returns only once mssqlCancelDrainTimeout has passed. That wait always ends, so the bound,
+			// which pgx's at-once deadline is also well within, is what shows the attempt ended with ctx
+			if returned >= mssqlCancelDrainTimeout {
+				t.Errorf("connectAlertTestBackend returned %s after cancellation, want less than go-mssqldb's cancelDrainTimeout of %s", returned, mssqlCancelDrainTimeout)
+			}
+			// Returns once the client has closed the held connection; the go test timeout bounds a client
+			// that never does
+			<-held.closed
 		})
 	}
 }

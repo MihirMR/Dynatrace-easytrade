@@ -1,3 +1,4 @@
+using System.Collections.Immutable;
 using System.Runtime.CompilerServices;
 using Microsoft.Extensions.Logging;
 
@@ -5,7 +6,8 @@ namespace EasyTrade.BrokerService.Test.Fakes
 {
     /// <summary>
     /// One recorded log call. <see cref="State"/> holds the structured pairs of the call, including
-    /// <c>{OriginalFormat}</c> and every named placeholder of the message template.
+    /// <c>{OriginalFormat}</c> and every named placeholder of the message template, as an immutable
+    /// copy taken when the entry is constructed.
     /// </summary>
     public sealed record LogEntry(
         string Category,
@@ -16,6 +18,18 @@ namespace EasyTrade.BrokerService.Test.Fakes
         Exception? Exception
     )
     {
+        private readonly ImmutableList<KeyValuePair<string, object?>> _state = CopyState(State);
+
+        /// <summary>
+        /// Immutable copy of the pairs given at construction or by a <c>with</c> expression, so
+        /// neither the caller's collection nor a reader of a snapshot can change a recorded entry.
+        /// </summary>
+        public IReadOnlyList<KeyValuePair<string, object?>> State
+        {
+            get => _state;
+            init => _state = CopyState(value);
+        }
+
         /// <summary>Value of the first state pair named <paramref name="name"/>, or null.</summary>
         public object? GetField(string name)
         {
@@ -36,6 +50,17 @@ namespace EasyTrade.BrokerService.Test.Fakes
         {
             return State.Any(pair => string.Equals(pair.Key, name, StringComparison.Ordinal));
         }
+
+        // An immutable copy, so no public route reaches writable storage: every write through a
+        // cast to IList<T>, ICollection<T> or IList throws NotSupportedException, and
+        // ICollection.SyncRoot is the list itself. An immutable list given is kept as it is.
+        private static ImmutableList<KeyValuePair<string, object?>> CopyState(
+            IReadOnlyList<KeyValuePair<string, object?>> state
+        )
+        {
+            ArgumentNullException.ThrowIfNull(state);
+            return state.ToImmutableList();
+        }
     }
 
     /// <summary>
@@ -47,6 +72,11 @@ namespace EasyTrade.BrokerService.Test.Fakes
         private readonly Lock _gate = new();
         private readonly List<LogEntry> _entries = [];
         private readonly List<Waiter> _waiters = [];
+
+        // The longest wait a CancellationTokenSource timer can time: uint.MaxValue - 1 ms.
+        private static readonly TimeSpan MaxWaitTimeout = TimeSpan.FromMilliseconds(
+            uint.MaxValue - 1
+        );
 
         /// <summary>Snapshot of the entries recorded since creation or the last Clear.</summary>
         public IReadOnlyList<LogEntry> Entries
@@ -60,6 +90,11 @@ namespace EasyTrade.BrokerService.Test.Fakes
             }
         }
 
+        /// <summary>
+        /// Records <paramref name="entry"/> and completes the waits it matches. Every
+        /// <see cref="LogEntry"/> holds its own immutable copy of its state, so a change the caller
+        /// makes afterwards to the pairs it built the entry from never reaches the recorded entry.
+        /// </summary>
         public void Add(LogEntry entry)
         {
             ArgumentNullException.ThrowIfNull(entry);
@@ -67,6 +102,8 @@ namespace EasyTrade.BrokerService.Test.Fakes
             lock (_gate)
             {
                 _entries.Add(entry);
+                // Removal under the lock claims a waiter, as the expiry's does, so a wait the
+                // expiry already claimed is not listed and its predicate never sees this entry.
                 _waiters.RemoveAll(waiter =>
                 {
                     if (!waiter.Matches(entry))
@@ -122,8 +159,14 @@ namespace EasyTrade.BrokerService.Test.Fakes
 
         /// <summary>
         /// Returns the first recorded entry matching <paramref name="predicate"/>, or waits for
-        /// the next one added. <paramref name="timeout"/> only bounds the wait; on expiry a
-        /// <see cref="TimeoutException"/> names the predicate.
+        /// the next one added. <paramref name="timeout"/> only bounds the wait and must lie from
+        /// zero to 4294967294 ms, the longest wait the timer supports, or an
+        /// <see cref="ArgumentOutOfRangeException"/> is thrown before any wait is registered.
+        /// A pending wait ends exactly once, by whichever claims it first under the sink's lock:
+        /// an added entry, which returns that entry or the exception the predicate threw for it,
+        /// a <see cref="TimeoutException"/> included, unchanged; or the expiry, which throws a
+        /// <see cref="TimeoutException"/> naming the predicate. No entry added after the expiry
+        /// reaches the predicate.
         /// </summary>
         public async Task<LogEntry> WaitForAsync(
             Func<LogEntry, bool> predicate,
@@ -132,8 +175,10 @@ namespace EasyTrade.BrokerService.Test.Fakes
         )
         {
             ArgumentNullException.ThrowIfNull(predicate);
-            // Waits are always bounded, so an infinite or negative timeout is a test bug.
+            // Waits are always bounded, so an infinite or negative timeout is a test bug. Both
+            // bounds are checked before a waiter is registered, so a rejected wait leaves none.
             ArgumentOutOfRangeException.ThrowIfLessThan(timeout, TimeSpan.Zero);
+            ArgumentOutOfRangeException.ThrowIfGreaterThan(timeout, MaxWaitTimeout);
             Waiter waiter;
             lock (_gate)
             {
@@ -150,18 +195,22 @@ namespace EasyTrade.BrokerService.Test.Fakes
 
             try
             {
-                return await waiter.Completion.Task.WaitAsync(timeout);
+                // A zero timeout starts the source cancelled, so Register runs the expiry at once.
+                using CancellationTokenSource expiry = new(timeout);
+                using CancellationTokenRegistration registration = expiry.Token.Register(
+                    () => Expire(waiter, predicateText, timeout)
+                );
+                // Exactly one claim completes the waiter: the expiry's, or that of the Add whose
+                // entry matched or made the predicate throw.
+                return await waiter.Completion.Task;
             }
-            catch (TimeoutException exception)
+            finally
             {
+                // Every exit leaves the waiter unregistered; removing it again is harmless.
                 lock (_gate)
                 {
                     _waiters.Remove(waiter);
                 }
-                throw new TimeoutException(
-                    $"No log entry matched [{predicateText}] within {timeout}.",
-                    exception
-                );
             }
         }
 
@@ -196,6 +245,27 @@ namespace EasyTrade.BrokerService.Test.Fakes
             lock (_gate)
             {
                 return _entries.Where(predicate).ToArray();
+            }
+        }
+
+        // Runs when the timeout elapses. Removing the waiter under the lock is the same claim Add
+        // makes, so the expiry fails the wait only while no added entry has claimed it, and no
+        // entry added after the expiry reaches the predicate.
+        private void Expire(Waiter waiter, string? predicateText, TimeSpan timeout)
+        {
+            bool claimed;
+            lock (_gate)
+            {
+                claimed = _waiters.Remove(waiter);
+            }
+            if (claimed)
+            {
+                // Completed outside the lock, as Add completes the waits it claims.
+                waiter.Completion.TrySetException(
+                    new TimeoutException(
+                        $"No log entry matched [{predicateText}] within {timeout}."
+                    )
+                );
             }
         }
 
@@ -255,13 +325,18 @@ namespace EasyTrade.BrokerService.Test.Fakes
             return NoopScope.Instance;
         }
 
-        // Always enabled: an enabled Microsoft.AspNetCore.Hosting.Diagnostics logger makes ASP.NET
-        // Core hosting create the request Activity, parented to any inbound traceparent, whatever
-        // any ActivitySource listener's sampling decides. A DiagnosticListener subscribed to the
-        // HttpRequestIn event does the same; an ActivitySource listener alone only samples the
-        // Activity, so a declined sample leaves none. The test hosts register neither listener,
-        // so the trace-context tests rely on this logger for the Activity their outbound calls
-        // carry.
+        // This logger declines no level except None. The LoggerFactory applies the host's filter
+        // rules before it consults this method: LoggerFilterOptions, with its minimum level
+        // (Information by default) and its category and provider rules from AddFilter or the
+        // Logging configuration section. Those rules, not this method alone, decide whether a
+        // category's line is recorded, a Debug line for example, and whether the
+        // Microsoft.AspNetCore.Hosting.Diagnostics logger counts as enabled. ASP.NET Core hosting
+        // checks that logger at Critical; while it is enabled, hosting starts the request
+        // Activity, parented to any inbound traceparent, whatever any ActivitySource listener's
+        // sampling decides. A DiagnosticListener subscriber enabled for the HttpRequestIn event
+        // does the same; an ActivitySource listener alone only samples the Activity, so a
+        // declined sample leaves none. A host that relies on this logger for the request Activity
+        // must register this provider without filtering that category out.
         public bool IsEnabled(LogLevel logLevel)
         {
             return logLevel != LogLevel.None;
@@ -281,7 +356,8 @@ namespace EasyTrade.BrokerService.Test.Fakes
                 return;
             }
 
-            // Copied, so a recorded entry never depends on the caller's state object afterwards.
+            // Materialised from the caller's state object; the entry keeps its own immutable copy,
+            // so neither that object nor a reader of a sink snapshot can change it afterwards.
             KeyValuePair<string, object?>[] fields = state
                 is IEnumerable<KeyValuePair<string, object?>> pairs
                 ? [.. pairs]
