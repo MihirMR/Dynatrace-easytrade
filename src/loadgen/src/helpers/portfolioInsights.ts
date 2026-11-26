@@ -63,7 +63,18 @@ export function withVisitLogger<T>(
 
 /** Why a 200 body is not this flag's answer, named without its content. */
 type FlagDefect =
-    "invalid_json" | "not_object" | "id_mismatch" | "enabled_not_boolean"
+    | "invalid_json"
+    | "not_object"
+    | "id_mismatch"
+    | "enabled_not_boolean"
+    | "body_too_large"
+
+/**
+ * The most bytes a flag answer's body may carry, counted once any content
+ * coding is undone. The answer is a few hundred bytes; a longer body is not
+ * this flag's answer, and is cancelled instead of buffered (CWE-400).
+ */
+const MAX_FLAG_BODY_BYTES = 16 * 1024
 
 /**
  * The error names a line may carry: the built-in errors, the DOMException
@@ -207,14 +218,77 @@ async function releaseBody(
     if (response.body === null) {
         return
     }
+    await awaitCancel(response.body.cancel(), signal, logger, subject)
+}
+
+/**
+ * Waits for a body cancel that has already started, but only until signal
+ * aborts, as releaseBody describes; a failed cancel is logged at debug by the
+ * error's name, also when it fails after the wait has ended.
+ *
+ * @param cancel the started cancel
+ * @param signal the abort signal of the request's deadline
+ * @param logger
+ * @param subject the request, as the debug line names it
+ */
+async function awaitCancel(
+    cancel: Promise<void>,
+    signal: AbortSignal,
+    logger: Logger,
+    subject: string
+): Promise<void> {
     // Handled from the start, so a cancel that fails once the wait has ended
     // is still logged instead of left an unhandled rejection.
-    const cancelled = response.body.cancel().catch((error: unknown) => {
+    const cancelled = cancel.catch((error: unknown) => {
         logger.debug(
             `${subject} response body not cancelled: error [${errorName(error)}]`
         )
     })
     await untilSettledOrAborted(cancelled, signal)
+}
+
+/**
+ * The body of response as text, decoded as response.text() decodes it, or
+ * undefined once more than maxBytes have arrived: the stream is then
+ * cancelled, so an oversized body is never buffered whole. The cancel is
+ * waited for as awaitCancel waits, only until signal, the request's deadline,
+ * aborts. A missing body reads as empty text, and a failed read propagates.
+ *
+ * @param response the response whose body is read
+ * @param maxBytes the most body bytes accepted, counted as they arrive, once
+ *     any content coding is undone
+ * @param signal the abort signal of the request's deadline
+ * @param logger
+ * @param subject the request, as the debug line of a failed cancel names it
+ */
+async function readBoundedText(
+    response: Response,
+    maxBytes: number,
+    signal: AbortSignal,
+    logger: Logger,
+    subject: string
+): Promise<string | undefined> {
+    if (response.body === null) {
+        return ""
+    }
+    const reader = response.body.getReader()
+    const chunks: Uint8Array[] = []
+    let size = 0
+    let chunk = await reader.read()
+    while (!chunk.done) {
+        size += chunk.value.byteLength
+        if (size > maxBytes) {
+            // The reader holds the stream's lock, so it is the one to cancel.
+            await awaitCancel(reader.cancel(), signal, logger, subject)
+            return undefined
+        }
+        chunks.push(chunk.value)
+        chunk = await reader.read()
+    }
+    // Decoded once, so a character split across chunks is read whole. As in
+    // response.text(), the decoder is UTF-8, drops a leading byte order mark
+    // and replaces invalid sequences.
+    return new TextDecoder().decode(Buffer.concat(chunks))
 }
 
 /**
@@ -245,6 +319,12 @@ async function untilSettledOrAborted(
  * Reads the portfolio-insights-enabled flag once, fail-closed: only a 200
  * whose body carries this flag's id and a boolean `enabled` counts as an
  * answer.
+ *
+ * A redirect is never followed: its 3xx is this read's own status, read as
+ * disabled like any other non-200, so no other endpoint's answer can count as
+ * this flag's. A 200 body is read only up to MAX_FLAG_BODY_BYTES: a longer one
+ * is cancelled once it passes the limit, and logged as invalid with reason
+ * `body_too_large`.
  *
  * The feature defines an unreachable flag service as disabled, so every other
  * outcome, the deadline abort included, is logged with its reason and read as
@@ -277,6 +357,7 @@ export async function isPortfolioInsightsEnabled(
             method: "GET",
             signal: controller.signal,
             headers: { accept: "application/json" },
+            redirect: "manual",
         })
         if (response.status !== 200) {
             await releaseBody(
@@ -290,7 +371,15 @@ export async function isPortfolioInsightsEnabled(
             )
             return false
         }
-        const state = readFlagState(await response.text())
+        const text = await readBoundedText(
+            response,
+            MAX_FLAG_BODY_BYTES,
+            controller.signal,
+            logger,
+            "Flag [portfolio-insights-enabled]"
+        )
+        const state =
+            text === undefined ? "body_too_large" : readFlagState(text)
         if (typeof state !== "boolean") {
             logger.warn(
                 `Flag [portfolio-insights-enabled] response invalid, treating as disabled: reason [${state}] status [${response.status}]`
@@ -807,6 +896,15 @@ async function deleteThroughUi(
 /**
  * Deletes the alert through broker REST. Never throws: every outcome is
  * logged and returned.
+ *
+ * A redirect is never followed: its 3xx is this request's own status, so the
+ * alert is left in place with that status, and another target's 204 or 404
+ * can never count as this alert deleted or absent.
+ *
+ * A request that fails before its deadline is left in place with status
+ * `error`, a line that carries the error object; a second line names the
+ * failure as the flag read does, by reason, error name and cause code from
+ * the fixed lists only, never by message, url or body.
  */
 async function deleteThroughApi(
     url: URL,
@@ -820,7 +918,7 @@ async function deleteThroughApi(
     try {
         const response = await fetchFn(
             new URL(`${ALERTS_API_PATH}${encodeURIComponent(id)}`, url),
-            { method: "DELETE", signal: controller.signal }
+            { method: "DELETE", signal: controller.signal, redirect: "manual" }
         )
         await releaseBody(
             response,
@@ -840,8 +938,16 @@ async function deleteThroughApi(
         logger.warn(`Alert [${id}] left in place: ${status}`)
         return { kind: "left_in_place", id, status }
     } catch (error) {
-        const status = controller.signal.aborted ? "timeout" : "error"
+        const timedOut = controller.signal.aborted
+        const status = timedOut ? "timeout" : "error"
         logger.warn(`Alert [${id}] left in place: ${status}`, { error })
+        if (!timedOut) {
+            // The visit log format prints no error object, so the failure's
+            // classified identity follows on a line of its own.
+            logger.warn(
+                `Alert [${id}] delete request failed: ${unreadableReason(error, false)}`
+            )
+        }
         return { kind: "left_in_place", id, status }
     } finally {
         clearTimeout(deadline)

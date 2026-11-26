@@ -139,7 +139,13 @@ function recordingLogger(): { logger: Logger; records: LogRecord[] } {
     return { logger, records }
 }
 
-type FetchCall = { url: string; method: string; signal?: AbortSignal }
+type FetchCall = {
+    url: string
+    method: string
+    signal?: AbortSignal
+    /** the request's redirect mode, undefined when the init sets none */
+    redirect?: string
+}
 
 function recordingFetch(respond: (call: FetchCall) => Promise<Response>): {
     fetchFn: typeof fetch
@@ -157,6 +163,7 @@ function recordingFetch(respond: (call: FetchCall) => Promise<Response>): {
             url: input instanceof Request ? input.url : String(input),
             method: init?.method ?? "GET",
             signal: init?.signal ?? undefined,
+            redirect: init?.redirect,
         }
         calls.push(call)
         sent(call)
@@ -274,25 +281,82 @@ function streamingResponse(
             )
         },
         cancel(): void | Promise<void> {
-            probe.cancels.push(
-                probe.settled ? "after settling" : "while pending"
-            )
-            probe.markStarted()
-            switch (end) {
-                case "resolves":
-                    return
-                case "rejects":
-                    throw failure
-                case "never":
-                    return new Promise<void>(() => undefined)
-                case "rejectsLate":
-                    return new Promise<void>((_resolve, reject) => {
-                        probe.failLate = () => reject(failure)
-                    })
-            }
+            return recordCancel(probe, end, failure)
         },
     })
     return Promise.resolve(new Response(body, { status }))
+}
+
+/**
+ * A body's cancel: recorded in probe, as made while the call under test was
+ * pending or after it settled, and ending as end says, failing with failure.
+ */
+function recordCancel(
+    probe: CancelProbe,
+    end: CancelEnd,
+    failure: Error
+): void | Promise<void> {
+    probe.cancels.push(probe.settled ? "after settling" : "while pending")
+    probe.markStarted()
+    switch (end) {
+        case "resolves":
+            return
+        case "rejects":
+            throw failure
+        case "never":
+            return new Promise<void>(() => undefined)
+        case "rejectsLate":
+            return new Promise<void>((_resolve, reject) => {
+                probe.failLate = () => reject(failure)
+            })
+    }
+}
+
+/** The helper's limit on a flag answer's body, in bytes. */
+const MAX_FLAG_BODY_BYTES = 16 * 1024
+/** A valid answer of the enabled flag. */
+const ENABLED_ANSWER = JSON.stringify({
+    id: "portfolio-insights-enabled",
+    enabled: true,
+})
+/** 1 KiB of JSON whitespace, each chunk of an endless body. */
+const KIB_CHUNK = new TextEncoder().encode(" ".repeat(1024))
+
+/**
+ * A 200 whose body never ends: each pull sends one more KIB_CHUNK and is
+ * counted in pulls. Its cancel is recorded in probe and ends as end says.
+ */
+function endlessResponse(
+    probe: CancelProbe,
+    end: CancelEnd,
+    pulls: { count: number }
+): Promise<Response> {
+    const body = new ReadableStream<Uint8Array>({
+        pull(controller) {
+            pulls.count++
+            controller.enqueue(KIB_CHUNK)
+        },
+        cancel(): void | Promise<void> {
+            return recordCancel(probe, end, cancelError)
+        },
+    })
+    return Promise.resolve(new Response(body, { status: 200 }))
+}
+
+/** A 200 whose body arrives as chunks, one per pull, and then ends. */
+function chunkedResponse(chunks: Uint8Array[]): Promise<Response> {
+    let next = 0
+    const body = new ReadableStream<Uint8Array>({
+        pull(controller) {
+            const chunk = chunks[next++]
+            if (chunk === undefined) {
+                controller.close()
+            } else {
+                controller.enqueue(chunk)
+            }
+        },
+    })
+    return Promise.resolve(new Response(body, { status: 200 }))
 }
 
 /** Answers call with answer only once its signal has aborted. */
@@ -889,6 +953,48 @@ const flagRows: FlagRow[] = [
             messages: [`${UNREADABLE}reason [transport] error [TypeError]`],
         },
     },
+    // The body limit is inclusive: a valid answer padded to it is accepted,
+    // and one byte more is not.
+    {
+        name: "bodyAtSizeLimit_true",
+        respond: () =>
+            textResponse(ENABLED_ANSWER.padEnd(MAX_FLAG_BODY_BYTES, " ")),
+        expected: { enabled: true, messages: [] },
+    },
+    {
+        name: "bodyOverSizeLimit_falseTooLarge",
+        respond: () =>
+            textResponse(ENABLED_ANSWER.padEnd(MAX_FLAG_BODY_BYTES + 1, " ")),
+        expected: {
+            enabled: false,
+            messages: [`${INVALID}reason [body_too_large] status [200]`],
+        },
+    },
+    {
+        name: "noBody_falseInvalidJson",
+        respond: () => statusResponse(200),
+        expected: {
+            enabled: false,
+            messages: [`${INVALID}reason [invalid_json] status [200]`],
+        },
+    },
+    // Chunks split inside the byte order mark and inside a character: decoded
+    // chunk by chunk, the mark would become text that is not JSON.
+    {
+        name: "charactersSplitAcrossChunks_true",
+        respond: () => {
+            const bytes = new TextEncoder().encode(
+                `\uFEFF{"id":"portfolio-insights-enabled","enabled":true,"label":"\u20AC"}`
+            )
+            const euro = bytes.indexOf(0xe2)
+            return chunkedResponse([
+                bytes.subarray(0, 1),
+                bytes.subarray(1, euro + 1),
+                bytes.subarray(euro + 1),
+            ])
+        },
+        expected: { enabled: true, messages: [] },
+    },
 ]
 
 test("isPortfolioInsightsEnabled_response_mapsToBoolean", async (t) => {
@@ -939,21 +1045,119 @@ test("isPortfolioInsightsEnabled_request_usesHyphenatedPath", async (t) => {
         )
     )
 
-    // The base url's own path is replaced, its origin kept, and the read is
-    // abortable so the deadline can end it.
+    // The base url's own path is replaced, its origin kept, the read is
+    // abortable so the deadline can end it, and a redirect is never followed.
     assert.deepEqual(
         calls.map((call) => ({
             request: `${call.method} ${call.url}`,
             abortable: call.signal instanceof AbortSignal,
+            redirect: call.redirect,
         })),
         [
             {
                 request:
                     "GET http://easytrade.test:8080/feature-flag-service/v1/flags/portfolio-insights-enabled",
                 abortable: true,
+                redirect: "manual",
             },
         ]
     )
+})
+
+/** Where the redirects of the redirect cases point: another endpoint. */
+const REDIRECT_TARGET = "http://elsewhere.test/other-endpoint"
+const REDIRECT_STATUSES = [301, 302, 303, 307, 308]
+
+/**
+ * A redirect to REDIRECT_TARGET whose body never ends; its cancel is
+ * recorded in probe and resolves.
+ */
+function redirectResponse(status: number, probe: CancelProbe): Response {
+    const body = new ReadableStream<Uint8Array>({
+        cancel(): void | Promise<void> {
+            return recordCancel(probe, "resolves", cancelError)
+        },
+    })
+    return new Response(body, {
+        status,
+        headers: { location: REDIRECT_TARGET },
+    })
+}
+
+/**
+ * Answers a request whose redirect mode is "manual" with a redirect of
+ * status. Any other request is followed as Node's fetch follows a redirect by
+ * default: a 303 turns every method but HEAD into a GET, and a 301 or 302
+ * turns a POST into one. The followed request is recorded in followed and
+ * answered by target, so following it shows as another endpoint's answer.
+ */
+function redirectingAnswer(
+    status: number,
+    probe: CancelProbe,
+    followed: string[],
+    target: () => Promise<Response>
+): (call: FetchCall) => Promise<Response> {
+    return async (call) => {
+        if (call.redirect === "manual") {
+            return redirectResponse(status, probe)
+        }
+        const turnsIntoGet =
+            (status === 303 && call.method !== "HEAD") ||
+            ((status === 301 || status === 302) && call.method === "POST")
+        followed.push(
+            `${turnsIntoGet ? "GET" : call.method} ${REDIRECT_TARGET}`
+        )
+        return await target()
+    }
+}
+
+test("isPortfolioInsightsEnabled_redirect_notFollowedDisabled", async (t) => {
+    for (const status of REDIRECT_STATUSES) {
+        await t.test(`status${status}_false`, async (st) => {
+            st.mock.timers.enable({ apis: ["setTimeout"] })
+            const probe = cancelProbe()
+            const followed: string[] = []
+            // The other endpoint would answer as this flag, enabled.
+            const { fetchFn, calls } = recordingFetch(
+                redirectingAnswer(status, probe, followed, () =>
+                    jsonResponse({
+                        id: "portfolio-insights-enabled",
+                        enabled: true,
+                    })
+                )
+            )
+            const { logger, records } = recordingLogger()
+
+            const enabled = await withVisitLogger(logger, () =>
+                isPortfolioInsightsEnabled(BASE_URL, fetchFn)
+            ).finally(() => {
+                probe.settled = true
+            })
+
+            // The 3xx is the read's status: its body is released, the other
+            // endpoint is never asked, and no url is logged.
+            assert.deepEqual(
+                {
+                    enabled,
+                    requests: calls.map((call) => `${call.method} ${call.url}`),
+                    followed,
+                    cancels: probe.cancels,
+                    messages: records.map(
+                        (record) => `${record.level}: ${record.message}`
+                    ),
+                },
+                {
+                    enabled: false,
+                    requests: [
+                        "GET http://easytrade.test/feature-flag-service/v1/flags/portfolio-insights-enabled",
+                    ],
+                    followed: [],
+                    cancels: ["while pending"],
+                    messages: [flagStatusLine(status)],
+                }
+            )
+        })
+    }
 })
 
 test("isPortfolioInsightsEnabled_untrustedContent_neverLogged", async (t) => {
@@ -1008,6 +1212,13 @@ test("isPortfolioInsightsEnabled_untrustedContent_neverLogged", async (t) => {
                         }),
                         { name: SECRET_IDENTIFIER }
                     )
+                ),
+        },
+        {
+            name: "oversizedBodyCarryingSecret",
+            respond: () =>
+                textResponse(
+                    `{"password":"${SECRET}",${" ".repeat(MAX_FLAG_BODY_BYTES)}}`
                 ),
         },
         {
@@ -1271,6 +1482,95 @@ test("isPortfolioInsightsEnabled_unreadStatusBody_cancelledBeforeResolving", asy
     }
 })
 
+const TOO_LARGE = `${INVALID}reason [body_too_large] status [200]`
+
+test("isPortfolioInsightsEnabled_oversizedBody_cancelledBeforeResolving", async (t) => {
+    const rows: {
+        name: string
+        cancel: CancelEnd
+        /** the clock is driven to the 2 s deadline once the cancel started */
+        heldToDeadline?: boolean
+        messages: string[]
+    }[] = [
+        {
+            name: "endlessBody_cancelledFalse",
+            cancel: "resolves",
+            messages: [TOO_LARGE],
+        },
+        {
+            name: "endlessBodyCancelRejects_stillFalse",
+            cancel: "rejects",
+            messages: [FLAG_CANCEL_FAILED, TOO_LARGE],
+        },
+        // A cancel that never settles is waited for until the deadline only.
+        {
+            name: "endlessBodyCancelPending_falseAtDeadline",
+            cancel: "never",
+            heldToDeadline: true,
+            messages: [TOO_LARGE],
+        },
+        {
+            name: "endlessBodyCancelRejectsAfterDeadline_loggedLate",
+            cancel: "rejectsLate",
+            heldToDeadline: true,
+            messages: [TOO_LARGE, FLAG_CANCEL_FAILED],
+        },
+    ]
+    for (const row of rows) {
+        await t.test(row.name, async (st) => {
+            st.mock.timers.enable({ apis: ["setTimeout"] })
+            const probe = cancelProbe()
+            const pulls = { count: 0 }
+            const { fetchFn } = recordingFetch(() =>
+                endlessResponse(probe, row.cancel, pulls)
+            )
+            const { logger, records } = recordingLogger()
+
+            const pending = withVisitLogger(logger, () =>
+                isPortfolioInsightsEnabled(BASE_URL, fetchFn)
+            ).finally(() => {
+                probe.settled = true
+            })
+            let settled: { before: boolean; at: boolean } | undefined
+            if (row.heldToDeadline === true) {
+                await probe.started
+                settled = await settledAroundDeadline(st, probe, 2000)
+            }
+            const enabled =
+                settled?.at === false ? STILL_PENDING : await pending
+            // A cancel failing after the read settled is still logged.
+            probe.failLate()
+            await drained()
+
+            // The body is cancelled once it passes the limit, so no more than
+            // a chunk beyond it, and the one the stream queues ahead, is sent.
+            assert.deepEqual(
+                {
+                    enabled,
+                    cancels: probe.cancels,
+                    pulledWithinBound:
+                        pulls.count * KIB_CHUNK.byteLength <=
+                        MAX_FLAG_BODY_BYTES + 2 * KIB_CHUNK.byteLength,
+                    settled,
+                    messages: records.map(
+                        (record) => `${record.level}: ${record.message}`
+                    ),
+                },
+                {
+                    enabled: false,
+                    cancels: ["while pending"],
+                    pulledWithinBound: true,
+                    settled:
+                        row.heldToDeadline === true
+                            ? { before: false, at: true }
+                            : undefined,
+                    messages: row.messages,
+                }
+            )
+        })
+    }
+})
+
 test("createAndDeleteOwnedAlert_unreadDeleteBody_cancelledBeforeOutcome", async (t) => {
     const absent = {
         outcome: { kind: "absent", id: OWN_ID } as const,
@@ -1375,6 +1675,99 @@ test("createAndDeleteOwnedAlert_unreadDeleteBody_cancelledBeforeOutcome", async 
                               ]
                             : []),
                         row.line,
+                    ],
+                }
+            )
+        })
+    }
+})
+
+/** A page on which the own alert is created, but its UI deletion never confirmed. */
+function uiDeleteUnconfirmedPage(): FakePageActions {
+    return new FakePageActions(
+        ownAlertPage({
+            present: { [deletedKey(OWN_ID)]: Number.POSITIVE_INFINITY },
+        })
+    )
+}
+
+test("createAndDeleteOwnedAlert_apiRequest_ownIdPathWithoutRedirects", async (t) => {
+    t.mock.timers.enable({ apis: ["setTimeout"] })
+    const { fetchFn, calls } = recordingFetch(() => statusResponse(204))
+    const { logger } = recordingLogger()
+
+    await createAndDeleteOwnedAlert(
+        uiDeleteUnconfirmedPage(),
+        BASE_URL,
+        logger,
+        {
+            fetchFn,
+            random: () => 0.5,
+        }
+    )
+
+    // One abortable DELETE of the own id, which never follows a redirect.
+    assert.deepEqual(
+        calls.map((call) => ({
+            request: `${call.method} ${call.url}`,
+            abortable: call.signal instanceof AbortSignal,
+            redirect: call.redirect,
+        })),
+        [{ request: DELETE_OWN, abortable: true, redirect: "manual" }]
+    )
+})
+
+test("createAndDeleteOwnedAlert_apiRedirect_notFollowedLeftInPlace", async (t) => {
+    // Followed, a 303 turns the DELETE into a GET, whose 404 would read as the
+    // alert already absent; the other redirects keep the DELETE, whose 204
+    // from the other endpoint would read as the alert deleted.
+    const rows = REDIRECT_STATUSES.map((status) => ({
+        status,
+        target: status === 303 ? 404 : 204,
+    }))
+    for (const row of rows) {
+        await t.test(`status${row.status}_leftInPlace`, async (st) => {
+            st.mock.timers.enable({ apis: ["setTimeout"] })
+            const probe = cancelProbe()
+            const followed: string[] = []
+            const { fetchFn, calls } = recordingFetch(
+                redirectingAnswer(row.status, probe, followed, () =>
+                    statusResponse(row.target)
+                )
+            )
+            const { logger, records } = recordingLogger()
+
+            const outcome = await createAndDeleteOwnedAlert(
+                uiDeleteUnconfirmedPage(),
+                BASE_URL,
+                logger,
+                { fetchFn, random: () => 0.5 }
+            ).finally(() => {
+                probe.settled = true
+            })
+
+            assert.deepEqual(
+                {
+                    outcome,
+                    requests: calls.map((call) => `${call.method} ${call.url}`),
+                    followed,
+                    cancels: probe.cancels,
+                    messages: records.map(
+                        (record) => `${record.level}: ${record.message}`
+                    ),
+                },
+                {
+                    outcome: {
+                        kind: "left_in_place",
+                        id: OWN_ID,
+                        status: `${row.status}`,
+                    },
+                    requests: [DELETE_OWN],
+                    followed: [],
+                    cancels: ["while pending"],
+                    messages: [
+                        CREATED_OWN,
+                        `warn: Alert [${OWN_ID}] left in place: ${row.status}`,
                     ],
                 }
             )
@@ -1737,6 +2130,8 @@ const UI_DELETE_UNCONFIRMED_STEPS = [
 const DELETED_VIA_UI = [CREATED_OWN, `info: Deleted alert [${OWN_ID}] via ui`]
 const UNCONFIRMED = `warn: Create unconfirmed threshold [${MARKER}], outcome unknown`
 const UI_DELETE_FAILED = `warn: UI deletion of alert [${OWN_ID}] failed, using the api`
+/** The classified diagnostic that follows a failed API DELETE's outcome line. */
+const DELETE_FAILED = `warn: Alert [${OWN_ID}] delete request failed: `
 /** The navigation link is gone, as once the flag turned off mid-visit. */
 const FEATURE_LOST = { [NAV_KEY]: Number.POSITIVE_INFINITY }
 /** The feature check that follows a failed page step. */
@@ -1995,8 +2390,27 @@ const alertRows: AlertRow[] = [
             messages: [
                 CREATED_OWN,
                 `warn: Alert [${OWN_ID}] left in place: error`,
+                `${DELETE_FAILED}reason [transport] error [TypeError]`,
             ],
             errors: ["networkError"],
+        },
+    },
+    {
+        name: "apiConnectionRefused_leftInPlaceErrorWithCauseCode",
+        page: ownAlertPage({
+            present: { [deletedKey(OWN_ID)]: Number.POSITIVE_INFINITY },
+        }),
+        respond: () => Promise.reject(refusedError),
+        expected: {
+            outcome: { kind: "left_in_place", id: OWN_ID, status: "error" },
+            steps: UI_DELETE_UNCONFIRMED_STEPS,
+            requests: [DELETE_OWN],
+            messages: [
+                CREATED_OWN,
+                `warn: Alert [${OWN_ID}] left in place: error`,
+                `${DELETE_FAILED}reason [transport] error [TypeError] cause [ECONNREFUSED]`,
+            ],
+            errors: ["TypeError"],
         },
     },
     {
@@ -2204,6 +2618,70 @@ test("createAndDeleteOwnedAlert_scenario_outcome", async (t) => {
         await t.test(row.name, (st) =>
             runAlertRow(st, row, createAndDeleteOwnedAlert)
         )
+    }
+})
+
+test("createAndDeleteOwnedAlert_apiErrorCarryingSecret_diagnosticClassifiedOnly", async (t) => {
+    const rows: { name: string; error: unknown }[] = [
+        {
+            name: "secretInNameCauseAndMessage_unknownNameNoCause",
+            error: Object.assign(
+                new TypeError(
+                    `fetch failed: http://user:${SECRET}@easytrade.test/`,
+                    { cause: { code: SECRET_IDENTIFIER, message: SECRET } }
+                ),
+                { name: SECRET_IDENTIFIER }
+            ),
+        },
+        {
+            name: "nonErrorRejectionCarryingSecret_unknownName",
+            error: `fetch failed: ${SECRET}`,
+        },
+    ]
+    for (const row of rows) {
+        await t.test(row.name, async (st) => {
+            st.mock.timers.enable({ apis: ["setTimeout"] })
+            const { fetchFn } = recordingFetch(() => Promise.reject(row.error))
+            const { logger, records } = recordingLogger()
+
+            const outcome = await createAndDeleteOwnedAlert(
+                uiDeleteUnconfirmedPage(),
+                BASE_URL,
+                logger,
+                { fetchFn, random: () => 0.5 }
+            )
+
+            // Only the outcome line's error field holds the error itself; no
+            // message carries its name, cause, message or url.
+            assert.deepEqual(
+                {
+                    outcome,
+                    messages: records.map(
+                        (record) => `${record.level}: ${record.message}`
+                    ),
+                    leaking: records
+                        .map((record) => record.message)
+                        .filter(
+                            (message) =>
+                                message.includes(SECRET) ||
+                                message.includes(SECRET_IDENTIFIER)
+                        ),
+                },
+                {
+                    outcome: {
+                        kind: "left_in_place",
+                        id: OWN_ID,
+                        status: "error",
+                    },
+                    messages: [
+                        CREATED_OWN,
+                        `warn: Alert [${OWN_ID}] left in place: error`,
+                        `${DELETE_FAILED}reason [transport] error [unknown]`,
+                    ],
+                    leaking: [],
+                }
+            )
+        })
     }
 })
 
