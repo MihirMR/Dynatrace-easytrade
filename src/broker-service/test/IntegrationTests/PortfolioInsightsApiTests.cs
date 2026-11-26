@@ -1,5 +1,7 @@
 using System.Net;
 using System.Text.Json;
+using EasyTrade.BrokerService.Connectors;
+using EasyTrade.BrokerService.Entities.Alerts.Repository;
 using EasyTrade.BrokerService.Entities.Balances;
 using EasyTrade.BrokerService.Entities.Balances.Repository;
 using EasyTrade.BrokerService.Entities.Instruments;
@@ -30,8 +32,24 @@ namespace EasyTrade.BrokerService.Test.IntegrationTests
             Trades,
         }
 
+        /// <summary>
+        /// A gated endpoint whose first db-adapter call is the existing account check.
+        /// </summary>
+        public enum AccountCheckedEndpoint
+        {
+            CreateAlert,
+            ListAlerts,
+            Notifications,
+            Insights,
+        }
+
         private const string InsightsPath = "v1/portfolio/insights/";
         private const string HistoryPath = "v1/portfolio/history/";
+        private const string AlertsPath = "v1/alerts";
+
+        // The gRPC method of IBalanceRepository.GetBalanceOfAccountAsync, the account check.
+        private const string BalanceReadPath =
+            "/easytrade.dbadapter.balance.BalanceService/GetBalanceByAccountId";
         private const string AlphaName = "Alpha";
         private const string BetaName = "Beta";
         private const decimal AccountBalance = 10000;
@@ -42,6 +60,10 @@ namespace EasyTrade.BrokerService.Test.IntegrationTests
 
         private static readonly Guid ProductId = Guid.NewGuid();
         private static readonly DateTimeOffset Time = new(2025, 1, 1, 12, 0, 0, TimeSpan.Zero);
+
+        // Bounds each wait for the held request's progress, so a request that never reaches its
+        // account check, or never answers, fails the row instead of hanging the run.
+        private static readonly TimeSpan HeldCallWait = TimeSpan.FromSeconds(10);
 
         [Fact]
         public async Task GetInsights_FlagDisabled_ShouldReturn403FeatureDisabled()
@@ -288,6 +310,60 @@ namespace EasyTrade.BrokerService.Test.IntegrationTests
             AssertNoEntryContains(host.Logs, marker);
         }
 
+        // The real repositories run over a db-adapter channel that accepts every call and never
+        // answers, as a paused db-adapter does, so each endpoint's first db-adapter call, the
+        // existing account check, is held with no deadline of its own. Once the clock passes the
+        // alert call budget, the endpoint answers the stable 503 body instead of holding the
+        // request until its caller, or the reverse proxy, gives up.
+        [Theory]
+        [InlineData(AccountCheckedEndpoint.CreateAlert)]
+        [InlineData(AccountCheckedEndpoint.ListAlerts)]
+        [InlineData(AccountCheckedEndpoint.Notifications)]
+        [InlineData(AccountCheckedEndpoint.Insights)]
+        public async Task GatedEndpoint_DbAdapterNeverAnswers_ShouldReturn503AfterCallTimeout(
+            AccountCheckedEndpoint endpoint
+        )
+        {
+            // Arrange
+            GrpcStatusHandler dbAdapter = new();
+            dbAdapter.Hold();
+            using FixedChannelDbAdapterConnector connector = new(dbAdapter);
+            ManualTimeProvider time = new();
+            await using BrokerTestHost host = await BrokerTestHost.StartComposedAsync(options =>
+                options.ConfigureServices = services =>
+                {
+                    services.AddSingleton<IDbAdapterConnector>(connector);
+                    services.AddTransient<IBalanceRepository, BalanceRepository>();
+                    services.AddTransient<IInstrumentRepository, InstrumentRepository>();
+                    services.AddTransient<ITradeRepository, TradeRepository>();
+                    services.AddTransient<IAlertRepository, AlertRepository>();
+                    services.AddSingleton<TimeProvider>(time);
+                }
+            );
+            host.Flag.SetEnabled(true);
+            Task<HttpResponseMessage> responseTask = SendAccountCheckedAsync(host, endpoint);
+            await dbAdapter.CallReceived.WaitAsync(HeldCallWait);
+            await time.WaitForCreatedTimersAsync(1).WaitAsync(HeldCallWait);
+
+            // Act
+            time.Advance(AlertRepository.CallTimeout);
+            using HttpResponseMessage response = await responseTask.WaitAsync(HeldCallWait);
+
+            // Assert: the held account check was the only db-adapter call.
+            Assert.Equal(
+                (
+                    HttpStatusCode.ServiceUnavailable,
+                    """{"statusCode":503,"message":"Database is unavailable"}""",
+                    BalanceReadPath
+                ),
+                (
+                    response.StatusCode,
+                    await response.Content.ReadAsStringAsync(),
+                    string.Join(", ", dbAdapter.RequestPaths)
+                )
+            );
+        }
+
         [Theory]
         [InlineData(true)]
         [InlineData(false)]
@@ -430,6 +506,35 @@ namespace EasyTrade.BrokerService.Test.IntegrationTests
         )
         {
             return host.Client.GetAsync($"{InsightsPath}{accountId}");
+        }
+
+        // Every account and instrument id is new: the held account check never lets a request
+        // reach anything else.
+        private static Task<HttpResponseMessage> SendAccountCheckedAsync(
+            BrokerTestHost host,
+            AccountCheckedEndpoint endpoint
+        )
+        {
+            Guid accountId = Guid.NewGuid();
+            return endpoint switch
+            {
+                AccountCheckedEndpoint.CreateAlert => BrokerTestHost.SendJsonAsync(
+                    host.Client,
+                    HttpMethod.Post,
+                    AlertsPath,
+                    $"{{\"accountId\":\"{accountId}\",\"type\":\"TARGET_PRICE\","
+                        + $"\"instrumentId\":\"{Guid.NewGuid()}\",\"direction\":\"ABOVE\","
+                        + "\"threshold\":100}"
+                ),
+                AccountCheckedEndpoint.ListAlerts => host.Client.GetAsync(
+                    $"{AlertsPath}?accountId={accountId}"
+                ),
+                AccountCheckedEndpoint.Notifications => host.Client.GetAsync(
+                    $"{AlertsPath}/notifications?accountId={accountId}&unacknowledged=true"
+                ),
+                AccountCheckedEndpoint.Insights => GetInsightsAsync(host, accountId),
+                _ => throw new ArgumentOutOfRangeException(nameof(endpoint), endpoint, null),
+            };
         }
 
         // Fails as a db-adapter read fails: GrpcHelper wraps the RPC error, whose detail is the

@@ -13,9 +13,11 @@ namespace EasyTrade.BrokerService.Entities.Alerts.Service
     /// <see cref="ExceptionHandling.Exceptions.BalanceNotFoundException"/> naming both ids.
     /// Every member takes the request's abort token as <c>cancellationToken</c> and passes it to
     /// every <see cref="Repository.IAlertRepository"/> call it makes, so a caller that disconnects
-    /// cancels the alert call in flight; the account, instrument and holding checks take no
-    /// token. Cancellation, like every failed db-adapter call, surfaces as that
-    /// <c>DbException</c>.
+    /// cancels the alert call in flight. The account, instrument and holding checks read through
+    /// existing repositories that take no token, so each check is awaited for at most
+    /// <see cref="Repository.AlertRepository.CallTimeout"/> and abandoned as soon as the token
+    /// cancels. Cancellation and a check left unanswered, like every failed db-adapter call,
+    /// surface as that <c>DbException</c>.
     /// </summary>
     public interface IAlertService
     {

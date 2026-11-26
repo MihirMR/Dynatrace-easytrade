@@ -1,4 +1,6 @@
+using System.Globalization;
 using EasyTrade.BrokerService.Connectors;
+using EasyTrade.BrokerService.ExceptionHandling.Exceptions;
 using EasyTrade.BrokerService.Helpers;
 using EasyTrade.DbAdapter.Common.Grpc;
 // Aliased because the generated namespace declares an AlertService type, which would clash
@@ -23,7 +25,10 @@ namespace EasyTrade.BrokerService.Entities.Alerts.Repository
     {
         /// <summary>
         /// Budget of every db-adapter <c>AlertService</c> call this repository makes, sent as the
-        /// gRPC deadline of that call when it starts.
+        /// gRPC deadline of that call when it starts. <see cref="BoundExistingReadAsync{T}"/> and
+        /// <see cref="WithinCallTimeoutAsync{T}"/> apply the same budget to the reads the insights
+        /// endpoint and the alert endpoints' checks make through the existing repositories, and
+        /// to the insights latest-price fetch, which set no deadline of their own.
         /// </summary>
         /// <remarks>
         /// Each call also carries its caller's token. The evaluator's calls,
@@ -43,6 +48,101 @@ namespace EasyTrade.BrokerService.Entities.Alerts.Repository
         /// arming no longer matches the conditional write, so no second notification follows.
         /// </remarks>
         public static readonly TimeSpan CallTimeout = TimeSpan.FromSeconds(10);
+
+        /// <summary>
+        /// Awaits <paramref name="call"/>, a db-adapter read made through an existing repository,
+        /// for at most <see cref="CallTimeout"/> on <paramref name="timeProvider"/>'s clock, and
+        /// stops waiting as soon as <paramref name="cancellationToken"/> is cancelled.
+        /// </summary>
+        /// <remarks>
+        /// The bound gives up the wait, not the call: the existing call sets no deadline and
+        /// takes no token, so it runs on until db-adapter answers or its connection fails. Its
+        /// result is discarded and its eventual fault is observed, so it never surfaces as an
+        /// unobserved task exception.
+        /// </remarks>
+        /// <param name="call">The read in flight.</param>
+        /// <param name="operation">
+        /// The repository method's name, for example
+        /// <c>nameof(IBalanceRepository.GetBalanceOfAccountAsync)</c>. It must be an
+        /// identifier, so the exception filter logs it as the failed db-adapter call.
+        /// </param>
+        /// <param name="timeProvider">The clock that times the bound.</param>
+        /// <param name="cancellationToken">
+        /// The caller's token, such as a request's abort token.
+        /// </param>
+        /// <returns>The read's own result.</returns>
+        /// <exception cref="DbException">
+        /// The read did not answer within <see cref="CallTimeout"/>, with the
+        /// <see cref="TimeoutException"/> as its inner exception, or
+        /// <paramref name="cancellationToken"/> was cancelled first, with the
+        /// <see cref="OperationCanceledException"/> as its inner exception. Its message starts
+        /// with <c>Db Adapter call error in "operation" method: </c>, as <c>GrpcHelper</c>'s
+        /// does, so it answers 503 like any failed db-adapter call. Any exception the read
+        /// throws itself, a <c>DbException</c> from <c>GrpcHelper</c> included, propagates
+        /// unchanged.
+        /// </exception>
+        public static async Task<T> BoundExistingReadAsync<T>(
+            Task<T> call,
+            string operation,
+            TimeProvider timeProvider,
+            CancellationToken cancellationToken = default
+        )
+        {
+            ArgumentNullException.ThrowIfNull(call);
+            ArgumentException.ThrowIfNullOrWhiteSpace(operation);
+            ArgumentNullException.ThrowIfNull(timeProvider);
+
+            try
+            {
+                return await call.WaitAsync(CallTimeout, timeProvider, cancellationToken);
+            }
+            catch (Exception exception) when (WaitGaveUp(call, exception, cancellationToken))
+            {
+                ObserveAbandoned(call);
+                string seconds = CallTimeout.TotalSeconds.ToString(CultureInfo.InvariantCulture);
+                string reason =
+                    exception is TimeoutException
+                        ? $"no reply within {seconds} s"
+                        : "the caller cancelled before a reply";
+                throw new DbException(
+                    $"Db Adapter call error in \"{operation}\" method: {reason}",
+                    exception
+                );
+            }
+        }
+
+        /// <summary>
+        /// Awaits <paramref name="call"/> for at most <see cref="CallTimeout"/> on
+        /// <paramref name="timeProvider"/>'s clock, for a caller that maps the expiry to an error
+        /// of its own, such as the insights latest-price fetch. Like
+        /// <see cref="BoundExistingReadAsync{T}"/>, it gives up the wait, not the call, and
+        /// observes the abandoned call's eventual fault.
+        /// </summary>
+        /// <param name="call">The call in flight.</param>
+        /// <param name="timeProvider">The clock that times the bound.</param>
+        /// <returns>The call's own result.</returns>
+        /// <exception cref="TimeoutException">
+        /// The call did not answer within <see cref="CallTimeout"/>. Any exception the call
+        /// throws itself propagates unchanged.
+        /// </exception>
+        public static async Task<T> WithinCallTimeoutAsync<T>(
+            Task<T> call,
+            TimeProvider timeProvider
+        )
+        {
+            ArgumentNullException.ThrowIfNull(call);
+            ArgumentNullException.ThrowIfNull(timeProvider);
+
+            try
+            {
+                return await call.WaitAsync(CallTimeout, timeProvider);
+            }
+            catch (Exception exception) when (WaitGaveUp(call, exception, CancellationToken.None))
+            {
+                ObserveAbandoned(call);
+                throw;
+            }
+        }
 
         public async Task<Alert> CreateAsync(
             Guid accountId,
@@ -208,6 +308,35 @@ namespace EasyTrade.BrokerService.Entities.Alerts.Repository
                         )
             );
             return response.Triggered;
+        }
+
+        // The wait, not the call, ended in the exception: a TimeoutException the call did not
+        // throw itself, or the cancellation of the caller's token, which the call never sees.
+        private static bool WaitGaveUp(
+            Task call,
+            Exception exception,
+            CancellationToken cancellationToken
+        )
+        {
+            return exception switch
+            {
+                TimeoutException => call.Exception?.InnerExceptions.Contains(exception) != true,
+                OperationCanceledException cancelled => cancellationToken.IsCancellationRequested
+                    && (cancelled.CancellationToken == cancellationToken),
+                _ => false,
+            };
+        }
+
+        // The abandoned call ends later; reading its fault then marks it observed.
+        private static void ObserveAbandoned(Task call)
+        {
+            _ = call.ContinueWith(
+                static abandoned => _ = abandoned.Exception,
+                CancellationToken.None,
+                TaskContinuationOptions.OnlyOnFaulted
+                    | TaskContinuationOptions.ExecuteSynchronously,
+                TaskScheduler.Default
+            );
         }
     }
 }

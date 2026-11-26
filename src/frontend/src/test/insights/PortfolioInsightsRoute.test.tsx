@@ -10,7 +10,10 @@ import {
 import { act, cleanup, render, screen, waitFor } from "@testing-library/react"
 import {
     type LoaderFunctionArgs,
+    NavigationType,
+    type RouteObject,
     RouterProvider,
+    createBrowserRouter,
     createMemoryRouter,
 } from "react-router"
 import type { Alert } from "../../api/alerts/types"
@@ -71,6 +74,12 @@ const INSTRUMENT_ID = "c0000000-0000-4000-8000-000000000001"
 const ROOT_ERROR_TEXT = "Oops! There was an error!"
 
 const HOME_MARKER = "home marker"
+
+/** What the page before an `/insights` entry in the tab's history shows. */
+const PREVIOUS_MARKER = "previous page marker"
+
+/** What a page other than `/home` that links to `/insights` shows. */
+const OTHER_MARKER = "other page marker"
 
 /** `totalValue` of each insights response, as `FormatterWrapper` shows it. */
 const TOTAL_A = "$1,111.11"
@@ -149,11 +158,17 @@ type AppRouter = ReturnType<typeof createMemoryRouter>
 /** What the router shows: its location and the screen rendered for it. */
 type Landing = {
     path: string
-    screen: "home" | "insights" | "root error" | "pending"
+    screen:
+        "home" | "previous" | "other" | "insights" | "root error" | "pending"
 }
 
 const HOME: Landing = { path: "/home", screen: "home" }
+const PREVIOUS: Landing = { path: "/previous", screen: "previous" }
+const OTHER: Landing = { path: "/other", screen: "other" }
 const INSIGHTS: Landing = { path: "/insights", screen: "insights" }
+
+/** The paths of the tab's history entries, oldest first. */
+type TabHistory = [string, ...string[]]
 
 /** Where an `/insights` entry ends, and what it left in the flag cache. */
 type EntryOutcome = Landing & {
@@ -354,7 +369,8 @@ function CountedPage() {
     return <PortfolioInsights />
 }
 
-function buildRouter(target: QueryClient): AppRouter {
+/** The routes every router mounts, with the loader and page sharing `target`. */
+function buildRoutes(target: QueryClient): RouteObject[] {
     const loadEntry = createPortfolioInsightsLoader(target)
     // Each decision is recorded, so a case can wait for one whose outcome
     // leaves nothing to observe.
@@ -363,29 +379,64 @@ function buildRouter(target: QueryClient): AppRouter {
         entryDecisions.push(decision)
         return decision
     }
-    return createMemoryRouter(
-        [
-            {
-                path: "/",
-                errorElement: <p>{ROOT_ERROR_TEXT}</p>,
-                hydrateFallbackElement: <p>route loading</p>,
-                children: [
-                    { path: "home", element: <p>{HOME_MARKER}</p> },
-                    {
-                        path: "insights",
-                        loader: recordedLoader,
-                        element: <CountedPage />,
-                    },
-                ],
-            },
-        ],
-        { initialEntries: ["/insights"] }
-    )
+    return [
+        {
+            path: "/",
+            errorElement: <p>{ROOT_ERROR_TEXT}</p>,
+            hydrateFallbackElement: <p>route loading</p>,
+            children: [
+                { path: "previous", element: <p>{PREVIOUS_MARKER}</p> },
+                { path: "other", element: <p>{OTHER_MARKER}</p> },
+                { path: "home", element: <p>{HOME_MARKER}</p> },
+                {
+                    path: "insights",
+                    loader: recordedLoader,
+                    element: <CountedPage />,
+                },
+            ],
+        },
+    ]
+}
+
+function buildRouter(target: QueryClient): AppRouter {
+    return createMemoryRouter(buildRoutes(target), {
+        initialEntries: ["/insights"],
+    })
+}
+
+/**
+ * A browser router, as the app runs, on the window's own history once that
+ * history is set to `tabHistory`, so it starts on the last entry. Unlike a
+ * memory router, it lets the loader see which entry the tab shows while it
+ * runs.
+ */
+function buildBrowserRouter(
+    target: QueryClient,
+    tabHistory: TabHistory
+): AppRouter {
+    const [oldest, ...later] = tabHistory
+    window.history.replaceState(null, "", oldest)
+    for (const path of later) {
+        window.history.pushState(null, "", path)
+    }
+    return createBrowserRouter(buildRoutes(target))
 }
 
 /** Enters `/insights` with the loader, page and cache sharing `client`. */
 function renderRoute(): AppRouter {
-    const built = buildRouter(client)
+    return mountRouter(buildRouter(client))
+}
+
+/**
+ * Renders a browser router on `tabHistory`, with the loader, page and cache
+ * sharing `client`.
+ */
+function renderBrowserRoute(tabHistory: TabHistory): AppRouter {
+    return mountRouter(buildBrowserRouter(client, tabHistory))
+}
+
+/** Renders `built` as the case's router, which `afterEach` disposes. */
+function mountRouter(built: AppRouter): AppRouter {
     router = built
     render(
         <QueryClientProvider client={client}>
@@ -407,6 +458,10 @@ function landing(target: AppRouter): Landing {
         shown = "root error"
     } else if (screen.queryByText(HOME_MARKER) !== null) {
         shown = "home"
+    } else if (screen.queryByText(PREVIOUS_MARKER) !== null) {
+        shown = "previous"
+    } else if (screen.queryByText(OTHER_MARKER) !== null) {
+        shown = "other"
     } else if (document.getElementById("portfolio-insights") !== null) {
         shown = "insights"
     }
@@ -566,6 +621,137 @@ const contextChangeRows: ContextChangeRow[] = [
     },
 ]
 
+type RefusalRow = {
+    refusal: string
+    /** Answers the entry's own flag read, held open, so the loader refuses. */
+    refuse: () => void
+}
+
+/** The two ways the loader refuses an entry, each ending with a shutdown. */
+const refusalRows: RefusalRow[] = [
+    {
+        refusal: "flag false",
+        refuse: () => {
+            releaseHeldFlagReads(false)
+        },
+    },
+    {
+        // The read answers `true`, but only after a shutdown ran during it.
+        refusal: "shutdown during the read",
+        refuse: () => {
+            onPortfolioInsightsDisabled(client)
+            releaseHeldFlagReads(true)
+        },
+    },
+]
+
+/** Renders a tab on `tabHistory` and follows a link to `/insights` from it. */
+function followInsightsLink(tabHistory: TabHistory): AppRouter {
+    const shown = renderBrowserRoute(tabHistory)
+    act(() => {
+        void shown.navigate("/insights")
+    })
+    return shown
+}
+
+type EntryPathRow = {
+    entry: string
+    /**
+     * Renders a tab and starts an `/insights` entry in it while the tab's
+     * current history entry is that `/insights` address or `/home`, with
+     * `/previous` before it.
+     */
+    enter: () => AppRouter
+}
+
+const entryPathRows: EntryPathRow[] = [
+    {
+        // A typed address, a bookmark or a reload: the router starts there.
+        entry: "cold entry",
+        enter: () => renderBrowserRoute(["/previous", "/insights"]),
+    },
+    {
+        // Back into an `/insights` entry the tab committed earlier: the
+        // window shows it before the loader runs.
+        entry: "Back into an earlier entry",
+        enter: () => {
+            const shown = renderBrowserRoute([
+                "/previous",
+                "/insights",
+                "/other",
+            ])
+            act(() => {
+                void shown.navigate(-1)
+            })
+            return shown
+        },
+    },
+    {
+        // A link followed from `/home`, such as one shown before the flag
+        // turned off.
+        entry: "link from /home",
+        enter: () => followInsightsLink(["/previous", "/home"]),
+    },
+]
+
+/** Each refusal on each entry path. */
+const refusedEntryRows = refusalRows.flatMap((refusal) =>
+    entryPathRows.map((path) => ({ ...refusal, ...path }))
+)
+
+/** How a refused entry enters the tab's history, and where Back then lands. */
+type RefusalHistory = {
+    historyAction: NavigationType
+    back: Landing
+}
+
+/**
+ * Starts the `/insights` entry `enter` makes on a held flag read, refuses it
+ * with `refuse`, steps Back once from the `/home` it lands on, and waits
+ * until both steps end as `expected`, Back with no flag read of its own.
+ */
+async function expectRefusalHistory(
+    enter: () => AppRouter,
+    refuse: () => void,
+    expected: RefusalHistory
+): Promise<void> {
+    flagMode = "held"
+    const entered = enter()
+    await waitFor(() => expect(heldFlagReads).toHaveLength(1))
+    refuse()
+    await settleEntryDecisions()
+    await waitFor(() =>
+        expect({
+            ...landing(entered),
+            navigation: entered.state.navigation.state,
+        }).toEqual({ ...HOME, navigation: "idle" })
+    )
+    const refused = {
+        ...entryOutcome(entered),
+        historyAction: entered.state.historyAction,
+    }
+    const flagReadsBeforeBack = flagRequestCount()
+
+    // Not awaited: the window delivers Back later as a popstate, and an
+    // `/insights` entry left behind would hold its navigation on the held read.
+    act(() => {
+        void entered.navigate(-1)
+    })
+
+    await waitFor(() =>
+        expect({
+            refused,
+            back: {
+                ...landing(entered),
+                flagReads: flagRequestCount(),
+            },
+        }).toEqual({
+            refused: { ...REFUSED, historyAction: expected.historyAction },
+            back: { ...expected.back, flagReads: flagReadsBeforeBack },
+        })
+    )
+}
+
 describe("Portfolio Insights route and flag query", () => {
     beforeEach(() => {
         sessionStorage.setItem(SESSION_KEY, ACCOUNT_ID)
@@ -595,6 +781,8 @@ describe("Portfolio Insights route and flag query", () => {
         // Unmount first, so restoring focus below starts no flag read.
         cleanup()
         router?.dispose()
+        // A browser router leaves the window on its last page.
+        window.history.replaceState(null, "", "/")
         for (const watcher of textWatchers) {
             watcher.disconnect()
         }
@@ -710,6 +898,34 @@ describe("Portfolio Insights route and flag query", () => {
                     featureRequests: [],
                     featureCacheEntries: [],
                 })
+            )
+        }
+    )
+
+    // Refused while the tab shows the `/insights` entry itself or `/home`,
+    // the redirect takes the place of that entry, so Back from `/home`
+    // returns to the page before it: it neither enters the loader again nor
+    // stops on a second `/home`.
+    it.each(refusedEntryRows)(
+        "portfolioInsightsLoader_refusedEntry_replacesHistoryEntry ($refusal, $entry)",
+        async ({ refuse, enter }) => {
+            await expectRefusalHistory(enter, refuse, {
+                historyAction: NavigationType.Replace,
+                back: PREVIOUS,
+            })
+        }
+    )
+
+    // A link followed from any other page is refused before the router
+    // commits `/insights`, while the tab still shows that page, so the
+    // redirect goes after it and Back returns there.
+    it.each(refusalRows)(
+        "portfolioInsightsLoader_refusedEntryFromOtherPage_keepsOriginInHistory ($refusal)",
+        async ({ refuse }) => {
+            await expectRefusalHistory(
+                () => followInsightsLink(["/previous", "/other"]),
+                refuse,
+                { historyAction: NavigationType.Push, back: OTHER }
             )
         }
     )

@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using EasyTrade.BrokerService.Entities.Alerts.Repository;
 using EasyTrade.BrokerService.Entities.Balances.Repository;
 using EasyTrade.BrokerService.Entities.Instruments;
 using EasyTrade.BrokerService.Entities.Instruments.Repository;
@@ -15,8 +16,11 @@ namespace EasyTrade.BrokerService.Entities.Portfolio.Service
     /// <summary>
     /// Loads an account's holdings, trades and latest prices through the existing data access and
     /// leaves every valuation rule to <see cref="PortfolioInsightsCalculator"/> and
-    /// <see cref="LatestPriceSelector"/>. It holds no state, so the alert evaluator may call it
-    /// from parallel tasks.
+    /// <see cref="LatestPriceSelector"/>. The existing data access sets no deadline, so
+    /// <see cref="GetInsightsAsync"/> awaits each of its calls within
+    /// <see cref="AlertRepository.CallTimeout"/> on the injected <see cref="TimeProvider"/>'s
+    /// clock, while <see cref="GetHoldingPositionsAsync"/> awaits its reads to the end. It holds
+    /// no state, so the alert evaluator may call it from parallel tasks.
     /// </summary>
     public class PortfolioInsightsService(
         IBalanceRepository balanceRepository,
@@ -24,6 +28,7 @@ namespace EasyTrade.BrokerService.Entities.Portfolio.Service
         ITradeRepository tradeRepository,
         IPriceServiceConnector priceServiceConnector,
         PortfolioInsightsMetrics metrics,
+        TimeProvider timeProvider,
         ILogger<PortfolioInsightsService> logger
     ) : IPortfolioInsightsService
     {
@@ -38,11 +43,16 @@ namespace EasyTrade.BrokerService.Entities.Portfolio.Service
             Stopwatch stopwatch = Stopwatch.StartNew();
 
             _ =
-                await balanceRepository.GetBalanceOfAccountAsync(accountId)
-                ?? throw new BalanceNotFoundException(accountId);
+                await BoundedReadAsync(
+                    balanceRepository.GetBalanceOfAccountAsync(accountId),
+                    nameof(IBalanceRepository.GetBalanceOfAccountAsync)
+                ) ?? throw new BalanceNotFoundException(accountId);
 
             IReadOnlyList<OwnedInstrument> holdings = PortfolioInsightsCalculator.SelectHoldings(
-                await instrumentRepository.GetOwnedInstrumentsOfAccountAsync(accountId)
+                await BoundedReadAsync(
+                    instrumentRepository.GetOwnedInstrumentsOfAccountAsync(accountId),
+                    nameof(IInstrumentRepository.GetOwnedInstrumentsOfAccountAsync)
+                )
             );
             if (holdings.Count == 0)
             {
@@ -51,11 +61,13 @@ namespace EasyTrade.BrokerService.Entities.Portfolio.Service
                 return Complete(accountId, PortfolioInsightsCalculator.Empty(), 0, stopwatch);
             }
 
-            Task<List<Instrument>> instrumentsTask = instrumentRepository.GetAllInstrumentsAsync();
-            Task<List<Trade>> tradesTask = tradeRepository.GetAccountTradesAsync(
-                accountId,
-                false,
-                false
+            Task<List<Instrument>> instrumentsTask = BoundedReadAsync(
+                instrumentRepository.GetAllInstrumentsAsync(),
+                nameof(IInstrumentRepository.GetAllInstrumentsAsync)
+            );
+            Task<List<Trade>> tradesTask = BoundedReadAsync(
+                tradeRepository.GetAccountTradesAsync(accountId, false, false),
+                nameof(ITradeRepository.GetAccountTradesAsync)
             );
             Task<List<Price>> pricesTask = FetchLatestPricesAsync();
             await Task.WhenAll(instrumentsTask, tradesTask, pricesTask);
@@ -101,6 +113,10 @@ namespace EasyTrade.BrokerService.Entities.Portfolio.Service
         {
             ArgumentNullException.ThrowIfNull(selectedPrices);
 
+            // Not bounded by the call budget: these reads take no token, so a wait abandoned at
+            // the budget would leave them running while the evaluator's workers start the next
+            // accounts, and its concurrency limit would no longer bound db-adapter load. The
+            // cycle checks its token once the reads return.
             Task<List<OwnedInstrument>> holdingsTask =
                 instrumentRepository.GetOwnedInstrumentsOfAccountAsync(accountId);
             Task<List<Trade>> tradesTask = tradeRepository.GetAccountTradesAsync(
@@ -118,16 +134,31 @@ namespace EasyTrade.BrokerService.Entities.Portfolio.Service
             );
         }
 
+        // A db-adapter read through the existing repositories, which set no gRPC deadline, bounded
+        // so a db-adapter that never answers fails it with a DbException (503).
+        private Task<T> BoundedReadAsync<T>(Task<T> call, string operation)
+        {
+            return AlertRepository.BoundExistingReadAsync(call, operation, timeProvider);
+        }
+
         // Materialised inside the try, so a lazily evaluated sequence that fails while being
-        // enumerated is reported as unavailable pricing too. A malformed response can deserialize
-        // to a null candle despite the annotation; it is rejected after the try, so the error is
-        // not wrapped twice and never reaches the selector.
+        // enumerated is reported as unavailable pricing too. The existing connector waits for
+        // HttpClient's 100 s default, so a fetch with no reply within the call budget is
+        // unavailable pricing as well. A malformed response can deserialize to a null candle
+        // despite the annotation; it is rejected after the try, so the error is not wrapped twice
+        // and never reaches the selector.
         private async Task<List<Price>> FetchLatestPricesAsync()
         {
             List<Price> prices;
             try
             {
-                prices = [.. await priceServiceConnector.GetLatestPrices()];
+                prices =
+                [
+                    .. await AlertRepository.WithinCallTimeoutAsync(
+                        priceServiceConnector.GetLatestPrices(),
+                        timeProvider
+                    ),
+                ];
             }
             catch (Exception exception)
             {

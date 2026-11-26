@@ -6,6 +6,7 @@ using EasyTrade.BrokerService.Helpers;
 using EasyTrade.BrokerService.Test.Fakes;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 
 namespace EasyTrade.BrokerService.Test.UnitTests
@@ -229,6 +230,111 @@ namespace EasyTrade.BrokerService.Test.UnitTests
             // Assert
             Assert.True(cycleRan, "The startup cycle did not run.");
             Assert.DoesNotContain(logger.Calls, call => call.Level == LogLevel.Information);
+        }
+
+        [Theory]
+        [InlineData("15", 15, false)]
+        [InlineData("abc", 60, true)]
+        public async Task StartingAsync_HostStart_ShouldLogStartupLinesBeforeEarlierServiceRuns(
+            string value,
+            int expectedInterval,
+            bool expectWarning
+        )
+        {
+            // Arrange
+            RecordingLoggerProvider loggerProvider = new();
+            HostApplicationBuilder builder = Host.CreateApplicationBuilder(
+                new HostApplicationBuilderSettings
+                {
+                    // No environment variables, settings files or default providers, so the
+                    // interval and every recorded line come from this test alone.
+                    DisableDefaults = true,
+                    EnvironmentName = Environments.Production,
+                    ContentRootPath = AppContext.BaseDirectory,
+                }
+            );
+            builder.Configuration.AddInMemoryCollection(
+                new Dictionary<string, string?> { [PublishedIntervalKey] = value }
+            );
+            builder.Logging.ClearProviders();
+            builder.Logging.AddProvider(loggerProvider);
+            builder.ConfigureContainer(
+                new DefaultServiceProviderFactory(
+                    new ServiceProviderOptions { ValidateOnBuild = true, ValidateScopes = true }
+                )
+            );
+            builder.Services.AddSingleton(loggerProvider.Sink);
+            builder.Services.AddSingleton(_ => new CycleProbe(null, false));
+            builder.Services.AddScoped<IAlertEvaluationService, ProbeEvaluationService>();
+            // Registered ahead of the scheduler, as the long-trade scheduler is in production,
+            // so the host starts it first.
+            builder.Services.AddHostedService<EarlierServiceProbe>();
+            builder.Services.AddHostedService<AlertEvaluationSchedulerService>();
+            using IHost host = builder.Build();
+            EarlierServiceProbe earlierService = host
+                .Services.GetServices<IHostedService>()
+                .OfType<EarlierServiceProbe>()
+                .Single();
+            CycleProbe cycles = host.Services.GetRequiredService<CycleProbe>();
+            List<string> expectedLines = [];
+            if (expectWarning)
+            {
+                expectedLines.Add($"{InvalidIntervalPrefix} [{value}], using 60");
+            }
+            expectedLines.Add(
+                $"Starting alert evaluation scheduler with an interval of [{expectedInterval}]s."
+            );
+            using CancellationTokenSource startBound = new(WaitBound);
+            using CancellationTokenSource stopBound = new(WaitBound);
+
+            // Act
+            await host.StartAsync(startBound.Token);
+            IReadOnlyList<string> seenByEarlierService =
+                await earlierService.SchedulerLines.WaitAsync(WaitBound);
+            bool cycleRan = await cycles.WaitForCycleAsync();
+            // The first cycle starts only once ExecuteAsync has passed its startup step, so the
+            // lines read now are every startup line the whole start wrote.
+            IReadOnlyList<string> afterFirstCycle = SchedulerMessages(loggerProvider.Sink);
+            await host.StopAsync(stopBound.Token);
+
+            // Assert
+            Assert.True(cycleRan, "The startup cycle did not run.");
+            // The service the host started first already sees the Warning, when there is one,
+            // and the startup line, so neither can be written while that service writes its own.
+            Assert.Equal(expectedLines, seenByEarlierService);
+            // Each line was written once, the Warning first, and ExecuteAsync wrote neither again.
+            Assert.Equal(expectedLines, afterFirstCycle);
+        }
+
+        /// <summary>The messages the scheduler has logged so far, in logging order.</summary>
+        private static IReadOnlyList<string> SchedulerMessages(RecordingLogSink sink)
+        {
+            return
+            [
+                .. sink.ByCategory<AlertEvaluationSchedulerService>()
+                    .Select(entry => entry.Message),
+            ];
+        }
+
+        /// <summary>
+        /// Hosted service registered ahead of the scheduler, as the long-trade scheduler is in
+        /// production. As its ExecuteAsync begins, where that scheduler writes its own startup
+        /// lines, it records the messages the alert scheduler has logged so far.
+        /// </summary>
+        private sealed class EarlierServiceProbe(RecordingLogSink sink) : BackgroundService
+        {
+            private readonly TaskCompletionSource<IReadOnlyList<string>> _schedulerLines = new(
+                TaskCreationOptions.RunContinuationsAsynchronously
+            );
+
+            /// <summary>The scheduler's messages as this service's ExecuteAsync began.</summary>
+            public Task<IReadOnlyList<string>> SchedulerLines => _schedulerLines.Task;
+
+            protected override Task ExecuteAsync(CancellationToken stoppingToken)
+            {
+                _schedulerLines.TrySetResult(SchedulerMessages(sink));
+                return Task.CompletedTask;
+            }
         }
 
         /// <summary>A cycle that completes at once with no armed alert to evaluate.</summary>

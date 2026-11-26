@@ -21,9 +21,12 @@ namespace EasyTrade.BrokerService.Entities.Portfolio.Service
         /// </returns>
         /// <remarks>
         /// Throws <c>BalanceNotFoundException</c> for an unknown account (404),
-        /// <c>PricingUnavailableException</c> when the price fetch fails or returns no candle
-        /// while the account holds instruments (503), and <c>DbException</c> when a db-adapter
-        /// call fails (503).
+        /// <c>PricingUnavailableException</c> when the price fetch fails, returns no candle
+        /// while the account holds instruments, or does not answer within
+        /// <c>AlertRepository.CallTimeout</c> (503), and <c>DbException</c> when a db-adapter
+        /// call fails or does not answer within <c>AlertRepository.CallTimeout</c> (503). The
+        /// existing data access takes no token, so each call is bounded by that time alone; a
+        /// call that misses it is no longer awaited and its result is discarded.
         /// </remarks>
         Task<PortfolioInsightsDTO> GetInsightsAsync(Guid accountId);
 

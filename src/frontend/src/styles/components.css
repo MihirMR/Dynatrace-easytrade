@@ -968,6 +968,12 @@ dialog::backdrop {
     --insights-focus-ring-width: 2px;
     /* Gap that keeps the ring visible beside a border of the ring's colour */
     --insights-focus-ring-offset: 2px;
+    /* Smallest touch target of an alerts control on narrow screens (WCAG 2.5.5) */
+    --insights-touch-target: 44px;
+    /* Alert form width, matching the Deposit and Withdraw form width */
+    --insights-alert-form-max-width: 420px;
+    /* Alert list and notifications width: the widest realistic row or notification ("Lemke - Braun Garden" with an 18-character threshold and trigger value, beside Re-arm, Disable and Delete or Acknowledge) measures 728px on one line; the rest leaves room for wider system fonts */
+    --insights-alert-list-max-width: 800px;
 }
 
 .insights-summary {
@@ -1013,8 +1019,9 @@ dialog::backdrop {
     border-bottom: none;
 }
 
-/* Keyboard focus ring of the alert buttons and the allocation scroll region */
+/* Keyboard focus ring of the alert buttons, the allocation scroll region and the alerts panel heading, which script focuses when a Dismiss or a settled action leaves no control to take focus */
 #alerts-panel .btn:focus-visible,
+#alerts-panel-heading:focus-visible,
 .insights-allocations-scroll:focus-visible {
     outline: var(--insights-focus-ring-width) solid var(--border-focus);
     outline-offset: var(--insights-focus-ring-offset);
@@ -1060,6 +1067,35 @@ dialog::backdrop {
 #alerts-panel input[type="text"]:not(:disabled):not(.error):active {
     border-color: var(--border-focus);
     background-color: var(--bg-hover);
+}
+
+/* Alert receipts and loading messages: --text-secondary meets WCAG AA (4.5:1) on the card; --text-muted does not */
+/* Scoped to the panel, so .form-hint and .empty-state keep their colour on every other screen */
+#alerts-panel .form-hint,
+#alerts-panel .alerts-loading {
+    color: var(--text-secondary);
+}
+
+/* Alert form fields as wide as the Deposit and Withdraw fields, not the panel */
+#alert-form {
+    width: 100%;
+    max-width: var(--insights-alert-form-max-width);
+}
+
+/* Each row's and notification's actions stay near its text on wide screens */
+#alerts-list,
+#alert-notifications {
+    max-width: var(--insights-alert-list-max-width);
+}
+
+/* Narrow screens: every alerts control is a full touch target */
+/* Height only: each alerts button's label and padding already exceed the target width, and an explicit min-width would let a button in a non-wrapping row (the Dismiss feedback) shrink below its label */
+@media (max-width: 768px) {
+    #alerts-panel .btn,
+    #alerts-panel select,
+    #alerts-panel input[type="text"] {
+        min-height: var(--insights-touch-target);
+    }
 }
 
 /* Mobile sidebar row: the Portfolio Insights entry takes no width in the row's flex sizing, so the five existing links keep the sizes and wrapping they have without it */

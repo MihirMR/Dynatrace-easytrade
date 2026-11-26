@@ -64,18 +64,24 @@ export function alertSummaryText(
 }
 
 /**
- * `output#alert-deleted-id`, reporting the latest confirmed delete. It is
- * rendered apart from the list, so a refetch that is pending or fails after
- * the 204 keeps the confirmation loadgen waits for.
+ * The "Deleted alert <id>" receipt of the latest confirmed delete, a
+ * `p.form-hint` worded and styled like the form's "Created alert <id>"
+ * receipt. Its `output#alert-deleted-id` carries the id as both `value` and
+ * text. It is rendered apart from the list, so a refetch that is pending or
+ * fails after the 204 keeps the confirmation loadgen waits for.
  */
 export function DeletedAlertOutput({ deletedId }: DeletedAlertOutputProps) {
     if (deletedId === null) return null
-    // `@types/react` 18 does not declare `value` on <output>; the spread
-    // passes it through, so loadgen can match `[@value="<id>"]`.
     return (
-        <output id="alert-deleted-id" {...{ value: deletedId }}>
-            {deletedId}
-        </output>
+        <p className="form-hint">
+            Deleted alert{" "}
+            {/* `@types/react` 18 does not declare `value` on <output>; the
+                spread passes it through, so loadgen can match
+                `[@value="<id>"]`. */}
+            <output id="alert-deleted-id" {...{ value: deletedId }}>
+                {deletedId}
+            </output>
+        </p>
     )
 }
 

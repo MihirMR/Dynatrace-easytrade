@@ -1,4 +1,5 @@
 using System.Globalization;
+using System.Runtime.CompilerServices;
 using EasyTrade.BrokerService.Entities.Alerts;
 using EasyTrade.BrokerService.Entities.Alerts.Repository;
 using EasyTrade.BrokerService.ExceptionHandling.Exceptions;
@@ -36,6 +37,9 @@ namespace EasyTrade.BrokerService.Test.UnitTests
         // Written out for the same reason: the method path is db-adapter's contract, not a value
         // to take from the generated client.
         private const string AlertServicePath = "/easytrade.dbadapter.alert.AlertService/";
+
+        // The operation the call-timeout bound cases name; any identifier serves.
+        private const string BoundedOperation = "GetBalanceOfAccountAsync";
 
         private static readonly DateTimeOffset CreatedTime = DateTimeOffset.Parse(
             "2025-03-14T09:26:53.5891234+00:00",
@@ -110,6 +114,29 @@ namespace EasyTrade.BrokerService.Test.UnitTests
             Delete,
             Acknowledge,
             Trigger,
+        }
+
+        // Public for the same reason: the two call-timeout bounds the repository offers to reads
+        // through the existing repositories and to the insights price fetch.
+        public enum BoundedMethod
+        {
+            BoundExistingRead,
+            WithinCallTimeout,
+        }
+
+        public enum OwnTimeout
+        {
+            AlreadyFaulted,
+            FaultsWhileWaiting,
+        }
+
+        public enum InvalidArgument
+        {
+            BoundExistingReadNullCall,
+            BoundExistingReadBlankOperation,
+            BoundExistingReadNullTimeProvider,
+            WithinCallTimeoutNullCall,
+            WithinCallTimeoutNullTimeProvider,
         }
 
         // A Type as the expected outcome means the call must throw that exception, wrapping the
@@ -466,6 +493,124 @@ namespace EasyTrade.BrokerService.Test.UnitTests
             Assert.False(caller.IsCancellationRequested);
         }
 
+        // The call-timeout bound cases cover what the insights and alert service suites cannot
+        // reach: a call's own timeout passing through the bound unchanged, the abandoned call's
+        // later fault, and the argument guards.
+
+        // A TimeoutException the call throws itself is the call's failure, not the bound's
+        // expiry, so it reaches the caller as the very instance thrown, whether the call failed
+        // before the wait began or during it.
+        [Theory]
+        [InlineData(BoundedMethod.BoundExistingRead, OwnTimeout.AlreadyFaulted)]
+        [InlineData(BoundedMethod.BoundExistingRead, OwnTimeout.FaultsWhileWaiting)]
+        [InlineData(BoundedMethod.WithinCallTimeout, OwnTimeout.AlreadyFaulted)]
+        [InlineData(BoundedMethod.WithinCallTimeout, OwnTimeout.FaultsWhileWaiting)]
+        public async Task CallTimeoutBound_CallThrowsOwnTimeout_ShouldPropagateItUnchanged(
+            BoundedMethod method,
+            OwnTimeout ownTimeout
+        )
+        {
+            // Arrange
+            ManualTimeProvider time = new();
+            TimeoutException own = new("The call's own timeout.");
+            TaskCompletionSource<int> call = new();
+            if (ownTimeout == OwnTimeout.AlreadyFaulted)
+            {
+                call.SetException(own);
+            }
+            Task<int> bounded = Bound(method, call.Task, time);
+
+            // Act
+            if (ownTimeout == OwnTimeout.FaultsWhileWaiting)
+            {
+                call.SetException(own);
+            }
+            Exception? error = await Record.ExceptionAsync(() => bounded.WaitAsync(TestBound));
+
+            // Assert
+            Assert.Same(own, error);
+        }
+
+        // The bound gives up the wait, not the call: when the call fails after the budget has
+        // passed, its failure is observed, so it never reaches
+        // TaskScheduler.UnobservedTaskException.
+        [Theory]
+        [InlineData(BoundedMethod.BoundExistingRead)]
+        [InlineData(BoundedMethod.WithinCallTimeout)]
+        public async Task CallTimeoutBound_AbandonedCallFaults_ShouldLeaveNoUnobservedException(
+            BoundedMethod method
+        )
+        {
+            // Arrange
+            InvalidOperationException marker = new($"abandoned-{Guid.NewGuid():N}");
+            bool reported = false;
+            EventHandler<UnobservedTaskExceptionEventArgs> handler = (_, args) =>
+            {
+                if (args.Exception.InnerExceptions.Contains(marker))
+                {
+                    reported = true;
+                }
+            };
+            TaskScheduler.UnobservedTaskException += handler;
+
+            // Act: on the thread pool no context holds the bound's continuation, and once the
+            // helper returns nothing references the faulted call, so a collection finalizes it.
+            try
+            {
+                await Task.Run(() => AbandonThenFault(method, marker));
+                GC.Collect();
+                GC.WaitForPendingFinalizers();
+                GC.Collect();
+            }
+            finally
+            {
+                TaskScheduler.UnobservedTaskException -= handler;
+            }
+
+            // Assert
+            Assert.False(reported);
+        }
+
+        [Theory]
+        [InlineData(InvalidArgument.BoundExistingReadNullCall, "call")]
+        [InlineData(InvalidArgument.BoundExistingReadBlankOperation, "operation")]
+        [InlineData(InvalidArgument.BoundExistingReadNullTimeProvider, "timeProvider")]
+        [InlineData(InvalidArgument.WithinCallTimeoutNullCall, "call")]
+        [InlineData(InvalidArgument.WithinCallTimeoutNullTimeProvider, "timeProvider")]
+        public async Task CallTimeoutBound_InvalidArgument_ShouldThrowNamingIt(
+            InvalidArgument invalidArgument,
+            string parameterName
+        )
+        {
+            // Arrange
+            Task<int> call = Task.FromResult(1);
+            ManualTimeProvider time = new();
+            Func<Task> act = invalidArgument switch
+            {
+                InvalidArgument.BoundExistingReadNullCall => () =>
+                    AlertRepository.BoundExistingReadAsync<int>(null!, BoundedOperation, time),
+                InvalidArgument.BoundExistingReadBlankOperation => () =>
+                    AlertRepository.BoundExistingReadAsync(call, " ", time),
+                InvalidArgument.BoundExistingReadNullTimeProvider => () =>
+                    AlertRepository.BoundExistingReadAsync(call, BoundedOperation, null!),
+                InvalidArgument.WithinCallTimeoutNullCall => () =>
+                    AlertRepository.WithinCallTimeoutAsync<int>(null!, time),
+                InvalidArgument.WithinCallTimeoutNullTimeProvider => () =>
+                    AlertRepository.WithinCallTimeoutAsync(call, null!),
+                _ => throw new ArgumentOutOfRangeException(
+                    nameof(invalidArgument),
+                    invalidArgument,
+                    null
+                ),
+            };
+
+            // Act
+            ArgumentException thrown = await Assert.ThrowsAnyAsync<ArgumentException>(act);
+
+            // Assert
+            Assert.Equal(parameterName, thrown.ParamName);
+        }
+
         // A successful reply of each call's response type, as db-adapter sends it. The alert
         // replies carry the snapshot, and the list reply two alerts, so ExpectedResult can tell a
         // mapped reply from a fabricated or reordered one.
@@ -717,6 +862,45 @@ namespace EasyTrade.BrokerService.Test.UnitTests
                     cancellationToken
                 ),
                 _ => throw new ArgumentOutOfRangeException(nameof(call), call, null),
+            };
+        }
+
+        // Not inlined, so none of its locals outlives it: the faulted call is then unreachable.
+        [MethodImpl(MethodImplOptions.NoInlining)]
+        private static void AbandonThenFault(BoundedMethod method, Exception marker)
+        {
+            ManualTimeProvider time = new();
+            TaskCompletionSource<int> call = new();
+            Task<int> bounded = Bound(method, call.Task, time);
+            time.Advance(AlertRepository.CallTimeout);
+            try
+            {
+                if (!bounded.Wait(TestBound))
+                {
+                    throw new InvalidOperationException("The bound did not end at the budget.");
+                }
+            }
+            catch (AggregateException)
+            {
+                // The bound's own failure; the call is still pending.
+            }
+            call.SetException(marker);
+        }
+
+        private static Task<int> Bound(BoundedMethod method, Task<int> call, TimeProvider time)
+        {
+            return method switch
+            {
+                BoundedMethod.BoundExistingRead => AlertRepository.BoundExistingReadAsync(
+                    call,
+                    BoundedOperation,
+                    time
+                ),
+                BoundedMethod.WithinCallTimeout => AlertRepository.WithinCallTimeoutAsync(
+                    call,
+                    time
+                ),
+                _ => throw new ArgumentOutOfRangeException(nameof(method), method, null),
             };
         }
     }

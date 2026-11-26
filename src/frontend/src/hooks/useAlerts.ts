@@ -38,9 +38,10 @@ import { guardFeatureRequest } from "./usePortfolioInsights"
  * `true`; otherwise it ends unfetched. A 403 runs the feature shutdown from
  * the query itself, whoever observes it, and is never retried. The cached
  * result keeps the context of the request that produced it. It neither polls
- * nor refetches on focus: mutations and the alerts panel's trigger check
- * refresh it. The query's signal reaches `fetch`, so a cancellation aborts
- * the HTTP read.
+ * nor refetches on focus: mutations refresh it, and so does the alerts panel
+ * after a successful notifications poll that shows a trigger the list lacks
+ * or that lands after the list failed. The query's signal reaches `fetch`, so
+ * a cancellation aborts the HTTP read.
  */
 export function alertsQuery(accountId: string) {
     return queryOptions({

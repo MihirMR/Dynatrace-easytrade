@@ -1,5 +1,6 @@
 using System.Collections;
 using System.Globalization;
+using EasyTrade.BrokerService.Entities.Alerts.Repository;
 using EasyTrade.BrokerService.Entities.Balances;
 using EasyTrade.BrokerService.Entities.Balances.Repository;
 using EasyTrade.BrokerService.Entities.Instruments;
@@ -60,6 +61,10 @@ namespace EasyTrade.BrokerService.Test.UnitTests
             new Dictionary<Guid, string>();
         private static readonly IReadOnlyDictionary<Guid, Price> NoPrices =
             new Dictionary<Guid, Price>();
+
+        // Bounds each wait on a test task, so a request that never ends fails the case instead
+        // of hanging the run.
+        private static readonly TimeSpan WaitBound = TimeSpan.FromSeconds(5);
 
         // xUnit creates one instance per test and disposes it afterwards, so every test gets its
         // own meter factory and listens only to the meters it created.
@@ -129,6 +134,15 @@ namespace EasyTrade.BrokerService.Test.UnitTests
         {
             HoldingsRead,
             TradesRead,
+        }
+
+        public enum UnansweredRead
+        {
+            Balance,
+            Holdings,
+            Instruments,
+            Trades,
+            Prices,
         }
 
         public void Dispose()
@@ -731,6 +745,256 @@ namespace EasyTrade.BrokerService.Test.UnitTests
             );
         }
 
+        // One db-adapter read of the insights path never answers, as on a db-adapter that accepted
+        // the call and stopped, while every other read answers: the request stays pending until
+        // the alert call budget has passed, then fails as a db-adapter failure naming that read
+        // (503), and no calculation duration is recorded.
+        [Theory]
+        [InlineData(UnansweredRead.Balance, nameof(IBalanceRepository.GetBalanceOfAccountAsync))]
+        [InlineData(
+            UnansweredRead.Holdings,
+            nameof(IInstrumentRepository.GetOwnedInstrumentsOfAccountAsync)
+        )]
+        [InlineData(
+            UnansweredRead.Instruments,
+            nameof(IInstrumentRepository.GetAllInstrumentsAsync)
+        )]
+        [InlineData(UnansweredRead.Trades, nameof(ITradeRepository.GetAccountTradesAsync))]
+        public async Task GetInsights_DbReadNeverAnswers_ShouldFailAtCallTimeoutWithoutDuration(
+            UnansweredRead unansweredRead,
+            string operation
+        )
+        {
+            // Arrange
+            ManualTimeProvider time = new();
+            PortfolioInsightsService service = BuildPositionsService(
+                InsightsReadsWithOneUnanswered(unansweredRead),
+                time
+            );
+            using MetricCapture capture = new(_services.GetRequiredService<IMeterFactory>());
+            Task<PortfolioInsightsDTO> request = service.GetInsightsAsync(AccountId);
+
+            // Act
+            (bool pendingBeforeBudget, Exception? error) = await ExpireCallBudgetAsync(
+                time,
+                request
+            );
+
+            // Assert
+            Assert.Equal(
+                (true, typeof(DbException), typeof(TimeoutException), true, 0),
+                (
+                    pendingBeforeBudget,
+                    error?.GetType(),
+                    error?.InnerException?.GetType(),
+                    error?.Message.StartsWith(
+                        $"Db Adapter call error in \"{operation}\" method: ",
+                        StringComparison.Ordinal
+                    ) == true,
+                    capture.Measurements.Count
+                )
+            );
+        }
+
+        // The latest-price fetch never answers, as from a pricing service that accepted the
+        // request and stopped, while every db-adapter read answers: the request stays pending
+        // until the alert call budget has passed instead of the connector's 100 s HttpClient
+        // default, then fails as unavailable pricing (503), and no calculation duration is
+        // recorded.
+        [Fact]
+        public async Task GetInsights_PricesNeverAnswer_ShouldFailAtCallTimeoutWithoutDuration()
+        {
+            // Arrange
+            ManualTimeProvider time = new();
+            PortfolioInsightsService service = BuildPositionsService(
+                InsightsReadsWithOneUnanswered(UnansweredRead.Prices),
+                time
+            );
+            using MetricCapture capture = new(_services.GetRequiredService<IMeterFactory>());
+            Task<PortfolioInsightsDTO> request = service.GetInsightsAsync(AccountId);
+
+            // Act
+            (bool pendingBeforeBudget, Exception? error) = await ExpireCallBudgetAsync(
+                time,
+                request
+            );
+
+            // Assert
+            Assert.Equal(
+                (
+                    true,
+                    typeof(PricingUnavailableException),
+                    typeof(TimeoutException),
+                    "Latest prices are unavailable",
+                    0
+                ),
+                (
+                    pendingBeforeBudget,
+                    error?.GetType(),
+                    error?.InnerException?.GetType(),
+                    error?.Message,
+                    capture.Measurements.Count
+                )
+            );
+        }
+
+        // The evaluator's positions load is not bounded by the alert call budget, because an
+        // abandoned wait would leave its reads running while the evaluator starts more: an
+        // unanswered holdings or trades read keeps it pending past the budget, and once that read
+        // answers, the positions are valued from it.
+        [Theory]
+        [InlineData(PositionsFailure.HoldingsRead)]
+        [InlineData(PositionsFailure.TradesRead)]
+        public async Task GetHoldingPositions_ReadsUnanswered_ShouldAwaitThemPastCallTimeout(
+            PositionsFailure unansweredRead
+        )
+        {
+            // Arrange
+            ManualTimeProvider time = new();
+            PositionsCase positionsCase = BuildPositionsCase(PositionsScenario.AllHoldingsPriced);
+            PositionsMocks mocks = StubPositionsReads(positionsCase);
+            Action answer = HoldPositionsRead(mocks, unansweredRead, positionsCase);
+            PortfolioInsightsService service = BuildPositionsService(mocks, time);
+            Task<IReadOnlyList<HoldingPosition>> request = service.GetHoldingPositionsAsync(
+                AccountId,
+                positionsCase.Prices
+            );
+
+            // Act
+            time.Advance(AlertRepository.CallTimeout * 2);
+            bool pendingPastBudget = !request.IsCompleted;
+            answer();
+            IReadOnlyList<HoldingPosition> positions = await request.WaitAsync(WaitBound);
+
+            // Assert
+            Assert.True(pendingPastBudget, "The positions load ended before its read answered.");
+            Assert.Equal(
+                positionsCase.Expected,
+                positions.Select(position =>
+                    (
+                        position.InstrumentId,
+                        position.Quantity,
+                        position.LatestPrice,
+                        position.HasPrice,
+                        position.Value,
+                        position.CostBasis,
+                        position.PnlPercent
+                    )
+                )
+            );
+        }
+
+        // Waits until the code under test has started its bound, moves the clock to one tick
+        // short of the alert call budget and notes whether the request is still pending with that
+        // bound scheduled, then moves the last tick and returns the request's exception.
+        private static async Task<(
+            bool PendingBeforeBudget,
+            Exception? Error
+        )> ExpireCallBudgetAsync(ManualTimeProvider time, Task request)
+        {
+            await time.WaitForCreatedTimersAsync(1).WaitAsync(WaitBound);
+            time.Advance(AlertRepository.CallTimeout - TimeSpan.FromTicks(1));
+            bool pending = !request.IsCompleted && (time.ScheduledTimerCount == 1);
+            time.Advance(TimeSpan.FromTicks(1));
+            Exception? error = await Record.ExceptionAsync(() => request.WaitAsync(WaitBound));
+            return (pending, error);
+        }
+
+        // Strict mocks answering every insights read of an account that holds the low and mid
+        // instruments, except the given read, whose task never completes.
+        private static PositionsMocks InsightsReadsWithOneUnanswered(UnansweredRead unansweredRead)
+        {
+            PositionsMocks mocks = StrictPositionsMocks();
+            mocks
+                .Balance.Setup(repository => repository.GetBalanceOfAccountAsync(AccountId))
+                .Returns(
+                    unansweredRead == UnansweredRead.Balance
+                        ? NeverAnswered<Balance?>()
+                        : Task.FromResult<Balance?>(FundedAccount()[0])
+                );
+            mocks
+                .Instruments.Setup(repository =>
+                    repository.GetOwnedInstrumentsOfAccountAsync(AccountId)
+                )
+                .Returns(
+                    unansweredRead == UnansweredRead.Holdings
+                        ? NeverAnswered<List<OwnedInstrument>>()
+                        : Task.FromResult(
+                            new List<OwnedInstrument>
+                            {
+                                Holding(LowInstrumentId, 2),
+                                Holding(MidInstrumentId, 4),
+                            }
+                        )
+                );
+            mocks
+                .Instruments.Setup(repository => repository.GetAllInstrumentsAsync())
+                .Returns(
+                    unansweredRead == UnansweredRead.Instruments
+                        ? NeverAnswered<List<Instrument>>()
+                        : Task.FromResult(Catalog().ToList())
+                );
+            mocks
+                .Trades.Setup(repository =>
+                    repository.GetAccountTradesAsync(AccountId, false, false)
+                )
+                .Returns(
+                    unansweredRead == UnansweredRead.Trades
+                        ? NeverAnswered<List<Trade>>()
+                        : Task.FromResult(new List<Trade>())
+                );
+            mocks
+                .Prices.Setup(connector => connector.GetLatestPrices())
+                .Returns(
+                    unansweredRead == UnansweredRead.Prices
+                        ? NeverAnswered<IEnumerable<Price>>()
+                        : Task.FromResult<IEnumerable<Price>>(
+                            [Candle(LowInstrumentId, 30), Candle(MidInstrumentId, 10)]
+                        )
+                );
+            return mocks;
+        }
+
+        // Replaces one stubbed read with one held until the returned action answers it with the
+        // case's rows.
+        private static Action HoldPositionsRead(
+            PositionsMocks mocks,
+            PositionsFailure heldRead,
+            PositionsCase positionsCase
+        )
+        {
+            switch (heldRead)
+            {
+                case PositionsFailure.HoldingsRead:
+                {
+                    TaskCompletionSource<List<OwnedInstrument>> held = new();
+                    mocks
+                        .Instruments.Setup(repository =>
+                            repository.GetOwnedInstrumentsOfAccountAsync(AccountId)
+                        )
+                        .Returns(held.Task);
+                    return () => held.SetResult(positionsCase.Holdings.ToList());
+                }
+                case PositionsFailure.TradesRead:
+                {
+                    TaskCompletionSource<List<Trade>> held = new();
+                    mocks
+                        .Trades.Setup(repository =>
+                            repository.GetAccountTradesAsync(AccountId, false, false)
+                        )
+                        .Returns(held.Task);
+                    return () => held.SetResult(positionsCase.Trades.ToList());
+                }
+                default:
+                    throw new ArgumentOutOfRangeException(nameof(heldRead), heldRead, null);
+            }
+        }
+
+        private static Task<T> NeverAnswered<T>()
+        {
+            return new TaskCompletionSource<T>().Task;
+        }
+
         // Rows without trades cost every holding as an opening lot at its close, so their total
         // invested equals their total value.
         private static EdgeCase BuildEdgeCase(EdgeInput edgeInput)
@@ -1144,6 +1408,7 @@ namespace EasyTrade.BrokerService.Test.UnitTests
                 new FakeTradeRepository([.. trades]),
                 prices,
                 new PortfolioInsightsMetrics(_services.GetRequiredService<IMeterFactory>()),
+                TimeProvider.System,
                 _logger
             );
         }
@@ -1435,7 +1700,11 @@ namespace EasyTrade.BrokerService.Test.UnitTests
             }
         }
 
-        private PortfolioInsightsService BuildPositionsService(PositionsMocks mocks)
+        // The clock defaults to the system's, for tests in which no bound expires.
+        private PortfolioInsightsService BuildPositionsService(
+            PositionsMocks mocks,
+            TimeProvider? timeProvider = null
+        )
         {
             return new PortfolioInsightsService(
                 mocks.Balance.Object,
@@ -1443,6 +1712,7 @@ namespace EasyTrade.BrokerService.Test.UnitTests
                 mocks.Trades.Object,
                 mocks.Prices.Object,
                 new PortfolioInsightsMetrics(_services.GetRequiredService<IMeterFactory>()),
+                timeProvider ?? TimeProvider.System,
                 new RecordingLogger<PortfolioInsightsService>()
             );
         }

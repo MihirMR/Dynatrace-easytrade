@@ -31,6 +31,10 @@ namespace EasyTrade.BrokerService.Test.UnitTests
         );
         private static readonly Guid UnknownAlertId = new("e1000000-0000-4000-8000-0000000000ff");
 
+        // Bounds each wait on a test task, so a request that never ends fails the row instead of
+        // hanging the run.
+        private static readonly TimeSpan WaitBound = TimeSpan.FromSeconds(5);
+
         private static readonly DateTimeOffset CreatedTime = FakeAlertRepository.BaseTime.AddDays(
             -1
         );
@@ -324,7 +328,13 @@ namespace EasyTrade.BrokerService.Test.UnitTests
             FakeAlertRepository alerts = new();
             alerts.ThrowOnNext(FakeAlertRepositoryMethod.Create, createFailure);
             RecordingLogger<AlertService> logger = new();
-            AlertService service = new(alerts, balances.Object, instruments.Object, logger);
+            AlertService service = new(
+                alerts,
+                balances.Object,
+                instruments.Object,
+                TimeProvider.System,
+                logger
+            );
             CreateAlertDTO request = Request("TARGET_PRICE", HeldInstrumentId, "ABOVE", 10m);
 
             // Act
@@ -770,6 +780,7 @@ namespace EasyTrade.BrokerService.Test.UnitTests
                 alertRepository.Object,
                 new FakeBalanceRepository([new Balance(AccountId, 1000)], []),
                 new FakeInstrumentRepository(),
+                TimeProvider.System,
                 new RecordingLogger<AlertService>()
             );
 
@@ -778,6 +789,241 @@ namespace EasyTrade.BrokerService.Test.UnitTests
 
             // Assert
             Assert.Equal(listed.Select(alert => alert.Id), results.Select(alert => alert.Id));
+        }
+
+        // Public, not private, like the case enums above: xUnit passes it to the public theories
+        // below, and a public method cannot take a parameter of a less accessible type.
+        public enum ReferenceCheck
+        {
+            AccountOnCreate,
+            AccountOnList,
+            AccountOnNotifications,
+            InstrumentOnCreate,
+            HoldingOnProfitLossCreate,
+        }
+
+        // The account, instrument and holding checks read through existing repositories that set
+        // no deadline and take no token. The checked read never answers, as on a db-adapter that
+        // accepted the call and stopped: the request stays pending until the alert call budget has
+        // passed, then fails as a db-adapter failure naming that read, before any alert call and
+        // without a log line.
+        [Theory]
+        [InlineData(
+            ReferenceCheck.AccountOnCreate,
+            nameof(IBalanceRepository.GetBalanceOfAccountAsync)
+        )]
+        [InlineData(
+            ReferenceCheck.AccountOnList,
+            nameof(IBalanceRepository.GetBalanceOfAccountAsync)
+        )]
+        [InlineData(
+            ReferenceCheck.AccountOnNotifications,
+            nameof(IBalanceRepository.GetBalanceOfAccountAsync)
+        )]
+        [InlineData(
+            ReferenceCheck.InstrumentOnCreate,
+            nameof(IInstrumentRepository.GetInstrumentAsync)
+        )]
+        [InlineData(
+            ReferenceCheck.HoldingOnProfitLossCreate,
+            nameof(IInstrumentRepository.GetOwnedInstrumentsOfAccountAsync)
+        )]
+        public async Task ReferenceCheck_ReadNeverAnswers_ShouldFailAtCallTimeoutWithoutAlertCall(
+            ReferenceCheck check,
+            string operation
+        )
+        {
+            // Arrange
+            ManualTimeProvider time = new();
+            AlertService service = BuildUnansweredCheckService(check, time);
+            Task request = StartCheckedRequest(service, check, CancellationToken.None);
+
+            // Act
+            (bool pendingBeforeBudget, Exception? error) = await ExpireCallBudgetAsync(
+                time,
+                request
+            );
+
+            // Assert
+            Assert.Equal(
+                (true, typeof(DbException), typeof(TimeoutException), true, 0, 0),
+                (
+                    pendingBeforeBudget,
+                    error?.GetType(),
+                    error?.InnerException?.GetType(),
+                    NamesOperation(error, operation),
+                    TotalAlertCalls(),
+                    _logger!.Entries.Count
+                )
+            );
+        }
+
+        // The caller's token cancels while the checked read is pending: the wait ends at once,
+        // with no time passing, as a db-adapter failure that wraps the cancellation of that very
+        // token, before any alert call and without a log line.
+        [Theory]
+        [InlineData(
+            ReferenceCheck.AccountOnCreate,
+            nameof(IBalanceRepository.GetBalanceOfAccountAsync)
+        )]
+        [InlineData(
+            ReferenceCheck.AccountOnList,
+            nameof(IBalanceRepository.GetBalanceOfAccountAsync)
+        )]
+        [InlineData(
+            ReferenceCheck.AccountOnNotifications,
+            nameof(IBalanceRepository.GetBalanceOfAccountAsync)
+        )]
+        [InlineData(
+            ReferenceCheck.InstrumentOnCreate,
+            nameof(IInstrumentRepository.GetInstrumentAsync)
+        )]
+        [InlineData(
+            ReferenceCheck.HoldingOnProfitLossCreate,
+            nameof(IInstrumentRepository.GetOwnedInstrumentsOfAccountAsync)
+        )]
+        public async Task ReferenceCheck_CallerCancelsDuringRead_ShouldFailWithCancellation(
+            ReferenceCheck check,
+            string operation
+        )
+        {
+            // Arrange
+            ManualTimeProvider time = new();
+            AlertService service = BuildUnansweredCheckService(check, time);
+            using CancellationTokenSource caller = new();
+            Task request = StartCheckedRequest(service, check, caller.Token);
+            await time.WaitForCreatedTimersAsync(1).WaitAsync(WaitBound);
+
+            // Act
+            await caller.CancelAsync();
+            Exception? error = await Record.ExceptionAsync(() => request.WaitAsync(WaitBound));
+
+            // Assert
+            Assert.Equal(
+                (typeof(DbException), true, true, ManualTimeProvider.DefaultStart, 0, 0),
+                (
+                    error?.GetType(),
+                    error?.InnerException is OperationCanceledException cancellation
+                        && (cancellation.CancellationToken == caller.Token),
+                    NamesOperation(error, operation),
+                    time.GetUtcNow(),
+                    TotalAlertCalls(),
+                    _logger!.Entries.Count
+                )
+            );
+        }
+
+        // Waits until the code under test has started its bound, moves the clock to one tick
+        // short of the alert call budget and notes whether the request is still pending with that
+        // bound scheduled, then moves the last tick and returns the request's exception.
+        private static async Task<(
+            bool PendingBeforeBudget,
+            Exception? Error
+        )> ExpireCallBudgetAsync(ManualTimeProvider time, Task request)
+        {
+            await time.WaitForCreatedTimersAsync(1).WaitAsync(WaitBound);
+            time.Advance(AlertRepository.CallTimeout - TimeSpan.FromTicks(1));
+            bool pending = !request.IsCompleted && (time.ScheduledTimerCount == 1);
+            time.Advance(TimeSpan.FromTicks(1));
+            Exception? error = await Record.ExceptionAsync(() => request.WaitAsync(WaitBound));
+            return (pending, error);
+        }
+
+        // GrpcHelper's prefix, which the exception filter reads the failed call's name from.
+        private static bool NamesOperation(Exception? error, string operation)
+        {
+            return error?.Message.StartsWith(
+                    $"Db Adapter call error in \"{operation}\" method: ",
+                    StringComparison.Ordinal
+                ) == true;
+        }
+
+        // The request whose first unanswered read is the given check's.
+        private static Task StartCheckedRequest(
+            AlertService service,
+            ReferenceCheck check,
+            CancellationToken cancellationToken
+        )
+        {
+            switch (check)
+            {
+                case ReferenceCheck.AccountOnCreate:
+                case ReferenceCheck.InstrumentOnCreate:
+                    return service.CreateAlertAsync(
+                        Request("TARGET_PRICE", HeldInstrumentId, "ABOVE", 10m),
+                        cancellationToken
+                    );
+                case ReferenceCheck.AccountOnList:
+                    return service.GetAlertsAsync(AccountId, cancellationToken);
+                case ReferenceCheck.AccountOnNotifications:
+                    return service.GetNotificationsAsync(AccountId, true, cancellationToken);
+                case ReferenceCheck.HoldingOnProfitLossCreate:
+                    return service.CreateAlertAsync(
+                        Request("PROFIT_LOSS", HeldInstrumentId, "ABOVE", 5m),
+                        cancellationToken
+                    );
+                default:
+                    throw new ArgumentOutOfRangeException(nameof(check), check, null);
+            }
+        }
+
+        // Strict mocks answer the account, instrument and holding reads of the fixture account
+        // and its held instrument, except the read of the given check, whose task never
+        // completes. The fake alert repository counts any alert call that follows.
+        private AlertService BuildUnansweredCheckService(ReferenceCheck check, TimeProvider time)
+        {
+            Mock<IBalanceRepository> balances = new(MockBehavior.Strict);
+            balances
+                .Setup(repository => repository.GetBalanceOfAccountAsync(AccountId))
+                .Returns(
+                    check
+                        is ReferenceCheck.AccountOnCreate
+                            or ReferenceCheck.AccountOnList
+                            or ReferenceCheck.AccountOnNotifications
+                        ? NeverAnswered<Balance?>()
+                        : Task.FromResult<Balance?>(new Balance(AccountId, 1000))
+                );
+            Mock<IInstrumentRepository> instruments = new(MockBehavior.Strict);
+            instruments
+                .Setup(repository => repository.GetInstrumentAsync(HeldInstrumentId))
+                .Returns(
+                    check == ReferenceCheck.InstrumentOnCreate
+                        ? NeverAnswered<Instrument?>()
+                        : Task.FromResult<Instrument?>(
+                            new Instrument(HeldInstrumentId, ProductId, "HELD", "Held", "Held")
+                        )
+                );
+            instruments
+                .Setup(repository => repository.GetOwnedInstrumentsOfAccountAsync(AccountId))
+                .Returns(
+                    check == ReferenceCheck.HoldingOnProfitLossCreate
+                        ? NeverAnswered<List<OwnedInstrument>>()
+                        : Task.FromResult(
+                            new List<OwnedInstrument>
+                            {
+                                new(AccountId, HeldInstrumentId, 5, CreatedTime),
+                            }
+                        )
+                );
+            _alertRepository = new FakeAlertRepository();
+            _logger = new RecordingLogger<AlertService>();
+            return new AlertService(
+                _alertRepository,
+                balances.Object,
+                instruments.Object,
+                time,
+                _logger
+            );
+        }
+
+        private static Task<T> NeverAnswered<T>()
+        {
+            return new TaskCompletionSource<T>().Task;
+        }
+
+        private int TotalAlertCalls()
+        {
+            return Enum.GetValues<FakeAlertRepositoryMethod>().Sum(_alertRepository!.CallCount);
         }
 
         // A failed create as the real repository reports it: GrpcHelper wraps the RpcException.
@@ -961,6 +1207,7 @@ namespace EasyTrade.BrokerService.Test.UnitTests
                 _alertRepository,
                 _balanceRepository,
                 _instrumentRepository,
+                TimeProvider.System,
                 _logger
             );
         }

@@ -5,7 +5,12 @@ import {
     queryOptions,
     useQuery,
 } from "@tanstack/react-query"
-import { type LoaderFunctionArgs, redirect } from "react-router"
+import {
+    type LoaderFunctionArgs,
+    redirect,
+    replace,
+    resolvePath,
+} from "react-router"
 import { getPortfolioInsightsFlag } from "../api/featureFlags"
 import { getPortfolioInsights } from "../api/portfolioInsights"
 import {
@@ -176,17 +181,42 @@ export function usePortfolioInsightsQuery(accountId: string, enabled: boolean) {
     return useQuery({ ...portfolioInsightsQuery(accountId), enabled })
 }
 
-/** The entry decision of `createPortfolioInsightsLoader` for `userId`. */
+/**
+ * The redirect to `/home` that refuses the `/insights` entry `request` made.
+ *
+ * Loader arguments carry no navigation type, but while a loader runs the
+ * window still shows the tab's current history entry. That entry is already
+ * the refused address after a typed address, a bookmark, a reload or a step
+ * Back or Forward into it, and it is `/home` when a link was followed from
+ * there; the redirect replaces it in both cases, so Back never enters the
+ * loader again and no second `/home` is stacked. Any other page is the origin
+ * of a link the router has not committed yet, so the redirect is pushed after
+ * it and Back returns there. `/home` is resolved as the sibling of the entry,
+ * which keeps the router's basename on both compared paths.
+ */
+function refuseEntry(request: Request): Response {
+    const entryPath = new URL(request.url).pathname
+    const homePath = resolvePath("../home", entryPath).pathname
+    const shownPath = window.location.pathname
+    return shownPath === entryPath || shownPath === homePath
+        ? replace("/home")
+        : redirect("/home")
+}
+
+/**
+ * The entry decision of `createPortfolioInsightsLoader` for `userId`, made
+ * for the navigation `request`.
+ */
 async function decidePortfolioInsightsEntry(
     client: QueryClient,
     userId: string,
-    signal: AbortSignal
+    request: Request
 ): Promise<null> {
     const entry = captureFeatureContext()
     // Read directly, not through the shared flag query, so entry never joins
     // a read already in flight and never trusts a cached `true`.
-    const enabled = await getPortfolioInsightsFlag(signal)
-    if (signal.aborted) {
+    const enabled = await getPortfolioInsightsFlag(request.signal)
+    if (request.signal.aborted) {
         // The router discards an abandoned navigation's result, and the read's
         // `false` may come from that abort alone.
         return null
@@ -194,12 +224,12 @@ async function decidePortfolioInsightsEntry(
     if (!enabled) {
         // Not the shared read, so a shared read in flight is cancelled.
         onPortfolioInsightsDisabled(client)
-        throw redirect("/home")
+        throw refuseEntry(request)
     }
     if (!isCurrentFeatureContext(entry) || entry.userId !== userId) {
         // A shutdown, a logout or an account switch ran during the read; a
         // shutdown has already done its own work.
-        throw redirect("/home")
+        throw refuseEntry(request)
     }
     client.setQueryData<boolean>(featureFlagKeys.portfolioInsights, true)
     // `prefetchQuery` never rejects, so neither call can fail the loader.
@@ -219,6 +249,11 @@ async function decidePortfolioInsightsEntry(
  * page's own error state and a 403 the feature shutdown, never the router's
  * error page.
  *
+ * The redirect replaces the tab's current history entry when that entry is
+ * already the refused `/insights` address or `/home`, so Back never enters
+ * the loader again and no second `/home` is stacked. After a link followed
+ * from any other page it is pushed after that page, so Back returns there.
+ *
  * The read carries the navigation's abort signal, and the account, its
  * session and the activation are captured before it. When the read returns:
  * - an abandoned navigation (the user left, or a newer navigation replaced
@@ -233,10 +268,10 @@ async function decidePortfolioInsightsEntry(
  */
 export function createPortfolioInsightsLoader(client: QueryClient) {
     // `requireUser` passes no router arguments to its callback, so it wraps
-    // each call to keep the navigation's signal in reach.
+    // each call to keep the navigation's request in reach.
     return ({ request }: LoaderFunctionArgs) =>
         requireUser((userId) =>
-            decidePortfolioInsightsEntry(client, userId, request.signal)
+            decidePortfolioInsightsEntry(client, userId, request)
         )()
 }
 

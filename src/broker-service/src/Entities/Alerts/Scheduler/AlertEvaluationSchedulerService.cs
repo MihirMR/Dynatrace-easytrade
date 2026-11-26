@@ -14,7 +14,7 @@ namespace EasyTrade.BrokerService.Entities.Alerts.Scheduler
         IServiceScopeFactory scopeFactory,
         IConfiguration configuration,
         ILogger<AlertEvaluationSchedulerService> logger
-    ) : BackgroundService
+    ) : BackgroundService, IHostedLifecycleService
     {
         /// <summary>
         /// The interval used when the configured value is unset or invalid.
@@ -33,6 +33,12 @@ namespace EasyTrade.BrokerService.Entities.Alerts.Scheduler
         /// placeholder readable while capping what configuration can write into the log.
         /// </summary>
         private const int MaxLoggedValueLength = 64;
+
+        // Guards the one-time resolution of the interval and its startup lines.
+        private readonly Lock _startupGate = new();
+
+        // The interval this instance runs on, or null until ResolveIntervalOnce first runs.
+        private int? _intervalSeconds;
 
         /// <summary>
         /// Reads <c>ALERT_EVALUATION_INTERVAL_SECONDS</c>. A whole number from 1 to
@@ -121,20 +127,75 @@ namespace EasyTrade.BrokerService.Entities.Alerts.Scheduler
             }
         }
 
+        /// <summary>
+        /// Resolves the interval and writes the startup lines: the interval's Warning, when the
+        /// configured value is invalid, then the startup line.
+        /// </summary>
+        public Task StartingAsync(CancellationToken cancellationToken)
+        {
+            // The host calls this before it starts any hosted service, so the startup lines are
+            // written while the host starts and never interleave with another service's console
+            // output.
+            _ = ResolveIntervalOnce();
+            return Task.CompletedTask;
+        }
+
+        /// <summary>Nothing runs here: the cycles run in <see cref="ExecuteAsync"/>.</summary>
+        public Task StartedAsync(CancellationToken cancellationToken)
+        {
+            return Task.CompletedTask;
+        }
+
+        /// <summary>Nothing runs here: StopAsync cancels the cycles.</summary>
+        public Task StoppingAsync(CancellationToken cancellationToken)
+        {
+            return Task.CompletedTask;
+        }
+
+        /// <summary>Nothing runs here: StopAsync has already ended the cycles.</summary>
+        public Task StoppedAsync(CancellationToken cancellationToken)
+        {
+            return Task.CompletedTask;
+        }
+
         protected override async Task ExecuteAsync(CancellationToken stoppingToken)
         {
-            int intervalSeconds = ResolveInterval(configuration, logger);
-            // The guard avoids boxing the interval when Information is off (CA1873).
-            if (logger.IsEnabled(LogLevel.Information))
-            {
-                logger.LogInformation(
-                    "Starting alert evaluation scheduler with an interval of [{interval}]s.",
-                    intervalSeconds
-                );
-            }
-
+            // Returns the interval StartingAsync resolved. Where StartingAsync never ran, as when
+            // StartAsync is called directly, this resolves it and writes the startup lines first.
+            int intervalSeconds = ResolveIntervalOnce();
             using PeriodicTimer timer = new(TimeSpan.FromSeconds(intervalSeconds));
             await RunLoopAsync(timer.WaitForNextTickAsync, stoppingToken);
+        }
+
+        /// <summary>
+        /// On the first call for this instance, resolves the interval through
+        /// <see cref="ResolveInterval"/>, which writes the Warning for an invalid value, then
+        /// writes the startup line. Every later call returns the stored interval and writes
+        /// nothing, so each line appears once whichever of <see cref="StartingAsync"/> and
+        /// <see cref="ExecuteAsync"/> comes first.
+        /// </summary>
+        private int ResolveIntervalOnce()
+        {
+            lock (_startupGate)
+            {
+                if (_intervalSeconds is int resolved)
+                {
+                    return resolved;
+                }
+
+                int intervalSeconds = ResolveInterval(configuration, logger);
+                // Stored before the startup line, so no later call writes the Warning again.
+                _intervalSeconds = intervalSeconds;
+                // The guard avoids boxing the interval when Information is off (CA1873).
+                if (logger.IsEnabled(LogLevel.Information))
+                {
+                    logger.LogInformation(
+                        "Starting alert evaluation scheduler with an interval of [{interval}]s.",
+                        intervalSeconds
+                    );
+                }
+                return intervalSeconds;
+            }
         }
 
         private async Task RunCycleInScopeAsync(CancellationToken cancellationToken)

@@ -17,12 +17,16 @@ namespace EasyTrade.BrokerService.Entities.Alerts.Service
     /// that db-adapter rejects as NotFound, because a reference was removed between the checks
     /// and the insert, with a 404 <see cref="BalanceNotFoundException"/> naming both the account
     /// and the instrument. Each audit line is written only after its db-adapter call has returned
-    /// successfully, so a failed write logs none.
+    /// successfully, so a failed write logs none. The checks read through existing repositories
+    /// that set no deadline and take no token, so each is awaited within
+    /// <see cref="AlertRepository.CallTimeout"/> on the injected <see cref="TimeProvider"/>'s
+    /// clock and only until the request's token is cancelled.
     /// </summary>
     public class AlertService(
         IAlertRepository alertRepository,
         IBalanceRepository balanceRepository,
         IInstrumentRepository instrumentRepository,
+        TimeProvider timeProvider,
         ILogger<AlertService> logger
     ) : IAlertService
     {
@@ -91,16 +95,19 @@ namespace EasyTrade.BrokerService.Entities.Alerts.Service
                 );
             }
 
-            await EnsureAccountExistsAsync(accountId);
+            await EnsureAccountExistsAsync(accountId, cancellationToken);
 
             _ =
-                await instrumentRepository.GetInstrumentAsync(instrumentId)
-                ?? throw new InstrumentNotFoundException(instrumentId);
+                await BoundedReadAsync(
+                    instrumentRepository.GetInstrumentAsync(instrumentId),
+                    nameof(IInstrumentRepository.GetInstrumentAsync),
+                    cancellationToken
+                ) ?? throw new InstrumentNotFoundException(instrumentId);
 
             // A TARGET_PRICE alert watches the price alone and never reads holdings.
             if (type == AlertType.PROFIT_LOSS)
             {
-                await EnsureHoldingAsync(accountId, instrumentId);
+                await EnsureHoldingAsync(accountId, instrumentId, cancellationToken);
             }
 
             Alert alert;
@@ -151,7 +158,7 @@ namespace EasyTrade.BrokerService.Entities.Alerts.Service
             CancellationToken cancellationToken = default
         )
         {
-            await EnsureAccountExistsAsync(accountId);
+            await EnsureAccountExistsAsync(accountId, cancellationToken);
 
             IReadOnlyList<Alert> alerts = await alertRepository.ListAsync(
                 accountId,
@@ -186,7 +193,7 @@ namespace EasyTrade.BrokerService.Entities.Alerts.Service
             CancellationToken cancellationToken = default
         )
         {
-            await EnsureAccountExistsAsync(accountId);
+            await EnsureAccountExistsAsync(accountId, cancellationToken);
 
             // db-adapter decides membership: a triggered alert stays listed after a disable.
             IReadOnlyList<Alert> alerts = await alertRepository.ListAsync(
@@ -287,17 +294,30 @@ namespace EasyTrade.BrokerService.Entities.Alerts.Service
         }
 
         // An account is known when it has a balance row, the existing broker account check.
-        private async Task EnsureAccountExistsAsync(Guid accountId)
+        private async Task EnsureAccountExistsAsync(
+            Guid accountId,
+            CancellationToken cancellationToken
+        )
         {
             _ =
-                await balanceRepository.GetBalanceOfAccountAsync(accountId)
-                ?? throw new BalanceNotFoundException(accountId);
+                await BoundedReadAsync(
+                    balanceRepository.GetBalanceOfAccountAsync(accountId),
+                    nameof(IBalanceRepository.GetBalanceOfAccountAsync),
+                    cancellationToken
+                ) ?? throw new BalanceNotFoundException(accountId);
         }
 
-        private async Task EnsureHoldingAsync(Guid accountId, Guid instrumentId)
+        private async Task EnsureHoldingAsync(
+            Guid accountId,
+            Guid instrumentId,
+            CancellationToken cancellationToken
+        )
         {
-            List<OwnedInstrument> owned =
-                await instrumentRepository.GetOwnedInstrumentsOfAccountAsync(accountId);
+            List<OwnedInstrument> owned = await BoundedReadAsync(
+                instrumentRepository.GetOwnedInstrumentsOfAccountAsync(accountId),
+                nameof(IInstrumentRepository.GetOwnedInstrumentsOfAccountAsync),
+                cancellationToken
+            );
             IReadOnlyList<OwnedInstrument> holdings = PortfolioInsightsCalculator.SelectHoldings(
                 owned
             );
@@ -313,6 +333,23 @@ namespace EasyTrade.BrokerService.Entities.Alerts.Service
         {
             return await alertRepository.GetAlertAsync(id, cancellationToken)
                 ?? throw new AlertNotFoundException(id);
+        }
+
+        // A check's read through an existing repository, which sets no gRPC deadline and takes no
+        // token: no reply within the call budget, or a cancelled request, fails it with a
+        // DbException (503) before any alert call is made.
+        private Task<T> BoundedReadAsync<T>(
+            Task<T> call,
+            string operation,
+            CancellationToken cancellationToken
+        )
+        {
+            return AlertRepository.BoundExistingReadAsync(
+                call,
+                operation,
+                timeProvider,
+                cancellationToken
+            );
         }
     }
 }

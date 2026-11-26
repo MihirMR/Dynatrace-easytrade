@@ -721,6 +721,8 @@ namespace EasyTrade.BrokerService.Test.IntegrationTests
             services.AddTransient<IPortfolioInsightsService, PortfolioInsightsService>();
             services.AddTransient<IAlertService, AlertService>();
             services.AddTransient<IAlertEvaluationService, AlertEvaluationService>();
+            // As the composition root registers it; ConfigureServices may swap in a test clock.
+            services.TryAddSingleton(TimeProvider.System);
             services.TryAddEnumerable(
                 ServiceDescriptor.Singleton<
                     MatcherPolicy,

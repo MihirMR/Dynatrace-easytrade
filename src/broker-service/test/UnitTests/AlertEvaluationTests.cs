@@ -1,13 +1,16 @@
 using System.Threading.Channels;
 using EasyTrade.BrokerService.Entities.Alerts;
+using EasyTrade.BrokerService.Entities.Alerts.Repository;
 using EasyTrade.BrokerService.Entities.Alerts.Service;
 using EasyTrade.BrokerService.Entities.Balances;
 using EasyTrade.BrokerService.Entities.Instruments;
+using EasyTrade.BrokerService.Entities.Instruments.Repository;
 using EasyTrade.BrokerService.Entities.Portfolio.DTO;
 using EasyTrade.BrokerService.Entities.Portfolio.Service;
 using EasyTrade.BrokerService.Entities.Prices;
 using EasyTrade.BrokerService.Entities.Prices.ServiceConnector;
 using EasyTrade.BrokerService.Entities.Trades;
+using EasyTrade.BrokerService.Entities.Trades.Repository;
 using EasyTrade.BrokerService.ExceptionHandling.Exceptions;
 using EasyTrade.BrokerService.Helpers;
 using EasyTrade.BrokerService.Helpers.FeatureFlags;
@@ -32,7 +35,9 @@ namespace EasyTrade.BrokerService.Test.UnitTests
     /// named log fields. Racing cycles are ordered with barriers and completion sources, and every
     /// wait is bounded. The concurrency case checks the bound on concurrent work: every positions
     /// load is held until the test releases it, one at a time in arrival order, so the loads in
-    /// flight are observed at each step without waiting on time.
+    /// flight are observed at each step without waiting on time. A second concurrency case holds
+    /// the loads' own repository reads while a manual clock passes the alert call budget, so no
+    /// read beyond the bound may start.
     /// </summary>
     public class AlertEvaluationTests
     {
@@ -1164,6 +1169,72 @@ namespace EasyTrade.BrokerService.Test.UnitTests
             Assert.Equal(expected, harness.Collect(result, completedWhileLoadHeld));
         }
 
+        // The positions reads are existing repository calls that take no token. Held as by a
+        // db-adapter that accepted them and stopped, they keep the bound's eight accounts busy
+        // however far the clock moves past the alert call budget, so no further read starts and
+        // db-adapter never has more than eight accounts' two reads in flight. Released, the
+        // cycle completes with every account read once.
+        [Fact]
+        public async Task RunCycle_PositionsReadsHeld_ShouldStartNoFurtherReadPastCallTimeout()
+        {
+            // Arrange
+            ManualTimeProvider time = new();
+            HeldPositionsReads reads = new();
+            using ConcurrencyHarness harness = new(reads, time);
+            // The loads run unheld, so only the reads hold the cycle.
+            harness.Probe.ReleaseAll();
+            const int boundReads = 2 * AccountBound;
+
+            // Act: the cycle runs off the test's context.
+            Task<AlertEvaluationResult> cycle = Task.Run(
+                () => harness.Service.RunCycleAsync(CancellationToken.None)
+            );
+            int startedPastBudget;
+            bool completedPastBudget;
+            try
+            {
+                await reads.WaitForStartedAsync(boundReads).WaitAsync(WaitBound);
+                time.Advance(AlertRepository.CallTimeout * 3);
+                startedPastBudget = reads.Started;
+                completedPastBudget = cycle.IsCompleted;
+            }
+            finally
+            {
+                // Lets every read through, so a failed wait never leaves the cycle parked.
+                reads.ReleaseAll();
+            }
+            AlertEvaluationResult result = await cycle.WaitAsync(WaitBound);
+
+            // Assert
+            ConcurrencyEffects expected = new(
+                AlertEvaluationOutcome.Completed,
+                AlertCount: harness.SeededAlerts,
+                Triggered: harness.SeededAlerts,
+                Failed: 0,
+                Skipped: 0,
+                MaxLoadsInFlight: AccountBound,
+                PositionLoads: ProfitLossAccounts,
+                ProfitLossAccountsLoadedOnce: ProfitLossAccounts,
+                OtherAccountLoads: 0,
+                DistinctSelectedPrices: 1,
+                SelectedPricesAreSeededCandles: true,
+                LatestPriceFetches: 1,
+                OtherPricingCalls: 0,
+                InsightsReads: 0,
+                CycleCompletedWhileLoadHeld: false
+            );
+            HeldReadEffects expectedReads = new(
+                StartedPastBudget: boundReads,
+                MaxUnanswered: boundReads,
+                Started: 2 * ProfitLossAccounts,
+                AccountsReadOnce: ProfitLossAccounts
+            );
+            Assert.Equal(
+                (expected, expectedReads),
+                (harness.Collect(result, completedPastBudget), reads.Collect(startedPastBudget))
+            );
+        }
+
         // Signals the barrier and waits for every party, failing rather than blocking past the
         // bound.
         private static void SignalAndWaitBounded(Barrier barrier)
@@ -1396,6 +1467,18 @@ namespace EasyTrade.BrokerService.Test.UnitTests
             bool CycleCompletedWhileLoadHeld
         );
 
+        /// <summary>
+        /// The positions path's repository reads, compared as one value: the reads started once
+        /// the clock had passed the alert call budget, the most unanswered at once, all reads
+        /// started, and the accounts read exactly once by each of the two reads.
+        /// </summary>
+        private sealed record HeldReadEffects(
+            int StartedPastBudget,
+            int MaxUnanswered,
+            int Started,
+            int AccountsReadOnce
+        );
+
         /// <summary>One positions load: its arguments and the release it waits for.</summary>
         private sealed class HeldLoad(Guid accountId, IReadOnlyDictionary<Guid, Price> selected)
         {
@@ -1522,6 +1605,152 @@ namespace EasyTrade.BrokerService.Test.UnitTests
         }
 
         /// <summary>
+        /// Holds the two repository reads of the positions path, the holdings and the trades of
+        /// an account, until <see cref="ReleaseAll"/>, then lets them and every later read through
+        /// to the in-memory repositories. A read counts as started when the repository is called
+        /// and as unanswered until its task is about to complete.
+        /// </summary>
+        private sealed class HeldPositionsReads
+        {
+            private const string HoldingsRead = "holdings";
+            private const string TradesRead = "trades";
+
+            private readonly Lock _lock = new();
+            private readonly TaskCompletionSource _release = new(
+                TaskCreationOptions.RunContinuationsAsynchronously
+            );
+            private readonly List<(Guid AccountId, string Read)> _started = [];
+            private readonly List<(int Count, TaskCompletionSource Signal)> _waiters = [];
+            private int _unanswered;
+            private int _maxUnanswered;
+
+            /// <summary>The reads started so far.</summary>
+            public int Started
+            {
+                get
+                {
+                    lock (_lock)
+                    {
+                        return _started.Count;
+                    }
+                }
+            }
+
+            /// <summary>Completes once <paramref name="count"/> reads have started.</summary>
+            public Task WaitForStartedAsync(int count)
+            {
+                lock (_lock)
+                {
+                    if (_started.Count >= count)
+                    {
+                        return Task.CompletedTask;
+                    }
+                    TaskCompletionSource signal = new(
+                        TaskCreationOptions.RunContinuationsAsynchronously
+                    );
+                    _waiters.Add((count, signal));
+                    return signal.Task;
+                }
+            }
+
+            public void ReleaseAll()
+            {
+                _release.TrySetResult();
+            }
+
+            /// <summary>The holdings reads of <paramref name="inner"/>, held.</summary>
+            public IInstrumentRepository Hold(FakeInstrumentRepository inner)
+            {
+                // Strict, so a read the positions path does not make throws.
+                Mock<IInstrumentRepository> held = new(MockBehavior.Strict);
+                held.Setup(repository =>
+                        repository.GetOwnedInstrumentsOfAccountAsync(It.IsAny<Guid>())
+                    )
+                    .Returns(
+                        (Guid accountId) =>
+                            HoldAsync(
+                                accountId,
+                                HoldingsRead,
+                                () => inner.GetOwnedInstrumentsOfAccountAsync(accountId)
+                            )
+                    );
+                return held.Object;
+            }
+
+            /// <summary>The executed-trade reads of <paramref name="inner"/>, held.</summary>
+            public ITradeRepository Hold(FakeTradeRepository inner)
+            {
+                Mock<ITradeRepository> held = new(MockBehavior.Strict);
+                held.Setup(repository =>
+                        repository.GetAccountTradesAsync(It.IsAny<Guid>(), false, false)
+                    )
+                    .Returns(
+                        (Guid accountId, bool onlyOpen, bool onlyLong) =>
+                            HoldAsync(
+                                accountId,
+                                TradesRead,
+                                () => inner.GetAccountTradesAsync(accountId, onlyOpen, onlyLong)
+                            )
+                    );
+                return held.Object;
+            }
+
+            public HeldReadEffects Collect(int startedPastBudget)
+            {
+                lock (_lock)
+                {
+                    return new HeldReadEffects(
+                        startedPastBudget,
+                        _maxUnanswered,
+                        _started.Count,
+                        _started
+                            .GroupBy(read => read.AccountId)
+                            .Count(account =>
+                                account.Count(read => read.Read == HoldingsRead) == 1
+                                && account.Count(read => read.Read == TradesRead) == 1
+                            )
+                    );
+                }
+            }
+
+            private async Task<T> HoldAsync<T>(Guid accountId, string read, Func<Task<T>> answer)
+            {
+                List<TaskCompletionSource> reached = [];
+                lock (_lock)
+                {
+                    _started.Add((accountId, read));
+                    _unanswered++;
+                    _maxUnanswered = Math.Max(_maxUnanswered, _unanswered);
+                    foreach ((int count, TaskCompletionSource signal) in _waiters)
+                    {
+                        if (count <= _started.Count)
+                        {
+                            reached.Add(signal);
+                        }
+                    }
+                    _waiters.RemoveAll(waiter => waiter.Count <= _started.Count);
+                }
+                foreach (TaskCompletionSource signal in reached)
+                {
+                    signal.TrySetResult();
+                }
+
+                try
+                {
+                    await _release.Task;
+                    return await answer();
+                }
+                finally
+                {
+                    lock (_lock)
+                    {
+                        _unanswered--;
+                    }
+                }
+            }
+        }
+
+        /// <summary>
         /// Delegates every member to <see cref="FakePriceServiceConnector"/> and counts the
         /// calls, so a pricing call from the evaluator or from the positions path is seen.
         /// </summary>
@@ -1568,7 +1797,9 @@ namespace EasyTrade.BrokerService.Test.UnitTests
         /// probe. Each P/L account holds one unit of two instruments, each bought at
         /// <see cref="EntryPrice"/>, and has one crossed PROFIT_LOSS alert on each; the first
         /// also has a crossed TARGET_PRICE alert. Each target-only account has two crossed
-        /// TARGET_PRICE alerts and no holding. Both candles share one timestamp.
+        /// TARGET_PRICE alerts and no holding. Both candles share one timestamp. Given
+        /// <see cref="HeldPositionsReads"/>, the positions service reads holdings and trades
+        /// through it, and given a clock, it runs on that clock.
         /// </summary>
         private sealed class ConcurrencyHarness : IDisposable
         {
@@ -1578,7 +1809,10 @@ namespace EasyTrade.BrokerService.Test.UnitTests
             private readonly CountingPriceServiceConnector _prices;
             private readonly FakeAlertRepository _alerts = new();
 
-            public ConcurrencyHarness()
+            public ConcurrencyHarness(
+                HeldPositionsReads? heldReads = null,
+                TimeProvider? timeProvider = null
+            )
             {
                 FakeInstrumentRepository instruments = new();
                 FakeTradeRepository trades = new();
@@ -1633,10 +1867,11 @@ namespace EasyTrade.BrokerService.Test.UnitTests
                 Probe = new HeldPositionsProbe(
                     new PortfolioInsightsService(
                         new FakeBalanceRepository(),
-                        instruments,
-                        trades,
+                        heldReads?.Hold(instruments) ?? instruments,
+                        heldReads?.Hold(trades) ?? trades,
                         _prices,
                         metrics,
+                        timeProvider ?? TimeProvider.System,
                         new RecordingLogger<PortfolioInsightsService>()
                     )
                 );
@@ -1834,6 +2069,7 @@ namespace EasyTrade.BrokerService.Test.UnitTests
                         _trades,
                         pricing,
                         _metrics,
+                        TimeProvider.System,
                         new RecordingLogger<PortfolioInsightsService>(Logs)
                     );
                 return new AlertEvaluationService(

@@ -67,7 +67,7 @@ export function AlertNotifications({
                                     {TYPE_LABELS[n.type]}{" "}
                                     {DIRECTION_LABELS[n.direction]}{" "}
                                     {formatAlertNumber(n.threshold)}{" "}
-                                    <span className="text-muted">
+                                    <span className="text-secondary">
                                         {`(now ${formatAlertNumber(n.triggerValue ?? 0)})`}
                                     </span>
                                 </span>
@@ -79,7 +79,7 @@ export function AlertNotifications({
                             </div>
                             <button
                                 type="button"
-                                className="btn btn-primary btn-sm alert-acknowledge"
+                                className="btn btn-secondary btn-sm alert-acknowledge"
                                 aria-describedby={textId}
                                 disabled={pendingIds.has(n.id)}
                                 onClick={() => onAcknowledge(n.id)}

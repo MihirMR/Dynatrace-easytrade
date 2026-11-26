@@ -103,6 +103,9 @@ public static class BrokerServiceDependencyExtension
             .AddSingleton<IPortfolioInsightsFeature, PortfolioInsightsFeature>()
             .AddSingleton<PortfolioInsightsMetrics>()
             .AddHostedService<AlertEvaluationSchedulerService>();
+        // The clock of the AlertRepository.CallTimeout bounds in the insights and alert services;
+        // the host registers none.
+        services.TryAddSingleton(TimeProvider.System);
         // PATCH and DELETE on /v1/alerts/notifications answer 404, as for any non-GUID id.
         services.TryAddEnumerable(
             ServiceDescriptor.Singleton<MatcherPolicy, AlertController.NotificationsMatcherPolicy>()

@@ -231,6 +231,30 @@ it("alertList_deleted_rendersDeletedIdOutput", () => {
     ).toEqual([{ value: armed.id, text: armed.id }])
 })
 
+it("deletedAlertOutput_deleted_rendersLabelledReceipt", () => {
+    const { container } = render(<DeletedAlertOutput deletedId={armed.id} />)
+
+    // Worded and styled like the "Created alert <id>" receipt: a labelled
+    // `p.form-hint` around the output loadgen binds, which keeps the id as
+    // its value and text.
+    const receipt = container.firstElementChild
+    const output = receipt?.querySelector("output#alert-deleted-id")
+    expect({
+        tag: receipt?.tagName,
+        className: receipt?.className,
+        text: receipt?.textContent,
+        output: {
+            value: output?.getAttribute("value"),
+            text: output?.textContent,
+        },
+    }).toEqual({
+        tag: "P",
+        className: "form-hint",
+        text: `Deleted alert ${armed.id}`,
+        output: { value: armed.id, text: armed.id },
+    })
+})
+
 it("deletedAlertOutput_noDelete_rendersNothing", () => {
     const { container } = render(<DeletedAlertOutput deletedId={null} />)
 

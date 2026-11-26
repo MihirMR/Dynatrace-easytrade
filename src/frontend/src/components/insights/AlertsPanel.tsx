@@ -12,7 +12,11 @@ import {
     useDeleteAlertMutation,
     useUpdateAlertEnabledMutation,
 } from "../../hooks/useAlerts"
-import { isFeatureDisabledError } from "../../utils/portfolioInsightsFeature"
+import {
+    type FeatureContext,
+    isCurrentFeatureContext,
+    isFeatureDisabledError,
+} from "../../utils/portfolioInsightsFeature"
 import { alertKeys } from "../../utils/queryKeys"
 import { AlertForm } from "./AlertForm"
 import { AlertList, DeletedAlertOutput, alertSummaryText } from "./AlertList"
@@ -113,6 +117,106 @@ function listLacksNotifiedTrigger(
     })
 }
 
+/** The two places an alert's actions are rendered: list rows and notifications. */
+type ItemRegion = "list" | "notifications"
+
+const ITEM_SELECTORS: Record<ItemRegion, string> = {
+    list: "li.alert-item",
+    notifications: "li.alert-notification",
+}
+
+/** The classes that tell the buttons of one row or notification apart. */
+const ACTION_CLASSES = [
+    "alert-toggle",
+    "alert-disable",
+    "alert-delete",
+    "alert-acknowledge",
+] as const
+
+function itemAlertId(
+    item: HTMLElement,
+    region: ItemRegion
+): string | undefined {
+    return region === "list"
+        ? item.dataset.alertId
+        : item.dataset.notificationId
+}
+
+/**
+ * Where focus returns once an action settles, captured when it starts: the
+ * control a create was submitted from, or the row or notification an action
+ * was started from, with its position and the class of its button.
+ */
+type FocusReturn =
+    | { kind: "form"; control: HTMLElement }
+    | {
+          kind: "item"
+          region: ItemRegion
+          id: string
+          index: number
+          actionClass: string | null
+      }
+
+/**
+ * True when no element holds focus, as after the focused control was
+ * disabled or removed; then focus may be moved without taking it from a
+ * control the user chose.
+ */
+function isFocusLost(): boolean {
+    const active = document.activeElement
+    return active === null || active === document.body
+}
+
+/** Focuses `element`; false when it cannot take focus, as when disabled. */
+function focusIfAble(element: HTMLElement): boolean {
+    element.focus()
+    return document.activeElement === element
+}
+
+function buttonsOf(item: HTMLElement | undefined): HTMLElement[] {
+    return item === undefined
+        ? []
+        : Array.from(item.querySelectorAll<HTMLElement>("button"))
+}
+
+/**
+ * The controls `target` hands focus to, best first, as `section` is rendered
+ * now. A create returns to the control it was submitted from, else to the
+ * submit button. An action returns to its item's button of the same class,
+ * else to the item's first button; once the item is gone, to the item that
+ * took its place, else to the one before it.
+ */
+function focusCandidates(
+    section: HTMLElement,
+    target: FocusReturn
+): HTMLElement[] {
+    if (target.kind === "form") {
+        const submit = section.querySelector<HTMLElement>("#alert-submit")
+        return submit === null ? [target.control] : [target.control, submit]
+    }
+    const items = Array.from(
+        section.querySelectorAll<HTMLElement>(ITEM_SELECTORS[target.region])
+    )
+    const item = items.find(
+        (candidate) => itemAlertId(candidate, target.region) === target.id
+    )
+    if (item !== undefined) {
+        const buttons = buttonsOf(item)
+        const { actionClass } = target
+        const sameAction =
+            actionClass === null
+                ? []
+                : buttons.filter((button) =>
+                      button.classList.contains(actionClass)
+                  )
+        return [...sameAction, ...buttons]
+    }
+    return [
+        ...buttonsOf(items[target.index]),
+        ...buttonsOf(items[target.index - 1]),
+    ]
+}
+
 /**
  * The alerts section of the `/insights` page: create form, alert list and
  * unacknowledged notifications.
@@ -121,8 +225,9 @@ function listLacksNotifiedTrigger(
  * the activation check, the business event, every 403 shutdown (each
  * feature query runs it itself) and the mutation error messages. The panel
  * itself renders the loading and error states of the list and notification
- * queries, and refetches the list when a notification shows a trigger the
- * list does not hold yet.
+ * queries, and refetches the list after a successful notifications read that
+ * shows a trigger the list does not hold yet, or that lands after the list
+ * failed.
  *
  * Only the notifications cache entry is shared with
  * `AlertNotificationWatcher`, which schedules that poll; the panel reads the
@@ -133,6 +238,11 @@ function listLacksNotifiedTrigger(
  * names the alert. Each failure is kept per alert and action, and stays until
  * it is dismissed or the same action starts again on that alert; once the
  * alert's delete succeeds, its update and acknowledge failures are dropped.
+ *
+ * A control is disabled, replaced or removed while its action runs, which
+ * drops keyboard focus. Once the latest action started from inside the panel
+ * settles, and only while no element holds focus, the panel hands focus to
+ * the control `focusCandidates` picks, else to its heading.
  */
 function AlertsPanelContent({ accountId, instruments }: AlertsPanelProps) {
     const queryClient = useQueryClient()
@@ -147,41 +257,56 @@ function AlertsPanelContent({ accountId, instruments }: AlertsPanelProps) {
     const remove = useDeleteAlertMutation(accountId)
     const acknowledge = useAcknowledgeAlertMutation(accountId)
 
-    // The list has no poll of its own. When the notifications poll shows a
-    // trigger the list does not hold yet, the list is refetched, so the row
-    // turns to "Triggered" beside its notification. The refetch passes the
-    // same activation check as every list read. The two reads are compared
-    // only once neither is in flight: a mutation refetches both at once, and
-    // a list that lands first, without a deleted alert, beside notifications
-    // that still hold it would otherwise read as stale and be fetched again.
-    // A list read that started before the trigger and lands after the
-    // notifications is compared when it settles. Each successful
-    // notifications read refetches the list at most once, so a list that
-    // still lacks the trigger after its refetch, because the alert was
-    // deleted meanwhile or the read failed, is fetched again only after the
-    // next successful poll, not whenever a read settles. Reads are told
-    // apart by `dataUpdatedAt`, which advances on every successful read even
-    // when structural sharing keeps the same alerts array.
+    // The list has no poll of its own, so a successful notifications read
+    // refetches it for either of two reasons. When the read shows a trigger
+    // the list does not hold yet, the row turns to "Triggered" beside its
+    // notification. When the list failed before the read landed, whether it
+    // never loaded or a refresh failed, the read shows the alert backend
+    // answering again, so the list leaves its error state within one poll of
+    // a recovery, without any user action. A 403 is left to the feature
+    // shutdown, which owns it. The refetch passes the same activation check
+    // as every list read. The two reads are compared only once neither is in
+    // flight: a mutation refetches both at once, and a list that lands
+    // first, without a deleted alert, beside notifications that still hold
+    // it would otherwise read as stale and be fetched again. A list read
+    // that started before the trigger and lands after the notifications is
+    // compared when it settles. Each successful notifications read refetches
+    // the list at most once, so a list that still lacks the trigger after
+    // its refetch, because the alert was deleted meanwhile, or whose refetch
+    // failed again, is fetched again only after the next successful poll,
+    // not whenever a read settles. Reads are told apart by `dataUpdatedAt`,
+    // which advances on every successful read even when structural sharing
+    // keeps the same alerts array; a list failure is ordered against them by
+    // `errorUpdatedAt`.
     const listRefetchedFor = useRef<number | null>(null)
     useEffect(() => {
         if (alertsResult.isFetching || notificationsResult.isFetching) return
         if (
-            alertsResult.data === undefined ||
             notificationsResult.data === undefined ||
-            notificationsResult.dataUpdatedAt === listRefetchedFor.current ||
-            !listLacksNotifiedTrigger(
-                alertsResult.data,
-                notificationsResult.data
-            )
+            notificationsResult.dataUpdatedAt === listRefetchedFor.current
         ) {
             return
         }
+        const listFailedBeforeRead =
+            alertsResult.isError &&
+            !isFeatureDisabledError(alertsResult.error) &&
+            notificationsResult.dataUpdatedAt > alertsResult.errorUpdatedAt
+        const listLacksTrigger =
+            alertsResult.data !== undefined &&
+            listLacksNotifiedTrigger(
+                alertsResult.data,
+                notificationsResult.data
+            )
+        if (!listFailedBeforeRead && !listLacksTrigger) return
         listRefetchedFor.current = notificationsResult.dataUpdatedAt
         void queryClient.invalidateQueries({
             queryKey: alertKeys.list(accountId),
         })
     }, [
         alertsResult.data,
+        alertsResult.error,
+        alertsResult.errorUpdatedAt,
+        alertsResult.isError,
         alertsResult.isFetching,
         notificationsResult.data,
         notificationsResult.dataUpdatedAt,
@@ -299,6 +424,97 @@ function AlertsPanelContent({ accountId, instruments }: AlertsPanelProps) {
         target?.focus()
     }, [dismissed])
 
+    // Every action that starts takes the next token and replaces the record,
+    // so only the latest action's settle moves focus; an earlier call that
+    // settles later finds another token and leaves focus alone. An action
+    // started while focus was outside the panel records nothing. A per-call
+    // `onSettled` runs only for the latest call of its hook, which is enough:
+    // a later call of the same hook has replaced the record. It runs after
+    // the hook's own handling, the refresh of the list and notifications
+    // included, so the render that `settledFocus` causes shows the regions
+    // as that handling left them. Like every other outcome, focus is applied
+    // only while the call's account session and activation are current:
+    // after a shutdown, a render of the panel would rebuild the alert
+    // queries the shutdown dropped.
+    const sectionRef = useRef<HTMLElement>(null)
+    const focusTokenRef = useRef(0)
+    const focusReturnRef = useRef<{
+        token: number
+        target: FocusReturn
+    } | null>(null)
+    const [settledFocus, setSettledFocus] = useState<{ token: number } | null>(
+        null
+    )
+
+    useEffect(() => {
+        if (settledFocus === null) return
+        setSettledFocus(null)
+        const record = focusReturnRef.current
+        const section = sectionRef.current
+        if (record?.token !== settledFocus.token || section === null) return
+        focusReturnRef.current = null
+        if (!isFocusLost()) return
+        if (!focusCandidates(section, record.target).some(focusIfAble)) {
+            headingRef.current?.focus()
+        }
+    }, [settledFocus])
+
+    /** The focused element while it is inside the panel, else null. */
+    function focusedInPanel(): HTMLElement | null {
+        const active = document.activeElement
+        const section = sectionRef.current
+        return active instanceof HTMLElement &&
+            section !== null &&
+            section.contains(active)
+            ? active
+            : null
+    }
+
+    /**
+     * Where focus returns after an action on the row or notification of
+     * `id`: the item's position, and the class of its button that holds
+     * focus. Null while focus is outside the panel or the item is not shown.
+     */
+    function itemFocusReturn(
+        region: ItemRegion,
+        id: string
+    ): FocusReturn | null {
+        const active = focusedInPanel()
+        const section = sectionRef.current
+        if (active === null || section === null) return null
+        const items = Array.from(
+            section.querySelectorAll<HTMLElement>(ITEM_SELECTORS[region])
+        )
+        const index = items.findIndex(
+            (item) => itemAlertId(item, region) === id
+        )
+        if (index === -1) return null
+        const actionClass = items[index].contains(active)
+            ? (ACTION_CLASSES.find((name) => active.classList.contains(name)) ??
+              null)
+            : null
+        return { kind: "item", region, id, index, actionClass }
+    }
+
+    /** Records where focus returns for the action starting now; its token. */
+    function startFocusReturn(target: FocusReturn | null): number {
+        focusTokenRef.current += 1
+        const token = focusTokenRef.current
+        focusReturnRef.current = target === null ? null : { token, target }
+        return token
+    }
+
+    /**
+     * Run when the call of `token`, started under `ctx`, settles. A later
+     * action's record stays, and a call whose context ended moves no focus.
+     */
+    function settleFocusReturn(token: number, ctx: FeatureContext | undefined) {
+        if (ctx === undefined || !isCurrentFeatureContext(ctx)) return
+        if (focusReturnRef.current?.token === token) {
+            setSettledFocus({ token })
+        }
+    }
+
     // Each alert's summary, captured when an action on it starts, so feedback
     // that outlives its row still names the alert.
     const [actionLabels, setActionLabels] = useState<
@@ -318,8 +534,27 @@ function AlertsPanelContent({ accountId, instruments }: AlertsPanelProps) {
         return actionLabels.get(id) ?? `Alert ${id.slice(0, 8)}`
     }
 
+    // Held from the first submit until its create settles. The form shows
+    // `disabled` only once the panel re-renders, so a second submit before
+    // then, as from a fast double-click, would send a second create.
+    const createInFlightRef = useRef(false)
+
     function handleCreate(input: ValidatedAlertInput) {
-        create.mutate({ accountId, ...input })
+        if (createInFlightRef.current) return
+        createInFlightRef.current = true
+        const control = focusedInPanel()
+        const token = startFocusReturn(
+            control === null ? null : { kind: "form", control }
+        )
+        create.mutate(
+            { accountId, ...input },
+            {
+                onSettled: (_data, _error, _request, ctx) => {
+                    createInFlightRef.current = false
+                    settleFocusReturn(token, ctx)
+                },
+            }
+        )
     }
 
     // Each hook clears its own earlier failure for the row when its action
@@ -327,17 +562,32 @@ function AlertsPanelContent({ accountId, instruments }: AlertsPanelProps) {
     // starts again or is dismissed.
     function handleSetEnabled(id: string, enabled: boolean) {
         rememberLabel(id, listedAlerts)
-        update.mutate({ id, enabled })
+        const token = startFocusReturn(itemFocusReturn("list", id))
+        update.mutate(
+            { id, enabled },
+            {
+                onSettled: (_data, _error, _variables, ctx) =>
+                    settleFocusReturn(token, ctx),
+            }
+        )
     }
 
     function handleDelete(id: string) {
         rememberLabel(id, listedAlerts)
-        remove.mutate(id)
+        const token = startFocusReturn(itemFocusReturn("list", id))
+        remove.mutate(id, {
+            onSettled: (_data, _error, _id, ctx) =>
+                settleFocusReturn(token, ctx),
+        })
     }
 
     function handleAcknowledge(id: string) {
         rememberLabel(id, notifiedAlerts)
-        acknowledge.mutate(id)
+        const token = startFocusReturn(itemFocusReturn("notifications", id))
+        acknowledge.mutate(id, {
+            onSettled: (_data, _error, _id, ctx) =>
+                settleFocusReturn(token, ctx),
+        })
     }
 
     function renderUnplacedErrors() {
@@ -389,7 +639,7 @@ function AlertsPanelContent({ accountId, instruments }: AlertsPanelProps) {
         }
         if (alertsResult.isPending) {
             return (
-                <p className="empty-state" role="status">
+                <p className="empty-state alerts-loading" role="status">
                     Loading alerts…
                 </p>
             )
@@ -421,7 +671,7 @@ function AlertsPanelContent({ accountId, instruments }: AlertsPanelProps) {
         }
         if (notificationsResult.isPending) {
             return (
-                <p className="empty-state" role="status">
+                <p className="empty-state alerts-loading" role="status">
                     Loading notifications…
                 </p>
             )
@@ -447,9 +697,11 @@ function AlertsPanelContent({ accountId, instruments }: AlertsPanelProps) {
             id="alerts-panel"
             className="card"
             aria-labelledby="alerts-panel-heading"
+            ref={sectionRef}
         >
-            {/* Focusable by script only, as the place a Dismiss of the last
-                feedback entry hands focus to; it stays out of the Tab order. */}
+            {/* Focusable by script only, as the place focus goes when a
+                Dismiss or a settled action leaves no control to take it; it
+                stays out of the Tab order. */}
             <h3
                 id="alerts-panel-heading"
                 className="section-heading"

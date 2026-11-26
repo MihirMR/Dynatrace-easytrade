@@ -78,7 +78,9 @@ cycle.
 ### Endpoint reference
 
 Besides the errors listed, every endpoint can answer `403` (flag off) and `503` (db-adapter
-failure).
+failure). A db-adapter call that gets no reply within 10 s, the alert call budget
+`AlertRepository.CallTimeout`, is such a failure, so a hung db-adapter answers 503 once that
+budget has passed rather than holding the request.
 
 | Method and path | Request | Success | Errors |
 | --- | --- | --- | --- |
@@ -139,8 +141,9 @@ negative. Nothing is rounded.
   totals, `allocations: []` and `null` `largestPosition` and `riskLevel`, and never calls
   pricing.
 - The price is the latest candle's `Close`; candles tied on timestamp go to the greater close,
-  then the greater open. A pricing failure, or an empty price list while holdings exist,
-  returns 503. A holding without a candle is valued at 0.
+  then the greater open. A pricing failure, a price fetch with no reply within the same 10 s
+  budget, or an empty price list while holdings exist, returns 503. A holding without a
+  candle is valued at 0.
 - `value = quantity × close`, `totalValue = Σ value`, `totalInvested = Σ cost basis`.
   `unrealizedPnl` and `unrealizedPnlPercent` are 0 when `totalInvested` is 0. `percent` is
   the share of `totalValue`, and 0 when `totalValue` is 0.

@@ -2,6 +2,7 @@ import "@testing-library/jest-dom/vitest"
 import {
     act,
     cleanup,
+    fireEvent,
     render,
     screen,
     waitFor,
@@ -37,7 +38,8 @@ import {
 // Covers the panel's own wiring: its two queries' loading, error and 403
 // states, how mutation results reach the form, rows and notifications, and
 // how pending, failure and confirmation state is kept per row and account,
-// and where focus goes when panel feedback is dismissed.
+// that a repeated submit sends one create, and where focus goes when panel
+// feedback is dismissed or an action settles.
 // Mutation outcomes themselves are covered by AlertMutations.test.tsx.
 
 const INSTRUMENT_ID = "c0000000-0000-4000-8000-000000000001"
@@ -485,6 +487,234 @@ const dismissFocusCases: DismissFocusCase[] = [
         triggeredAlert,
         secondTriggeredAlert,
     ],
+]
+
+/** Fills the create form with a valid alert, ready to submit. */
+async function fillCreateForm(user: User): Promise<void> {
+    await user.selectOptions(screen.getByLabelText("Instrument"), INSTRUMENT_ID)
+    await user.type(screen.getByLabelText("Threshold"), "105.5")
+}
+
+/** One way to submit the filled form, and the id of the control it uses. */
+type CreateSubmission = [string, (user: User) => Promise<void>, string]
+
+const createSubmissions: CreateSubmission[] = [
+    [
+        "Enter in the threshold",
+        (user) => user.type(screen.getByLabelText("Threshold"), "{Enter}"),
+        "alert-threshold",
+    ],
+    [
+        "Create alert clicked",
+        (user) =>
+            user.click(screen.getByRole("button", { name: "Create alert" })),
+        "alert-submit",
+    ],
+]
+
+const createOutcomes: [string, StubResponse][] = [
+    ["created", { status: 201, body: createdAlert }],
+    ["rejected", { status: 400 }],
+]
+
+/**
+ * Leaves no element focused, as a browser does once the focused control is
+ * disabled. jsdom keeps focus on a disabled control and ignores `blur()` on
+ * it, so focus moves to a stand-in that is then removed.
+ */
+function dropFocus(): void {
+    const standIn = document.createElement("button")
+    document.body.append(standIn)
+    act(() => {
+        standIn.focus()
+        standIn.remove()
+    })
+}
+
+/**
+ * Releases a held write inside `act` and resolves once at most
+ * `stillPending` mutations are pending, so every render and effect that the
+ * write's settle causes has run.
+ */
+async function releaseAndSettle(
+    release: () => void,
+    stillPending = 0
+): Promise<void> {
+    await act(async () => {
+        const settled = new Promise<void>((resolve) => {
+            const unsubscribe = client.getMutationCache().subscribe(() => {
+                if (client.isMutating() <= stillPending) {
+                    unsubscribe()
+                    resolve()
+                }
+            })
+        })
+        release()
+        await settled
+    })
+}
+
+function panelHeading(): HTMLElement {
+    return screen.getByRole("heading", { name: "Price and P/L alerts" })
+}
+
+function firstButtonOf(region: HTMLElement): HTMLElement {
+    return within(region).getAllByRole("button")[0]
+}
+
+function acknowledgeOf(alert: Alert): HTMLElement {
+    return within(notificationOf(alert.id)).getByRole("button", {
+        name: "Acknowledge",
+    })
+}
+
+/**
+ * A broker serving `listed` and `notified`: a delete drops the alert from
+ * both, as its notification goes with it, and an acknowledge from
+ * `notified`.
+ */
+function removingHandlers(
+    listed: Alert[],
+    notified: Alert[]
+): Record<string, Handler> {
+    let list = listed
+    let notifications = notified
+    const without = (alerts: Alert[], id: string) =>
+        alerts.filter((alert) => alert.id !== id)
+    const handlers: Record<string, Handler> = {
+        [`GET ${LIST_URL}`]: () => ({ status: 200, body: { results: list } }),
+        [`GET ${NOTIFICATIONS_URL}`]: () => ({
+            status: 200,
+            body: { results: notifications },
+        }),
+    }
+    for (const { id } of listed) {
+        handlers[deleteAction.request(id)] = () => {
+            list = without(list, id)
+            notifications = without(notifications, id)
+            return { status: 204 }
+        }
+    }
+    for (const { id } of notified) {
+        handlers[acknowledgeAction.request(id)] = () => {
+            notifications = without(notifications, id)
+            return { status: 204 }
+        }
+    }
+    return handlers
+}
+
+const disabledAlert: Alert = { ...armedAlert, enabled: false }
+
+/**
+ * A row's toggle: the case, the row before it, the button pressed, the row
+ * the broker then returns, and the name of the button that should then have
+ * focus.
+ */
+type ToggleFocusCase = [string, Alert, string, Alert, string]
+
+const toggleFocusCases: ToggleFocusCase[] = [
+    [
+        "armed, Disable",
+        armedAlert,
+        "button.alert-toggle",
+        disabledAlert,
+        "Enable",
+    ],
+    [
+        "disabled, Enable",
+        disabledAlert,
+        "button.alert-toggle",
+        armedAlert,
+        "Disable",
+    ],
+    [
+        "triggered, Re-arm",
+        triggeredAlert,
+        "button.alert-toggle",
+        {
+            ...triggeredAlert,
+            armingRevision: 2,
+            triggeredAt: null,
+            triggerValue: null,
+        },
+        "Disable",
+    ],
+    [
+        "triggered, Disable",
+        triggeredAlert,
+        "button.alert-disable",
+        { ...triggeredAlert, enabled: false },
+        "Enable",
+    ],
+]
+
+/**
+ * An action whose success removes its item: the alerts listed and notified
+ * before it, the alert it runs on, and the control that should then have
+ * focus.
+ */
+type RemovalFocusCase = {
+    removed: string
+    action: RowAction
+    listed: Alert[]
+    notified: Alert[]
+    target: Alert
+    focused: () => HTMLElement
+}
+
+const threeRows = [armedAlert, triggeredAlert, secondTriggeredAlert]
+const twoNotifications = [triggeredAlert, secondTriggeredAlert]
+
+const removalFocusCases: RemovalFocusCase[] = [
+    {
+        removed: "delete, middle of three rows",
+        action: deleteAction,
+        listed: threeRows,
+        notified: [],
+        target: triggeredAlert,
+        focused: () => firstButtonOf(rowOf(secondTriggeredAlert.id)),
+    },
+    {
+        removed: "delete, last of three rows",
+        action: deleteAction,
+        listed: threeRows,
+        notified: [],
+        target: secondTriggeredAlert,
+        focused: () => firstButtonOf(rowOf(triggeredAlert.id)),
+    },
+    {
+        removed: "delete, only row",
+        action: deleteAction,
+        listed: [armedAlert],
+        notified: [],
+        target: armedAlert,
+        focused: panelHeading,
+    },
+    {
+        removed: "acknowledge, first of two notifications",
+        action: acknowledgeAction,
+        listed: twoNotifications,
+        notified: twoNotifications,
+        target: triggeredAlert,
+        focused: () => acknowledgeOf(secondTriggeredAlert),
+    },
+    {
+        removed: "acknowledge, last of two notifications",
+        action: acknowledgeAction,
+        listed: twoNotifications,
+        notified: twoNotifications,
+        target: secondTriggeredAlert,
+        focused: () => acknowledgeOf(triggeredAlert),
+    },
+    {
+        removed: "acknowledge, only notification",
+        action: acknowledgeAction,
+        listed: [triggeredAlert],
+        notified: [triggeredAlert],
+        target: triggeredAlert,
+        focused: panelHeading,
+    },
 ]
 
 /** Resolves once the panel shows the loaded list of account "2". */
@@ -1346,6 +1576,306 @@ describe("AlertsPanel", () => {
         }
     )
 
+    it("alertsPanel_doubleSubmit_sendsOneCreate", async () => {
+        let creates = 0
+        stubFetch({
+            [`POST ${BROKER}/alerts`]: () => {
+                creates += 1
+                return { status: 201, body: createdAlert }
+            },
+        })
+        const user = userEvent.setup({ delay: null })
+        renderPanel()
+        await screen.findByText("Armed")
+        await fillCreateForm(user)
+        const submit = screen.getByRole("button", { name: "Create alert" })
+
+        // Both clicks land before the panel renders the pending form, as a
+        // fast double-click does.
+        act(() => {
+            submit.click()
+            submit.click()
+        })
+        await waitFor(() => expect(client.isMutating()).toBe(0))
+
+        expect(creates).toBe(1)
+    })
+
+    it.each(createOutcomes)(
+        "alertsPanel_submitAfterCreateSettles_sendsNextCreate (%s)",
+        async (_outcome, response) => {
+            let creates = 0
+            stubFetch({
+                [`POST ${BROKER}/alerts`]: () => {
+                    creates += 1
+                    return response
+                },
+            })
+            const user = userEvent.setup({ delay: null })
+            renderPanel()
+            await screen.findByText("Armed")
+            await fillCreateForm(user)
+            const submit = screen.getByRole("button", { name: "Create alert" })
+            const settledAndEnabled = () =>
+                waitFor(() =>
+                    expect({
+                        mutating: client.isMutating(),
+                        disabled: submit.matches(":disabled"),
+                    }).toEqual({ mutating: 0, disabled: false })
+                )
+            await user.click(submit)
+            await settledAndEnabled()
+
+            await user.click(submit)
+            await settledAndEnabled()
+
+            expect(creates).toBe(2)
+        }
+    )
+
+    it.each(
+        createSubmissions.flatMap(([how, submit, controlId]) =>
+            createOutcomes.map(
+                ([outcome, response]): [
+                    string,
+                    string,
+                    CreateSubmission[1],
+                    string,
+                    StubResponse,
+                ] => [how, outcome, submit, controlId, response]
+            )
+        )
+    )(
+        "alertsPanel_createSettlesAfterFocusLost_focusesSubmittingControl (%s, %s)",
+        async (_how, _outcome, submit, controlId, response) => {
+            const created = heldResponse(response)
+            stubFetch({ [`POST ${BROKER}/alerts`]: created.handler })
+            const user = userEvent.setup({ delay: null })
+            renderPanel()
+            await screen.findByText("Armed")
+            await fillCreateForm(user)
+            await submit(user)
+            const control = elementBySelector(`#${controlId}`)
+            await waitFor(() => expect(control).toBeDisabled())
+            dropFocus()
+
+            created.release()
+
+            await waitFor(() => expect(control).toHaveFocus())
+        }
+    )
+
+    it("alertsPanel_createSettlesAfterSubmittingControlRemoved_focusesSubmit", async () => {
+        let listed = [armedAlert, triggeredAlert]
+        stubFetch({
+            [`GET ${LIST_URL}`]: () => ({
+                status: 200,
+                body: { results: listed },
+            }),
+            [`POST ${BROKER}/alerts`]: () => {
+                listed = [createdAlert, triggeredAlert]
+                return { status: 201, body: createdAlert }
+            },
+        })
+        const user = userEvent.setup({ delay: null })
+        renderPanel()
+        await screen.findByText("Armed")
+        await fillCreateForm(user)
+        // A submit made by script while a row button holds focus; the
+        // refresh after the create drops that row.
+        within(rowOf(armedAlert.id))
+            .getByRole("button", { name: "Disable" })
+            .focus()
+
+        fireEvent.submit(elementBySelector("form#alert-form"))
+
+        await waitFor(() =>
+            expect(
+                screen.getByRole("button", { name: "Create alert" })
+            ).toHaveFocus()
+        )
+    })
+
+    it.each(toggleFocusCases)(
+        "alertsPanel_rowToggled_focusesReplacementButton (%s)",
+        async (_label, before, pressed, after, focusedName) => {
+            let listed = [before]
+            stubFetch({
+                [`GET ${LIST_URL}`]: () => ({
+                    status: 200,
+                    body: { results: listed },
+                }),
+                [`GET ${NOTIFICATIONS_URL}`]: () => ({
+                    status: 200,
+                    body: { results: [] },
+                }),
+                [updateAction.request(before.id)]: () => {
+                    listed = [after]
+                    return { status: 200, body: after }
+                },
+            })
+            const user = userEvent.setup({ delay: null })
+            renderPanel()
+            await waitFor(() =>
+                expect(
+                    document.querySelector(rowSelector(before.id))
+                ).not.toBeNull()
+            )
+
+            // The pressed button is replaced, which leaves focus on the body.
+            await clickIn(user, rowOf(before.id), pressed)
+
+            await waitFor(() =>
+                expect(
+                    within(rowOf(before.id)).getByRole("button", {
+                        name: focusedName,
+                    })
+                ).toHaveFocus()
+            )
+        }
+    )
+
+    it.each(removalFocusCases)(
+        "alertsPanel_actionRemovesItem_focusesNextItemElseHeading ($removed)",
+        async ({ action, listed, notified, target, focused }) => {
+            stubFetch(removingHandlers(listed, notified))
+            const user = userEvent.setup({ delay: null })
+            renderPanel()
+            await waitFor(() =>
+                expect(
+                    document.querySelector(action.selector(target.id))
+                ).not.toBeNull()
+            )
+
+            // The removed item takes the focused button with it.
+            await action.start(user, target.id)
+
+            await waitFor(() => expect(focused()).toHaveFocus())
+        }
+    )
+
+    it.each(rowActions)(
+        "alertsPanel_rowActionFailsAfterFocusLost_focusesStartingButton (%s)",
+        async (_kind, action) => {
+            const failed = heldResponse({ status: 500 })
+            stubFetch({
+                ...bothRowsHandlers(),
+                [action.request(action.first.id)]: failed.handler,
+            })
+            const user = userEvent.setup({ delay: null })
+            renderPanel()
+            await waitForBothRows(action)
+            await action.start(user, action.first.id)
+            const started = document.activeElement
+            await waitFor(() =>
+                expect(
+                    controlState(
+                        elementBySelector(action.selector(action.first.id))
+                    )
+                ).toBe("disabled")
+            )
+            dropFocus()
+
+            failed.release()
+
+            await waitFor(() => expect(started).toHaveFocus())
+        }
+    )
+
+    it.each(rowActions)(
+        "alertsPanel_focusMovedWhileRowActionPending_keepsFocus (%s)",
+        async (_kind, action) => {
+            const held = heldResponse(action.success)
+            stubFetch({
+                ...bothRowsHandlers(),
+                [action.request(action.first.id)]: held.handler,
+            })
+            const user = userEvent.setup({ delay: null })
+            renderPanel()
+            await waitForBothRows(action)
+            await action.start(user, action.first.id)
+            const threshold = screen.getByLabelText("Threshold")
+            await user.click(threshold)
+
+            await releaseAndSettle(held.release)
+
+            expect(threshold).toHaveFocus()
+        }
+    )
+
+    it("alertsPanel_earlierActionSettlesAfterLaterStarted_leavesFocusToLater", async () => {
+        let listed = [armedAlert, triggeredAlert]
+        const updateHeld = hold()
+        const deleteHeld = hold()
+        releaseHeld.push(updateHeld.release, deleteHeld.release)
+        stubFetch({
+            [`GET ${LIST_URL}`]: () => ({
+                status: 200,
+                body: { results: listed },
+            }),
+            [`GET ${NOTIFICATIONS_URL}`]: () => ({
+                status: 200,
+                body: { results: [] },
+            }),
+            [updateAction.request(armedAlert.id)]: async () => {
+                await updateHeld.promise
+                listed = [disabledAlert, triggeredAlert]
+                return { status: 200, body: disabledAlert }
+            },
+            [deleteAction.request(triggeredAlert.id)]: async () => {
+                await deleteHeld.promise
+                listed = [disabledAlert]
+                return { status: 204 }
+            },
+        })
+        const user = userEvent.setup({ delay: null })
+        renderPanel()
+        await screen.findByText("Armed")
+        await updateAction.start(user, armedAlert.id)
+        await deleteAction.start(user, triggeredAlert.id)
+        dropFocus()
+
+        await releaseAndSettle(updateHeld.release, 1)
+        const focusedAfterEarlier = document.activeElement
+        await releaseAndSettle(deleteHeld.release)
+
+        expect([focusedAfterEarlier, document.activeElement]).toEqual([
+            document.body,
+            within(rowOf(armedAlert.id)).getByRole("button", {
+                name: "Enable",
+            }),
+        ])
+    })
+
+    it("alertsPanel_actionStartedWithFocusOutsidePanel_movesNoFocus", async () => {
+        let listed = [armedAlert, triggeredAlert]
+        const deleteHeld = hold()
+        releaseHeld.push(deleteHeld.release)
+        stubFetch({
+            [`GET ${LIST_URL}`]: () => ({
+                status: 200,
+                body: { results: listed },
+            }),
+            [deleteAction.request(armedAlert.id)]: async () => {
+                await deleteHeld.promise
+                listed = [triggeredAlert]
+                return { status: 204 }
+            },
+        })
+        renderPanel()
+        await screen.findByText("Armed")
+        const remove = within(rowOf(armedAlert.id)).getByRole("button", {
+            name: "Delete",
+        })
+
+        // A click that does not move focus, as in browsers whose buttons
+        // take no focus on click.
+        act(() => remove.click())
+        await releaseAndSettle(deleteHeld.release)
+
+        expect(document.body).toHaveFocus()
+    })
+
     it("alertsPanel_rowFailsWhileListUnavailable_showsMessageInPanelFeedback", async () => {
         let listRequests = 0
         stubFetch({
@@ -1786,8 +2316,13 @@ describe("AlertsPanel", () => {
             await screen.findByText("Armed")
         }
 
-        /** Mounts the panel beside the watcher, as `/insights` does. */
-        async function renderWithWatcher(): Promise<void> {
+        /**
+         * Mounts the panel beside the watcher, as `/insights` does, and waits
+         * for `ready`: by default, until both regions show their reads.
+         */
+        async function renderWithWatcher(
+            ready: () => Promise<void> = regionsLoaded
+        ): Promise<void> {
             render(
                 <QueryClientProvider client={client}>
                     <UserContextWrapper>
@@ -1803,7 +2338,7 @@ describe("AlertsPanel", () => {
                     </UserContextWrapper>
                 </QueryClientProvider>
             )
-            await regionsLoaded()
+            await ready()
         }
 
         /** Advances the fake clock and lets the work it starts settle. */
@@ -1918,6 +2453,157 @@ describe("AlertsPanel", () => {
             }).toEqual({
                 listReads: 1,
                 actions: ["Re-arm", "Disable", "Delete"],
+            })
+        })
+
+        const LIST_ERROR = "Could not load alerts. Please try again later."
+
+        /**
+         * Requests per list fetch: its read and the three retries
+         * `featureQueryRetry` allows.
+         */
+        const REQUESTS_PER_LIST_FETCH = 4
+
+        /**
+         * Runs the next three polls one at a time, each in its own act scope,
+         * and lets the reads each one starts settle. React flushes the work
+         * scheduled inside an act scope only when the scope ends, so a single
+         * scope over three polls would show the panel the last one alone.
+         */
+        async function pollThreeTimesOneByOne(): Promise<void> {
+            for (let poll = 0; poll < 3; poll += 1) {
+                await advance(POLL_INTERVAL_MS)
+                await waitFor(() => expect(client.isFetching()).toBe(0))
+            }
+        }
+
+        /** The ids of the rendered list rows, in list order. */
+        function listedRowIds(): (string | null)[] {
+            return Array.from(
+                document.querySelectorAll("#alerts-list li.alert-item"),
+                (row) => row.getAttribute("data-alert-id")
+            )
+        }
+
+        /** Every read of the list fails from the start, retries included. */
+        async function renderWithListNeverLoaded(): Promise<void> {
+            listAnswer = () => ({ status: 503 })
+            await renderWithWatcher(async () => {
+                await screen.findByRole("button", { name: "Acknowledge" })
+                await screen.findByText(LIST_ERROR)
+            })
+        }
+
+        /** The list loads, then a refresh of it fails, retries included. */
+        async function renderWithListRefreshFailed(): Promise<void> {
+            await renderWithWatcher()
+            listAnswer = () => ({ status: 503 })
+            await act(async () => {
+                await client.invalidateQueries({
+                    queryKey: alertKeys.list("1"),
+                })
+            })
+            await screen.findByText(LIST_ERROR)
+        }
+
+        const listRecovered: StubResponse = {
+            status: 200,
+            body: { results: [armedAlert, triggeredAlert] },
+        }
+
+        const listStillFailing = {
+            reads: { list: 3 * REQUESTS_PER_LIST_FETCH, notifications: 3 },
+            listError: true,
+            rows: [],
+        }
+
+        const listLoadedOnFirstPoll = {
+            reads: { list: 1, notifications: 3 },
+            listError: false,
+            rows: [armedAlert.id, triggeredAlert.id],
+        }
+
+        // The notifications show no trigger the list lacks, so only the
+        // list's own failure makes a successful poll refetch it: once per
+        // poll while it fails, and never again once a read loads.
+        it.each<{
+            failure: string
+            renderFailed: () => Promise<void>
+            later: StubResponse
+            expected: {
+                reads: { list: number; notifications: number }
+                listError: boolean
+                rows: (string | null)[]
+            }
+        }>([
+            {
+                failure: "never loaded",
+                renderFailed: renderWithListNeverLoaded,
+                later: listRecovered,
+                expected: listLoadedOnFirstPoll,
+            },
+            {
+                failure: "never loaded",
+                renderFailed: renderWithListNeverLoaded,
+                later: { status: 503 },
+                expected: listStillFailing,
+            },
+            {
+                failure: "refresh failed",
+                renderFailed: renderWithListRefreshFailed,
+                later: listRecovered,
+                expected: listLoadedOnFirstPoll,
+            },
+            {
+                failure: "refresh failed",
+                renderFailed: renderWithListRefreshFailed,
+                later: { status: 503 },
+                expected: listStillFailing,
+            },
+        ])(
+            "alertsPanel_listFailed_refetchesListOncePerPollUntilLoaded (list $failure, then answers $later.status)",
+            async ({ renderFailed, later, expected }) => {
+                await renderFailed()
+                const before = { ...reads }
+                listAnswer = () => later
+
+                await pollThreeTimesOneByOne()
+
+                expect({
+                    reads: alertReadsSince(before),
+                    listError: screen.queryByText(LIST_ERROR) !== null,
+                    rows: listedRowIds(),
+                }).toEqual(expected)
+            }
+        )
+
+        it("alertsPanel_listForbiddenBesidePoll_refetchesNoList", async () => {
+            await renderWithWatcher()
+            // A forbidden read runs the shutdown, which removes the list
+            // before any later poll lands, so the 403 is written to the list
+            // directly: only the panel's own rule decides whether it is
+            // refetched.
+            const list = client
+                .getQueryCache()
+                .find<Alert[]>({ queryKey: alertKeys.list("1"), exact: true })
+            if (list === undefined) throw new Error("No list query")
+            act(() => {
+                list.setState({
+                    ...list.state,
+                    status: "error",
+                    error: new ApiError(403, LIST_URL),
+                    errorUpdateCount: list.state.errorUpdateCount + 1,
+                    errorUpdatedAt: Date.now(),
+                    fetchStatus: "idle",
+                })
+            })
+            const before = { ...reads }
+
+            await pollThreeTimesOneByOne()
+
+            expect(alertReadsSince(before)).toEqual({
+                list: 0,
+                notifications: 3,
             })
         })
     })
