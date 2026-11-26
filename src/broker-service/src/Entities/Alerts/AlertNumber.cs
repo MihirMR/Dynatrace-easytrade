@@ -5,8 +5,9 @@ namespace EasyTrade.BrokerService.Entities.Alerts
     /// <summary>
     /// The numeric domain of alert thresholds and trigger values, and their wire format.
     /// Decimals cross the db-adapter gRPC contract as normalised invariant strings, which
-    /// db-adapter validates with <c>^-?(0|[1-9][0-9]{0,9})(\.[0-9]{0,7}[1-9])?$</c> for
-    /// thresholds and <c>^-?(0|[1-9][0-9]{0,19})(\.[0-9]{0,7}[1-9])?$</c> for trigger values.
+    /// db-adapter validates in <c>src/db-adapter/server/alert.go</c> with
+    /// <c>^-?(0|[1-9][0-9]{0,9})(\.[0-9]{0,7}[1-9])?$</c> for thresholds and
+    /// <c>^-?(0|[1-9][0-9]{0,19})(\.[0-9]{0,7}[1-9])?$</c> for trigger values.
     /// </summary>
     public static class AlertNumber
     {
@@ -19,9 +20,10 @@ namespace EasyTrade.BrokerService.Entities.Alerts
         /// <summary>
         /// Largest trigger-value magnitude: 20 integer and 8 fractional digits (28 significant
         /// digits), which .NET <c>decimal</c> arithmetic holds exactly. Across gRPC and in
-        /// db-adapter it stays decimal text, never a Go numeric type: db-adapter validates it with
-        /// the trigger-value pattern on <see cref="AlertNumber"/> and passes it unchanged as the
-        /// SQL parameter, and <c>DECIMAL(28, 8)</c> stores it exactly.
+        /// db-adapter it stays decimal text, never a Go numeric type: db-adapter enforces its own
+        /// equivalent of the trigger-value pattern in the class summary (the compiled
+        /// <c>triggerValuePattern</c> in <c>src/db-adapter/server/alert.go</c>), passes the text
+        /// unchanged as the SQL parameter, and <c>DECIMAL(28, 8)</c> stores it exactly.
         /// </summary>
         public const decimal MaxTriggerValue = 99_999_999_999_999_999_999.99999999m;
 
@@ -135,17 +137,14 @@ namespace EasyTrade.BrokerService.Entities.Alerts
                 }
             }
 
-            if (
-                !decimal.TryParse(
-                    text[..length],
-                    WireStyles,
-                    CultureInfo.InvariantCulture,
-                    out decimal parsed
-                )
-            )
-            {
-                return false;
-            }
+            // Cannot throw: the guards above bound the text to an optional '-', at most 10 integer
+            // and 8 fractional ASCII digits, always a valid in-range decimal, so neither
+            // FormatException nor OverflowException can occur.
+            decimal parsed = decimal.Parse(
+                text[..length],
+                WireStyles,
+                CultureInfo.InvariantCulture
+            );
 
             // -0 and -0.0 become plain zero.
             value = parsed == 0m ? 0m : parsed;

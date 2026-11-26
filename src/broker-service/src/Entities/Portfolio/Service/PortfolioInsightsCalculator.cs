@@ -207,9 +207,10 @@ namespace EasyTrade.BrokerService.Entities.Portfolio.Service
         /// Aggregates positions into the insights result: totals, allocations ordered by value
         /// descending then by the lowercase instrument id string ordinally, the largest position
         /// and its risk level. Nothing is rounded, and every division is guarded against zero.
-        /// The largest position is the first allocation; when the total value is 0, every
-        /// percent is 0 and the largest is the allocation with the ordinally lowest instrument
-        /// id string, so its risk level is <see cref="RiskLow"/>.
+        /// With a nonzero total value, the largest position is the first allocation. When the
+        /// total value is 0, which signed values can net to, every percent is 0 and the largest
+        /// is the allocation with the ordinally lowest instrument id string, so its risk level
+        /// is <see cref="RiskLow"/>.
         /// </summary>
         /// <param name="positions">The account's positions; empty for no holdings.</param>
         /// <returns>
