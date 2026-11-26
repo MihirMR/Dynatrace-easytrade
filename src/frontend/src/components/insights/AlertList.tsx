@@ -1,5 +1,5 @@
-import type { Alert, AlertDirection, AlertType } from "../../api/alerts"
-import type { Instrument } from "../../api/instrument"
+import type { Alert, AlertDirection, AlertType } from "../../api/alerts/types"
+import type { Instrument } from "../../api/instrument/types"
 import { useFormatter } from "../../contexts/FormatterContext/context"
 import { formatAlertNumber } from "../../utils/alertValidation"
 

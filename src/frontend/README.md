@@ -132,7 +132,8 @@ Other ids, used by the tests and the browser check: `insights-total-value`,
 `insights-total-invested`, `insights-unrealized-pnl`,
 `insights-unrealized-pnl-percent`, `insights-largest-position`,
 `insights-risk-badge`, `insights-allocations` (the allocation table),
-`insights-empty-state`, `insights-loading`, `insights-error`,
+`insights-empty-state`, `insights-loading` (rendered inside the persistent
+`role="status"` region `insights-status`), `insights-error`,
 `insights-disclaimer`, `alerts-panel`, `alert-form`, `alert-form-error`,
 `alerts-list`, `alerts-empty` and `alert-notifications`.
 

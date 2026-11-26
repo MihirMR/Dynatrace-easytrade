@@ -275,9 +275,14 @@ describe("PortfolioInsights page", () => {
         })
         renderPage(client)
 
-        expect(
-            await screen.findByText("Loading portfolio insights\u2026")
-        ).toHaveAttribute("id", "insights-loading")
+        const loading = await screen.findByText(
+            "Loading portfolio insights\u2026"
+        )
+        expect(loading).toHaveAttribute("id", "insights-loading")
+        // Announced through the summary's persistent status region.
+        const statusRegion = document.getElementById("insights-status")
+        expect(statusRegion).toHaveAttribute("role", "status")
+        expect(statusRegion).toContainElement(loading)
     })
 
     it("portfolioInsightsPage_requestFails_showsErrorKeepsLayout", async () => {
@@ -302,6 +307,12 @@ describe("PortfolioInsights page", () => {
                 "Could not load portfolio insights. Please try again later."
             )
         ).toHaveAttribute("id", "insights-error")
+        // Other regions of the page may be alert regions too.
+        expect(screen.getAllByRole("alert")).toContain(
+            screen.getByText(
+                "Could not load portfolio insights. Please try again later."
+            )
+        )
         expect(document.getElementById("alerts-panel")).toBeInTheDocument()
     })
 
@@ -314,6 +325,19 @@ describe("PortfolioInsights page", () => {
         expect(client.getQueryData(featureFlagKeys.portfolioInsights)).toBe(
             false
         )
+    })
+
+    it("portfolioInsightsPage_loaded_keepsEmptyStatusRegion", async () => {
+        stub = stubFetch({})
+        renderPage(client)
+        // The loaded total value: the summary has replaced the loading state.
+        await screen.findByText("$400.00")
+
+        // The region outlives the loading text, so a later loading state is
+        // added to a region that is already present and gets announced.
+        const statusRegion = document.getElementById("insights-status")
+        expect(statusRegion).toHaveAttribute("role", "status")
+        expect(statusRegion).toBeEmptyDOMElement()
     })
 
     it("portfolioInsightsPage_disclaimer_isShown", async () => {

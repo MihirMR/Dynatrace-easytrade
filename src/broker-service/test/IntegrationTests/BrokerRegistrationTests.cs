@@ -95,6 +95,19 @@ namespace EasyTrade.BrokerService.Test.IntegrationTests
             Assert.Same(metrics, otherServices.GetService<PortfolioInsightsMetrics>());
             Assert.NotSame(gate, services.GetService<PortfolioInsightsFeatureGate>());
 
+            // Routing takes the gate's decision through one shared matcher policy.
+            PortfolioInsightsFeatureMatcherPolicy routingPolicy = Assert.Single(
+                root.GetServices<MatcherPolicy>().OfType<PortfolioInsightsFeatureMatcherPolicy>()
+            );
+            Assert.Same(
+                routingPolicy,
+                Assert.Single(
+                    otherServices
+                        .GetServices<MatcherPolicy>()
+                        .OfType<PortfolioInsightsFeatureMatcherPolicy>()
+                )
+            );
+
             // Both periodic jobs run as hosted services.
             Assert.Contains(hostedServices, service => service is LongTradeSchedulerService);
             Assert.Contains(hostedServices, service => service is AlertEvaluationSchedulerService);

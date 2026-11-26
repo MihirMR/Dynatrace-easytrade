@@ -1,8 +1,12 @@
+import { AsyncLocalStorage } from "node:async_hooks"
+import { IHandleWrapper } from "@demoability/loadgen-core/lib/handles"
 import { createLoggerOptions } from "@demoability/loadgen-core/lib/logger"
 import { IPageActions } from "@demoability/loadgen-core/lib/pageActions"
 import { ISelector } from "@demoability/loadgen-core/lib/selectors"
+import { Page } from "puppeteer"
 import { Logger, createLogger } from "winston"
 import { selectors } from "../selectors"
+import { User } from "../user"
 import { gotoPageWithNavBar } from "./common"
 
 export const PORTFOLIO_INSIGHTS_FLAG_ID = "portfolio-insights-enabled"
@@ -27,17 +31,214 @@ const VALUE_ATTRIBUTE_PATTERN = /\svalue="([^"]*)"/
 
 const fallbackLogger: Logger = createLogger(createLoggerOptions("visit"))
 
-type FlagResponse = { id: string; enabled: boolean }
+/**
+ * The logger of the visit whose withVisitLogger scope is running. Each scope
+ * holds its own logger across its awaits, so visits of several workers in one
+ * process never log through each other's logger.
+ */
+const visitLogger = new AsyncLocalStorage<Logger>()
 
-function isFlagResponse(value: unknown): value is FlagResponse {
+/**
+ * Runs action with logger as the visit logger of the flag reads it starts, so
+ * their lines carry the tags of the visit's worker logger.
+ *
+ * @param logger the visit's logger
+ * @param action work whose flag reads log to logger
+ */
+export function withVisitLogger<T>(
+    logger: Logger,
+    action: () => Promise<T>
+): Promise<T> {
+    return visitLogger.run(logger, action)
+}
+
+// The flag read logs classified values only: the status, a fixed reason, and
+// the error's name and its cause's code, each only when it is one of the fixed
+// values below, all in the message text, the one part the visit log format
+// prints. The body, the parsed value, parser messages, error objects and any
+// other name or code never reach the logger, because they can carry upstream
+// bytes or the configured url (CWE-532). That is why this read logs the
+// error's classified identity instead of the full error object that
+// .claude/rules/typescript.md asks for.
+
+/** Why a 200 body is not this flag's answer, named without its content. */
+type FlagDefect =
+    "invalid_json" | "not_object" | "id_mismatch" | "enabled_not_boolean"
+
+/**
+ * The error names a line may carry: the built-in errors, the DOMException
+ * names of an abort or a timeout, and the errors of undici, Node's fetch.
+ */
+const KNOWN_ERROR_NAMES: ReadonlySet<string> = new Set([
+    "AbortError",
+    "TimeoutError",
+    "TypeError",
+    "SyntaxError",
+    "RangeError",
+    "Error",
+    "DOMException",
+    "SocketError",
+    "ConnectTimeoutError",
+    "HeadersTimeoutError",
+    "BodyTimeoutError",
+    "RequestAbortedError",
+    "ClientDestroyedError",
+    "ClientClosedError",
+    "UndiciError",
+    "InformationalError",
+])
+
+/** The cause codes a line may carry: network system codes and undici's. */
+const KNOWN_CAUSE_CODES: ReadonlySet<string> = new Set([
+    "ECONNREFUSED",
+    "ECONNRESET",
+    "ECONNABORTED",
+    "ENOTFOUND",
+    "EAI_AGAIN",
+    "ETIMEDOUT",
+    "EHOSTUNREACH",
+    "ENETUNREACH",
+    "EPIPE",
+    "EPROTO",
+    "UND_ERR_SOCKET",
+    "UND_ERR_CONNECT_TIMEOUT",
+    "UND_ERR_HEADERS_TIMEOUT",
+    "UND_ERR_BODY_TIMEOUT",
+    "UND_ERR_CLOSED",
+    "UND_ERR_DESTROYED",
+    "UND_ERR_ABORTED",
+])
+
+/**
+ * The `enabled` state a 200 body carries, or the class of its first defect.
+ * The parser's message is dropped, because it quotes the body.
+ */
+function readFlagState(text: string): boolean | FlagDefect {
+    let value: unknown
+    try {
+        value = JSON.parse(text)
+    } catch {
+        return "invalid_json"
+    }
+    if (typeof value !== "object" || value === null || Array.isArray(value)) {
+        return "not_object"
+    }
+    if (!("id" in value) || value.id !== PORTFOLIO_INSIGHTS_FLAG_ID) {
+        return "id_mismatch"
+    }
+    if (!("enabled" in value) || typeof value.enabled !== "boolean") {
+        return "enabled_not_boolean"
+    }
+    return value.enabled
+}
+
+/**
+ * The value of property key of value, or undefined when value is not an
+ * object or reading the property throws, as a getter or a proxy trap can:
+ * classifying an error must never throw out of the catch block that logs it.
+ */
+function readProperty(value: unknown, key: string): unknown {
+    if (typeof value !== "object" || value === null) {
+        return undefined
+    }
+    try {
+        return Reflect.get(value, key)
+    } catch {
+        return undefined
+    }
+}
+
+/** value when it is one of known, otherwise undefined. */
+function knownValue(
+    value: unknown,
+    known: ReadonlySet<string>
+): string | undefined {
+    return typeof value === "string" && known.has(value) ? value : undefined
+}
+
+/** The error's name when it is a known error name, otherwise `unknown`. */
+function errorName(error: unknown): string {
     return (
-        typeof value === "object" &&
-        value !== null &&
-        "id" in value &&
-        "enabled" in value &&
-        value.id === PORTFOLIO_INSIGHTS_FLAG_ID &&
-        typeof value.enabled === "boolean"
+        knownValue(readProperty(error, "name"), KNOWN_ERROR_NAMES) ?? "unknown"
     )
+}
+
+/**
+ * The code of the error's cause when it is a known code, such as
+ * `ECONNREFUSED`, otherwise undefined.
+ */
+function causeCode(error: unknown): string | undefined {
+    return knownValue(
+        readProperty(readProperty(error, "cause"), "code"),
+        KNOWN_CAUSE_CODES
+    )
+}
+
+/** Why the read failed: its deadline, or the transport error's identity. */
+function unreadableReason(error: unknown, timedOut: boolean): string {
+    if (timedOut) {
+        return "reason [timeout]"
+    }
+    const code = causeCode(error)
+    const cause = code === undefined ? "" : ` cause [${code}]`
+    return `reason [transport] error [${errorName(error)}]${cause}`
+}
+
+/**
+ * Cancels a response body that a status-only outcome leaves unread, so its
+ * connection is released instead of staying busy until the server finishes
+ * sending. Callers run it while their request deadline is still armed: the
+ * cancel starts at once, and is waited for only until signal, that deadline,
+ * aborts, so a cancel that never settles cannot hold the caller past it. A
+ * failed cancel does not change the outcome the status decided; it is logged
+ * at debug by the error's name, also when it fails after the wait has ended.
+ *
+ * @param response the response whose body is not read
+ * @param signal the abort signal of the request's deadline
+ * @param logger
+ * @param subject the request, as the debug line names it
+ */
+async function releaseBody(
+    response: Response,
+    signal: AbortSignal,
+    logger: Logger,
+    subject: string
+): Promise<void> {
+    if (response.body === null) {
+        return
+    }
+    // Handled from the start, so a cancel that fails once the wait has ended
+    // is still logged instead of left an unhandled rejection.
+    const cancelled = response.body.cancel().catch((error: unknown) => {
+        logger.debug(
+            `${subject} response body not cancelled: error [${errorName(error)}]`
+        )
+    })
+    await untilSettledOrAborted(cancelled, signal)
+}
+
+/**
+ * Waits for work, but only until signal aborts if that comes first; a signal
+ * already aborted ends the wait at once. The abort listener is removed as the
+ * wait ends.
+ */
+async function untilSettledOrAborted(
+    work: Promise<void>,
+    signal: AbortSignal
+): Promise<void> {
+    if (signal.aborted) {
+        return
+    }
+    let onAbort: () => void = () => undefined
+    const aborted = new Promise<void>((resolve) => {
+        onAbort = () => resolve()
+    })
+    signal.addEventListener("abort", onAbort, { once: true })
+    try {
+        await Promise.race([work, aborted])
+    } finally {
+        signal.removeEventListener("abort", onAbort)
+    }
 }
 
 /**
@@ -45,22 +246,28 @@ function isFlagResponse(value: unknown): value is FlagResponse {
  * whose body carries this flag's id and a boolean `enabled` counts as an
  * answer.
  *
- * This is the one place loadgen turns an error into a value instead of
- * propagating it (the documented exception to .claude/rules/typescript.md):
- * the feature defines an unreachable flag service as disabled, so every other
- * outcome, the deadline abort included, is logged in full and read as false.
+ * The feature defines an unreachable flag service as disabled, so every other
+ * outcome, the deadline abort included, is logged with its reason and read as
+ * false instead of propagated: the documented exception for flag reads to
+ * .claude/rules/typescript.md. The created-id read retries and the cleanup
+ * outcomes of createAndDeleteOwnedAlert are separately specified outcomes of
+ * the alert lifecycle, not part of this exception.
+ *
+ * The lines go to the logger of the withVisitLogger scope the read is started
+ * in, so they carry that visit's tags; outside any scope they go to a
+ * standalone logger in the visit format.
  *
  * @param url EasyTrade base url
  * @param fetchFn fetch implementation
  * @param timeoutMs abort deadline of the whole read
- * @param logger logger receiving the read's outcomes
  */
 export async function isPortfolioInsightsEnabled(
     url: URL,
     fetchFn: typeof fetch = fetch,
-    timeoutMs = 2000,
-    logger: Logger = fallbackLogger
+    timeoutMs = 2000
 ): Promise<boolean> {
+    // Taken before the first await, from the scope this read was started in.
+    const logger = visitLogger.getStore() ?? fallbackLogger
     const controller = new AbortController()
     // Armed before the first await, through the global setTimeout looked up at
     // call time, so a mocked clock drives the deadline.
@@ -72,32 +279,87 @@ export async function isPortfolioInsightsEnabled(
             headers: { accept: "application/json" },
         })
         if (response.status !== 200) {
+            await releaseBody(
+                response,
+                controller.signal,
+                logger,
+                "Flag [portfolio-insights-enabled]"
+            )
             logger.warn(
                 `Flag [portfolio-insights-enabled] read returned status [${response.status}], treating as disabled`
             )
             return false
         }
-        const body: unknown = await response.json()
-        if (!isFlagResponse(body)) {
+        const state = readFlagState(await response.text())
+        if (typeof state !== "boolean") {
             logger.warn(
-                "Flag [portfolio-insights-enabled] response invalid, treating as disabled",
-                { body }
+                `Flag [portfolio-insights-enabled] response invalid, treating as disabled: reason [${state}] status [${response.status}]`
             )
             return false
         }
-        if (!body.enabled) {
+        if (!state) {
             logger.debug("Flag [portfolio-insights-enabled] is disabled")
         }
-        return body.enabled
+        return state
     } catch (error) {
         logger.warn(
-            "Flag [portfolio-insights-enabled] unreadable, treating as disabled",
-            { error }
+            `Flag [portfolio-insights-enabled] unreadable, treating as disabled: ${unreadableReason(error, controller.signal.aborted)}`
         )
         return false
     } finally {
         clearTimeout(deadline)
     }
+}
+
+/**
+ * Assumes starting point on login screen.
+ * End point on user Dashboard
+ *
+ * The steps and selectors of helpers/login.ts, except that the password never
+ * passes through a loadgen-core page action: PageActions.inputHandle logs the
+ * value it types, and clearInput the value it clears, at debug level. The
+ * password field is therefore cleared and typed through its Puppeteer element.
+ *
+ * @param pageActions
+ * @param user
+ */
+export async function loginWithoutLoggingPassword(
+    pageActions: IPageActions,
+    user: User
+): Promise<void> {
+    await pageActions.input(selectors.loginPage_username, user.username)
+    await pageActions.shortDelay()
+    await inputWithoutLogging(
+        pageActions,
+        selectors.loginPage_password,
+        user.password
+    )
+    await pageActions.shortDelay()
+    await pageActions.navigate(selectors.loginPage_loginButton)
+}
+
+/**
+ * Replaces the text of the field with value as PageActions.input does, by
+ * focusing it, deleting its current characters and typing value, but without
+ * logging the field's old or new text.
+ */
+async function inputWithoutLogging(
+    pageActions: IPageActions,
+    selector: ISelector,
+    value: string
+): Promise<void> {
+    const handle = await pageActions.getHandle(selector)
+    await pageActions.scrollIntoView(handle)
+    const element = handle.getHandle()
+    const property = await element.getProperty("value")
+    const current: unknown = await property.jsonValue()
+    await property.dispose()
+    await element.focus()
+    const length = typeof current === "string" ? current.length : 0
+    for (let deleted = 0; deleted < length; deleted++) {
+        await element.press("Backspace")
+    }
+    await element.type(value)
 }
 
 /**
@@ -116,6 +378,101 @@ export async function gotoPortfolioInsightsPage(
 }
 
 /**
+ * Whether the Portfolio Insights feature is verifiably gone from the page.
+ * The frontend renders the navigation link only while the flag reads true,
+ * and its shutdown sends an open /insights page to /home, so a link missing
+ * from the DOM means the flag turned off during the visit.
+ *
+ * The link is looked up through navigationLinkPresence, whose DOM query lets
+ * browser failures through; the stock check would read any of them, a closed
+ * target included, as a missing link. A failed lookup verifies no loss: it is
+ * logged at debug, the message naming only the error's name and the entry
+ * carrying the error object, and answers false, so the caller rethrows the
+ * error of its own page step.
+ *
+ * @param pageActions
+ * @param logger
+ */
+async function isFeatureLost(
+    pageActions: IPageActions,
+    logger: Logger
+): Promise<boolean> {
+    try {
+        return !(await pageActions.isSelectorPresent(navigationLinkPresence))
+    } catch (error) {
+        logger.debug(
+            `Portfolio insights feature check failed, loss not verified: error [${errorName(error)}]`,
+            { error }
+        )
+        return false
+    }
+}
+
+/**
+ * Assumes user is logged in on any protected page.
+ * Endpoint Portfolio Insights page, or the page the frontend left for once
+ * the feature was lost.
+ *
+ * Opens the page through gotoPortfolioInsightsPage, then runs
+ * createAndDeleteOwnedAlert. A navigation that fails while the feature is
+ * verifiably lost (see isFeatureLost) ends with nothing submitted; any other
+ * navigation error propagates, unchanged also when the loss check fails.
+ *
+ * @param pageActions
+ * @param url EasyTrade base url
+ * @param logger
+ * @param options the test seams of createAndDeleteOwnedAlert
+ */
+export async function openPageAndRunOwnedAlert(
+    pageActions: IPageActions,
+    url: URL,
+    logger: Logger,
+    options?: Parameters<typeof createAndDeleteOwnedAlert>[3]
+): Promise<OwnedAlertOutcome> {
+    try {
+        await gotoPortfolioInsightsPage(pageActions)
+    } catch (error) {
+        if (!(await isFeatureLost(pageActions, logger))) {
+            throw error
+        }
+        logger.warn("Portfolio insights page unavailable, no alert created", {
+            error,
+        })
+        return { kind: "not_submitted" }
+    }
+    return await createAndDeleteOwnedAlert(pageActions, url, logger, options)
+}
+
+/**
+ * The error a visit fails with when its owned alert did not end clean, or
+ * undefined when it did. Clean means the create was confirmed and the alert
+ * deleted, through the UI or the API, or found already absent.
+ *
+ * @param outcome the outcome of createAndDeleteOwnedAlert
+ */
+export function ownedAlertFailure(
+    outcome: OwnedAlertOutcome
+): Error | undefined {
+    switch (outcome.kind) {
+        case "deleted":
+        case "absent":
+            return undefined
+        case "not_submitted":
+            return new Error(
+                "Owned alert outcome [not_submitted]: no alert was submitted"
+            )
+        case "unconfirmed":
+            return new Error(
+                `Owned alert outcome [unconfirmed]: create of threshold [${outcome.marker}] not confirmed`
+            )
+        case "left_in_place":
+            return new Error(
+                `Owned alert outcome [left_in_place]: alert [${outcome.id}] not deleted, status [${outcome.status}]`
+            )
+    }
+}
+
+/**
  * Assumes starting point Portfolio Insights page.
  * Endpoint Portfolio Insights page.
  *
@@ -123,6 +480,14 @@ export async function gotoPortfolioInsightsPage(
  * only that id: through its own row, or through the broker REST API when the
  * UI deletion is not confirmed. It never touches an alert it did not create,
  * so visits sharing one preset user cannot disturb each other.
+ *
+ * A page step that fails while the feature is verifiably lost mid-visit (see
+ * isFeatureLost) ends with the owned-id outcome reached so far: not_submitted
+ * before the submit click, unconfirmed from it until the id is read. Any other
+ * page error before the id is read propagates, unchanged also when the loss
+ * check fails. Once the id is known, a failing UI deletion is logged and the
+ * API fallback decides the outcome, so nothing is thrown after the outcome is
+ * decided.
  *
  * @param pageActions
  * @param url EasyTrade base url
@@ -143,23 +508,44 @@ export async function createAndDeleteOwnedAlert(
         apiTimeoutMs?: number
     } = {}
 ): Promise<OwnedAlertOutcome> {
-    const instrumentId = await waitForInstrumentId(pageActions)
-    if (instrumentId === undefined) {
-        logger.warn("Alert instrument options did not load, no alert created")
+    let marker: string
+    try {
+        const instrumentId = await waitForInstrumentId(pageActions)
+        if (instrumentId === undefined) {
+            logger.warn(
+                "Alert instrument options did not load, no alert created"
+            )
+            return { kind: "not_submitted" }
+        }
+
+        marker = createMarker(random)
+        await fillAlertForm(pageActions, instrumentId, marker)
+    } catch (error) {
+        // Nothing is submitted yet: a verified loss of the feature ends the
+        // visit without an alert, and any other error propagates without an
+        // outcome line.
+        if (!(await isFeatureLost(pageActions, logger))) {
+            throw error
+        }
+        logger.warn(
+            "Portfolio insights feature lost before submit, no alert created",
+            { error }
+        )
         return { kind: "not_submitted" }
     }
-
-    const marker = createMarker(random)
-    await fillAlertForm(pageActions, instrumentId, marker)
     let id: string | undefined
     try {
         await pageActions.click(selectors.portfolioInsightsPage_alertSubmit)
         id = await readCreatedAlertId(pageActions, marker, logger)
     } catch (error) {
         // From the submit click on, the alert may exist, so the marker is
-        // logged for an operator to find it; the error still fails the visit.
+        // logged for an operator to find it. A verified loss of the feature
+        // ends the visit with that outcome; any other error still propagates.
         logger.warn(unconfirmedMessage(marker), { error })
-        throw error
+        if (!(await isFeatureLost(pageActions, logger))) {
+            throw error
+        }
+        return { kind: "unconfirmed", marker }
     }
     if (id === undefined) {
         logger.warn(unconfirmedMessage(marker))
@@ -173,6 +559,12 @@ export async function createAndDeleteOwnedAlert(
             logger.info(`Deleted alert [${id}] via ui`)
             outcome = { kind: "deleted", id, via: "ui" }
         }
+    } catch (error) {
+        // The id is known, so the API fallback below decides the outcome and
+        // the UI error ends here instead of failing a visit already decided.
+        logger.warn(`UI deletion of alert [${id}] failed, using the api`, {
+            error,
+        })
     } finally {
         outcome ??= await deleteThroughApi(
             url,
@@ -221,14 +613,63 @@ async function waitForPresence(
 }
 
 /**
- * Waits for the first instrument option and returns its value.
- * Options of a closed <select> have no layout box, so the visibility-based
- * isSelectorPresent never reports them; their presence is read from the DOM.
+ * A selector whose presence check reads the DOM alone, through the wrapped
+ * selector's non-waiting selectAll, and releases the handles it acquired.
+ * The stock XPath check waits for a visible element, and an <option> of a
+ * closed <select> has no layout box, so only this check can report it. The
+ * stock check also answers false for any browser failure, while here a failed
+ * DOM query propagates, so a false answer is verified absence. Selecting and
+ * the string form are the wrapped selector's own.
+ */
+export class DomPresenceSelector implements ISelector {
+    private readonly wrapped: ISelector
+
+    constructor(wrapped: ISelector) {
+        this.wrapped = wrapped
+    }
+
+    async isPresent(page: Page): Promise<boolean> {
+        const handles = await this.wrapped.selectAll(page)
+        await Promise.all(handles.map((handle) => handle.getHandle().dispose()))
+        return handles.length > 0
+    }
+
+    async select(page: Page): Promise<IHandleWrapper | null> {
+        return await this.wrapped.select(page)
+    }
+
+    async selectAll(page: Page): Promise<IHandleWrapper[]> {
+        return await this.wrapped.selectAll(page)
+    }
+
+    toString(): string {
+        return this.wrapped.toString()
+    }
+}
+
+const instrumentOptionPresence = new DomPresenceSelector(
+    selectors.portfolioInsightsPage_alertInstrumentOption
+)
+
+/** The navigation link as isFeatureLost looks it up: in the DOM alone. */
+const navigationLinkPresence = new DomPresenceSelector(
+    selectors.navigation_portfolioInsightsPage
+)
+
+/**
+ * Waits for the first instrument option and returns its value. Each of the
+ * bounded checks is an isSelectorPresent of the option selector, answered
+ * from the DOM because the options of a closed <select> are never visible;
+ * once options are present, the first one's value is read, and an empty or
+ * non-string value counts as not yet loaded.
  */
 async function waitForInstrumentId(
     pageActions: IPageActions
 ): Promise<string | undefined> {
     return await pollBounded(pageActions, async () => {
+        if (!(await pageActions.isSelectorPresent(instrumentOptionPresence))) {
+            return undefined
+        }
         const options = await pageActions.getAllHandles(
             selectors.portfolioInsightsPage_alertInstrumentOption
         )
@@ -380,6 +821,12 @@ async function deleteThroughApi(
         const response = await fetchFn(
             new URL(`${ALERTS_API_PATH}${encodeURIComponent(id)}`, url),
             { method: "DELETE", signal: controller.signal }
+        )
+        await releaseBody(
+            response,
+            controller.signal,
+            logger,
+            `Alert [${id}] delete`
         )
         if (response.status === 204) {
             logger.info(`Deleted alert [${id}] via api`)

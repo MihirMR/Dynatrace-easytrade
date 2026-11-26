@@ -1,5 +1,5 @@
 import "@testing-library/jest-dom/vitest"
-import { render, renderHook, within } from "@testing-library/react"
+import { render, renderHook, screen, within } from "@testing-library/react"
 import { InsightsSummary } from "../../components/insights/InsightsSummary"
 import { useFormatter } from "../../contexts/FormatterContext/context"
 import { FormatterWrapper } from "../providers"
@@ -168,6 +168,33 @@ describe("InsightsSummary", () => {
             )
         }
     )
+
+    it("insightsSummary_allocations_exposeColumnHeadersInNamedScrollRegion", () => {
+        renderSummary(twoHoldings)
+
+        const table = getById("insights-allocations")
+        const region = screen.getByRole("region", { name: "Allocation" })
+        // The table scrolls inside a named region the keyboard can focus.
+        expect({
+            columnHeaders: within(table)
+                .getAllByRole("columnheader")
+                .map((header) => ({
+                    text: header.textContent,
+                    scope: header.getAttribute("scope"),
+                })),
+            regionTabIndex: region.getAttribute("tabindex"),
+            regionContainsTable: region.contains(table),
+        }).toEqual({
+            columnHeaders: [
+                "Instrument",
+                "Quantity",
+                "Value",
+                "Allocation",
+            ].map((text) => ({ text, scope: "col" })),
+            regionTabIndex: "0",
+            regionContainsTable: true,
+        })
+    })
 
     it("insightsSummary_largestPosition_showsNameAndPercent", () => {
         const { formatPercent } = productionFormatter()

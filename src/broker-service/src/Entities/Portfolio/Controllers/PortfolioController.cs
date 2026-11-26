@@ -27,7 +27,11 @@ public class PortfolioController(
     /// </summary>
     /// <param name="accountId">Account id</param>
     [ProducesResponseType(typeof(PortfolioInsightsDTO), StatusCodes.Status200OK)]
-    [ProducesResponseType(StatusCodes.Status403Forbidden)]
+    [ProducesResponseType(
+        typeof(FeatureDisabledResponse),
+        StatusCodes.Status403Forbidden,
+        "application/json"
+    )]
     [ProducesResponseType(typeof(ErrorResponse), StatusCodes.Status404NotFound)]
     [ProducesResponseType(typeof(ErrorResponse), StatusCodes.Status503ServiceUnavailable)]
     [ServiceFilter(typeof(PortfolioInsightsFeatureGate))]

@@ -1,7 +1,7 @@
 import type { DepositRequest, WithdrawRequest } from "../creditCard"
 import type { QuickTransactionRequest } from "../transaction"
-import type { RiskLevel } from "../portfolioInsights"
-import type { AlertType, AlertDirection } from "../alerts"
+import type { RiskLevel } from "../portfolioInsights/types"
+import type { AlertType, AlertDirection } from "../alerts/types"
 
 export class BizEvents {
     private static sendBizEvent(type: string, body: unknown): void {

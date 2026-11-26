@@ -1,8 +1,9 @@
 import assert from "node:assert/strict"
-import { afterEach, beforeEach, mock, test } from "node:test"
+import { afterEach, beforeEach, describe, it, mock, test } from "node:test"
 import { IHandleWrapper } from "@demoability/loadgen-core/lib/handles"
 import { IPageActions } from "@demoability/loadgen-core/lib/pageActions"
 import { ISelector } from "@demoability/loadgen-core/lib/selectors"
+import type { ElementHandle } from "puppeteer"
 import { Logger, createLogger, format, transports } from "winston"
 import { Config } from "../config"
 import { getRegularProviderFunction } from "../provider/regularVisits"
@@ -61,12 +62,50 @@ class FakeOptionHandle implements IHandleWrapper {
 }
 
 /**
+ * An empty form field acquired through getHandle. Its Puppeteer element
+ * records, into the page's calls, what the login step does on it directly.
+ */
+class FakeFieldHandle implements IHandleWrapper {
+    private readonly target: string
+    private readonly calls: string[]
+
+    constructor(target: string, calls: string[]) {
+        this.target = target
+        this.calls = calls
+    }
+
+    getHandle(): ElementHandle {
+        const element = {
+            getProperty: async () => ({
+                jsonValue: async () => "",
+                dispose: async () => undefined,
+            }),
+            focus: async () => {
+                this.calls.push(`focus ${this.target}`)
+            },
+            press: async (pressed: string) => {
+                this.calls.push(`press ${this.target} ${pressed}`)
+            },
+            type: async (text: string) => {
+                this.calls.push(`type ${this.target}=${text}`)
+            },
+        }
+        return element as unknown as ElementHandle
+    }
+
+    toString(): string {
+        return this.target
+    }
+}
+
+/**
  * Records every page action in order. The instrument options, the own
  * created output, the own row and its deleted-id output are present at once.
  */
 class RecordingPageActions implements IPageActions {
     readonly calls: string[] = []
     private readonly present = new Set([
+        selectors.portfolioInsightsPage_alertInstrumentOption.toString(),
         selectors.portfolioInsightsPage_createdAlert(MARKER).toString(),
         selectors.portfolioInsightsPage_alertRow(OWN_ID).toString(),
         selectors.portfolioInsightsPage_deletedAlert(OWN_ID).toString(),
@@ -155,12 +194,13 @@ class RecordingPageActions implements IPageActions {
         return unexpected("setupPage")
     }
 
-    async getHandle(): Promise<IHandleWrapper> {
-        return unexpected("getHandle")
+    async getHandle(selector: ISelector): Promise<IHandleWrapper> {
+        this.calls.push(`getHandle ${key(selector)}`)
+        return new FakeFieldHandle(key(selector), this.calls)
     }
 
-    async scrollIntoView(): Promise<void> {
-        return unexpected("scrollIntoView")
+    async scrollIntoView(handle: IHandleWrapper): Promise<void> {
+        this.calls.push(`scrollIntoView ${handle}`)
     }
 
     async clickHandle(): Promise<void> {
@@ -196,11 +236,22 @@ class RecordingPageActions implements IPageActions {
     }
 }
 
-/** A winston logger whose format records every entry as it is written. */
-function recordingLogger(): { logger: Logger; messages: string[] } {
+/**
+ * A winston logger whose format records every entry as it is written, and
+ * the error object of each entry that carries one.
+ */
+function recordingLogger(): {
+    logger: Logger
+    messages: string[]
+    errors: unknown[]
+} {
     const messages: string[] = []
+    const errors: unknown[] = []
     const record = format((info) => {
         messages.push(`${info.level}: ${String(info.message)}`)
+        if (info.error !== undefined) {
+            errors.push(info.error)
+        }
         return info
     })
     const logger = createLogger({
@@ -208,7 +259,7 @@ function recordingLogger(): { logger: Logger; messages: string[] } {
         format: record(),
         transports: [new transports.Console({ silent: true })],
     })
-    return { logger, messages }
+    return { logger, messages, errors }
 }
 
 /** Answers the flag read with the given state and fails any other request. */
@@ -286,13 +337,17 @@ test("run_flagOn_runsLoginLifecycleLogoutInOrder", async () => {
             !call.startsWith("getProperty") &&
             !call.endsWith("Delay")
     )
+    // The password is typed on its element, not through a logging page action.
     assert.deepEqual(
         { steps, requests, messages },
         {
             steps: [
                 "gotoPage http://easytrade.test/",
                 `input ${key(selectors.loginPage_username)}=test_visitor`,
-                `input ${key(selectors.loginPage_password)}=test-visitor-password`,
+                `getHandle ${key(selectors.loginPage_password)}`,
+                `scrollIntoView ${key(selectors.loginPage_password)}`,
+                `focus ${key(selectors.loginPage_password)}`,
+                `type ${key(selectors.loginPage_password)}=test-visitor-password`,
                 `navigate ${key(selectors.loginPage_loginButton)}`,
                 `navigate ${key(selectors.navigation_portfolioInsightsPage)}`,
                 `selectOption ${key(selectors.portfolioInsightsPage_alertType)}=TARGET_PRICE`,
@@ -317,6 +372,326 @@ test("run_flagOn_runsLoginLifecycleLogoutInOrder", async () => {
             ],
         }
     )
+})
+
+const NAV_KEY = key(selectors.navigation_portfolioInsightsPage)
+const SUBMIT_KEY = key(selectors.portfolioInsightsPage_alertSubmit)
+const DROPDOWN_KEY = key(selectors.navigation_dropdownToggler)
+const LOGOUT_KEY = key(selectors.navigation_logout)
+const DELETE_OWN = `DELETE http://easytrade.test/broker-service/v1/alerts/${OWN_ID}`
+const pageError = new Error("Execution context was destroyed")
+const logoutError = new Error("Node is not clickable")
+const knownErrors = new Map<unknown, string>([
+    [pageError, "pageError"],
+    [logoutError, "logoutError"],
+])
+
+/** Names a known error object, or another error by its message. */
+function describeError(error: unknown): string {
+    return (
+        knownErrors.get(error) ??
+        (error instanceof Error
+            ? `Error: ${error.message}`
+            : `not an error object: ${String(error)}`)
+    )
+}
+
+type VisitScenario = {
+    /** selector keys present beyond RecordingPageActions' own */
+    present?: string[]
+    /** selector keys never present */
+    absent?: string[]
+    /** `click <key>` or `navigate <key>` actions that throw */
+    failing?: Map<string, Error>
+    /** status of the API DELETE of the own alert; unset fails the request */
+    deleteStatus?: number
+}
+
+/** RecordingPageActions with the presence and failures of one scenario. */
+class ScenarioPageActions extends RecordingPageActions {
+    private readonly scenario: VisitScenario
+
+    constructor(scenario: VisitScenario) {
+        super()
+        this.scenario = scenario
+    }
+
+    override async isSelectorPresent(selector: ISelector): Promise<boolean> {
+        const present = await super.isSelectorPresent(selector)
+        const target = key(selector)
+        if (this.scenario.absent?.includes(target)) {
+            return false
+        }
+        return present || (this.scenario.present?.includes(target) ?? false)
+    }
+
+    override async click(selector: ISelector): Promise<void> {
+        await super.click(selector)
+        this.fail(`click ${key(selector)}`)
+    }
+
+    override async navigate(selector: ISelector): Promise<void> {
+        await super.navigate(selector)
+        this.fail(`navigate ${key(selector)}`)
+    }
+
+    private fail(action: string): void {
+        const error = this.scenario.failing?.get(action)
+        if (error !== undefined) {
+            throw error
+        }
+    }
+}
+
+/** Answers the flag read with true and the own alert's DELETE with status. */
+function enabledFetch(deleteStatus?: number): {
+    fetchFn: typeof fetch
+    requests: string[]
+} {
+    const requests: string[] = []
+    const fetchFn: typeof fetch = async (input, init) => {
+        const url = input instanceof Request ? input.url : String(input)
+        const request = `${init?.method ?? "GET"} ${url}`
+        requests.push(request)
+        if (request === FLAG_REQUEST) {
+            return new Response(
+                JSON.stringify({
+                    id: "portfolio-insights-enabled",
+                    enabled: true,
+                }),
+                { status: 200 }
+            )
+        }
+        if (request === DELETE_OWN && deleteStatus !== undefined) {
+            return new Response(null, { status: deleteStatus })
+        }
+        throw new Error(`Unexpected request [${request}]`)
+    }
+    return { fetchFn, requests }
+}
+
+const OPENING = [
+    "info: Going to EasyTrade frontend at [http://easytrade.test/]",
+    "info: Logging in as user [test_visitor]",
+    "info: Opening portfolio insights page",
+]
+const CREATED = `info: Created alert [${OWN_ID}] threshold [${MARKER}]`
+const UNCONFIRMED = `warn: Create unconfirmed threshold [${MARKER}], outcome unknown`
+const CLOSING = [
+    "info: Logging out user [test_visitor]",
+    "info: Attempting to end dynatrace session",
+]
+const CLOSED = [
+    `click ${DROPDOWN_KEY}`,
+    `navigate ${LOGOUT_KEY}`,
+    "endDtSession",
+]
+
+const visitRows: {
+    name: string
+    scenario: VisitScenario
+    expected: {
+        /** "resolved", or the rejection as describeError names it */
+        settled: string
+        requests: string[]
+        messages: string[]
+        errors: string[]
+        /** the logout and session-end actions, in order */
+        closed: string[]
+    }
+}[] = [
+    {
+        name: "deletedViaApi_resolves",
+        scenario: {
+            absent: [key(selectors.portfolioInsightsPage_deletedAlert(OWN_ID))],
+            deleteStatus: 204,
+        },
+        expected: {
+            settled: "resolved",
+            requests: [FLAG_REQUEST, DELETE_OWN],
+            messages: [
+                ...OPENING,
+                CREATED,
+                `info: Deleted alert [${OWN_ID}] via api`,
+                ...CLOSING,
+            ],
+            errors: [],
+            closed: CLOSED,
+        },
+    },
+    {
+        name: "alreadyAbsent_resolves",
+        scenario: {
+            absent: [key(selectors.portfolioInsightsPage_deletedAlert(OWN_ID))],
+            deleteStatus: 404,
+        },
+        expected: {
+            settled: "resolved",
+            requests: [FLAG_REQUEST, DELETE_OWN],
+            messages: [
+                ...OPENING,
+                CREATED,
+                `info: Alert [${OWN_ID}] already absent`,
+                ...CLOSING,
+            ],
+            errors: [],
+            closed: CLOSED,
+        },
+    },
+    {
+        name: "leftInPlace_rejectsAfterClosingSession",
+        scenario: {
+            absent: [key(selectors.portfolioInsightsPage_deletedAlert(OWN_ID))],
+            deleteStatus: 500,
+        },
+        expected: {
+            settled: `Error: Owned alert outcome [left_in_place]: alert [${OWN_ID}] not deleted, status [500]`,
+            requests: [FLAG_REQUEST, DELETE_OWN],
+            messages: [
+                ...OPENING,
+                CREATED,
+                `warn: Alert [${OWN_ID}] left in place: 500`,
+                ...CLOSING,
+            ],
+            errors: [],
+            closed: CLOSED,
+        },
+    },
+    {
+        name: "createUnconfirmed_rejectsAfterClosingSession",
+        scenario: {
+            absent: [key(selectors.portfolioInsightsPage_createdAlert(MARKER))],
+        },
+        expected: {
+            settled: `Error: Owned alert outcome [unconfirmed]: create of threshold [${MARKER}] not confirmed`,
+            requests: [FLAG_REQUEST],
+            messages: [...OPENING, UNCONFIRMED, ...CLOSING],
+            errors: [],
+            closed: CLOSED,
+        },
+    },
+    {
+        name: "featureLostAtNavigation_notSubmittedRejectsAfterClosingSession",
+        scenario: { failing: new Map([[`navigate ${NAV_KEY}`, pageError]]) },
+        expected: {
+            settled:
+                "Error: Owned alert outcome [not_submitted]: no alert was submitted",
+            requests: [FLAG_REQUEST],
+            messages: [
+                ...OPENING,
+                "warn: Portfolio insights page unavailable, no alert created",
+                ...CLOSING,
+            ],
+            errors: ["pageError"],
+            closed: CLOSED,
+        },
+    },
+    {
+        name: "featureLostAtSubmit_unconfirmedRejectsAfterClosingSession",
+        scenario: { failing: new Map([[`click ${SUBMIT_KEY}`, pageError]]) },
+        expected: {
+            settled: `Error: Owned alert outcome [unconfirmed]: create of threshold [${MARKER}] not confirmed`,
+            requests: [FLAG_REQUEST],
+            messages: [...OPENING, UNCONFIRMED, ...CLOSING],
+            errors: ["pageError"],
+            closed: CLOSED,
+        },
+    },
+    {
+        name: "unrelatedLifecycleError_rejectsWithItAfterClosingSession",
+        scenario: {
+            present: [NAV_KEY],
+            failing: new Map([[`click ${SUBMIT_KEY}`, pageError]]),
+        },
+        expected: {
+            settled: "pageError",
+            requests: [FLAG_REQUEST],
+            messages: [...OPENING, UNCONFIRMED, ...CLOSING],
+            errors: ["pageError"],
+            closed: CLOSED,
+        },
+    },
+    {
+        name: "logoutThrowsAfterLifecycleError_keepsLifecycleError",
+        scenario: {
+            present: [NAV_KEY],
+            failing: new Map([
+                [`click ${SUBMIT_KEY}`, pageError],
+                [`click ${DROPDOWN_KEY}`, logoutError],
+            ]),
+        },
+        expected: {
+            settled: "pageError",
+            requests: [FLAG_REQUEST],
+            messages: [
+                ...OPENING,
+                UNCONFIRMED,
+                ...CLOSING,
+                "warn: Closing the session after a failed visit failed",
+            ],
+            errors: ["pageError", "logoutError"],
+            closed: [`click ${DROPDOWN_KEY}`, "endDtSession"],
+        },
+    },
+    {
+        name: "logoutThrowsAfterCleanLifecycle_rejectsWithLogoutError",
+        scenario: {
+            failing: new Map([[`click ${DROPDOWN_KEY}`, logoutError]]),
+        },
+        expected: {
+            settled: "logoutError",
+            requests: [FLAG_REQUEST],
+            messages: [
+                ...OPENING,
+                CREATED,
+                `info: Deleted alert [${OWN_ID}] via ui`,
+                ...CLOSING,
+            ],
+            errors: [],
+            closed: [`click ${DROPDOWN_KEY}`, "endDtSession"],
+        },
+    },
+]
+
+// A suite rather than subtests, so the file's beforeEach mocks the clock
+// once per row.
+describe("run_lifecycleScenario_closesSessionThenSettles", () => {
+    for (const row of visitRows) {
+        it(row.name, async () => {
+            const page = new ScenarioPageActions(row.scenario)
+            const { fetchFn, requests } = enabledFetch(
+                row.scenario.deleteStatus
+            )
+            const { logger, messages, errors } = recordingLogger()
+            const visit = new PortfolioInsightsAlertVisit(
+                "portfolio_insights_alert",
+                BASE_URL,
+                USER,
+                { fetchFn, random: () => 0.5 }
+            )
+
+            const settled = await visit.run(page, logger).then(
+                () => "resolved",
+                (error: unknown) => describeError(error)
+            )
+
+            assert.deepEqual(
+                {
+                    settled,
+                    requests,
+                    messages,
+                    errors: errors.map(describeError),
+                    closed: page.calls.filter(
+                        (call) =>
+                            call === `click ${DROPDOWN_KEY}` ||
+                            call === `navigate ${LOGOUT_KEY}` ||
+                            call === "endDtSession"
+                    ),
+                },
+                row.expected
+            )
+        })
+    }
 })
 
 // The provider constructs the visit with three arguments, so the run must

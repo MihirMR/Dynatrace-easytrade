@@ -64,8 +64,11 @@ through the registered OpenFeature provider with a **2 s deadline** and fails cl
 While the flag is disabled:
 
 - all seven endpoints answer **403** with `Content-Type: application/json` and exactly
-  `{"error":"feature_disabled"}`. The gate is a resource filter that runs before model
-  binding, so even a malformed body or a missing `accountId` gets 403;
+  `{"error":"feature_disabled"}`. The flag is read while the request is routed, before the
+  problem-pattern middleware, and the gate, a resource filter that runs before model binding,
+  answers from that decision, so even a malformed body or a missing `accountId` gets 403. The
+  2 s is the flag read's deadline: with a hung flag service the 403 is answered once that read
+  gives up, and the tests check that it arrives within 3 s;
 - a non-GUID path segment matches no route and returns 404, with the flag on or off;
 - the alert evaluator does nothing: no db-adapter, pricing or metric activity.
 

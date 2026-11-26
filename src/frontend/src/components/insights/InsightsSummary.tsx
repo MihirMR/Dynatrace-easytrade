@@ -1,4 +1,4 @@
-import { PortfolioInsights } from "../../api/portfolioInsights"
+import type { PortfolioInsights } from "../../api/portfolioInsights/types"
 import { useFormatter } from "../../contexts/FormatterContext/context"
 import { AllocationTable } from "./AllocationTable"
 import { RiskBadge } from "./RiskBadge"

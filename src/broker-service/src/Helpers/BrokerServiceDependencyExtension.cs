@@ -98,6 +98,8 @@ public static class BrokerServiceDependencyExtension
             .AddTransient<IAlertService, AlertService>()
             .AddTransient<IAlertEvaluationService, AlertEvaluationService>()
             .AddTransient<PortfolioInsightsFeatureGate>()
+            // Takes the gate's decision while routing, before the problem-pattern middleware.
+            .AddSingleton<MatcherPolicy, PortfolioInsightsFeatureMatcherPolicy>()
             .AddSingleton<IPortfolioInsightsFeature, PortfolioInsightsFeature>()
             .AddSingleton<PortfolioInsightsMetrics>()
             .AddHostedService<AlertEvaluationSchedulerService>();

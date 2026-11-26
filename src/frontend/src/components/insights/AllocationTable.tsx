@@ -1,4 +1,4 @@
-import { Allocation } from "../../api/portfolioInsights"
+import type { Allocation } from "../../api/portfolioInsights/types"
 import { useFormatter } from "../../contexts/FormatterContext/context"
 
 type AllocationTableProps = {
@@ -11,16 +11,31 @@ export function AllocationTable({ allocations }: AllocationTableProps) {
 
     return (
         <div>
-            <h3 className="section-heading">Allocation</h3>
-            {/* Same horizontal-scroll wrapper as the other data tables. */}
-            <div style={{ overflowX: "auto" }}>
+            <h3 id="insights-allocations-heading" className="section-heading">
+                Allocation
+            </h3>
+            {/* Same horizontal-scroll wrapper as the other data tables. It is a
+                named, focusable region so the keyboard can scroll it. */}
+            <div
+                className="insights-allocations-scroll"
+                style={{ overflowX: "auto" }}
+                role="region"
+                aria-labelledby="insights-allocations-heading"
+                tabIndex={0}
+            >
                 <table id="insights-allocations" className="data-table">
                     <thead>
                         <tr>
-                            <th>Instrument</th>
-                            <th className="col-number">Quantity</th>
-                            <th className="col-number">Value</th>
-                            <th className="col-number">Allocation</th>
+                            <th scope="col">Instrument</th>
+                            <th scope="col" className="col-number">
+                                Quantity
+                            </th>
+                            <th scope="col" className="col-number">
+                                Value
+                            </th>
+                            <th scope="col" className="col-number">
+                                Allocation
+                            </th>
                         </tr>
                     </thead>
                     <tbody>

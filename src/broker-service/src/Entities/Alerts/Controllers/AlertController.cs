@@ -43,7 +43,11 @@ namespace EasyTrade.BrokerService.Entities.Alerts.Controllers
                 + " JSON, a member value that does not convert to its type, or a threshold"
                 + " token outside the exact decimal grammar and domain"
         )]
-        [ProducesResponseType(StatusCodes.Status403Forbidden)]
+        [ProducesResponseType(
+            typeof(FeatureDisabledResponse),
+            StatusCodes.Status403Forbidden,
+            "application/json"
+        )]
         [ProducesResponseType(typeof(ErrorResponse), StatusCodes.Status404NotFound)]
         [ProducesResponseType(typeof(ErrorResponse), StatusCodes.Status503ServiceUnavailable)]
         [HttpPost]
@@ -65,7 +69,11 @@ namespace EasyTrade.BrokerService.Entities.Alerts.Controllers
         /// <returns>Alerts of the account</returns>
         [ProducesResponseType(typeof(AlertsResultDTO), StatusCodes.Status200OK)]
         [ProducesResponseType(typeof(ValidationProblemDetails), StatusCodes.Status400BadRequest)]
-        [ProducesResponseType(StatusCodes.Status403Forbidden)]
+        [ProducesResponseType(
+            typeof(FeatureDisabledResponse),
+            StatusCodes.Status403Forbidden,
+            "application/json"
+        )]
         [ProducesResponseType(typeof(ErrorResponse), StatusCodes.Status404NotFound)]
         [ProducesResponseType(typeof(ErrorResponse), StatusCodes.Status503ServiceUnavailable)]
         [HttpGet]
@@ -90,7 +98,11 @@ namespace EasyTrade.BrokerService.Entities.Alerts.Controllers
         /// <returns>Triggered alerts of the account</returns>
         [ProducesResponseType(typeof(AlertsResultDTO), StatusCodes.Status200OK)]
         [ProducesResponseType(typeof(ValidationProblemDetails), StatusCodes.Status400BadRequest)]
-        [ProducesResponseType(StatusCodes.Status403Forbidden)]
+        [ProducesResponseType(
+            typeof(FeatureDisabledResponse),
+            StatusCodes.Status403Forbidden,
+            "application/json"
+        )]
         [ProducesResponseType(typeof(ErrorResponse), StatusCodes.Status404NotFound)]
         [ProducesResponseType(typeof(ErrorResponse), StatusCodes.Status503ServiceUnavailable)]
         [HttpGet("notifications")]
@@ -128,7 +140,11 @@ namespace EasyTrade.BrokerService.Entities.Alerts.Controllers
                 + " (application/problem+json) when the body cannot bind, such as malformed"
                 + " JSON or an enabled value that is not a JSON boolean"
         )]
-        [ProducesResponseType(StatusCodes.Status403Forbidden)]
+        [ProducesResponseType(
+            typeof(FeatureDisabledResponse),
+            StatusCodes.Status403Forbidden,
+            "application/json"
+        )]
         [ProducesResponseType(typeof(ErrorResponse), StatusCodes.Status404NotFound)]
         [ProducesResponseType(typeof(ErrorResponse), StatusCodes.Status503ServiceUnavailable)]
         [HttpPatch("{id:guid}")]
@@ -147,7 +163,11 @@ namespace EasyTrade.BrokerService.Entities.Alerts.Controllers
         /// <param name="id">Alert ID</param>
         /// <param name="cancellationToken">Request abort token, passed to the service</param>
         [ProducesResponseType(StatusCodes.Status204NoContent)]
-        [ProducesResponseType(StatusCodes.Status403Forbidden)]
+        [ProducesResponseType(
+            typeof(FeatureDisabledResponse),
+            StatusCodes.Status403Forbidden,
+            "application/json"
+        )]
         [ProducesResponseType(typeof(ErrorResponse), StatusCodes.Status404NotFound)]
         [ProducesResponseType(typeof(ErrorResponse), StatusCodes.Status503ServiceUnavailable)]
         [HttpDelete("{id:guid}")]
@@ -164,7 +184,11 @@ namespace EasyTrade.BrokerService.Entities.Alerts.Controllers
         /// <param name="id">Alert ID</param>
         /// <param name="cancellationToken">Request abort token, passed to the service</param>
         [ProducesResponseType(StatusCodes.Status204NoContent)]
-        [ProducesResponseType(StatusCodes.Status403Forbidden)]
+        [ProducesResponseType(
+            typeof(FeatureDisabledResponse),
+            StatusCodes.Status403Forbidden,
+            "application/json"
+        )]
         [ProducesResponseType(typeof(ErrorResponse), StatusCodes.Status404NotFound)]
         [ProducesResponseType(typeof(ErrorResponse), StatusCodes.Status503ServiceUnavailable)]
         [HttpPost("{id:guid}/acknowledge")]

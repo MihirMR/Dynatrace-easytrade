@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react"
+import { useEffect, useRef, useState, type ReactNode } from "react"
 import { useNavigate } from "react-router"
 import { useQueryClient } from "@tanstack/react-query"
 import { BizEvents } from "../../api/bizEvents"
@@ -15,6 +15,22 @@ import {
     isFeatureDisabledError,
     onPortfolioInsightsDisabled,
 } from "../../utils/portfolioInsightsFeature"
+
+/**
+ * Renders its content one commit after it mounts, so text placed in a live
+ * region through it is added to a region that is already present: a region
+ * inserted already holding its text may stay silent. The state is local, so
+ * the page and its queries do not render again when it flips.
+ */
+function AfterMount({ children }: { children: ReactNode }) {
+    const [mounted, setMounted] = useState(false)
+
+    useEffect(() => {
+        setMounted(true)
+    }, [])
+
+    return mounted ? children : null
+}
 
 /**
  * The `/insights` page: the broker's portfolio figures and the alerts panel,
@@ -85,18 +101,38 @@ export function PortfolioInsights() {
         if (isFeatureDisabledError(insights.error)) {
             return null
         }
+        // One plain block keeps the page stack's spacing in every state. The
+        // status region in it stays mounted, empty unless the query is pending.
+        return (
+            <div>
+                <div id="insights-status" role="status">
+                    {insights.isPending && (
+                        <AfterMount>
+                            <p id="insights-loading">
+                                Loading portfolio insights…
+                            </p>
+                        </AfterMount>
+                    )}
+                </div>
+                {renderSummaryResult()}
+            </div>
+        )
+    }
+
+    function renderSummaryResult() {
         if (insights.isError) {
             return (
                 <div
                     id="insights-error"
                     className="status-message status-error"
+                    role="alert"
                 >
                     Could not load portfolio insights. Please try again later.
                 </div>
             )
         }
         if (insights.isPending) {
-            return <p id="insights-loading">Loading portfolio insights…</p>
+            return null
         }
         return <InsightsSummary insights={insights.data} />
     }

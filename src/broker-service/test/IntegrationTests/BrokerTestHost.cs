@@ -17,6 +17,8 @@ using EasyTrade.BrokerService.Entities.Trades.Scheduler;
 using EasyTrade.BrokerService.Helpers;
 using EasyTrade.BrokerService.Helpers.FeatureFlags;
 using EasyTrade.BrokerService.Helpers.Metrics;
+using EasyTrade.BrokerService.Middleware.CreditCardValidation;
+using EasyTrade.BrokerService.ProblemPatterns.HighCpuUsage;
 using EasyTrade.BrokerService.ProblemPatterns.OpenFeature.Providers;
 using EasyTrade.BrokerService.ProblemPatterns.OpenFeature.Providers.FeatureFlagService;
 using EasyTrade.BrokerService.Test.Fakes;
@@ -43,7 +45,8 @@ namespace EasyTrade.BrokerService.Test.IntegrationTests
 
         /// <summary>
         /// The shipped <c>AddBrokerServiceDependencyGroup()</c> registrations, both hosted
-        /// services included, with the flag and pricing services served by a
+        /// services included, and Program.cs's middleware in its order, the problem-pattern
+        /// middleware included, with the flag and pricing services served by a
         /// <see cref="StubHttpServer"/>. Only the db-adapter repositories are fakes, unless
         /// <see cref="BrokerTestHostOptions.KeepRealRepositories"/> is set.
         /// </summary>
@@ -649,8 +652,18 @@ namespace EasyTrade.BrokerService.Test.IntegrationTests
             options.ConfigureServices?.Invoke(builder.Services);
 
             WebApplication app = builder.Build();
-            // No HTTPS redirection, authorization, problem-pattern middleware or health checks:
-            // the tests reach the controllers only.
+            if (Mode == BrokerHostMode.ProductionRegistrations)
+            {
+                // Program.cs's middleware, in its order. As there, the automatic routing runs
+                // before all of it, so a request meets the problem-pattern middleware, which read
+                // their own flags from the stub's flag service, after the route is matched.
+                app.UseHttpsRedirection();
+                app.UseAuthorization();
+                app.UseMiddleware<HighCpuUsageMiddleware>();
+                app.UseMiddleware<CreditCardValidationMiddleware>();
+            }
+            // No health checks, and in composed mode no middleware: the tests reach the
+            // controllers only.
             app.MapControllers();
             app.Urls.Add(LoopbackUrl);
             return app;
@@ -716,8 +729,9 @@ namespace EasyTrade.BrokerService.Test.IntegrationTests
             );
         }
 
-        // Program.cs without its middleware, CORS, health checks and console logger, so the
-        // shipped composition root and both hosted services run as they do in production.
+        // Program.cs's registrations without CORS, health checks and console logger, so the
+        // shipped composition root, both hosted services and the middleware BuildApp adds run as
+        // they do in production.
         private void AddProductionServices(
             IServiceCollection services,
             BrokerTestHostOptions options
@@ -726,6 +740,7 @@ namespace EasyTrade.BrokerService.Test.IntegrationTests
             services.AddSingleton<IDbAdapterConnector, DbAdapterConnector>();
             services.AddMemoryCache();
             services.AddBrokerServiceDependencyGroup();
+            services.AddTransient<HighCpuUsageMiddleware>();
             services.AddHttpClient();
             AddFakeInstances(services);
             if (!options.KeepRealRepositories)

@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Net;
 using System.Text.Json;
@@ -9,6 +10,10 @@ using EasyTrade.BrokerService.Helpers;
 using EasyTrade.BrokerService.Helpers.FeatureFlags;
 using EasyTrade.BrokerService.ProblemPatterns.OpenFeature.Providers.FeatureFlagService;
 using EasyTrade.BrokerService.Test.Fakes;
+using Microsoft.AspNetCore.Mvc;
+using Microsoft.AspNetCore.Mvc.Controllers;
+using Microsoft.AspNetCore.Mvc.Filters;
+using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
 
 namespace EasyTrade.BrokerService.Test.IntegrationTests
@@ -30,12 +35,15 @@ namespace EasyTrade.BrokerService.Test.IntegrationTests
             "Portfolio insights flag unreadable, treating as disabled";
         private const string TimeoutReason = "timeout";
 
+        // Not JSON, so a request that reached model binding would answer 400.
+        private const string MalformedJson = "{\"accountId\": ";
+
         private static readonly TimeSpan StartupTimeout = TimeSpan.FromSeconds(10);
         private static readonly TimeSpan ClientAbortTimeout = TimeSpan.FromSeconds(5);
 
-        // The feature's read deadline plus a margin for the request itself.
-        private static readonly TimeSpan GateAnswerLimit =
-            PortfolioInsightsFeature.ReadDeadline + TimeSpan.FromSeconds(1);
+        // The fixed ceiling within which every gated request must answer 403 during an outage,
+        // a literal independent of the feature's read deadline, so a longer deadline fails.
+        private static readonly TimeSpan GateAnswerLimit = TimeSpan.FromSeconds(3);
 
         private readonly Guid _accountId = Guid.NewGuid();
         private readonly Guid _instrumentId = Guid.NewGuid();
@@ -166,6 +174,122 @@ namespace EasyTrade.BrokerService.Test.IntegrationTests
             Assert.Empty(UnreadableWarnings(host));
         }
 
+        /// <summary>
+        /// The whole flag service fails before the host has served any request, so the
+        /// problem-pattern middleware's flag cache is empty: had the gate's decision waited for
+        /// MVC, that middleware would read its own flags from the failed service first, each read
+        /// unbounded when held. Every gated endpoint still answers the exact 403 within the
+        /// ceiling, with an unbindable request where it takes one, and the middleware never reads.
+        /// </summary>
+        [Theory]
+        [InlineData(StubMode.Hold)]
+        [InlineData(StubMode.Refuse)]
+        public async Task FlagOutage_ColdLegacyCacheFlagServiceDown_ShouldReturn403WithinCeiling(
+            StubMode failureMode
+        )
+        {
+            await using StubHttpServer stub = await StartStubAsync();
+            await using BrokerTestHost host = await StartHostAsync(stub);
+            await stub.SetModeAsync(StubRoute.Flag, failureMode);
+            GatedRequest[] requests = GatedRequests();
+
+            foreach ((HttpMethod method, string path, string? body, _) in requests)
+            {
+                Exception? failure = await Record.ExceptionAsync(
+                    () =>
+                        AssertGatedAsync(
+                            () => BrokerTestHost.SendJsonAsync(host.Client, method, path, body)
+                        )
+                );
+                Assert.True(failure is null, $"{method} {path}: {failure?.Message}");
+            }
+
+            // One portfolio insights read per request, which a refused connect never delivers,
+            // and no problem-pattern read: the middleware never ran for a disabled request.
+            int expectedFlagReads = failureMode == StubMode.Hold ? requests.Length : 0;
+            Assert.Equal(expectedFlagReads, stub.Count(StubHttpServer.FlagPath));
+            Assert.All(
+                FlagReads(stub),
+                request => Assert.Equal(StubHttpServer.FlagPath, request.Path)
+            );
+            Assert.All(
+                Enum.GetValues<FakeAlertRepositoryMethod>(),
+                method => Assert.Equal(0, host.Alerts.CallCount(method))
+            );
+
+            // Recovered: an enabled request passes routing and meets the problem-pattern
+            // middleware, which now read their flags for the first time.
+            await stub.SetModeAsync(StubRoute.Flag, StubMode.Respond);
+            stub.ClearRecordings();
+            await AssertInsightsAvailableAsync(host);
+            // A path that matches no route keeps its 404 and reads no portfolio insights flag.
+            using HttpResponseMessage unmatched = await host.Client.GetAsync(
+                "v1/portfolio/insights/not-a-guid"
+            );
+            Assert.Equal(HttpStatusCode.NotFound, unmatched.StatusCode);
+            Assert.Equal(1, stub.Count(StubHttpServer.FlagPath));
+            Assert.Equal(1, stub.Count(StubHttpServer.FlagPathPrefix + Constants.HighCpuUsage));
+            Assert.Equal(
+                1,
+                stub.Count(StubHttpServer.FlagPathPrefix + Constants.CreditCardValidation)
+            );
+        }
+
+        /// <summary>
+        /// The flag service answers disabled before the host has served any request. Each gated
+        /// endpoint's 403 is the result the gate set as a resource filter, which MVC executed for
+        /// that action before model binding, from the decision taken while the request was
+        /// routed: one flag read per request, and none by the problem-pattern middleware, which
+        /// the short-circuited request never met.
+        /// </summary>
+        [Fact]
+        public async Task FlagDisabled_GatedRequests_ShouldBeAnsweredByGateResourceFilter()
+        {
+            ResultProbe probe = new();
+            await using StubHttpServer stub = await StartStubAsync();
+            await using BrokerTestHost host = await StartHostAsync(
+                stub,
+                services => services.Configure<MvcOptions>(mvc => mvc.Filters.Add(probe))
+            );
+            stub.SetFlagEnabled(false);
+            GatedRequest[] requests = GatedRequests();
+
+            foreach ((HttpMethod method, string path, string? body, _) in requests)
+            {
+                using HttpResponseMessage response = await BrokerTestHost.SendJsonAsync(
+                    host.Client,
+                    method,
+                    path,
+                    body
+                );
+                await BrokerTestHost.AssertFeatureDisabledAsync(response);
+            }
+
+            IReadOnlyList<ProbedResult> results = probe.Results;
+            Assert.Equal(requests.Select(request => request.Action), results.Select(r => r.Action));
+            Assert.All(
+                results,
+                result =>
+                {
+                    JsonResult forbidden = Assert.IsType<JsonResult>(result.Result);
+                    Assert.Equal((int)HttpStatusCode.Forbidden, forbidden.StatusCode);
+                    Assert.Equal(new FeatureDisabledResponse("feature_disabled"), forbidden.Value);
+                    // The gate ran in the action's filter pipeline, and nothing was bound.
+                    Assert.True(result.GateInPipeline);
+                    Assert.Equal(0, result.ModelStateEntries);
+                }
+            );
+            Assert.Equal(requests.Length, stub.Count(StubHttpServer.FlagPath));
+            Assert.All(
+                FlagReads(stub),
+                request => Assert.Equal(StubHttpServer.FlagPath, request.Path)
+            );
+            Assert.All(
+                Enum.GetValues<FakeAlertRepositoryMethod>(),
+                method => Assert.Equal(0, host.Alerts.CallCount(method))
+            );
+        }
+
         // On Windows a refused connect is reported only after its SYN retries, about 2 s on
         // loopback, so the deadline usually expires first; on Linux the refusal comes at once.
         private static string[] AllowedUnreadableReasons(StubMode failureMode)
@@ -173,6 +297,14 @@ namespace EasyTrade.BrokerService.Test.IntegrationTests
             return failureMode == StubMode.Refuse
                 ? [TimeoutReason, nameof(HttpRequestException)]
                 : [TimeoutReason];
+        }
+
+        // Every request the stub recorded at the flag address, whatever the flag id.
+        private static IEnumerable<StubRecordedRequest> FlagReads(StubHttpServer stub)
+        {
+            return stub.Requests.Where(request =>
+                request.Path.StartsWith(StubHttpServer.FlagPathPrefix, StringComparison.Ordinal)
+            );
         }
 
         private static IReadOnlyList<LogEntry> UnreadableWarnings(BrokerTestHost host)
@@ -191,7 +323,7 @@ namespace EasyTrade.BrokerService.Test.IntegrationTests
             ];
         }
 
-        // Asserts the gate's 403 body and that it answered within the read deadline's bound.
+        // Asserts the gate's 403 body and that it answered within the fixed 3 s ceiling.
         private static async Task AssertGatedAsync(Func<Task<HttpResponseMessage>> send)
         {
             Stopwatch stopwatch = Stopwatch.StartNew();
@@ -275,9 +407,15 @@ namespace EasyTrade.BrokerService.Test.IntegrationTests
             return stub;
         }
 
-        private async Task<BrokerTestHost> StartHostAsync(StubHttpServer stub)
+        private async Task<BrokerTestHost> StartHostAsync(
+            StubHttpServer stub,
+            Action<IServiceCollection>? configureServices = null
+        )
         {
-            BrokerTestHost host = await BrokerTestHost.StartProductionAsync(stub);
+            BrokerTestHost host = await BrokerTestHost.StartProductionAsync(
+                stub,
+                options => options.ConfigureServices = configureServices
+            );
             try
             {
                 await host.WaitForStartupLinesAsync(StartupTimeout);
@@ -306,6 +444,33 @@ namespace EasyTrade.BrokerService.Test.IntegrationTests
                 await host.DisposeAsync();
                 throw;
             }
+        }
+
+        // One request to each gated endpoint, with an unbindable body or query where it takes
+        // one, and the action that serves it.
+        private GatedRequest[] GatedRequests()
+        {
+            Guid alertId = Guid.NewGuid();
+            return
+            [
+                new(
+                    HttpMethod.Get,
+                    $"v1/portfolio/insights/{_accountId}",
+                    null,
+                    "GetPortfolioInsights"
+                ),
+                new(HttpMethod.Post, "v1/alerts", MalformedJson, "CreateAlert"),
+                new(HttpMethod.Get, "v1/alerts", null, "GetAlerts"),
+                new(
+                    HttpMethod.Get,
+                    "v1/alerts/notifications?accountId=not-a-guid",
+                    null,
+                    "GetNotifications"
+                ),
+                new(HttpMethod.Patch, $"v1/alerts/{alertId}", MalformedJson, "UpdateAlert"),
+                new(HttpMethod.Delete, $"v1/alerts/{alertId}", null, "DeleteAlert"),
+                new(HttpMethod.Post, $"v1/alerts/{alertId}/acknowledge", null, "AcknowledgeAlert"),
+            ];
         }
 
         private Task<HttpResponseMessage> GetInsightsAsync(BrokerTestHost host)
@@ -345,6 +510,53 @@ namespace EasyTrade.BrokerService.Test.IntegrationTests
             JsonElement alert = await ReadSuccessAsync(response, HttpStatusCode.Created);
             Assert.Equal(1, alert.GetProperty("armingRevision").GetInt32());
             return alert.GetProperty("id").GetGuid();
+        }
+
+        /// <summary>A request to one gated endpoint and the action that serves it.</summary>
+        private sealed record GatedRequest(
+            HttpMethod Method,
+            string Path,
+            string? Body,
+            string Action
+        );
+
+        /// <summary>
+        /// What <see cref="ResultProbe"/> saw for one result: the action, the result, whether
+        /// the gate was among the action's filters, and how many model state entries binding
+        /// had made by then.
+        /// </summary>
+        private sealed record ProbedResult(
+            string? Action,
+            IActionResult? Result,
+            bool GateInPipeline,
+            int ModelStateEntries
+        );
+
+        /// <summary>
+        /// A global MVC filter that records every result MVC executes, the one a resource
+        /// filter short-circuits with included, and passes it on unchanged.
+        /// </summary>
+        private sealed class ResultProbe : IAsyncAlwaysRunResultFilter
+        {
+            private readonly ConcurrentQueue<ProbedResult> _results = new();
+
+            public IReadOnlyList<ProbedResult> Results => [.. _results];
+
+            public Task OnResultExecutionAsync(
+                ResultExecutingContext context,
+                ResultExecutionDelegate next
+            )
+            {
+                _results.Enqueue(
+                    new ProbedResult(
+                        (context.ActionDescriptor as ControllerActionDescriptor)?.ActionName,
+                        context.Result,
+                        context.Filters.OfType<PortfolioInsightsFeatureGate>().Any(),
+                        context.ModelState.Count
+                    )
+                );
+                return next();
+            }
         }
     }
 }

@@ -1,7 +1,7 @@
 import { useEffect } from "react"
 import { useQueryClient } from "@tanstack/react-query"
 import type { Alert } from "../../api/alerts/types"
-import type { Instrument } from "../../api/instrument"
+import type { Instrument } from "../../api/instrument/types"
 import { useToast } from "../../contexts/ToastContext/context"
 import { useAuthUser } from "../../contexts/UserContext/context"
 import { useAlertNotificationsQuery } from "../../hooks/useAlerts"

@@ -958,9 +958,25 @@ dialog::backdrop {
 }
 
 /* ---- Portfolio insights ---- */
+/* Insights feature sizes, named for the rules below */
+:root {
+    /* Narrowest summary card before the grid wraps to another row */
+    --insights-figure-min-width: 180px;
+    /* Row divider hairline, as wide as the .card-header and .data-table dividers */
+    --insights-divider-width: 1px;
+    /* Keyboard focus ring, as wide as the sidebar link ring */
+    --insights-focus-ring-width: 2px;
+    /* Gap that keeps the ring visible beside a border of the ring's colour */
+    --insights-focus-ring-offset: 2px;
+}
+
 .insights-summary {
     display: grid;
-    grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+    /* The minimum shrinks to a narrower container, so no card overflows it */
+    grid-template-columns: repeat(
+        auto-fit,
+        minmax(min(var(--insights-figure-min-width), 100%), 1fr)
+    );
     gap: var(--space-4);
 }
 
@@ -989,12 +1005,55 @@ dialog::backdrop {
     align-items: center;
     gap: var(--space-3);
     padding: var(--space-3);
-    border-bottom: 1px solid var(--border);
+    border-bottom: var(--insights-divider-width) solid var(--border);
 }
 
 .alert-item:last-child,
 .alert-notification:last-child {
     border-bottom: none;
+}
+
+/* Keyboard focus ring of the alert buttons and the allocation scroll region */
+#alerts-panel .btn:focus-visible,
+.insights-allocations-scroll:focus-visible {
+    outline: var(--insights-focus-ring-width) solid var(--border-focus);
+    outline-offset: var(--insights-focus-ring-offset);
+}
+
+/* Pressed alert buttons change colour only: no transition, no size change */
+#alerts-panel .btn-primary:active:not(:disabled) {
+    background-color: var(--accent-muted);
+    border-color: var(--accent);
+}
+
+#alerts-panel .btn-secondary:active:not(:disabled) {
+    background-color: var(--bg-surface);
+    border-color: var(--text-secondary);
+}
+
+#alerts-panel .btn-danger:active:not(:disabled) {
+    background-color: var(--danger-muted);
+    border-color: var(--danger);
+}
+
+/* Alert fields: hover as on .btn-secondary; focus keeps the focus border */
+/* Disabled and .error fields keep their own rules */
+#alerts-panel select:not(:disabled):not(.error):hover,
+#alerts-panel input[type="text"]:not(:disabled):not(.error):hover {
+    border-color: var(--text-secondary);
+}
+
+#alerts-panel select:not(:disabled):not(.error):focus,
+#alerts-panel input[type="text"]:not(:disabled):not(.error):focus {
+    border-color: var(--border-focus);
+}
+
+/* Pressed alert fields add the hover surface to the focus border */
+/* Background colour only, so the select arrow image stays */
+#alerts-panel select:not(:disabled):not(.error):active,
+#alerts-panel input[type="text"]:not(:disabled):not(.error):active {
+    border-color: var(--border-focus);
+    background-color: var(--bg-hover);
 }
 
 /* Keyboard focus ring shared by every sidebar link while the Portfolio Insights link is shown */

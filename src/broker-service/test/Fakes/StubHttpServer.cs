@@ -23,7 +23,10 @@ namespace EasyTrade.BrokerService.Test.Fakes
     /// <summary>Stub route whose behaviour a test controls.</summary>
     public enum StubRoute
     {
-        /// <summary><c>GET /v1/flags/portfolio-insights-enabled</c>.</summary>
+        /// <summary>
+        /// <c>GET /v1/flags/portfolio-insights-enabled</c>; in <see cref="StubMode.Hold"/>, every
+        /// <c>GET /v1/flags/{id}</c>.
+        /// </summary>
         Flag,
 
         /// <summary><c>GET /v1/prices/latest</c>.</summary>
@@ -57,7 +60,8 @@ namespace EasyTrade.BrokerService.Test.Fakes
 
         /// <summary>
         /// Keeps the request open until the client aborts it, the route enters
-        /// <see cref="Refuse"/> or the stub stops.
+        /// <see cref="Refuse"/> or the stub stops. On the flag route it holds the read of every
+        /// flag id, the problem-pattern ids included, as a hung flag service would.
         /// </summary>
         Hold,
     }
@@ -82,15 +86,18 @@ namespace EasyTrade.BrokerService.Test.Fakes
     /// recorded before it is answered.
     /// </summary>
     /// <remarks>
-    /// While an HTTP listener listens, its route in <see cref="StubMode.Respond"/> or
-    /// <see cref="StubMode.Hold"/>, only a GET of that route's path, the portfolio insights flag
-    /// or the latest prices, follows the configured <see cref="StubMode"/>; every other request
-    /// answers 404, including every other flag id at the flag address and every other pricing
-    /// route at the pricing address. While a route is in <see cref="StubMode.Refuse"/>, its
-    /// connects are refused and get no HTTP response, and nothing is recorded: every flag id at
-    /// the flag address is refused, and OpenFeature's client resolves the failed read to the
-    /// caller's default as it does a 404. Either way problem-pattern reads resolve to their
-    /// defaults, so problem-pattern behaviour stays at its defaults (Guardrails directive 1).
+    /// While an HTTP listener listens, its route in <see cref="StubMode.Respond"/>, only a GET of
+    /// that route's path, the portfolio insights flag or the latest prices, gets the configured
+    /// answer; every other request answers 404, including every other flag id at the flag
+    /// address and every other pricing route at the pricing address. In
+    /// <see cref="StubMode.Hold"/> the pricing route holds only the latest prices, while the flag
+    /// route holds every <c>GET /v1/flags/{id}</c>: a whole hung flag service, whose
+    /// problem-pattern reads hang until their client gives up. While a route is in
+    /// <see cref="StubMode.Refuse"/>, its connects are refused and get no HTTP response, and
+    /// nothing is recorded: every flag id at the flag address is refused, and OpenFeature's
+    /// client resolves the failed read to the caller's default as it does a 404. In Respond and
+    /// Refuse, problem-pattern reads therefore resolve to their defaults, so problem-pattern
+    /// behaviour stays at its defaults (Guardrails directive 1).
     /// The gRPC listener has no mode and serves HTTP/2 only: it records every HTTP/2 request,
     /// whatever its path or method, and answers HTTP 200 with a trailers-only <c>grpc-status</c>
     /// 12 (Unimplemented), which Grpc.Net.Client raises as RpcException(Unimplemented). The one
@@ -104,8 +111,11 @@ namespace EasyTrade.BrokerService.Test.Fakes
         public const string HttpListenerName = "http";
         public const string GrpcListenerName = "grpc";
 
+        /// <summary>Path of every flag read; the flag id follows it.</summary>
+        public const string FlagPathPrefix = "/v1/flags/";
+
         /// <summary>Path the broker requests for the portfolio insights flag.</summary>
-        public const string FlagPath = "/v1/flags/" + Constants.PortfolioInsightsEnabled;
+        public const string FlagPath = FlagPathPrefix + Constants.PortfolioInsightsEnabled;
 
         /// <summary>Path the broker requests for the latest prices.</summary>
         public const string LatestPricesPath = "/v1/prices/latest";
@@ -702,8 +712,33 @@ namespace EasyTrade.BrokerService.Test.Fakes
                 await ServeAsync(context, listener.Route, request.Path, generation, closingToken);
                 return;
             }
+            if (IsHeldFlagRead(listener.Route, request))
+            {
+                // A hung flag service hangs every flag read, not only the portfolio insights one.
+                await HoldAsync(context, request.Path, generation, closingToken);
+                return;
+            }
             // Every other flag id, every other pricing route and anything else.
             context.Response.StatusCode = StatusCodes.Status404NotFound;
+        }
+
+        // A GET of /v1/flags/{id} for any other id while the flag route is in Hold.
+        private bool IsHeldFlagRead(StubRoute route, StubRecordedRequest request)
+        {
+            if (
+                (route != StubRoute.Flag)
+                || !HttpMethods.IsGet(request.Method)
+                || !request.Path.StartsWith(FlagPathPrefix, StringComparison.Ordinal)
+                || (request.Path.Length == FlagPathPrefix.Length)
+                || (request.Path.IndexOf('/', FlagPathPrefix.Length) >= 0)
+            )
+            {
+                return false;
+            }
+            lock (_gate)
+            {
+                return _flagRoute.Mode == StubMode.Hold;
+            }
         }
 
         private async Task HandleGrpcAsync(HttpContext context)
@@ -980,7 +1015,7 @@ namespace EasyTrade.BrokerService.Test.Fakes
             List<string> held = [];
             if (_flagRoute.Mode == StubMode.Hold)
             {
-                held.Add(FlagPath);
+                held.Add(FlagPathPrefix + "{id}");
             }
             if (_latestPricesRoute.Mode == StubMode.Hold)
             {

@@ -1,4 +1,4 @@
-import { RiskLevel } from "../../api/portfolioInsights"
+import type { RiskLevel } from "../../api/portfolioInsights/types"
 
 // The label stays mixed case in the DOM; `.badge` uppercases it visually only.
 const riskBadges: Record<RiskLevel, { className: string; label: string }> = {

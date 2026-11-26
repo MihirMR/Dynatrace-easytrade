@@ -10,8 +10,11 @@ using EasyTrade.BrokerService.Entities.Trades;
 using EasyTrade.BrokerService.Entities.Trades.Repository;
 using EasyTrade.BrokerService.ExceptionHandling;
 using EasyTrade.BrokerService.Helpers;
+using EasyTrade.BrokerService.Helpers.FeatureFlags;
 using EasyTrade.BrokerService.Test.Fakes;
 using Grpc.Core;
+using Microsoft.AspNetCore.Mvc.ApiExplorer;
+using Microsoft.AspNetCore.Mvc.Controllers;
 using Microsoft.Extensions.DependencyInjection;
 
 namespace EasyTrade.BrokerService.Test.IntegrationTests
@@ -340,6 +343,49 @@ namespace EasyTrade.BrokerService.Test.IntegrationTests
             );
             // The gate is attached to the insights action only, so history never reads the flag.
             Assert.Equal(0, host.Flag.CallCount);
+        }
+
+        [Theory]
+        [InlineData("Portfolio", "GetPortfolioInsights")]
+        [InlineData("Alert", "CreateAlert")]
+        [InlineData("Alert", "GetAlerts")]
+        [InlineData("Alert", "GetNotifications")]
+        [InlineData("Alert", "UpdateAlert")]
+        [InlineData("Alert", "DeleteAlert")]
+        [InlineData("Alert", "AcknowledgeAlert")]
+        public async Task GatedEndpoint_ApiMetadata_ShouldDeclareFeatureDisabledJson403(
+            string controller,
+            string action
+        )
+        {
+            // Arrange
+            await using BrokerTestHost host = await BrokerTestHost.StartComposedAsync();
+            IApiDescriptionGroupCollectionProvider explorer =
+                host.Services.GetRequiredService<IApiDescriptionGroupCollectionProvider>();
+
+            // Act
+            ApiDescription description = Assert.Single(
+                explorer.ApiDescriptionGroups.Items.SelectMany(group => group.Items),
+                candidate =>
+                    candidate.ActionDescriptor is ControllerActionDescriptor descriptor
+                    && string.Equals(
+                        descriptor.ControllerName,
+                        controller,
+                        StringComparison.Ordinal
+                    )
+                    && string.Equals(descriptor.ActionName, action, StringComparison.Ordinal)
+            );
+            ApiResponseType forbidden = Assert.Single(
+                description.SupportedResponseTypes,
+                response => response.StatusCode == (int)HttpStatusCode.Forbidden
+            );
+
+            // Assert
+            // The body the gate writes, not the ProblemDetails [ApiController] infers for an
+            // untyped 403, in the gate's one content type.
+            Assert.Equal(typeof(FeatureDisabledResponse), forbidden.Type);
+            ApiResponseFormat format = Assert.Single(forbidden.ApiResponseFormats);
+            Assert.Equal("application/json", format.MediaType);
         }
 
         // Adds an account with a balance and, per entry, a new instrument and an owned row of it.

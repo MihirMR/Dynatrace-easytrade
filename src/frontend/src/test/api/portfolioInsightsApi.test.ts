@@ -1,12 +1,8 @@
 import "@testing-library/jest-dom/vitest"
 import { getPortfolioInsightsFlag } from "../../api/featureFlags"
 import { getPortfolioInsights } from "../../api/portfolioInsights"
-import {
-    createAlert,
-    listAlerts,
-    type Alert,
-    type CreateAlertRequest,
-} from "../../api/alerts"
+import { createAlert, listAlerts } from "../../api/alerts"
+import type { Alert, CreateAlertRequest } from "../../api/alerts/types"
 import { ApiError, patchJson, services } from "../../api/http"
 
 // Contract cases of the Portfolio Insights fetch modules: what each sends and
