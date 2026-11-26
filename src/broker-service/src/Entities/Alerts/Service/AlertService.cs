@@ -5,6 +5,7 @@ using EasyTrade.BrokerService.Entities.Instruments;
 using EasyTrade.BrokerService.Entities.Instruments.Repository;
 using EasyTrade.BrokerService.Entities.Portfolio.Service;
 using EasyTrade.BrokerService.ExceptionHandling.Exceptions;
+using Grpc.Core;
 
 namespace EasyTrade.BrokerService.Entities.Alerts.Service
 {
@@ -12,8 +13,11 @@ namespace EasyTrade.BrokerService.Entities.Alerts.Service
     /// Alert CRUD rules behind the six <c>/v1/alerts</c> endpoints. Every write goes through
     /// db-adapter by <see cref="IAlertRepository"/>; account, instrument and holding checks are
     /// read-only. This class is the only place where a repository miss (<c>null</c> or
-    /// <c>false</c>) becomes an <see cref="AlertNotFoundException"/>. Each audit line is written
-    /// only after its db-adapter call has returned successfully, so a failed write logs none.
+    /// <c>false</c>) becomes an <see cref="AlertNotFoundException"/>. It also answers a create
+    /// that db-adapter rejects as NotFound, because a reference was removed between the checks
+    /// and the insert, with a 404 <see cref="BalanceNotFoundException"/> naming both the account
+    /// and the instrument. Each audit line is written only after its db-adapter call has returned
+    /// successfully, so a failed write logs none.
     /// </summary>
     public class AlertService(
         IAlertRepository alertRepository,
@@ -29,8 +33,8 @@ namespace EasyTrade.BrokerService.Entities.Alerts.Service
             "Alert [{alertId}] of account [{accountId}] enabled [{enabled}] "
             + "revision [{armingRevision}]";
         private const string DeletedTemplate = "Alert [{alertId}] of account [{accountId}] deleted";
-        private const string AcknowledgedTemplate =
-            "Alert [{alertId}] of account [{accountId}] acknowledged";
+        private const string AcknowledgeAcceptedTemplate =
+            "Alert [{alertId}] of account [{accountId}] acknowledgement request accepted";
         private const string AlertsListedTemplate =
             "Listed [{count}] alerts for account [{accountId}]";
         private const string NotificationsListedTemplate =
@@ -40,7 +44,10 @@ namespace EasyTrade.BrokerService.Entities.Alerts.Service
         // computed while the level is off (CA1873).
 
         /// <inheritdoc/>
-        public async Task<AlertDTO> CreateAlertAsync(CreateAlertDTO request)
+        public async Task<AlertDTO> CreateAlertAsync(
+            CreateAlertDTO request,
+            CancellationToken cancellationToken = default
+        )
         {
             ArgumentNullException.ThrowIfNull(request);
 
@@ -96,13 +103,31 @@ namespace EasyTrade.BrokerService.Entities.Alerts.Service
                 await EnsureHoldingAsync(accountId, instrumentId);
             }
 
-            Alert alert = await alertRepository.CreateAsync(
-                accountId,
-                type,
-                instrumentId,
-                direction,
-                threshold
-            );
+            Alert alert;
+            try
+            {
+                alert = await alertRepository.CreateAsync(
+                    accountId,
+                    type,
+                    instrumentId,
+                    direction,
+                    threshold,
+                    cancellationToken
+                );
+            }
+            catch (DbException exception)
+                when (exception.InnerException is RpcException { StatusCode: StatusCode.NotFound })
+            {
+                // db-adapter answers the create with NotFound only when a foreign key names no
+                // row, so a reference was removed after the checks above passed. Its reply does
+                // not say which one, so the 404 names both ids, with no further read. The account
+                // exception carries it because accounts are the reference that can disappear;
+                // instruments are seeded reference data with no delete path. Every other failure
+                // stays the DbException thrown (503), and no audit line is written.
+                throw new BalanceNotFoundException(
+                    $"Account {accountId} or instrument {instrumentId} not found"
+                );
+            }
 
             if (logger.IsEnabled(LogLevel.Information))
             {
@@ -121,7 +146,10 @@ namespace EasyTrade.BrokerService.Entities.Alerts.Service
         }
 
         /// <inheritdoc/>
-        public async Task<IEnumerable<AlertDTO>> GetAlertsAsync(Guid accountId)
+        public async Task<IEnumerable<AlertDTO>> GetAlertsAsync(
+            Guid accountId,
+            CancellationToken cancellationToken = default
+        )
         {
             await EnsureAccountExistsAsync(accountId);
 
@@ -129,7 +157,8 @@ namespace EasyTrade.BrokerService.Entities.Alerts.Service
                 accountId,
                 false,
                 false,
-                false
+                false,
+                cancellationToken
             );
 
             // Ordered here rather than trusted from SQL, so the order is the same on both
@@ -153,7 +182,8 @@ namespace EasyTrade.BrokerService.Entities.Alerts.Service
         /// <inheritdoc/>
         public async Task<IEnumerable<AlertDTO>> GetNotificationsAsync(
             Guid accountId,
-            bool unacknowledgedOnly
+            bool unacknowledgedOnly,
+            CancellationToken cancellationToken = default
         )
         {
             await EnsureAccountExistsAsync(accountId);
@@ -163,16 +193,13 @@ namespace EasyTrade.BrokerService.Entities.Alerts.Service
                 accountId,
                 false,
                 true,
-                unacknowledgedOnly
+                unacknowledgedOnly,
+                cancellationToken
             );
 
-            List<AlertDTO> results =
-            [
-                .. alerts
-                    .OrderByDescending(alert => alert.TriggeredAt)
-                    .ThenByDescending(alert => alert.Id.ToString(), StringComparer.Ordinal)
-                    .Select(AlertMapper.ToDto),
-            ];
+            // db-adapter returns triggered alerts newest trigger first, which is the contract
+            // order, so they are kept as listed; ties have no contracted order.
+            List<AlertDTO> results = [.. alerts.Select(AlertMapper.ToDto)];
 
             if (logger.IsEnabled(LogLevel.Debug))
             {
@@ -183,7 +210,11 @@ namespace EasyTrade.BrokerService.Entities.Alerts.Service
         }
 
         /// <inheritdoc/>
-        public async Task<AlertDTO> UpdateEnabledAsync(Guid id, UpdateAlertDTO request)
+        public async Task<AlertDTO> UpdateEnabledAsync(
+            Guid id,
+            UpdateAlertDTO request,
+            CancellationToken cancellationToken = default
+        )
         {
             ArgumentNullException.ThrowIfNull(request);
 
@@ -195,7 +226,7 @@ namespace EasyTrade.BrokerService.Entities.Alerts.Service
             // The reply is the snapshot db-adapter read inside the update's own transaction, so
             // it is returned as is: a second read could show another PATCH or a later trigger.
             Alert alert =
-                await alertRepository.UpdateEnabledAsync(id, enabled)
+                await alertRepository.UpdateEnabledAsync(id, enabled, cancellationToken)
                 ?? throw new AlertNotFoundException(id);
 
             if (logger.IsEnabled(LogLevel.Information))
@@ -213,13 +244,13 @@ namespace EasyTrade.BrokerService.Entities.Alerts.Service
         }
 
         /// <inheritdoc/>
-        public async Task DeleteAlertAsync(Guid id)
+        public async Task DeleteAlertAsync(Guid id, CancellationToken cancellationToken = default)
         {
             // Read first only so that the audit line can name the owning account.
-            Alert alert = await GetAlertOrThrowAsync(id);
+            Alert alert = await GetAlertOrThrowAsync(id, cancellationToken);
 
             // false here means a concurrent delete removed the alert after the read.
-            if (!await alertRepository.DeleteAsync(id))
+            if (!await alertRepository.DeleteAsync(id, cancellationToken))
             {
                 throw new AlertNotFoundException(id);
             }
@@ -231,20 +262,27 @@ namespace EasyTrade.BrokerService.Entities.Alerts.Service
         }
 
         /// <inheritdoc/>
-        public async Task AcknowledgeAlertAsync(Guid id)
+        public async Task AcknowledgeAlertAsync(
+            Guid id,
+            CancellationToken cancellationToken = default
+        )
         {
-            Alert alert = await GetAlertOrThrowAsync(id);
+            Alert alert = await GetAlertOrThrowAsync(id, cancellationToken);
 
-            // The repository reports false only for an unknown id. Acknowledging an arming that
-            // has not triggered returns true and changes nothing, which is still a 204.
-            if (!await alertRepository.AcknowledgeAsync(id))
+            // The repository reports only whether the alert exists: false for an unknown id, true
+            // otherwise. db-adapter acknowledges the current arming only if it has triggered at
+            // the moment of this write, so the broker cannot tell an acknowledgement from the
+            // no-op on an untriggered arming, which is still a 204; the read above can be stale
+            // by then. The audit line therefore records that the request was accepted, never
+            // that a notification was acknowledged.
+            if (!await alertRepository.AcknowledgeAsync(id, cancellationToken))
             {
                 throw new AlertNotFoundException(id);
             }
 
             if (logger.IsEnabled(LogLevel.Information))
             {
-                logger.LogInformation(AcknowledgedTemplate, alert.Id, alert.AccountId);
+                logger.LogInformation(AcknowledgeAcceptedTemplate, alert.Id, alert.AccountId);
             }
         }
 
@@ -271,9 +309,10 @@ namespace EasyTrade.BrokerService.Entities.Alerts.Service
             }
         }
 
-        private async Task<Alert> GetAlertOrThrowAsync(Guid id)
+        private async Task<Alert> GetAlertOrThrowAsync(Guid id, CancellationToken cancellationToken)
         {
-            return await alertRepository.GetAlertAsync(id) ?? throw new AlertNotFoundException(id);
+            return await alertRepository.GetAlertAsync(id, cancellationToken)
+                ?? throw new AlertNotFoundException(id);
         }
     }
 }

@@ -29,6 +29,7 @@ namespace EasyTrade.BrokerService.Entities.Alerts.Controllers
         /// Create a TARGET_PRICE or PROFIT_LOSS alert for an account
         /// </summary>
         /// <param name="request">Alert account, type, instrument, direction and threshold</param>
+        /// <param name="cancellationToken">Request abort token, passed to the service</param>
         /// <returns>The created alert, enabled and not yet triggered</returns>
         [ProducesResponseType(typeof(AlertDTO), StatusCodes.Status201Created)]
         // ApiExplorer keeps one response type per status code, so the description names both.
@@ -46,9 +47,12 @@ namespace EasyTrade.BrokerService.Entities.Alerts.Controllers
         [ProducesResponseType(typeof(ErrorResponse), StatusCodes.Status404NotFound)]
         [ProducesResponseType(typeof(ErrorResponse), StatusCodes.Status503ServiceUnavailable)]
         [HttpPost]
-        public async Task<ActionResult<AlertDTO>> CreateAlert([FromBody] CreateAlertDTO request)
+        public async Task<ActionResult<AlertDTO>> CreateAlert(
+            [FromBody] CreateAlertDTO request,
+            CancellationToken cancellationToken
+        )
         {
-            AlertDTO alert = await alertService.CreateAlertAsync(request);
+            AlertDTO alert = await alertService.CreateAlertAsync(request, cancellationToken);
             // Not CreatedAtAction: there is no GET-by-id route, so no Location header is sent.
             return StatusCode(StatusCodes.Status201Created, alert);
         }
@@ -57,6 +61,7 @@ namespace EasyTrade.BrokerService.Entities.Alerts.Controllers
         /// Get every alert of an account, newest first
         /// </summary>
         /// <param name="accountId">Account ID</param>
+        /// <param name="cancellationToken">Request abort token, passed to the service</param>
         /// <returns>Alerts of the account</returns>
         [ProducesResponseType(typeof(AlertsResultDTO), StatusCodes.Status200OK)]
         [ProducesResponseType(typeof(ValidationProblemDetails), StatusCodes.Status400BadRequest)]
@@ -64,9 +69,15 @@ namespace EasyTrade.BrokerService.Entities.Alerts.Controllers
         [ProducesResponseType(typeof(ErrorResponse), StatusCodes.Status404NotFound)]
         [ProducesResponseType(typeof(ErrorResponse), StatusCodes.Status503ServiceUnavailable)]
         [HttpGet]
-        public async Task<AlertsResultDTO> GetAlerts([FromQuery, BindRequired] Guid accountId)
+        public async Task<AlertsResultDTO> GetAlerts(
+            [FromQuery, BindRequired] Guid accountId,
+            CancellationToken cancellationToken
+        )
         {
-            IEnumerable<AlertDTO> alerts = await alertService.GetAlertsAsync(accountId);
+            IEnumerable<AlertDTO> alerts = await alertService.GetAlertsAsync(
+                accountId,
+                cancellationToken
+            );
             return AlertMapper.ToResult(alerts);
         }
 
@@ -75,6 +86,7 @@ namespace EasyTrade.BrokerService.Entities.Alerts.Controllers
         /// </summary>
         /// <param name="accountId">Account ID</param>
         /// <param name="unacknowledged">When true, only notifications not yet acknowledged</param>
+        /// <param name="cancellationToken">Request abort token, passed to the service</param>
         /// <returns>Triggered alerts of the account</returns>
         [ProducesResponseType(typeof(AlertsResultDTO), StatusCodes.Status200OK)]
         [ProducesResponseType(typeof(ValidationProblemDetails), StatusCodes.Status400BadRequest)]
@@ -86,12 +98,14 @@ namespace EasyTrade.BrokerService.Entities.Alerts.Controllers
             [FromQuery, BindRequired] Guid accountId,
             // Each supplied value must be a boolean; a blank one is not an omitted filter.
             [FromQuery, ModelBinder(typeof(UnacknowledgedFilterBinder))]
-                bool? unacknowledged
+                bool? unacknowledged,
+            CancellationToken cancellationToken
         )
         {
             IEnumerable<AlertDTO> notifications = await alertService.GetNotificationsAsync(
                 accountId,
-                unacknowledged == true
+                unacknowledged == true,
+                cancellationToken
             );
             return AlertMapper.ToResult(notifications);
         }
@@ -101,6 +115,7 @@ namespace EasyTrade.BrokerService.Entities.Alerts.Controllers
         /// </summary>
         /// <param name="id">Alert ID</param>
         /// <param name="request">The enabled value to set</param>
+        /// <param name="cancellationToken">Request abort token, passed to the service</param>
         /// <returns>The alert as this update wrote it</returns>
         [ProducesResponseType(typeof(AlertDTO), StatusCodes.Status200OK)]
         // ApiExplorer keeps one response type per status code, so the description names both.
@@ -117,23 +132,28 @@ namespace EasyTrade.BrokerService.Entities.Alerts.Controllers
         [ProducesResponseType(typeof(ErrorResponse), StatusCodes.Status404NotFound)]
         [ProducesResponseType(typeof(ErrorResponse), StatusCodes.Status503ServiceUnavailable)]
         [HttpPatch("{id:guid}")]
-        public async Task<AlertDTO> UpdateAlert(Guid id, [FromBody] UpdateAlertDTO request)
+        public async Task<AlertDTO> UpdateAlert(
+            Guid id,
+            [FromBody] UpdateAlertDTO request,
+            CancellationToken cancellationToken
+        )
         {
-            return await alertService.UpdateEnabledAsync(id, request);
+            return await alertService.UpdateEnabledAsync(id, request, cancellationToken);
         }
 
         /// <summary>
         /// Delete an alert together with its notification
         /// </summary>
         /// <param name="id">Alert ID</param>
+        /// <param name="cancellationToken">Request abort token, passed to the service</param>
         [ProducesResponseType(StatusCodes.Status204NoContent)]
         [ProducesResponseType(StatusCodes.Status403Forbidden)]
         [ProducesResponseType(typeof(ErrorResponse), StatusCodes.Status404NotFound)]
         [ProducesResponseType(typeof(ErrorResponse), StatusCodes.Status503ServiceUnavailable)]
         [HttpDelete("{id:guid}")]
-        public async Task<IActionResult> DeleteAlert(Guid id)
+        public async Task<IActionResult> DeleteAlert(Guid id, CancellationToken cancellationToken)
         {
-            await alertService.DeleteAlertAsync(id);
+            await alertService.DeleteAlertAsync(id, cancellationToken);
             return NoContent();
         }
 
@@ -142,14 +162,18 @@ namespace EasyTrade.BrokerService.Entities.Alerts.Controllers
         /// arming has not triggered is left unchanged
         /// </summary>
         /// <param name="id">Alert ID</param>
+        /// <param name="cancellationToken">Request abort token, passed to the service</param>
         [ProducesResponseType(StatusCodes.Status204NoContent)]
         [ProducesResponseType(StatusCodes.Status403Forbidden)]
         [ProducesResponseType(typeof(ErrorResponse), StatusCodes.Status404NotFound)]
         [ProducesResponseType(typeof(ErrorResponse), StatusCodes.Status503ServiceUnavailable)]
         [HttpPost("{id:guid}/acknowledge")]
-        public async Task<IActionResult> AcknowledgeAlert(Guid id)
+        public async Task<IActionResult> AcknowledgeAlert(
+            Guid id,
+            CancellationToken cancellationToken
+        )
         {
-            await alertService.AcknowledgeAlertAsync(id);
+            await alertService.AcknowledgeAlertAsync(id, cancellationToken);
             return NoContent();
         }
 

@@ -17,6 +17,7 @@ import type { Instrument } from "../../api/instrument/types"
 import { AlertNotificationWatcher } from "../../components/insights/AlertNotificationWatcher"
 import { SESSION_KEY } from "../../contexts/AuthContext/storage"
 import { portfolioInsightsFlagQuery } from "../../hooks/useFeatureFlags"
+import { NOTIFIED_STORAGE_KEY } from "../../utils/alertNotificationTracker"
 import { onPortfolioInsightsDisabled } from "../../utils/portfolioInsightsFeature"
 import {
     alertKeys,
@@ -302,7 +303,9 @@ describe("AlertNotificationWatcher", () => {
         notifyManager.setScheduler(defaultScheduler)
         vi.useRealTimers()
         vi.restoreAllMocks()
-        // Also drops the tracker's record of shown notifications.
+        // Also drops the tracker's stored record of shown notifications. Keys
+        // whose write failed stay in the page's memory, hence the unique ids
+        // in the failed-write case.
         sessionStorage.clear()
         for (const used of clients) used.clear()
         clients = []
@@ -503,4 +506,45 @@ describe("AlertNotificationWatcher", () => {
             await waitFor(() => expect(shownToasts()).toEqual([expected]))
         }
     )
+
+    it("watcher_storageWriteFails_changedPollDoesNotRepeatToast", async () => {
+        // Ids no other case uses: a key whose write failed stays in the
+        // tracker's memory for the rest of this file.
+        const alertX: Alert = {
+            ...triggeredAlert,
+            id: "a0000000-0000-4000-8000-0000000000f1",
+        }
+        const alertY: Alert = {
+            ...triggeredAlert,
+            id: "a0000000-0000-4000-8000-0000000000f2",
+            direction: "BELOW",
+            threshold: 11,
+            triggerValue: 10.75,
+        }
+        vi.spyOn(console, "error").mockImplementation(() => undefined)
+        // Bound before the spy replaces it; the app writes only sessionStorage.
+        const storeItem = Storage.prototype.setItem.bind(sessionStorage)
+        vi.spyOn(Storage.prototype, "setItem").mockImplementation(
+            (key, value) => {
+                if (key === NOTIFIED_STORAGE_KEY) {
+                    throw new DOMException("quota", "QuotaExceededError")
+                }
+                storeItem(key, value)
+            }
+        )
+        // The second poll changes the data, so the Toast effect runs again.
+        stub.replies = [[alertX], [alertX, alertY]]
+        seedInstruments(client)
+        renderWatcher(client)
+        await waitFor(() => expect(shownToasts()).toHaveLength(1))
+
+        await advance(POLL_INTERVAL_MS)
+        await waitFor(() => expect(stub.notificationRequests).toBe(2))
+        await servedPollsSettled(stub)
+
+        expect(shownToasts()).toEqual([
+            "Alert triggered: EasyTravel Price above 10 (now 10.5)",
+            "Alert triggered: EasyTravel Price below 11 (now 10.75)",
+        ])
+    })
 })

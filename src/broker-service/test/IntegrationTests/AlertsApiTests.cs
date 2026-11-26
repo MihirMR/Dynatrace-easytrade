@@ -3,6 +3,9 @@ using System.Net;
 using System.Text.Json;
 using EasyTrade.BrokerService.Entities.Alerts;
 using EasyTrade.BrokerService.Entities.Alerts.Controllers;
+using EasyTrade.BrokerService.Entities.Alerts.DTO;
+using EasyTrade.BrokerService.Entities.Alerts.Repository;
+using EasyTrade.BrokerService.Entities.Alerts.Service;
 using EasyTrade.BrokerService.Entities.Balances;
 using EasyTrade.BrokerService.Entities.Balances.Repository;
 using EasyTrade.BrokerService.Entities.Instruments;
@@ -624,6 +627,63 @@ namespace EasyTrade.BrokerService.Test.IntegrationTests
             Assert.Empty(host.Alerts.All());
         }
 
+        // Both references pass the checks, then the create RPC fails as the real repository
+        // reports it. NotFound is a reference removed before the insert: db-adapter does not say
+        // which one, so the 404 names both. Any other status is a dependency failure. The
+        // message is a format whose {0} is the account id and {1} the instrument id.
+        [Theory]
+        [InlineData(
+            StatusCode.NotFound,
+            HttpStatusCode.NotFound,
+            "Account {0} or instrument {1} not found"
+        )]
+        [InlineData(
+            StatusCode.Unavailable,
+            HttpStatusCode.ServiceUnavailable,
+            "Database is unavailable"
+        )]
+        public async Task CreateAlert_CreateRpcFailsAfterChecks_ShouldMapStatus(
+            StatusCode rpcStatus,
+            HttpStatusCode expected,
+            string messageFormat
+        )
+        {
+            // Arrange
+            await using BrokerTestHost host = await BrokerTestHost.StartComposedAsync();
+            host.Flag.SetEnabled(true);
+            AccountFixture fixture = SeedAccount(host, HeldQuantity);
+            string diagnostic = $"Db Adapter call error in \"CreateAsync\" method: {rpcStatus}";
+            host.Alerts.ThrowOnNext(
+                FakeAlertRepositoryMethod.Create,
+                new DbException(diagnostic, new RpcException(new Status(rpcStatus, diagnostic)))
+            );
+
+            // Act
+            using HttpResponseMessage response = await SendAsync(
+                host,
+                new AlertRequest(
+                    HttpMethod.Post,
+                    AlertsPath,
+                    CreateBody(fixture.AccountId, fixture.InstrumentId)
+                )
+            );
+
+            // Assert: the create ran once after the checks, and nothing was stored.
+            await BrokerTestHost.AssertErrorResponseAsync(response, expected);
+            JsonElement error = await BrokerTestHost.ReadJsonAsync(response);
+            Assert.Equal(
+                string.Format(
+                    CultureInfo.InvariantCulture,
+                    messageFormat,
+                    fixture.AccountId,
+                    fixture.InstrumentId
+                ),
+                error.GetProperty("message").GetString()
+            );
+            Assert.Equal(1, host.Alerts.CallCount(FakeAlertRepositoryMethod.Create));
+            Assert.Empty(host.Alerts.All());
+        }
+
         [Theory]
         [InlineData(AlertEndpoint.List)]
         [InlineData(AlertEndpoint.Notifications)]
@@ -960,6 +1020,81 @@ namespace EasyTrade.BrokerService.Test.IntegrationTests
             Assert.Empty(await response.Content.ReadAsStringAsync());
             Alert expected = triggered ? seeded with { Acknowledged = true } : seeded;
             Assert.Equal(expected, host.Alerts.Get(seeded.Id));
+        }
+
+        // Calls the controller directly, not over HTTP: MVC binds an action's CancellationToken
+        // parameter to the request's abort token, and this proves each action forwards that exact
+        // token. The strict mock answers only a call that carries it, so an action that drops or
+        // replaces the token fails.
+        [Theory]
+        [InlineData(AlertEndpoint.Create)]
+        [InlineData(AlertEndpoint.List)]
+        [InlineData(AlertEndpoint.Notifications)]
+        [InlineData(AlertEndpoint.UpdateEnabled)]
+        [InlineData(AlertEndpoint.Delete)]
+        [InlineData(AlertEndpoint.Acknowledge)]
+        public async Task AlertEndpoints_RequestToken_ShouldReachServiceCall(AlertEndpoint endpoint)
+        {
+            // Arrange
+            using CancellationTokenSource request = new();
+            CancellationToken token = request.Token;
+            Mock<IAlertService> service = new(MockBehavior.Strict);
+            AlertController controller = new(service.Object);
+            Alert alert = ArmedAlert(Guid.NewGuid(), Guid.NewGuid(), CreatedTime);
+            Guid accountId = alert.AccountId;
+            Guid alertId = alert.Id;
+            AlertDTO result = AlertMapper.ToDto(alert);
+            CreateAlertDTO createRequest = new();
+            UpdateAlertDTO updateRequest = new() { Enabled = true };
+            Func<Task> act;
+            switch (endpoint)
+            {
+                case AlertEndpoint.Create:
+                    service
+                        .Setup(alerts => alerts.CreateAlertAsync(createRequest, token))
+                        .ReturnsAsync(result);
+                    act = () => controller.CreateAlert(createRequest, token);
+                    break;
+                case AlertEndpoint.List:
+                    service
+                        .Setup(alerts => alerts.GetAlertsAsync(accountId, token))
+                        .ReturnsAsync(Array.Empty<AlertDTO>());
+                    act = () => controller.GetAlerts(accountId, token);
+                    break;
+                case AlertEndpoint.Notifications:
+                    service
+                        .Setup(alerts => alerts.GetNotificationsAsync(accountId, true, token))
+                        .ReturnsAsync(Array.Empty<AlertDTO>());
+                    act = () => controller.GetNotifications(accountId, true, token);
+                    break;
+                case AlertEndpoint.UpdateEnabled:
+                    service
+                        .Setup(alerts => alerts.UpdateEnabledAsync(alertId, updateRequest, token))
+                        .ReturnsAsync(result);
+                    act = () => controller.UpdateAlert(alertId, updateRequest, token);
+                    break;
+                case AlertEndpoint.Delete:
+                    service
+                        .Setup(alerts => alerts.DeleteAlertAsync(alertId, token))
+                        .Returns(Task.CompletedTask);
+                    act = () => controller.DeleteAlert(alertId, token);
+                    break;
+                case AlertEndpoint.Acknowledge:
+                    service
+                        .Setup(alerts => alerts.AcknowledgeAlertAsync(alertId, token))
+                        .Returns(Task.CompletedTask);
+                    act = () => controller.AcknowledgeAlert(alertId, token);
+                    break;
+                default:
+                    throw new ArgumentOutOfRangeException(nameof(endpoint), endpoint, null);
+            }
+
+            // Act: bounded, so an action that never completes fails the row instead of hanging.
+            await act().WaitAsync(TimeSpan.FromSeconds(5));
+
+            // Assert: the action's one service call carried the request's token.
+            service.VerifyAll();
+            service.VerifyNoOtherCalls();
         }
 
         [Theory]

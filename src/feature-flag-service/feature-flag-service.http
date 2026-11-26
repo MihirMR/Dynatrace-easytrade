@@ -30,7 +30,7 @@ Content-Type: application/json
 GET {{baseUrl}}/v1/flags/portfolio-insights-enabled
 
 ### Enable portfolio insights (walkthrough step 1)
-# broker-service applies it on its next request, a visible frontend tab within about 15 s; a restart restores the startup default; 400 when ENABLE_MODIFY=false.
+# broker-service applies it on its next request, a visible frontend tab within 15 s plus the 2 s read deadline and at once on focus; a restart restores the startup default; 400 when ENABLE_MODIFY=false.
 PUT {{baseUrl}}/v1/flags/portfolio-insights-enabled
 Content-Type: application/json
 

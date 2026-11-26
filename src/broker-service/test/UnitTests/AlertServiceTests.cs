@@ -1,10 +1,14 @@
 using EasyTrade.BrokerService.Entities.Alerts;
 using EasyTrade.BrokerService.Entities.Alerts.DTO;
+using EasyTrade.BrokerService.Entities.Alerts.Repository;
 using EasyTrade.BrokerService.Entities.Alerts.Service;
 using EasyTrade.BrokerService.Entities.Balances;
+using EasyTrade.BrokerService.Entities.Balances.Repository;
 using EasyTrade.BrokerService.Entities.Instruments;
+using EasyTrade.BrokerService.Entities.Instruments.Repository;
 using EasyTrade.BrokerService.ExceptionHandling.Exceptions;
 using EasyTrade.BrokerService.Test.Fakes;
+using Grpc.Core;
 using Microsoft.Extensions.Logging;
 
 namespace EasyTrade.BrokerService.Test.UnitTests
@@ -293,6 +297,110 @@ namespace EasyTrade.BrokerService.Test.UnitTests
             );
         }
 
+        // Both references pass the checks, then the create RPC fails as the real repository
+        // reports it. NotFound means a reference was removed before the insert: the 404 names
+        // both ids and nothing is read again. Any other status stays the DbException thrown.
+        // Strict mocks admit only the two check reads; no row is stored and nothing is logged.
+        [Theory]
+        [InlineData(StatusCode.NotFound)]
+        [InlineData(StatusCode.Unavailable)]
+        [InlineData(StatusCode.DeadlineExceeded)]
+        public async Task CreateAlert_CreateRpcFailsAfterChecks_ShouldMapToDomainOrPropagate(
+            StatusCode rpcStatus
+        )
+        {
+            // Arrange: each reference is read once, by its own check.
+            Balance balance = new(AccountId, 1000);
+            Instrument instrument = new(HeldInstrumentId, ProductId, "HELD", "Held", "Held");
+            DbException createFailure = CreateFailure(rpcStatus, rpcStatus.ToString());
+            Mock<IBalanceRepository> balances = new(MockBehavior.Strict);
+            balances
+                .Setup(repository => repository.GetBalanceOfAccountAsync(AccountId))
+                .ReturnsAsync(balance);
+            Mock<IInstrumentRepository> instruments = new(MockBehavior.Strict);
+            instruments
+                .Setup(repository => repository.GetInstrumentAsync(HeldInstrumentId))
+                .ReturnsAsync(instrument);
+            FakeAlertRepository alerts = new();
+            alerts.ThrowOnNext(FakeAlertRepositoryMethod.Create, createFailure);
+            RecordingLogger<AlertService> logger = new();
+            AlertService service = new(alerts, balances.Object, instruments.Object, logger);
+            CreateAlertDTO request = Request("TARGET_PRICE", HeldInstrumentId, "ABOVE", 10m);
+
+            // Act
+            Exception thrown = await Assert.ThrowsAnyAsync<Exception>(
+                () => service.CreateAlertAsync(request)
+            );
+
+            // Assert: NotFound is the 404 naming both ids; any other status is the very
+            // DbException thrown below the service.
+            if (rpcStatus == StatusCode.NotFound)
+            {
+                BalanceNotFoundException notFound = Assert.IsType<BalanceNotFoundException>(thrown);
+                Assert.Equal(
+                    $"Account {AccountId} or instrument {HeldInstrumentId} not found",
+                    notFound.Message
+                );
+            }
+            else
+            {
+                Assert.Same(createFailure, thrown);
+            }
+            Assert.Equal(1, alerts.CallCount(FakeAlertRepositoryMethod.Create));
+            balances.Verify(
+                repository => repository.GetBalanceOfAccountAsync(AccountId),
+                Times.Once()
+            );
+            instruments.Verify(
+                repository => repository.GetInstrumentAsync(HeldInstrumentId),
+                Times.Once()
+            );
+            balances.VerifyNoOtherCalls();
+            instruments.VerifyNoOtherCalls();
+            Assert.Empty(alerts.All());
+            Assert.Empty(logger.Entries);
+        }
+
+        // Public, not private, like the case enums above: xUnit passes it to the public theory
+        // below, and a public method cannot take a parameter of a less accessible type.
+        public enum NullCase
+        {
+            Create,
+            UpdateEnabled,
+        }
+
+        // The null-request guards of CreateAlertAsync and UpdateEnabledAsync, which only a direct
+        // caller reaches: MVC never binds a null body. With an alert seeded, the rejection names
+        // the parameter and leaves no repository call, row change or log line behind.
+        [Theory]
+        [InlineData(NullCase.Create)]
+        [InlineData(NullCase.UpdateEnabled)]
+        public async Task RequestDto_Null_ShouldThrowArgumentNullWithoutRepositoryCall(
+            NullCase nullCase
+        )
+        {
+            // Arrange
+            AlertService service = BuildFixtureService([ArmedAlert]);
+            Func<Task> act = nullCase switch
+            {
+                NullCase.Create => () => service.CreateAlertAsync(null!),
+                NullCase.UpdateEnabled => () => service.UpdateEnabledAsync(ArmedAlert.Id, null!),
+                _ => throw new ArgumentOutOfRangeException(nameof(nullCase), nullCase, null),
+            };
+
+            // Act
+            ArgumentNullException thrown = await Assert.ThrowsAsync<ArgumentNullException>(act);
+
+            // Assert
+            Assert.Equal("request", thrown.ParamName);
+            Assert.All(
+                Enum.GetValues<FakeAlertRepositoryMethod>(),
+                method => Assert.Equal(0, _alertRepository!.CallCount(method))
+            );
+            Assert.Equal(ArmedAlert, Assert.Single(_alertRepository!.All()));
+            Assert.Empty(_logger!.Entries);
+        }
+
         [Theory]
         [InlineData(UpdateCase.EnableTriggered)]
         [InlineData(UpdateCase.DisableTriggered)]
@@ -406,6 +514,95 @@ namespace EasyTrade.BrokerService.Test.UnitTests
             Assert.Equal(testCase.Expected, _alertRepository!.Get(id));
         }
 
+        public enum TokenCase
+        {
+            CreateAlert,
+            GetAlerts,
+            GetNotifications,
+            UpdateEnabled,
+            DeleteAlert,
+            AcknowledgeAlert,
+        }
+
+        // Each member passes its caller's token to the alert repository. The token is cancelled
+        // before the call, so the first alert repository call fails as a cancelled gRPC call does,
+        // before it decides anything.
+        [Theory]
+        [InlineData(TokenCase.CreateAlert)]
+        [InlineData(TokenCase.GetAlerts)]
+        [InlineData(TokenCase.GetNotifications)]
+        [InlineData(TokenCase.UpdateEnabled)]
+        [InlineData(TokenCase.DeleteAlert)]
+        [InlineData(TokenCase.AcknowledgeAlert)]
+        public async Task AlertCall_CancelledToken_ShouldFailWithoutWriteOrAudit(
+            TokenCase tokenCase
+        )
+        {
+            // Arrange: a triggered, unacknowledged row, which every write would change.
+            Guid id = UnacknowledgedNotification.Id;
+            AlertService service = BuildFixtureService([UnacknowledgedNotification]);
+            using CancellationTokenSource caller = new();
+            caller.Cancel();
+            CancellationToken token = caller.Token;
+            (Func<Task> Act, FakeAlertRepositoryMethod FirstCall) testCase = tokenCase switch
+            {
+                TokenCase.CreateAlert => (
+                    () =>
+                        service.CreateAlertAsync(
+                            Request("TARGET_PRICE", HeldInstrumentId, "ABOVE", 10m),
+                            token
+                        ),
+                    FakeAlertRepositoryMethod.Create
+                ),
+                TokenCase.GetAlerts => (
+                    () => service.GetAlertsAsync(AccountId, token),
+                    FakeAlertRepositoryMethod.List
+                ),
+                TokenCase.GetNotifications => (
+                    () => service.GetNotificationsAsync(AccountId, false, token),
+                    FakeAlertRepositoryMethod.List
+                ),
+                TokenCase.UpdateEnabled => (
+                    () =>
+                        service.UpdateEnabledAsync(
+                            id,
+                            new UpdateAlertDTO { Enabled = true },
+                            token
+                        ),
+                    FakeAlertRepositoryMethod.UpdateEnabled
+                ),
+                TokenCase.DeleteAlert => (
+                    () => service.DeleteAlertAsync(id, token),
+                    FakeAlertRepositoryMethod.Get
+                ),
+                TokenCase.AcknowledgeAlert => (
+                    () => service.AcknowledgeAlertAsync(id, token),
+                    FakeAlertRepositoryMethod.Get
+                ),
+                _ => throw new ArgumentOutOfRangeException(nameof(tokenCase), tokenCase, null),
+            };
+
+            // Act: bounded, so a call that never ends fails the test instead of hanging it.
+            DbException error = await Assert.ThrowsAsync<DbException>(
+                () => testCase.Act().WaitAsync(TimeSpan.FromSeconds(5))
+            );
+
+            // Assert: the failure carries this very token, the call that saw it was the first
+            // alert repository call and the only one, no row changed and no audit line followed.
+            OperationCanceledException cancellation = Assert.IsType<OperationCanceledException>(
+                error.InnerException
+            );
+            Assert.Equal(token, cancellation.CancellationToken);
+            Assert.Equal(1, _alertRepository!.CallCount(testCase.FirstCall));
+            Assert.All(
+                Enum.GetValues<FakeAlertRepositoryMethod>()
+                    .Where(other => other != testCase.FirstCall),
+                method => Assert.Equal(0, _alertRepository.CallCount(method))
+            );
+            Assert.Equal(UnacknowledgedNotification, Assert.Single(_alertRepository.All()));
+            Assert.Empty(_logger!.Sink.ByLevel(LogLevel.Information));
+        }
+
         [Fact]
         public async Task Acknowledge_NotTriggered_ShouldChangeNothing()
         {
@@ -417,6 +614,66 @@ namespace EasyTrade.BrokerService.Test.UnitTests
 
             // Assert: no notification is acknowledged in advance of a future trigger.
             Assert.Equal(ArmedAlert, _alertRepository!.Get(ArmedAlert.Id));
+        }
+
+        public enum AcknowledgeAuditCase
+        {
+            Triggered,
+            NotTriggered,
+        }
+
+        // db-adapter acknowledges only an arming that has triggered when it writes, and the
+        // broker learns only that the alert exists, so a real acknowledgement and the no-op on an
+        // untriggered arming write the same outcome-neutral line.
+        [Theory]
+        [InlineData(AcknowledgeAuditCase.Triggered)]
+        [InlineData(AcknowledgeAuditCase.NotTriggered)]
+        public async Task Acknowledge_ArmingState_ShouldLogAcceptedRequest(
+            AcknowledgeAuditCase auditCase
+        )
+        {
+            // Arrange
+            Alert seeded = auditCase switch
+            {
+                AcknowledgeAuditCase.Triggered => UnacknowledgedNotification,
+                AcknowledgeAuditCase.NotTriggered => ArmedAlert,
+                _ => throw new ArgumentOutOfRangeException(nameof(auditCase), auditCase, null),
+            };
+            (string Name, object Value)[] expectedFields =
+            [
+                ("alertId", seeded.Id),
+                ("accountId", AccountId),
+            ];
+            AlertService service = BuildFixtureService([seeded]);
+
+            // Act
+            await service.AcknowledgeAlertAsync(seeded.Id);
+
+            // Assert: exactly one line, with the accepted template and only the alert and account
+            // ids as named fields, and its rendered text claims neither outcome.
+            LogEntry entry = Assert.Single(_logger!.Sink.ByLevel(LogLevel.Information));
+            Assert.Equal(
+                "Alert [{alertId}] of account [{accountId}] acknowledgement request accepted",
+                entry.GetField("{OriginalFormat}")
+            );
+            Assert.Equal(
+                expectedFields.Select(field => field.Name).Append("{OriginalFormat}"),
+                entry.State.Select(pair => pair.Key)
+            );
+            Assert.All(
+                expectedFields,
+                field => Assert.Equal(field.Value, entry.GetField(field.Name))
+            );
+            Assert.DoesNotContain(
+                "acknowledged",
+                entry.Message,
+                StringComparison.OrdinalIgnoreCase
+            );
+            Assert.DoesNotContain(
+                "changed nothing",
+                entry.Message,
+                StringComparison.OrdinalIgnoreCase
+            );
         }
 
         [Theory]
@@ -479,6 +736,57 @@ namespace EasyTrade.BrokerService.Test.UnitTests
             }
             IEnumerable<AlertDTO> results = await testCase.Act();
             Assert.Equal(testCase.ExpectedIds, results.Select(alert => alert.Id));
+        }
+
+        [Fact]
+        public async Task GetNotifications_RepositoryOrder_ShouldBePreserved()
+        {
+            // Arrange: db-adapter's order, newest trigger first, then two alerts triggered at the
+            // same instant in ascending id order. The fake store breaks such ties by id
+            // descending, so a stub returns this order; any service-side re-sort with an id
+            // tie-break would swap the last two.
+            Alert[] listed =
+            [
+                AcknowledgedNotification,
+                UnacknowledgedNotification with
+                {
+                    TriggeredAt = TriggerTime,
+                },
+                TriggeredAlert,
+            ];
+            Mock<IAlertRepository> alertRepository = new(MockBehavior.Strict);
+            alertRepository
+                .Setup(repository =>
+                    repository.ListAsync(
+                        AccountId,
+                        false,
+                        true,
+                        false,
+                        It.IsAny<CancellationToken>()
+                    )
+                )
+                .ReturnsAsync(listed);
+            AlertService service = new(
+                alertRepository.Object,
+                new FakeBalanceRepository([new Balance(AccountId, 1000)], []),
+                new FakeInstrumentRepository(),
+                new RecordingLogger<AlertService>()
+            );
+
+            // Act
+            IEnumerable<AlertDTO> results = await service.GetNotificationsAsync(AccountId, false);
+
+            // Assert
+            Assert.Equal(listed.Select(alert => alert.Id), results.Select(alert => alert.Id));
+        }
+
+        // A failed create as the real repository reports it: GrpcHelper wraps the RpcException.
+        private static DbException CreateFailure(StatusCode status, string detail)
+        {
+            return new DbException(
+                $"Db Adapter call error in \"CreateAsync\" method: {detail}",
+                new RpcException(new Status(status, detail))
+            );
         }
 
         private static CreateAlertDTO Request(

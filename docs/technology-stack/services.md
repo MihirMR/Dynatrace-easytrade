@@ -60,9 +60,8 @@ while the flag is off or unreadable. Insights reuse the existing holdings, trade
 latest-price access. A second hosted service, `AlertEvaluationSchedulerService`,
 evaluates armed alerts every `ALERT_EVALUATION_INTERVAL_SECONDS` (default `60`) and
 records each trigger through db-adapter's conditional `TriggerAlert`, so each arming
-yields one notification. See
-[Portfolio insights (demo feature)](../../README.md#portfolio-insights-demo-feature) for
-the walkthrough, flag and variables.
+yields one notification.
+See [Portfolio insights (demo feature)](../../README.md#portfolio-insights-demo-feature) for the walkthrough, flag and variables.
 
 ### `user-service` — Go + Gin
 
@@ -135,8 +134,7 @@ Both dialects create an `Alerts` table for Portfolio Insights alerts, in
 `src/db/postgres/sql-scripts/13-alerts.sql` and `src/db/mssql/sql-scripts/sql-alerts.sql`.
 Init scripts do not add it to an already-initialised database; see
 [Recreating the database for alerts](data-layer.md#recreating-the-database-for-alerts).
-The feature is described in
-[Portfolio insights (demo feature)](../../README.md#portfolio-insights-demo-feature).
+The database-recreate note, endpoints, flag and walkthrough: see [Portfolio insights (demo feature)](../../README.md#portfolio-insights-demo-feature).
 
 ### `loadgen` — Puppeteer
 

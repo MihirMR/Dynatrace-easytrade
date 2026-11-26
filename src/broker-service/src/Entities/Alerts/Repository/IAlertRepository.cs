@@ -16,14 +16,21 @@ namespace EasyTrade.BrokerService.Entities.Alerts.Repository
         /// <summary>
         /// Creates an armed alert: <c>Enabled = true</c>, <c>ArmingRevision = 1</c>, no trigger
         /// and not acknowledged. db-adapter generates <see cref="Alert.Id"/> and
-        /// <see cref="Alert.CreatedAt"/>.
+        /// <see cref="Alert.CreatedAt"/>. db-adapter answers NotFound when the account or the
+        /// instrument names no row; that too is a <c>DbException</c>, whose inner exception is
+        /// the NotFound <see cref="Grpc.Core.RpcException"/>. <paramref name="cancellationToken"/>
+        /// reaches the gRPC call, which is also bounded by the per-call deadline
+        /// <see cref="AlertRepository.CallTimeout"/>. Its expiry is a failed call, thrown as a
+        /// <c>DbException</c> while the token is not cancelled, and so distinct from
+        /// cancellation; a create db-adapter committed but answered too late stays committed.
         /// </summary>
         Task<Alert> CreateAsync(
             Guid accountId,
             AlertType type,
             Guid instrumentId,
             AlertDirection direction,
-            decimal threshold
+            decimal threshold,
+            CancellationToken cancellationToken = default
         );
 
         /// <summary>
@@ -34,7 +41,7 @@ namespace EasyTrade.BrokerService.Entities.Alerts.Repository
         /// <see cref="Alert.CreatedAt"/> descending, then <see cref="Alert.Id"/> descending.
         /// <paramref name="unacknowledgedOnly"/> keeps alerts that are not acknowledged.
         /// <paramref name="cancellationToken"/> reaches the gRPC call, which is also bounded by
-        /// the per-call deadline <see cref="AlertRepository.EvaluatorCallTimeout"/>. Its expiry
+        /// the per-call deadline <see cref="AlertRepository.CallTimeout"/>. Its expiry
         /// is a failed call, thrown as a <c>DbException</c> while the token is not cancelled, and
         /// so distinct from cancellation.
         /// </summary>
@@ -46,28 +53,53 @@ namespace EasyTrade.BrokerService.Entities.Alerts.Repository
             CancellationToken cancellationToken = default
         );
 
-        /// <summary>Reads one alert; <c>null</c> when it does not exist.</summary>
-        Task<Alert?> GetAlertAsync(Guid id);
+        /// <summary>
+        /// Reads one alert; <c>null</c> when it does not exist.
+        /// <paramref name="cancellationToken"/> reaches the gRPC call, which is also bounded by
+        /// the per-call deadline <see cref="AlertRepository.CallTimeout"/>. Its expiry is a failed
+        /// call, thrown as a <c>DbException</c> while the token is not cancelled, and so distinct
+        /// from cancellation and from a missing alert.
+        /// </summary>
+        Task<Alert?> GetAlertAsync(Guid id, CancellationToken cancellationToken = default);
 
         /// <summary>
         /// <c>true</c> re-arms the alert: it clears the trigger fields and the acknowledgement and
         /// increments <see cref="Alert.ArmingRevision"/>. <c>false</c> sets only
         /// <c>Enabled = false</c> and keeps any trigger data. Returns the snapshot this update
         /// wrote, or <c>null</c> when the alert does not exist.
+        /// <paramref name="cancellationToken"/> reaches the gRPC call, which is also bounded by
+        /// the per-call deadline <see cref="AlertRepository.CallTimeout"/>. Its expiry is a failed
+        /// call, thrown as a <c>DbException</c> while the token is not cancelled, and so distinct
+        /// from cancellation and from a missing alert; an update db-adapter committed but
+        /// answered too late stays committed.
         /// </summary>
-        Task<Alert?> UpdateEnabledAsync(Guid id, bool enabled);
+        Task<Alert?> UpdateEnabledAsync(
+            Guid id,
+            bool enabled,
+            CancellationToken cancellationToken = default
+        );
 
         /// <summary>
         /// Deletes the alert and its notification; <c>false</c> when it does not exist.
+        /// <paramref name="cancellationToken"/> reaches the gRPC call, which is also bounded by
+        /// the per-call deadline <see cref="AlertRepository.CallTimeout"/>. Its expiry is a failed
+        /// call, thrown as a <c>DbException</c> while the token is not cancelled, and so distinct
+        /// from cancellation and from a missing alert; a delete db-adapter committed but
+        /// answered too late stays committed.
         /// </summary>
-        Task<bool> DeleteAsync(Guid id);
+        Task<bool> DeleteAsync(Guid id, CancellationToken cancellationToken = default);
 
         /// <summary>
         /// Acknowledges the notification of the current arming when that arming has triggered.
         /// Returns <c>true</c> whenever the alert exists, including the no-op on an arming that
         /// has not triggered, and <c>false</c> when it does not exist.
+        /// <paramref name="cancellationToken"/> reaches the gRPC call, which is also bounded by
+        /// the per-call deadline <see cref="AlertRepository.CallTimeout"/>. Its expiry is a failed
+        /// call, thrown as a <c>DbException</c> while the token is not cancelled, and so distinct
+        /// from cancellation and from a missing alert; an acknowledgement db-adapter committed
+        /// but answered too late stays committed.
         /// </summary>
-        Task<bool> AcknowledgeAsync(Guid id);
+        Task<bool> AcknowledgeAsync(Guid id, CancellationToken cancellationToken = default);
 
         /// <summary>
         /// The single conditional write that records a trigger: it succeeds only for the alert
@@ -77,7 +109,7 @@ namespace EasyTrade.BrokerService.Entities.Alerts.Repository
         /// deleted or re-armed meanwhile. <paramref name="triggerValue"/> is already rounded and
         /// validated by the caller. <paramref name="cancellationToken"/> reaches the gRPC call,
         /// which is also bounded by the per-call deadline
-        /// <see cref="AlertRepository.EvaluatorCallTimeout"/>. Its expiry is a failed call,
+        /// <see cref="AlertRepository.CallTimeout"/>. Its expiry is a failed call,
         /// thrown as a <c>DbException</c> while the token is not cancelled, and so distinct from
         /// cancellation; a write db-adapter committed but answered too late stays committed.
         /// </summary>

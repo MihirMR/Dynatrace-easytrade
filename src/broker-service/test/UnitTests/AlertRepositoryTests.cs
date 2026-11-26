@@ -112,13 +112,15 @@ namespace EasyTrade.BrokerService.Test.UnitTests
             Trigger,
         }
 
-        // A Type as the expected outcome means the call must throw that exception; any other
-        // value is the result the call must return.
+        // A Type as the expected outcome means the call must throw that exception, wrapping the
+        // RpcException of the status; any other value is the result the call must return. The
+        // create NotFound row is the contract the alert service translates to a reference 404.
         [Theory]
         [InlineData(RepositoryCall.Get, StatusCode.NotFound, null)]
         [InlineData(RepositoryCall.UpdateEnabled, StatusCode.NotFound, null)]
         [InlineData(RepositoryCall.Delete, StatusCode.NotFound, false)]
         [InlineData(RepositoryCall.Acknowledge, StatusCode.NotFound, false)]
+        [InlineData(RepositoryCall.Create, StatusCode.NotFound, typeof(DbException))]
         [InlineData(RepositoryCall.Create, StatusCode.Unavailable, typeof(DbException))]
         [InlineData(RepositoryCall.List, StatusCode.Unavailable, typeof(DbException))]
         [InlineData(RepositoryCall.Get, StatusCode.Unavailable, typeof(DbException))]
@@ -149,6 +151,8 @@ namespace EasyTrade.BrokerService.Test.UnitTests
             if (expected is Type exceptionType)
             {
                 Assert.IsType(exceptionType, error);
+                RpcException transport = Assert.IsType<RpcException>(error?.InnerException);
+                Assert.Equal(status, transport.StatusCode);
             }
             else
             {
@@ -356,6 +360,37 @@ namespace EasyTrade.BrokerService.Test.UnitTests
             Assert.True(handler.ObservedCancellation);
         }
 
+        // The calls behind the REST create and by-id endpoints, held as by a db-adapter that
+        // accepts a call but never answers.
+        [Theory]
+        [InlineData(RepositoryCall.Create)]
+        [InlineData(RepositoryCall.Get)]
+        [InlineData(RepositoryCall.UpdateEnabled)]
+        [InlineData(RepositoryCall.Delete)]
+        [InlineData(RepositoryCall.Acknowledge)]
+        public async Task Call_Token_ShouldReachCallOptions(RepositoryCall call)
+        {
+            // Arrange
+            GrpcStatusHandler handler = new();
+            handler.Hold();
+            using FixedChannelDbAdapterConnector connector = new(handler);
+            AlertRepository repository = new(connector);
+            using CancellationTokenSource request = new();
+            Task<object?> calling = InvokeAsync(repository, call, request.Token);
+            await handler.CallReceived.WaitAsync(TestBound);
+
+            // Act
+            request.Cancel();
+
+            // Assert: the caller's token ends the held call as a failed call, never as a miss,
+            // and the call was bounded by its deadline while it was held.
+            await Assert.ThrowsAsync<DbException>(() => calling.WaitAsync(TestBound));
+            Assert.True(handler.ObservedCancellation);
+            TimeSpan? timeout = Assert.Single(handler.RequestTimeouts);
+            Assert.NotNull(timeout);
+            Assert.InRange(timeout.Value, TimeSpan.FromTicks(1), AlertRepository.CallTimeout);
+        }
+
         [Fact]
         public async Task Trigger_ResponseFalse_ShouldReturnFalse()
         {
@@ -375,34 +410,40 @@ namespace EasyTrade.BrokerService.Test.UnitTests
         }
 
         [Theory]
+        [InlineData(RepositoryCall.Create)]
         [InlineData(RepositoryCall.List)]
+        [InlineData(RepositoryCall.Get)]
+        [InlineData(RepositoryCall.UpdateEnabled)]
+        [InlineData(RepositoryCall.Delete)]
+        [InlineData(RepositoryCall.Acknowledge)]
         [InlineData(RepositoryCall.Trigger)]
-        public async Task EvaluatorCall_Sent_ShouldCarryBoundedDeadline(RepositoryCall call)
+        public async Task Call_Sent_ShouldCarryBoundedDeadline(RepositoryCall call)
         {
             // Arrange
             GrpcStatusHandler handler = new();
             handler.ReplyWithMessage(SuccessReply(call));
             using FixedChannelDbAdapterConnector connector = new(handler);
             AlertRepository repository = new(connector);
-            using CancellationTokenSource host = new();
+            using CancellationTokenSource caller = new();
 
             // Act
-            await InvokeAsync(repository, call, host.Token).WaitAsync(TestBound);
+            await InvokeAsync(repository, call, caller.Token).WaitAsync(TestBound);
 
             // Assert
             TimeSpan? timeout = Assert.Single(handler.RequestTimeouts);
             Assert.NotNull(timeout);
-            Assert.InRange(
-                timeout.Value,
-                TimeSpan.FromTicks(1),
-                AlertRepository.EvaluatorCallTimeout
-            );
+            Assert.InRange(timeout.Value, TimeSpan.FromTicks(1), AlertRepository.CallTimeout);
         }
 
         [Theory]
+        [InlineData(RepositoryCall.Create)]
         [InlineData(RepositoryCall.List)]
+        [InlineData(RepositoryCall.Get)]
+        [InlineData(RepositoryCall.UpdateEnabled)]
+        [InlineData(RepositoryCall.Delete)]
+        [InlineData(RepositoryCall.Acknowledge)]
         [InlineData(RepositoryCall.Trigger)]
-        public async Task EvaluatorCall_DeadlineExceeded_ShouldThrowDbExceptionWithoutCancellation(
+        public async Task Call_DeadlineExceeded_ShouldThrowDbExceptionWithoutCancellation(
             RepositoryCall call
         )
         {
@@ -411,18 +452,18 @@ namespace EasyTrade.BrokerService.Test.UnitTests
             handler.ReplyWithStatus(StatusCode.DeadlineExceeded);
             using FixedChannelDbAdapterConnector connector = new(handler);
             AlertRepository repository = new(connector);
-            using CancellationTokenSource host = new();
+            using CancellationTokenSource caller = new();
 
             // Act
             DbException exception = await Assert.ThrowsAsync<DbException>(
-                () => InvokeAsync(repository, call, host.Token).WaitAsync(TestBound)
+                () => InvokeAsync(repository, call, caller.Token).WaitAsync(TestBound)
             );
 
-            // Assert: the evaluator's failure path, which it tells apart from cancellation by the
-            // host token alone.
+            // Assert: a failed call, which the evaluator tells apart from cancellation by the
+            // caller's token alone, and which the by-id calls never report as a missing alert.
             RpcException rpcException = Assert.IsType<RpcException>(exception.InnerException);
             Assert.Equal(StatusCode.DeadlineExceeded, rpcException.StatusCode);
-            Assert.False(host.IsCancellationRequested);
+            Assert.False(caller.IsCancellationRequested);
         }
 
         // A successful reply of each call's response type, as db-adapter sends it. The alert
@@ -627,8 +668,8 @@ namespace EasyTrade.BrokerService.Test.UnitTests
             };
         }
 
-        // Fixed valid arguments, so only the reply decides the outcome. Only the evaluator calls,
-        // List and Trigger, take the token.
+        // Fixed valid arguments, so only the reply decides the outcome. Every call takes the
+        // token.
         private static async Task<object?> InvokeAsync(
             AlertRepository repository,
             RepositoryCall call,
@@ -642,7 +683,8 @@ namespace EasyTrade.BrokerService.Test.UnitTests
                     AlertType.TARGET_PRICE,
                     FixedInstrumentId,
                     AlertDirection.ABOVE,
-                    threshold: 10m
+                    threshold: 10m,
+                    cancellationToken
                 ),
                 RepositoryCall.List => await repository.ListAsync(
                     accountId: null,
@@ -651,13 +693,23 @@ namespace EasyTrade.BrokerService.Test.UnitTests
                     unacknowledgedOnly: false,
                     cancellationToken
                 ),
-                RepositoryCall.Get => await repository.GetAlertAsync(FixedAlertId),
+                RepositoryCall.Get => await repository.GetAlertAsync(
+                    FixedAlertId,
+                    cancellationToken
+                ),
                 RepositoryCall.UpdateEnabled => await repository.UpdateEnabledAsync(
                     FixedAlertId,
-                    enabled: true
+                    enabled: true,
+                    cancellationToken
                 ),
-                RepositoryCall.Delete => await repository.DeleteAsync(FixedAlertId),
-                RepositoryCall.Acknowledge => await repository.AcknowledgeAsync(FixedAlertId),
+                RepositoryCall.Delete => await repository.DeleteAsync(
+                    FixedAlertId,
+                    cancellationToken
+                ),
+                RepositoryCall.Acknowledge => await repository.AcknowledgeAsync(
+                    FixedAlertId,
+                    cancellationToken
+                ),
                 RepositoryCall.Trigger => await repository.TriggerAsync(
                     FixedAlertId,
                     armingRevision: 1,

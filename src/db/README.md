@@ -66,8 +66,20 @@ a Dockerfile change.
   script in the order the list is written, not by filename. Each script switches to the
   database with `USE [TradeManagement]`. The script prints `Setup done` after the last call
   whether or not every script succeeded.
-- Both dialects create the same tables with identical table, column and constraint names.
-  The two script sets are hand-maintained parallel ports and must be kept in sync.
+- Both dialects create the same tables with identical table and column names. Primary keys,
+  foreign keys and indexes are named explicitly, with the same names on both (for example
+  `PK_Alerts`, `FK_Alerts_Accounts` and `IX_Alerts_AccountId`).
+- CHECK constraints and defaults are declared without names. PostgreSQL names each check
+  `<Table>_<Column>_check` and gives defaults no name; SQL Server generates `CK__` and `DF__`
+  names from truncated table and column names and a hex suffix (for example
+  `CK__Alerts__Directio__09A971A2`). Nothing may refer to them by name.
+- Check expressions are written per dialect where the types behave differently. Outside
+  `Alerts`, the enum checks lowercase the value on PostgreSQL, while SQL Server's
+  case-insensitive default collation already ignores case. `Alerts` accepts only the exact
+  enum values on both; SQL Server enforces this with a binary collation and `DATALENGTH`.
+  PostgreSQL also gives `Alerts` four checks refusing `NaN` and infinite timestamps, which
+  the SQL Server types cannot store.
+- The two script sets are hand-maintained parallel ports and must be kept in sync.
 
 ## Adding a table to both dialects
 
@@ -78,8 +90,11 @@ a Dockerfile change.
       depends on (in practice, the end of the list) and before the `END=` line; the existing
       lines keep their order.
 - [ ] Add a branch for the table to the row-count `UNION ALL` in `mssql/debug/check-db.sh`.
-- [ ] Keep table, column and constraint names identical on both dialects; db-adapter quotes
-      identifiers, so PascalCase names work on both.
+- [ ] Keep table and column names identical on both dialects; db-adapter quotes identifiers,
+      so PascalCase names work on both. Name primary keys, foreign keys and indexes
+      explicitly, with the same names on both. CHECK expressions may differ per dialect where
+      the types behave differently, and nothing may depend on the generated names of CHECK
+      constraints or defaults.
 - [ ] Use single-quoted string literals in T-SQL, so the script runs with `QUOTED_IDENTIFIER`
       on or off (for example through `sqlcmd -I`).
 - [ ] Guard creation, so a rerun or a manual apply is harmless: `CREATE TABLE IF NOT EXISTS`
@@ -149,11 +164,32 @@ make start
 
 `make clean` removes the stack's containers, their volumes (anonymous ones included) and the
 locally built images, so `make start` rebuilds the `db` image from the current scripts and
-initialises an empty database. **This deletes all of the stack's data.**
+initialises an empty database. **This deletes all of the stack's data**, with one PostgreSQL
+exception.
+
+Once the `db` container has been recreated, the volume Compose carried over (see
+[above](#why-init-scripts-do-not-add-it-to-an-existing-database)) is mounted by name, and
+Docker does not delete a volume mounted by name when it removes the container. `make clean`
+then leaves it behind as a dangling volume that still holds the database's data;
+`make start` gets a new, empty volume regardless. The volume carries no Compose project
+label, and on a shared engine other stacks leave dangling volumes too, so record its name
+before cleaning and remove exactly that volume afterwards:
+
+```sh
+# PostgreSQL only: the MSSQL db container mounts no volume, so vol stays empty
+vol=$(docker inspect --format '{{range .Mounts}}{{.Name}}{{end}}' \
+  "$(docker compose -f compose.dev.yaml ps -aq db)")
+make clean
+docker volume rm "$vol"   # "no such volume" means make clean already removed it
+```
+
+If you did not record it, `docker volume ls -f dangling=true` lists the candidates; remove
+the db's with `docker volume rm <volume>`.
 
 With the runtime `compose.yaml`, run `docker compose -f compose.yaml down --volumes`, then
 `docker compose -f compose.yaml up -d` with a `TAG` whose `db-${DB_TYPE}` image contains the
-script. This deletes that stack's data too.
+script. This deletes that stack's data too, with the same exception: record the volume with
+`-f compose.yaml` in the `ps` command above.
 
 ### Helm
 
@@ -213,7 +249,10 @@ Both scripts are guarded, so a second run changes nothing.
   docker compose -f compose.dev.yaml exec db psql -U postgres -d TradeManagement -c '\d "Alerts"'
   ```
 
+- **Every target:** the full fresh-database check of each Compose and Helm target, with the
+  typed catalog, the seed and the runtime path, is in
+  [Verifying a stack](../../README.md#verifying-a-stack).
+
 ## Portfolio Insights
 
-Endpoints, the `portfolio-insights-enabled` flag, its environment variables and the demo
-walkthrough: see [Portfolio insights (demo feature)](../../README.md#portfolio-insights-demo-feature).
+Endpoints, the `portfolio-insights-enabled` flag, its environment variables and the demo walkthrough: see [Portfolio insights (demo feature)](../../README.md#portfolio-insights-demo-feature).

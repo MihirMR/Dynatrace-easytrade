@@ -7,7 +7,15 @@ namespace EasyTrade.BrokerService.Entities.Alerts.Service
     /// <see cref="AlertDTO"/> values; wrapping a list in the <c>{"results": [...]}</c> envelope is
     /// the controller's job. Operations by alert id take only the id and perform no ownership
     /// check. A failed db-adapter call throws
-    /// <see cref="ExceptionHandling.Exceptions.DbException"/> (503) from every member.
+    /// <see cref="ExceptionHandling.Exceptions.DbException"/> (503) from every member, except a
+    /// create that db-adapter rejects as NotFound because a reference was removed between the
+    /// checks and the insert: <see cref="CreateAlertAsync"/> answers it with a 404
+    /// <see cref="ExceptionHandling.Exceptions.BalanceNotFoundException"/> naming both ids.
+    /// Every member takes the request's abort token as <c>cancellationToken</c> and passes it to
+    /// every <see cref="Repository.IAlertRepository"/> call it makes, so a caller that disconnects
+    /// cancels the alert call in flight; the account, instrument and holding checks take no
+    /// token. Cancellation, like every failed db-adapter call, surfaces as that
+    /// <c>DbException</c>.
     /// </summary>
     public interface IAlertService
     {
@@ -15,7 +23,10 @@ namespace EasyTrade.BrokerService.Entities.Alerts.Service
         /// Serves <c>POST /v1/alerts</c>. Checks run in order and the first failure answers:
         /// required fields, exact type and direction names and the threshold domain (a
         /// <c>TARGET_PRICE</c> threshold must be positive); the account; the instrument; and,
-        /// for <c>PROFIT_LOSS</c>, a holding of the instrument with a positive quantity.
+        /// for <c>PROFIT_LOSS</c>, a holding of the instrument with a positive quantity. When
+        /// db-adapter rejects the create as NotFound, a reference was removed between these
+        /// checks and the insert; db-adapter does not say which one, so the 404 names both ids
+        /// and nothing is read again.
         /// </summary>
         /// <returns>
         /// The created alert: enabled, arming revision 1, no trigger data and not acknowledged.
@@ -25,12 +36,17 @@ namespace EasyTrade.BrokerService.Entities.Alerts.Service
         /// the account does not hold.
         /// </exception>
         /// <exception cref="ExceptionHandling.Exceptions.BalanceNotFoundException">
-        /// 404: the account is unknown.
+        /// 404: the account is unknown, or a reference was removed between the checks and the
+        /// insert, with the message <c>Account {accountId} or instrument {instrumentId} not
+        /// found</c>.
         /// </exception>
         /// <exception cref="ExceptionHandling.Exceptions.InstrumentNotFoundException">
         /// 404: the instrument is unknown.
         /// </exception>
-        Task<AlertDTO> CreateAlertAsync(CreateAlertDTO request);
+        Task<AlertDTO> CreateAlertAsync(
+            CreateAlertDTO request,
+            CancellationToken cancellationToken = default
+        );
 
         /// <summary>
         /// Serves <c>GET /v1/alerts?accountId=</c>: every alert of the account, newest first
@@ -39,7 +55,10 @@ namespace EasyTrade.BrokerService.Entities.Alerts.Service
         /// <exception cref="ExceptionHandling.Exceptions.BalanceNotFoundException">
         /// 404: the account is unknown.
         /// </exception>
-        Task<IEnumerable<AlertDTO>> GetAlertsAsync(Guid accountId);
+        Task<IEnumerable<AlertDTO>> GetAlertsAsync(
+            Guid accountId,
+            CancellationToken cancellationToken = default
+        );
 
         /// <summary>
         /// Serves <c>GET /v1/alerts/notifications?accountId=&amp;unacknowledged=</c>: the alerts
@@ -49,7 +68,11 @@ namespace EasyTrade.BrokerService.Entities.Alerts.Service
         /// <exception cref="ExceptionHandling.Exceptions.BalanceNotFoundException">
         /// 404: the account is unknown.
         /// </exception>
-        Task<IEnumerable<AlertDTO>> GetNotificationsAsync(Guid accountId, bool unacknowledgedOnly);
+        Task<IEnumerable<AlertDTO>> GetNotificationsAsync(
+            Guid accountId,
+            bool unacknowledgedOnly,
+            CancellationToken cancellationToken = default
+        );
 
         /// <summary>
         /// Serves <c>PATCH /v1/alerts/{id}</c>. <c>true</c> re-arms the alert whatever its state:
@@ -63,7 +86,11 @@ namespace EasyTrade.BrokerService.Entities.Alerts.Service
         /// <exception cref="ExceptionHandling.Exceptions.AlertNotFoundException">
         /// 404: the alert is unknown or was deleted.
         /// </exception>
-        Task<AlertDTO> UpdateEnabledAsync(Guid id, UpdateAlertDTO request);
+        Task<AlertDTO> UpdateEnabledAsync(
+            Guid id,
+            UpdateAlertDTO request,
+            CancellationToken cancellationToken = default
+        );
 
         /// <summary>
         /// Serves <c>DELETE /v1/alerts/{id}</c>: removes the alert together with its
@@ -72,7 +99,7 @@ namespace EasyTrade.BrokerService.Entities.Alerts.Service
         /// <exception cref="ExceptionHandling.Exceptions.AlertNotFoundException">
         /// 404: the alert is unknown or was deleted.
         /// </exception>
-        Task DeleteAlertAsync(Guid id);
+        Task DeleteAlertAsync(Guid id, CancellationToken cancellationToken = default);
 
         /// <summary>
         /// Serves <c>POST /v1/alerts/{id}/acknowledge</c>: acknowledges the notification of the
@@ -82,6 +109,6 @@ namespace EasyTrade.BrokerService.Entities.Alerts.Service
         /// <exception cref="ExceptionHandling.Exceptions.AlertNotFoundException">
         /// 404: the alert is unknown or was deleted.
         /// </exception>
-        Task AcknowledgeAlertAsync(Guid id);
+        Task AcknowledgeAlertAsync(Guid id, CancellationToken cancellationToken = default);
     }
 }

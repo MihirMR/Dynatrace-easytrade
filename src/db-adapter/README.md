@@ -39,9 +39,7 @@ rather than an error, so each arming yields at most one trigger.
 `ArmingRevision`. The table DDL lives in `src/db/postgres/sql-scripts/13-alerts.sql` and
 `src/db/mssql/sql-scripts/sql-alerts.sql` (see [`../db/README.md`](../db/README.md)).
 
-Portfolio Insights endpoints, the `portfolio-insights-enabled` flag, configuration variables,
-the database-recreate note and the demo walkthrough: see
-[Portfolio insights (demo feature)](../../README.md#portfolio-insights-demo-feature).
+Portfolio Insights endpoints, the `portfolio-insights-enabled` flag, configuration variables, the database-recreate note and the demo walkthrough: see [Portfolio insights (demo feature)](../../README.md#portfolio-insights-demo-feature).
 
 ## Add a new backend
 

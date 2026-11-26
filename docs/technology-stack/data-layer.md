@@ -61,7 +61,20 @@ not, and needs one of the procedures below.
   holdings seed inserts duplicate rows. Restarting a persistent MSSQL database is
   therefore **not** a way to get the table.
 - **Compose:** run `make clean`, which runs `down --volumes` and so removes the
-  database's anonymous volume, then `make start`. **This deletes the stack's data.**
+  database's anonymous volume, then `make start`. **This deletes the stack's data.** Once
+  the PostgreSQL `db` container has been recreated (for example by
+  `make restart services=db`), that volume survives `make clean` as a dangling volume, so
+  record its name first and remove it afterwards (if you did not record it,
+  `docker volume ls -f dangling=true` lists the candidates; see
+  [`src/db/README.md`](../../src/db/README.md#compose)):
+
+  ```sh
+  vol=$(docker inspect --format '{{range .Mounts}}{{.Name}}{{end}}' \
+    "$(docker compose -f compose.dev.yaml ps -aq db)")
+  make clean
+  docker volume rm "$vol"
+  ```
+
 - **Helm:** persistence is off by default, so a new database pod starts empty. With
   persistence enabled, `helm uninstall` keeps the StatefulSet's PVC; delete that PVC
   explicitly, which destroys its data.
@@ -70,8 +83,7 @@ not, and needs one of the procedures below.
   scripts are guarded (`IF OBJECT_ID(N'dbo.Alerts', N'U') IS NULL` /
   `CREATE TABLE IF NOT EXISTS`), so applying one again is harmless.
 
-See [Portfolio insights (demo feature)](../../README.md#portfolio-insights-demo-feature)
-for the endpoints, flag, variables and walkthrough.
+See [Portfolio insights (demo feature)](../../README.md#portfolio-insights-demo-feature) for the endpoints, flag, variables and walkthrough.
 
 ## Pluggable backends
 

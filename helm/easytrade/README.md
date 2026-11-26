@@ -101,8 +101,7 @@ helm upgrade --install easytrade ./helm/easytrade -n easytrade --create-namespac
   --set loadgen.env.PORTFOLIO_INSIGHTS_ALERT_WEIGHT="1"
 ```
 
-The endpoints, runtime toggling and the demo walkthrough are in
-[Portfolio insights (demo feature)](../../README.md#portfolio-insights-demo-feature).
+The endpoints, runtime toggling and the demo walkthrough are in [Portfolio insights (demo feature)](../../README.md#portfolio-insights-demo-feature).
 
 ### Example Configurations
 
@@ -329,12 +328,19 @@ helm lint helm/easytrade
 ### Template rendering
 
 ```bash
-# Render templates to verify output
-helm template easytrade ./helm/easytrade -f values.yaml
+# Render templates to verify output (values.yaml is the chart's default values file)
+helm template easytrade helm/easytrade
+
+# The same render on PostgreSQL instead of MSSQL
+helm template easytrade helm/easytrade --set global.database.type=postgres --set db-mssql.enabled=false --set db-postgres.enabled=true
 
 # Debug mode
 helm install easytrade ./helm/easytrade --dry-run --debug
 ```
+
+[Verifying a stack](../../README.md#verifying-a-stack) in the root README checks the three
+Portfolio Insights variables in the rendered Deployments on both dialects, and installs each
+dialect into its own disposable namespace.
 
 ## References
 - https://helm.sh/docs/howto/charts_tips_and_tricks/#complex-charts-with-many-dependencies

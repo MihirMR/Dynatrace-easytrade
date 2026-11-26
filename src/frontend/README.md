@@ -78,9 +78,11 @@ make redeploy services=frontend   # rebuild and recreate it in the running stack
     deduplication key `${accountId}:${id}:${armingRevision}` is kept in
     `sessionStorage` under `portfolio-insights.notified`, so a reload does not
     repeat a Toast, an independently opened tab shows it once more, and a
-    re-armed alert that triggers again toasts again. The server's
-    `acknowledged` flag is the state of record, shown in the notifications
-    list; "Acknowledge" removes the item.
+    re-armed alert that triggers again toasts again. When `sessionStorage`
+    rejects the write (quota exceeded or storage disabled), the open page
+    still remembers the key, so it toasts once there, but a reload can show it
+    once more. The server's `acknowledged` flag is the state of record, shown
+    in the notifications list; "Acknowledge" removes the item.
   - Endpoints, the startup variable `ENABLE_PORTFOLIO_INSIGHTS`, the database-recreate note and a demo walkthrough: see [Portfolio insights (demo feature)](../../README.md#portfolio-insights-demo-feature).
 
 ---

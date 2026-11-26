@@ -304,11 +304,13 @@ namespace EasyTrade.BrokerService.Test.Fakes
             AlertType type,
             Guid instrumentId,
             AlertDirection direction,
-            decimal threshold
+            decimal threshold,
+            CancellationToken cancellationToken = default
         )
         {
             return RunLocked(
                 FakeAlertRepositoryMethod.Create,
+                cancellationToken,
                 () =>
                 {
                     Alert alert = new(
@@ -391,10 +393,11 @@ namespace EasyTrade.BrokerService.Test.Fakes
             return snapshot;
         }
 
-        public Task<Alert?> GetAlertAsync(Guid id)
+        public Task<Alert?> GetAlertAsync(Guid id, CancellationToken cancellationToken = default)
         {
             return RunLocked<Alert?>(
                 FakeAlertRepositoryMethod.Get,
+                cancellationToken,
                 () =>
                     _missNext.Remove(FakeAlertRepositoryMethod.Get)
                         ? null
@@ -402,10 +405,15 @@ namespace EasyTrade.BrokerService.Test.Fakes
             );
         }
 
-        public Task<Alert?> UpdateEnabledAsync(Guid id, bool enabled)
+        public Task<Alert?> UpdateEnabledAsync(
+            Guid id,
+            bool enabled,
+            CancellationToken cancellationToken = default
+        )
         {
             return RunLocked<Alert?>(
                 FakeAlertRepositoryMethod.UpdateEnabled,
+                cancellationToken,
                 () =>
                 {
                     if (
@@ -436,18 +444,20 @@ namespace EasyTrade.BrokerService.Test.Fakes
             );
         }
 
-        public Task<bool> DeleteAsync(Guid id)
+        public Task<bool> DeleteAsync(Guid id, CancellationToken cancellationToken = default)
         {
             return RunLocked(
                 FakeAlertRepositoryMethod.Delete,
+                cancellationToken,
                 () => !_missNext.Remove(FakeAlertRepositoryMethod.Delete) && _alerts.Remove(id)
             );
         }
 
-        public Task<bool> AcknowledgeAsync(Guid id)
+        public Task<bool> AcknowledgeAsync(Guid id, CancellationToken cancellationToken = default)
         {
             return RunLocked(
                 FakeAlertRepositoryMethod.Acknowledge,
+                cancellationToken,
                 () =>
                 {
                     if (
@@ -577,12 +587,18 @@ namespace EasyTrade.BrokerService.Test.Fakes
         }
 
         // Runs a hook-free call atomically and reports any failure through the returned task,
-        // as the real asynchronous repository does.
-        private Task<T> RunLocked<T>(FakeAlertRepositoryMethod method, Func<T> operation)
+        // as the real asynchronous repository does. An already-cancelled token fails the counted
+        // call before it decides anything, so it writes nothing and consumes no miss switch.
+        private Task<T> RunLocked<T>(
+            FakeAlertRepositoryMethod method,
+            CancellationToken cancellationToken,
+            Func<T> operation
+        )
         {
             lock (_lock)
             {
-                Exception? failure = BeginCallLocked(method);
+                Exception? failure =
+                    BeginCallLocked(method) ?? CancellationFailure(cancellationToken);
                 if (failure is not null)
                 {
                     return Task.FromException<T>(failure);

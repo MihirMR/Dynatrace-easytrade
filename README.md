@@ -114,7 +114,21 @@ holdings. Restarting a persistent MSSQL database is therefore **not** a way to g
 - **Compose:** neither Compose file declares a named database volume, but the PostgreSQL
   base image keeps its data in an anonymous volume. For a fresh database run `make clean`,
   then `make start`; with the runtime `compose.yaml`, run `docker compose down --volumes`,
-  then `docker compose up -d`. **This deletes the stack's data.**
+  then `docker compose up -d`. **This deletes the stack's data**, except that once the
+  PostgreSQL `db` container has been recreated (`make restart services=db`,
+  `make redeploy services=db` or a configuration change), its data volume survives as a
+  dangling volume. Record its name before cleaning and remove it afterwards, with
+  `-f compose.yaml` and its `down --volumes` for the runtime stack (if you did not record
+  it, `docker volume ls -f dangling=true` lists the candidates; see
+  [`src/db/README.md`](src/db/README.md#compose)):
+
+  ```sh
+  vol=$(docker inspect --format '{{range .Mounts}}{{.Name}}{{end}}' \
+    "$(docker compose -f compose.dev.yaml ps -aq db)")
+  make clean
+  docker volume rm "$vol"
+  ```
+
 - **Helm:** persistence is off by default, so a new database pod starts empty. With
   persistence enabled, `helm uninstall` leaves the StatefulSet's PVC in place, so the PVC
   must be deleted explicitly, which destroys its data. See
@@ -419,7 +433,8 @@ in [Database](#database).
    next request, and a visible tab within 15 s plus the 2 s read deadline, at once on focus.
    A restart restores the startup default, and an `ENABLE_MODIFY=false` deployment cannot
    toggle it.
-2. Log in (for example `james_norton` / `pass_james_123`), deposit, and buy an instrument.
+2. Log in with a demo user (see [EasyTrade users](#easytrade-users)) or a new account,
+   deposit, and buy an instrument.
 3. Open **Portfolio Insights** in the sidebar. Read the figures and the risk badge.
 4. Read the instrument's current price. Before waiting, create two target-price alerts on
    it: `ABOVE` with a threshold just below the price, and `BELOW` with a threshold just above
@@ -432,6 +447,256 @@ in [Database](#database).
 > **NOTE:** Cost basis is not stored; it is derived from the account's retained executed
 > trades. Quantity older than that history, such as seeded holdings, is valued at the
 > latest price and therefore shows near-zero P/L.
+
+### Verifying a stack
+
+These checks show that a stack built from this checkout renders, starts on a fresh database
+with the `Alerts` table and an intact seed, and serves the feature. They cover six targets:
+Compose dev, Compose release and Helm, each on MSSQL and on PostgreSQL. Run them in one bash
+session from the repository root, with `curl` and `jq` installed; `set -o pipefail` makes a
+failing command fail its pipeline.
+
+**Render.** Every command exits 0; a failure prints `FAIL`.
+
+```bash
+set -o pipefail
+# Expect ["<file>","false","60","0"], then ["<file>","true","60","1"], for each file
+for f in compose.yaml compose.dev.yaml; do
+  for opt in '' 'ENABLE_PORTFOLIO_INSIGHTS=true PORTFOLIO_INSIGHTS_ALERT_WEIGHT=1'; do
+    env $opt docker compose -f "$f" config --format json | jq -c --arg f "$f" '[$f, (.services |
+      ."feature-flag-service".environment.ENABLE_PORTFOLIO_INSIGHTS,
+      ."broker-service".environment.ALERT_EVALUATION_INTERVAL_SECONDS,
+      .loadgen.environment.PORTFOLIO_INSIGHTS_ALERT_WEIGHT)]' || echo "FAIL $f $opt"
+  done
+done
+
+# The CI sequence, then the three Deployments on each dialect. Expect, twice:
+#   easytrade-feature-flag-service ENABLE_PORTFOLIO_INSIGHTS "false"
+#   easytrade-broker-service ALERT_EVALUATION_INTERVAL_SECONDS "60"
+#   easytrade-loadgen PORTFOLIO_INSIGHTS_ALERT_WEIGHT "0"
+helm dependency update helm/easytrade && helm lint helm/easytrade && helm template easytrade helm/easytrade > /dev/null || echo FAIL
+PG='--set global.database.type=postgres --set db-mssql.enabled=false --set db-postgres.enabled=true'
+for switches in '' "$PG"; do
+  helm template easytrade helm/easytrade $switches \
+    --show-only charts/feature-flag-service/templates/deployment.yaml \
+    --show-only charts/broker-service/templates/deployment.yaml \
+    --show-only charts/loadgen/templates/deployment.yaml |
+    awk '/^  name: /{d=$2}
+      $3 ~ /^(ENABLE_PORTFOLIO_INSIGHTS|ALERT_EVALUATION_INTERVAL_SECONDS|PORTFOLIO_INSIGHTS_ALERT_WEIGHT)$/ {v=$3; getline; print d, v, $2}' || echo FAIL
+done
+```
+
+**Isolation.**
+
+- **One target at a time:** every Compose target publishes the same host ports.
+- **Before the first target**, `docker compose ls | grep -E 'compose(\.dev)?\.yaml'` must print
+  nothing. Stop each project it lists with `docker compose -p <name> stop`, because it would
+  hold the ports and could serve stale images.
+- **One name per target:** the Compose projects `pi-dev-mssql`, `pi-dev-postgres`,
+  `pi-rel-mssql` and `pi-rel-postgres`, and the Helm namespaces `easytrade-pi-mssql` and
+  `easytrade-pi-postgres`. That name and the dialect select the build, the start, the checks
+  (`--project` of the scripts) and the teardown.
+- **Unused name before each start:** a project that still exists, stopped included, starts
+  again on its old database. `docker compose ls -a | grep -E '^pi-(dev|rel)-'` must print
+  nothing; remove each project it lists with the Compose teardown below, `NAME` and `FILE` set
+  to that project. On Helm, `kubectl get namespace easytrade-pi-<dialect>` must fail;
+  otherwise delete it with `kubectl delete namespace easytrade-pi-<dialect>`.
+- **Dialect:** `DB_TYPE` and `DB_URL` in the shell take precedence over `.env`, which stays
+  unedited. `<url>` is
+  `'sqlserver://sa:<DB_PASSWORD>@db:1433?database=TradeManagement&encrypt=disable'` for
+  `mssql` and `'postgres://postgres:<DB_PASSWORD>@db:5432/TradeManagement?sslmode=disable'`
+  for `postgres`.
+- **Credentials:** `DB_PASSWORD`, `DB_URL` and the registry credentials are runtime inputs,
+  from `.env`, the shell, `docker login` or `--set`, and are never committed.
+  `<DB_PASSWORD>` is the `DB_PASSWORD` the stack runs with.
+
+**Build and start.**
+
+```bash
+# Compose dev, per dialect
+DB_TYPE=<dialect> DB_URL=<url> make DOCKER_COMPOSE_CMD="docker compose -p pi-dev-<dialect>" build start
+
+# Compose release: build once, then start per dialect
+REGISTRY=<registry> TAG=<unique tag> make build-prod
+REGISTRY=<registry> TAG=<unique tag> DB_TYPE=<dialect> DB_URL=<url> \
+  make DOCKER_COMPOSE_CMD="docker compose -p pi-rel-<dialect>" start-remote
+
+# Helm: push the build-prod images once, then install per dialect on a disposable cluster,
+# adding $PG for PostgreSQL
+REGISTRY=<registry> TAG=<unique tag> make push
+helm upgrade --install easytrade helm/easytrade --namespace easytrade-pi-<dialect> --create-namespace \
+  --set global.image.baseRepository=<registry> --set global.image.tag=<unique tag> --wait --timeout 15m
+```
+
+| Target          | Why no stale image or data is used                                                                                                                      |
+| --------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Compose dev     | `build` rebuilds every image from the checkout, the dialect-named `easytrade-db-<dialect>` included, and a new project has no volume yet                |
+| Compose release | `compose.build.yaml` builds every image under the unique tag, both database images included, and `compose.yaml` runs `db-${DB_TYPE}` under the same tag |
+| Helm            | The unique tag replaces the default `latest`, and persistence is off by default, so each database pod starts empty                                      |
+
+**Runtime checks**, on every target. Set the target and the helpers first. Every wait is a
+bounded poll with a 5-minute deadline, and any SQL error fails the check. `poll` checks the
+deadline before each attempt and fails a success that comes after it. An attempt gets
+`budget`, the time left up to 10 s, as its `curl` limit or client login timeout. `mssql` runs
+the image's own client inside the container with the container's `SA_PASSWORD`, and its `-b`
+turns any SQL error into a nonzero exit.
+
+```bash
+NAME=pi-dev-mssql FILE=compose.dev.yaml BASE=http://localhost   # pi-rel-*: FILE=compose.yaml
+db() { docker compose -p "$NAME" -f "$FILE" exec -T db "$@"; }
+dblog() { docker compose -p "$NAME" -f "$FILE" logs db; }
+# Helm instead: NS=easytrade-pi-<dialect> POD=easytrade-db-<dialect>-0 BASE=http://localhost:8080
+#   kubectl -n "$NS" port-forward svc/easytrade-reverse-proxy 8080:8080 & PF=$!
+#   db() { kubectl -n "$NS" exec "$POD" -- "$@"; }; dblog() { kubectl -n "$NS" logs "$POD"; }
+poll() { local end=$((SECONDS + 300)) budget
+  while ((budget = end - SECONDS, budget > 0)); do ((budget < 10)) || budget=10
+    "$@" && { ((SECONDS <= end)) && return 0; break; }; sleep 5
+  done; echo "FAIL: $*" >&2; return 1; }
+mssql() { db bash -c '/opt/mssql-tools/bin/sqlcmd -S localhost -U sa -P "$SA_PASSWORD" -d TradeManagement -b -l "$2" -W -s "|" -Q "$1"' _ "$1" "${budget:-10}"; }
+pgsql() { db env PGCONNECT_TIMEOUT="${budget:-10}" psql -v ON_ERROR_STOP=1 -U postgres -d TradeManagement -c "$1"; }
+```
+
+MSSQL targets run every check but the PostgreSQL schema; PostgreSQL targets skip the two
+MSSQL checks.
+
+**Readiness** through the reverse proxy:
+
+```bash
+ready() { [ "$(curl -s --max-time "${budget:-10}" -o /dev/null -w '%{http_code}' "$BASE$1")" = 200 ]; }
+poll ready /broker-service/readyz && poll ready /feature-flag-service/readyz && echo ready
+```
+
+**MSSQL initialisation.** `Setup done` is printed even after a failed script, so it only marks
+the end of the run. `setup_done` keeps the `db` log it read, and a failed read is a failed
+attempt. That log must hold no `Msg <n>, Level <11 or above>` line:
+
+```bash
+setup_done() { LOG=$(dblog) && grep 'Setup done' <<< "$LOG" > /dev/null; }
+poll setup_done && if grep -E 'Msg [0-9]+, Level (1[1-9]|2[0-9])' <<< "$LOG"; then echo FAIL; else echo "init ok"; fi
+```
+
+**MSSQL catalog** of `dbo.Alerts`, read from `sys.columns`, `sys.key_constraints`,
+`sys.foreign_keys`, `sys.check_constraints` and `sys.indexes`:
+
+```bash
+CATALOG=$(cat <<'SQL'
+SET NOCOUNT ON;
+DECLARE @t int = OBJECT_ID(N'dbo.Alerts');
+SELECT kind, name, detail FROM (
+  SELECT 1 AS g, column_id AS n, 'column' AS kind, name,
+    TYPE_NAME(user_type_id) + CASE TYPE_NAME(user_type_id)
+      WHEN 'varchar' THEN CONCAT('(', max_length, ') ', collation_name)
+      WHEN 'decimal' THEN CONCAT('(', precision, ',', scale, ')')
+      WHEN 'datetimeoffset' THEN CONCAT('(', scale, ')') ELSE '' END
+    + IIF(is_nullable = 1, ' NULL', ' NOT NULL') COLLATE DATABASE_DEFAULT AS detail
+  FROM sys.columns WHERE object_id = @t
+  UNION ALL SELECT 2, 0, 'key', k.name, CONCAT(k.type_desc, ' ', i.type_desc) COLLATE DATABASE_DEFAULT
+  FROM sys.key_constraints k JOIN sys.indexes i ON i.object_id = k.parent_object_id AND i.index_id = k.unique_index_id
+  WHERE k.parent_object_id = @t
+  UNION ALL SELECT 3, 0, 'foreign key', name,
+    CONCAT(OBJECT_NAME(referenced_object_id), ' ON DELETE ', delete_referential_action_desc) COLLATE DATABASE_DEFAULT
+  FROM sys.foreign_keys WHERE parent_object_id = @t
+  UNION ALL SELECT 4, 0, 'check', NULL, definition COLLATE DATABASE_DEFAULT
+  FROM sys.check_constraints WHERE parent_object_id = @t
+  UNION ALL SELECT 5, 0, 'index', i.name, CONCAT(i.type_desc, ' (',
+    STRING_AGG(COL_NAME(c.object_id, c.column_id), ', ') WITHIN GROUP (ORDER BY c.key_ordinal), ')') COLLATE DATABASE_DEFAULT
+  FROM sys.indexes i JOIN sys.index_columns c ON c.object_id = i.object_id AND c.index_id = i.index_id
+  WHERE i.object_id = @t AND i.is_primary_key = 0 GROUP BY i.name, i.type_desc
+) x ORDER BY g, n, name, detail;
+SQL
+)
+mssql "$CATALOG"
+```
+
+It must print exactly:
+
+```text
+kind|name|detail
+----|----|------
+column|Id|uniqueidentifier NOT NULL
+column|AccountId|uniqueidentifier NOT NULL
+column|Type|varchar(12) Latin1_General_BIN2 NOT NULL
+column|InstrumentId|uniqueidentifier NOT NULL
+column|Direction|varchar(5) Latin1_General_BIN2 NOT NULL
+column|Threshold|decimal(18,8) NOT NULL
+column|Enabled|bit NOT NULL
+column|ArmingRevision|int NOT NULL
+column|TriggeredAt|datetimeoffset(6) NULL
+column|TriggerValue|decimal(28,8) NULL
+column|Acknowledged|bit NOT NULL
+column|CreatedAt|datetimeoffset(6) NOT NULL
+key|PK_Alerts|PRIMARY_KEY_CONSTRAINT CLUSTERED
+foreign key|FK_Alerts_Accounts|Accounts ON DELETE CASCADE
+foreign key|FK_Alerts_Instruments|Instruments ON DELETE NO_ACTION
+check|NULL|(([Direction]='BELOW' OR [Direction]='ABOVE') AND datalength([Direction])=(5))
+check|NULL|([Type]='TARGET_PRICE' AND datalength([Type])=(12) OR [Type]='PROFIT_LOSS' AND datalength([Type])=(11))
+index|IX_Alerts_AccountId|NONCLUSTERED (AccountId, CreatedAt)
+```
+
+**PostgreSQL schema.** `poll pgsql '\d "Alerts"'` exits 0 and lists the same twelve columns
+with the types of `src/db/postgres/sql-scripts/13-alerts.sql`, `PK_Alerts` and
+`IX_Alerts_AccountId` on `("AccountId", "CreatedAt")`, `FK_Alerts_Accounts` with
+`ON DELETE CASCADE` and `FK_Alerts_Instruments`. It also lists six checks with generated
+names, where MSSQL has two: the `Type` and `Direction` values, `Threshold` and
+`TriggerValue` not `NaN`, and finite `CreatedAt` and `TriggeredAt`. The image runs its init
+scripts before it accepts external connections, but `psql` inside the container can connect
+while they run, hence the poll.
+
+**Seed intact.** `Instruments` holds 15 rows, and the first preset account owns all 15
+instruments, so the dialect's query prints 15 and 15. The two readiness endpoints do not show
+that db-adapter serves, so the preset account is read with a poll:
+
+```bash
+preset() { ACCOUNT=$(curl -fsS --max-time "${budget:-10}" "$BASE/user-service/api/accounts/presets?limit=1" | jq -re '.results[0].id'); }
+poll preset
+# MSSQL
+mssql "SELECT (SELECT COUNT(*) FROM Instruments) AS instruments, (SELECT COUNT(DISTINCT InstrumentId)
+  FROM Ownedinstruments WHERE AccountId = '$ACCOUNT' AND Quantity > 0) AS owned"
+# PostgreSQL
+pgsql "SELECT (SELECT count(*) FROM \"Instruments\") AS instruments, (SELECT count(DISTINCT \"InstrumentId\")
+  FROM \"Ownedinstruments\" WHERE \"AccountId\" = '$ACCOUNT' AND \"Quantity\" > 0) AS owned"
+```
+
+**Runtime path to the table.** Record the flag, which must read `true` or `false`, enable it,
+read the same account's alerts, then restore the recorded value, even when the read fails.
+The read must print `{"results":[]} 200`, which shows db-adapter reads the new table:
+
+```bash
+FLAG="$BASE/feature-flag-service/v1/flags/portfolio-insights-enabled"
+put_flag() { curl -fsS --max-time 10 -X PUT "$FLAG" -H 'accept: application/json' -d "{\"enabled\": $1}" > /dev/null; }
+PRIOR=$(curl -fsS --max-time 10 "$FLAG" | jq -r '.enabled | booleans')
+if [[ $PRIOR =~ ^(true|false)$ ]]; then
+  put_flag true && curl -sS --max-time 10 -w ' %{http_code}\n' "$BASE/broker-service/v1/alerts?accountId=$ACCOUNT"
+  put_flag "$PRIOR" || echo "FAIL: flag not restored to $PRIOR"
+else echo "FAIL: flag state unreadable, not changed"; fi
+```
+
+**Full suites**, on each Compose dev project before its teardown:
+
+- the db-adapter [real-database tests](src/db-adapter/README.md#real-database-tests), with the
+  `localhost` form of `DB_URL`, since the dev `db` publishes 1433 and 5432;
+- `bash scripts/portfolio-insights/e2e.sh --base-url http://localhost --compose-file compose.dev.yaml --project pi-dev-<dialect>`,
+  after `npm ci` in `src/loadgen` for its browser check. `perf.sh` and `loadgen-check.sh`
+  take the same options; run one script at a time.
+
+**Teardown**, before the next target:
+
+```bash
+# Compose
+VOL=$(docker inspect --format '{{range .Mounts}}{{.Name}}{{end}}' "$(docker compose -p "$NAME" -f "$FILE" ps -aq db)")
+docker compose -p "$NAME" -f "$FILE" down --volumes --remove-orphans
+if [ -n "$VOL" ] && docker volume inspect "$VOL" > /dev/null 2>&1; then docker volume rm "$VOL"; fi
+# Helm
+kill "$PF"; helm uninstall easytrade -n "$NS" && kubectl delete namespace "$NS"
+```
+
+On Compose, `down --volumes` removes the project's containers, its network and the volume
+created with its current `db` container. After a PostgreSQL `db` recreate, the current
+container mounts the earlier volume by name, which `down --volumes` leaves behind, so the
+teardown records the `db` volume first and removes it afterwards; MSSQL has none, and `VOL`
+stays empty. See
+[Getting the `Alerts` table into an existing database](#getting-the-alerts-table-into-an-existing-database).
+On Helm, deleting the namespace also deletes any PVC.
 
 ## EasyTrade on Dynatrace - how to configure
 
