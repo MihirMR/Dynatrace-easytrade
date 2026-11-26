@@ -27,6 +27,10 @@ npm test        # Vitest
 npm run format     # prettier
 ```
 
+`npm run lint` works on a clean `npm ci` with no extra setup.
+The `brace-expansion` 5.0.9 override in `package.json` breaks brace globs in ESLint's minimatch 3 (`TypeError: expand is not a function`), so `eslint.config.js` lists one glob per extension, covering the same files and rules as a single `**/*.{js,mjs,cjs,ts,jsx,tsx}` glob would.
+When running ESLint by hand, pass paths or one-extension globs such as `"src/**/*.tsx"`, never brace globs such as `{ts,tsx}`.
+
 The dev server only serves the frontend. For anything that talks to a backend run the full stack from the repo root:
 
 ```bash
@@ -77,9 +81,7 @@ make redeploy services=frontend   # rebuild and recreate it in the running stack
     re-armed alert that triggers again toasts again. The server's
     `acknowledged` flag is the state of record, shown in the notifications
     list; "Acknowledge" removes the item.
-  - Endpoints, the startup variable `ENABLE_PORTFOLIO_INSIGHTS`, the
-    database-recreate note and a demo walkthrough: see
-    [Portfolio insights (demo feature)](../../README.md#portfolio-insights-demo-feature).
+  - Endpoints, the startup variable `ENABLE_PORTFOLIO_INSIGHTS`, the database-recreate note and a demo walkthrough: see [Portfolio insights (demo feature)](../../README.md#portfolio-insights-demo-feature).
 
 ---
 

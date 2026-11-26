@@ -122,6 +122,10 @@ Run `make help` for every target.
 
 In `src/loadgen`, `npm ci && npm test` runs the `node:test` unit suites: `tsc` builds into `build/`, then `node --test "build/**/*.test.js"` runs every compiled test file.
 
+The full local check is `npm ci && npm test && npm run lint`; `npm run lint` lints `src/` with `eslint.config.mjs` and works on a clean `npm ci` with no extra setup.
+The `brace-expansion` 5.0.9 override in `package.json` breaks brace globs in ESLint's minimatch 3 (`TypeError: expand is not a function`), so `eslint.config.mjs` lists one glob per extension, covering the same files and rules as a single `**/*.{js,mjs,cjs,ts}` glob would.
+When running ESLint by hand, pass paths or one-extension globs such as `"src/**/*.ts"`, never brace globs such as `{js,ts}`.
+
 [`verification/portfolio-insights-page-check.mjs`](verification/portfolio-insights-page-check.mjs) is the browser check of the Portfolio Insights page; [`scripts/portfolio-insights/e2e.sh`](../../scripts/portfolio-insights/e2e.sh) runs it. It sits outside `src/`, so neither the build nor the image includes it.
 
 ## Health endpoints
