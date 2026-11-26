@@ -3,6 +3,8 @@
 # against a disposable SQL Server container built from src/db/mssql:
 #   - a counted table exits 0 with its count row and the full report;
 #   - an incomplete count batch exits 1 with a diagnostic after the full report;
+#   - an existing table whose count produced no row exits 1 with the diagnostic and
+#     without the missing notice, after the full report;
 #   - a missing table exits 1 with its notice after the full report;
 #   - a client failure stops the report and returns the client's exit status.
 # The checkout's src/db/mssql/debug scripts are copied into the container, so the
@@ -321,7 +323,38 @@ expect_line "$check_db_out" "=== Accounts ==="
 expect_line "$check_db_out" "=== Latest Price Per Instrument ==="
 conclude "$check"
 
-# c. A missing table: exit 1 with the missing notice, the other counts and the full report.
+# c. An existing table whose count produced no row: a row-level security filter predicate that
+# divides by zero for every row fails the dynamic Alerts count with Msg 8134, while the rest of
+# the batch still runs. A clustered-index disable cannot stand in for it, because its Msg 8655
+# aborts the whole batch. Exit 1 with the diagnostic, no missing notice, the other counts and
+# the full report.
+check="checkDb_alertsExistUncounted_exitsOneWithoutMissingNotice"
+count_rows_or_abort "$check" Instruments
+instruments_direct="$sql_out"
+# The predicate runs only for a stored row, so one fixture row makes the count fail.
+sql_or_abort "$check" "SET NOCOUNT ON; INSERT INTO [dbo].[Alerts] ([AccountId], [Type], [InstrumentId], [Direction], [Threshold], [CreatedAt]) OUTPUT INSERTED.[Id] SELECT (SELECT TOP 1 [Id] FROM [dbo].[Accounts] ORDER BY [Id]), 'TARGET_PRICE', (SELECT TOP 1 [Id] FROM [dbo].[Instruments] ORDER BY [Id]), 'ABOVE', 1, SYSDATETIMEOFFSET();"
+if [[ ! "$sql_out" =~ ^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$ ]]; then
+    abort "$check" "fixture insert returned '${sql_out}' instead of one alert id"
+fi
+uncounted_alert_id="$sql_out"
+sql_or_abort "$check" "CREATE FUNCTION [dbo].[Alerts_checkdb_failing_filter] (@Threshold DECIMAL (18, 8)) RETURNS TABLE WITH SCHEMABINDING AS RETURN SELECT 1 AS [Visible] WHERE 1 / (@Threshold - @Threshold) = 1;"
+sql_or_abort "$check" "CREATE SECURITY POLICY [dbo].[Alerts_checkdb_failing_policy] ADD FILTER PREDICATE [dbo].[Alerts_checkdb_failing_filter]([Threshold]) ON [dbo].[Alerts] WITH (STATE = ON);"
+run_check_db alerts-uncounted
+# The filter predicate also applies to DELETE, so the policy goes before the fixture row.
+sql_or_abort "$check" "DROP SECURITY POLICY [dbo].[Alerts_checkdb_failing_policy]; DROP FUNCTION [dbo].[Alerts_checkdb_failing_filter];"
+sql_or_abort "$check" "DELETE FROM [dbo].[Alerts] WHERE [Id] = '${uncounted_alert_id}';"
+expect_status 1
+if grep -q '^Alerts|' "$check_db_out"; then
+    reasons+=("$(basename "$check_db_out") has an Alerts count row")
+fi
+expect_no_line "$check_db_out" "$MISSING_NOTICE"
+expect_text "$check_db_err" "$UNCOUNTED_DIAGNOSTIC"
+expect_line "$check_db_out" "Instruments|${instruments_direct}"
+expect_line "$check_db_out" "=== Accounts ==="
+expect_line "$check_db_out" "=== Latest Price Per Instrument ==="
+conclude "$check"
+
+# d. A missing table: exit 1 with the missing notice, the other counts and the full report.
 check="checkDb_alertsMissing_exitsOneAfterFullReport"
 count_rows_or_abort "$check" Instruments
 instruments_direct="$sql_out"
@@ -335,7 +368,7 @@ expect_line "$check_db_out" "=== Latest Price Per Instrument ==="
 expect_no_text "$check_db_err" "$UNCOUNTED_DIAGNOSTIC"
 conclude "$check"
 
-# d. A client failure: a wrong password makes the count's sqlcmd fail; check-db.sh exits with
+# e. A client failure: a wrong password makes the count's sqlcmd fail; check-db.sh exits with
 # the client's own status and stops at the row counts.
 check="checkDb_clientLoginFails_propagatesClientExitStatus"
 client_status=0

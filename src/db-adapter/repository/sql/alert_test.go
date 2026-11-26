@@ -30,6 +30,7 @@ import (
 	// no dependency
 	mssql "github.com/microsoft/go-mssqldb"
 	log "github.com/sirupsen/logrus"
+	logtest "github.com/sirupsen/logrus/hooks/test"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
@@ -363,15 +364,6 @@ func mustUpdateEnabled(t *testing.T, repo repository.AlertRepository, id string,
 	return snapshot
 }
 
-// awaitAdapterClockAfter returns once the adapter clock reads later than ts. Two sequential calls can
-// land in one wall-clock tick (about 0.3 ms on Windows), which ties their timestamps and leaves the
-// order to the Id tie-break; this waits on that clock condition, never for a fixed time.
-func awaitAdapterClockAfter(ts time.Time) {
-	for !alertNow().After(ts) {
-		runtime.Gosched()
-	}
-}
-
 // listOwnAlertIDs lists with req and keeps only the given ids, in the order returned, because other
 // rows (a running stack's, another test run's) may share the table
 func listOwnAlertIDs(t *testing.T, repo repository.AlertRepository, req *pb.ListAlertsRequest, own ...string) []string {
@@ -655,27 +647,49 @@ func TestAlertRepository_readInNonUTCZone_timestampsUTC(t *testing.T) {
 }
 
 func TestAlertRepository_list_newestFirst(t *testing.T) {
-	repo := alertTestBackend(t).Alert()
+	b := alertTestBackend(t)
+	repo := b.Alert()
 
-	older := createArmedTestAlert(t, repo)
-	awaitAdapterClockAfter(older.CreatedAt.AsTime())
-	newer := createArmedTestAlert(t, repo)
+	// The fixture sets each CreatedAt, one second apart in the past, so the order owes nothing to the
+	// adapter clock. The rows go in newer first in one case and older first in the other, so a list
+	// in insertion order, or in its reverse, fails one of them
+	orders := []struct {
+		name             string
+		insertNewerFirst bool
+	}{
+		{"olderInsertedFirst", false},
+		{"newerInsertedFirst", true},
+	}
+	for _, tc := range orders {
+		t.Run(tc.name, func(t *testing.T) {
+			newerCreatedAt := alertNow().Add(-time.Second)
+			olderCreatedAt := newerCreatedAt.Add(-time.Second)
+			var older, newer *pb.AlertMessage
+			if tc.insertNewerFirst {
+				newer = insertArmedTestAlertCreatedAt(t, b, newerCreatedAt)
+				older = insertArmedTestAlertCreatedAt(t, b, olderCreatedAt)
+			} else {
+				older = insertArmedTestAlertCreatedAt(t, b, olderCreatedAt)
+				newer = insertArmedTestAlertCreatedAt(t, b, newerCreatedAt)
+			}
 
-	alerts, err := repo.List(context.Background(), &pb.ListAlertsRequest{AccountId: testOwnerAccountID})
-	if err != nil {
-		t.Fatalf("List: %v", err)
-	}
-	var own []*pb.AlertMessage
-	for _, alert := range alerts {
-		if alert.Id == older.Id || alert.Id == newer.Id {
-			own = append(own, alert)
-		}
-	}
-	if len(own) != 2 || own[0].Id != newer.Id || own[1].Id != older.Id {
-		t.Fatalf("List returned own alerts %v, want [%s %s]", own, newer.Id, older.Id)
-	}
-	if !own[0].CreatedAt.AsTime().After(own[1].CreatedAt.AsTime()) {
-		t.Errorf("newest CreatedAt %v is not after %v", own[0].CreatedAt.AsTime(), own[1].CreatedAt.AsTime())
+			alerts, err := repo.List(context.Background(), &pb.ListAlertsRequest{AccountId: testOwnerAccountID})
+			if err != nil {
+				t.Fatalf("List: %v", err)
+			}
+			var own []*pb.AlertMessage
+			for _, alert := range alerts {
+				if alert.Id == older.Id || alert.Id == newer.Id {
+					own = append(own, alert)
+				}
+			}
+			if len(own) != 2 || own[0].Id != newer.Id || own[1].Id != older.Id {
+				t.Fatalf("List returned own alerts %v, want [%s %s]", own, newer.Id, older.Id)
+			}
+			if !own[0].CreatedAt.AsTime().After(own[1].CreatedAt.AsTime()) {
+				t.Errorf("newest CreatedAt %v is not after %v", own[0].CreatedAt.AsTime(), own[1].CreatedAt.AsTime())
+			}
+		})
 	}
 }
 
@@ -727,24 +741,47 @@ func insertArmedTestAlertCreatedAt(t *testing.T, b *sqlBackend, createdAt time.T
 	return alert
 }
 
+// insertTriggeredTestAlert inserts, as insertArmedTestAlertCreatedAt does, a TARGET_PRICE ABOVE alert
+// at the threshold domain maximum on the owner account, but one triggered at revision 1 with
+// triggerValue and not acknowledged, with a CreatedAt and a TriggeredAt no repository call can set.
+// It returns the row as read back; insertRawAlertValues deletes it by id when the test ends
+func insertTriggeredTestAlert(t *testing.T, b *sqlBackend, createdAt, triggeredAt time.Time, triggerValue string) *pb.AlertMessage {
+	t.Helper()
+	id := uuid.New().String()
+	if err := insertRawAlertValues(t, b, id, map[string]any{
+		repository.ColThreshold:    thresholdDomainMax,
+		repository.ColTriggerValue: triggerValue,
+		repository.ColCreatedAt:    createdAt,
+		repository.ColTriggeredAt:  triggeredAt,
+	}); err != nil {
+		t.Fatalf("insert alert %s created at %v, triggered at %v: %v", id, createdAt, triggeredAt, err)
+	}
+	alert := getTestAlert(t, b.Alert(), id)
+	if !alert.CreatedAt.AsTime().Equal(createdAt) || alert.TriggeredAt == nil ||
+		!alert.TriggeredAt.AsTime().Equal(triggeredAt) || alert.TriggerValue != triggerValue {
+		t.Fatalf("alert %s read back as CreatedAt %v TriggeredAt %v TriggerValue %q, want %v %v %q",
+			id, alert.CreatedAt.AsTime(), alert.TriggeredAt, alert.TriggerValue, createdAt, triggeredAt, triggerValue)
+	}
+	return alert
+}
+
 func TestAlertRepository_listFilters_apply(t *testing.T) {
 	b := alertTestBackend(t)
 	repo := b.Alert()
 	ctx := context.Background()
 
 	armed := createArmedTestAlert(t, repo)
-	// triggered and acknowledged are created one second apart, acknowledged the later, both before
-	// either trigger, and are then triggered in the opposite order, acknowledged first. Their
-	// CreatedAt DESC order is therefore acknowledged, triggered and their TriggeredAt DESC order
-	// triggered, acknowledged, with no tie in either for the Id tie-break to decide
-	triggeredCreatedAt := alertNow().Add(-2 * time.Second)
-	triggered := insertArmedTestAlertCreatedAt(t, b, triggeredCreatedAt)
-	acknowledged := insertArmedTestAlertCreatedAt(t, b, triggeredCreatedAt.Add(time.Second))
+	// The fixture sets both timestamps of triggered and acknowledged, in the past, so neither order
+	// owes anything to the adapter clock. acknowledged is created one second after triggered, and
+	// both are created before either trigger, which runs in the opposite order, acknowledged one
+	// second before triggered. Their CreatedAt DESC order is therefore acknowledged, triggered and
+	// their TriggeredAt DESC order triggered, acknowledged, with no tie in either for the Id
+	// tie-break to decide
+	triggeredCreatedAt := alertNow().Add(-4 * time.Second)
+	triggered := insertTriggeredTestAlert(t, b, triggeredCreatedAt, triggeredCreatedAt.Add(3*time.Second), "6")
+	acknowledged := insertTriggeredTestAlert(t, b, triggeredCreatedAt.Add(time.Second), triggeredCreatedAt.Add(2*time.Second), "5")
 	disabled := createArmedTestAlert(t, repo)
 	otherAccountArmed := createOtherAccountArmedTestAlert(t, b)
-	mustTrigger(t, repo, acknowledged.Id, 1, "5")
-	awaitAdapterClockAfter(getTestAlert(t, repo, acknowledged.Id).TriggeredAt.AsTime())
-	mustTrigger(t, repo, triggered.Id, 1, "6")
 	if n, err := repo.Acknowledge(ctx, acknowledged.Id); err != nil || n != 1 {
 		t.Fatalf("Acknowledge(%s) = (%d, %v), want (1, nil)", acknowledged.Id, n, err)
 	}
@@ -1086,8 +1123,8 @@ func insertRawAlertValues(t *testing.T, b *sqlBackend, id string, values map[str
 }
 
 // PostgreSQL's numeric admits NaN and its timestamptz admits infinity and -infinity, which SQL
-// Server's DECIMAL and datetimeoffset refuse. A direct write of one must fail on both dialects, so
-// neither stores a value outside the one domain the adapter and the broker read
+// Server's DECIMAL and datetimeoffset refuse. A direct write of NaN or of either infinity must fail
+// on both dialects
 func TestAlertRepository_nonFiniteValue_rejectedByDatabase(t *testing.T) {
 	b := alertTestBackend(t)
 	// ISO 8601 with microseconds, which timestamptz and datetimeoffset(6) both parse from text
@@ -1316,6 +1353,47 @@ func TestAlertRepository_serverCreateUnknownReference_notFound(t *testing.T) {
 			}
 			if stored := storedWithReferences(t, repo, ref.req); len(stored) != 0 {
 				t.Errorf("CreateAlert(%s) stored %v, want no row", ref.name, stored)
+			}
+		})
+	}
+}
+
+// The AlertServer handler over the real repository: a create whose account or instrument names no
+// row logs one warning in all, the repository's statement warning, and the handler adds none
+func TestAlertRepository_serverCreateUnknownReference_oneWarning(t *testing.T) {
+	b := alertTestBackend(t)
+	for _, ref := range unknownAlertReferences {
+		t.Run(ref.name, func(t *testing.T) {
+			// GORM's own logger at the Warn level of the logger.Default the backend's gorm.Config
+			// leaves in place, writing to a buffer instead of stdout
+			var statementLog bytes.Buffer
+			session := b.gormDB.Session(&gorm.Session{Logger: logger.New(stdlog.New(&statementLog, "", 0), logger.Config{LogLevel: logger.Warn})})
+			srv := server.NewAlertServer(NewAlertRepository(session))
+			std := log.StandardLogger()
+			hook := new(logtest.Hook)
+			previous := std.ReplaceHooks(log.LevelHooks{})
+			std.AddHook(hook)
+			t.Cleanup(func() { std.ReplaceHooks(previous) })
+
+			created, err := srv.CreateAlert(context.Background(), ref.req)
+
+			if created != nil {
+				deleteAlertAtCleanup(t, b.Alert(), created.Id)
+			}
+			if status.Code(err) != codes.NotFound {
+				t.Fatalf("CreateAlert(%s) = %v, want NotFound", ref.name, status.Code(err))
+			}
+			// logrus numbers its levels from Panic (0) upwards, so Warn and every more severe level
+			// are the ones at or below WarnLevel
+			handlerWarnings := 0
+			for _, entry := range hook.AllEntries() {
+				if entry.Level <= log.WarnLevel {
+					handlerWarnings++
+				}
+			}
+			got := statementLog.String()
+			if strings.Count(got, "[warn] ") != 1 || !strings.Contains(got, "[warn] account or instrument not found") || handlerWarnings != 0 {
+				t.Errorf("CreateAlert(%s) logged GORM output %q and %d handler entries at Warn or above, want the one %q statement warning and no handler entry", ref.name, got, handlerWarnings, "account or instrument not found")
 			}
 		})
 	}

@@ -1,6 +1,6 @@
 -- Portfolio Insights alerts; guarded for reruns and manual applies. Kept in sync with src/db/mssql/sql-scripts/sql-alerts.sql.
 -- PostgreSQL drops spaces beyond the declared width of "Type"/"Direction"; the CHECKs then validate the remaining value, so only exact values are stored.
--- PostgreSQL numeric admits NaN and timestamptz admits infinity and -infinity, which the SQL Server types reject; the CHECKs on "Threshold", "TriggerValue", "CreatedAt" and "TriggeredAt" refuse them, so both dialects store one value domain.
+-- PostgreSQL numeric admits NaN and timestamptz admits infinity and -infinity, which the SQL Server types reject; the CHECKs on "Threshold", "TriggerValue", "CreatedAt" and "TriggeredAt" refuse those non-finite values.
 CREATE TABLE IF NOT EXISTS "Alerts" (
     "Id" uuid NOT NULL DEFAULT gen_random_uuid(),
     "AccountId" uuid NOT NULL,

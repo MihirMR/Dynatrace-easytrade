@@ -10,8 +10,9 @@ source "$(dirname "$0")/_sqlcmd.sh"
 
 echo "=== Row Counts ==="
 # sqlcmd exits 0 on SQL errors here, so the count batch's output decides the exit status.
-# Alerts is reported by its missing-table notice or by its own count row. Output with
-# neither means the batch did not complete, such as after a SQL error or a deadlock.
+# Alerts is reported by its missing-table notice, printed only when the table does not
+# exist, or by its own count row. Output with neither means the table exists but its count
+# produced no row, or the batch did not complete, such as after a SQL error or a deadlock.
 # scripts/portfolio-insights/check-db-test.sh tests these branches against a
 # disposable MSSQL container.
 alerts_missing_notice="Table [dbo].[Alerts] is missing; sql-alerts.sql must be applied."
@@ -19,8 +20,11 @@ row_counts_status=0
 row_counts="$(sqlcmd "
 SET NOCOUNT ON;
 -- Alerts is counted through dynamic SQL, so a missing table leaves the other counts intact.
+-- Its existence is read once, so a count that fails while the batch goes on is not
+-- reported as a missing table.
+DECLARE @AlertsExists BIT = CASE WHEN OBJECT_ID(N'dbo.Alerts', N'U') IS NULL THEN 0 ELSE 1 END;
 DECLARE @Alerts TABLE ([Table] VARCHAR(6), [Rows] INT);
-IF OBJECT_ID(N'dbo.Alerts', N'U') IS NOT NULL
+IF @AlertsExists = 1
     INSERT INTO @Alerts EXEC (N'SELECT ''Alerts'', COUNT(*) FROM [dbo].[Alerts]');
 SET NOCOUNT OFF;
 SELECT 'Accounts'          AS [Table], COUNT(*) AS [Rows] FROM [dbo].[Accounts]
@@ -49,7 +53,7 @@ SELECT 'CreditCards',                   COUNT(*)           FROM [dbo].[CreditCar
 UNION ALL
 SELECT [Table],                         [Rows]             FROM @Alerts
 ORDER BY [Table];
-IF NOT EXISTS (SELECT 1 FROM @Alerts) PRINT '${alerts_missing_notice}';
+IF @AlertsExists = 0 PRINT '${alerts_missing_notice}';
 ")" || row_counts_status=$?
 if [[ -n "$row_counts" ]]; then
     printf '%s\n' "$row_counts"
@@ -64,7 +68,7 @@ if grep -qxF "$alerts_missing_notice" <<< "$row_counts"; then
     alerts_missing=true
 elif ! grep -qE '^Alerts\|[0-9]+$' <<< "$row_counts"; then
     alerts_uncounted=true
-    echo "The [dbo].[Alerts] row count could not be produced; the count batch did not complete." >&2
+    echo "The [dbo].[Alerts] row count could not be produced; its count failed or the count batch did not complete." >&2
 fi
 
 echo ""

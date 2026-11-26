@@ -305,7 +305,8 @@ func safeAlertError(err error) error {
 // classification. The statement text, duration and row count are logged as before; GORM reports
 // Trace below as the caller, so the statement text identifies the call. An unknown account or
 // instrument is the caller's mistake, not a storage failure, so its statement is logged as a warning
-// in GORM's trace layout instead of as an error
+// in GORM's trace layout instead of as an error. That warning is the only log line for an unknown
+// reference: the AlertServer handler maps the error to NotFound without logging it
 type alertLogger struct{ logger.Interface }
 
 var (

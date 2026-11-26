@@ -1,6 +1,7 @@
 package server
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
@@ -14,6 +15,7 @@ import (
 
 	pb "github.com/dynatrace/easytrade/dbadapter/proto"
 	"github.com/dynatrace/easytrade/dbadapter/repository"
+	"github.com/google/uuid"
 	log "github.com/sirupsen/logrus"
 	logtest "github.com/sirupsen/logrus/hooks/test"
 	"google.golang.org/grpc"
@@ -93,21 +95,37 @@ func (r *fakeAlertRepository) find(id string) *pb.AlertMessage {
 	return nil
 }
 
-// Create holds an armed alert: enabled, arming revision 1, not acknowledged, no trigger
+// Create holds an armed alert: enabled, arming revision 1, not acknowledged, no trigger. It records
+// the account id as sent; like the SQL repository, which binds the parsed UUIDs and replies with
+// their canonical text, it holds and returns the canonical account and instrument ids
 func (r *fakeAlertRepository) Create(_ context.Context, req *pb.CreateAlertRequest) (*pb.AlertMessage, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if err := r.record("Create", req.AccountId); err != nil {
 		return nil, err
 	}
+	accountID, err := uuid.Parse(req.AccountId)
+	if err != nil {
+		return nil, fmt.Errorf("fake Create: account_id: %w", err)
+	}
+	instrumentID, err := uuid.Parse(req.InstrumentId)
+	if err != nil {
+		return nil, fmt.Errorf("fake Create: instrument_id: %w", err)
+	}
+	// The SQL repository replies with the threshold normalised as a read of the column gives it, so
+	// the accepted "-0" is held and returned as "0"; every other accepted threshold is already canonical
+	threshold := req.Threshold
+	if threshold == "-0" {
+		threshold = "0"
+	}
 	r.created++
 	a := &pb.AlertMessage{
 		Id:             fakeAlertID(r.created),
-		AccountId:      req.AccountId,
+		AccountId:      accountID.String(),
 		Type:           req.Type,
-		InstrumentId:   req.InstrumentId,
+		InstrumentId:   instrumentID.String(),
 		Direction:      req.Direction,
-		Threshold:      req.Threshold,
+		Threshold:      threshold,
 		Enabled:        true,
 		ArmingRevision: 1,
 		CreatedAt:      timestamppb.New(fakeTime),
@@ -117,7 +135,10 @@ func (r *fakeAlertRepository) Create(_ context.Context, req *pb.CreateAlertReque
 }
 
 // List returns every account's alerts for an empty account id, combines the three filters with AND,
-// and returns the alert held last first
+// and orders as the SQL repository does: newest CreatedAt first, then the higher Id, or newest
+// TriggeredAt first with TriggeredOnly. Ids compare as their canonical text, which both dialects
+// agree with for ids that differ only in the last hex digit. Alerts the contract leaves unordered,
+// notifications triggered at one instant, keep the order the fake holds them in
 func (r *fakeAlertRepository) List(_ context.Context, req *pb.ListAlertsRequest) ([]*pb.AlertMessage, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -125,7 +146,7 @@ func (r *fakeAlertRepository) List(_ context.Context, req *pb.ListAlertsRequest)
 		return nil, err
 	}
 	var alerts []*pb.AlertMessage
-	for _, a := range slices.Backward(r.alerts) {
+	for _, a := range r.alerts {
 		if (req.AccountId != "" && a.AccountId != req.AccountId) ||
 			(req.ArmedOnly && (!a.Enabled || a.TriggeredAt != nil)) ||
 			(req.TriggeredOnly && a.TriggeredAt == nil) ||
@@ -134,6 +155,12 @@ func (r *fakeAlertRepository) List(_ context.Context, req *pb.ListAlertsRequest)
 		}
 		alerts = append(alerts, proto.CloneOf(a))
 	}
+	slices.SortStableFunc(alerts, func(a, b *pb.AlertMessage) int {
+		if req.TriggeredOnly {
+			return b.TriggeredAt.AsTime().Compare(a.TriggeredAt.AsTime())
+		}
+		return cmp.Or(b.CreatedAt.AsTime().Compare(a.CreatedAt.AsTime()), strings.Compare(b.Id, a.Id))
+	})
 	return alerts, nil
 }
 
@@ -286,15 +313,20 @@ func createRequest(set func(*pb.CreateAlertRequest)) *pb.CreateAlertRequest {
 	return req
 }
 
-// createdAlert is the alert a fake holds after its first Create, of req
+// createdAlert is the alert a fake holds after its first Create, of req with canonical UUIDs
 func createdAlert(req *pb.CreateAlertRequest) *pb.AlertMessage {
+	// The canonical text of the accepted "-0" is "0"; every other accepted threshold is its own
+	threshold := req.Threshold
+	if threshold == "-0" {
+		threshold = "0"
+	}
 	return &pb.AlertMessage{
 		Id:             fakeAlertID(1),
 		AccountId:      req.AccountId,
 		Type:           req.Type,
 		InstrumentId:   req.InstrumentId,
 		Direction:      req.Direction,
-		Threshold:      req.Threshold,
+		Threshold:      threshold,
 		Enabled:        true,
 		ArmingRevision: 1,
 		CreatedAt:      timestamppb.New(fakeTime),
@@ -458,8 +490,34 @@ func TestAlertRPCs_validInput_delegated(t *testing.T) {
 			want:     createdAlert(req),
 		}
 	}
+	// listCase lists with req from a fake seeded with seed in its order
+	listCase := func(label string, req *pb.ListAlertsRequest, seed []*pb.AlertMessage, want ...*pb.AlertMessage) delegatedCase {
+		return delegatedCase{
+			name:     "ListAlerts/" + label,
+			seed:     seed,
+			call:     func(ctx context.Context, s *AlertServer) (proto.Message, error) { return s.ListAlerts(ctx, req) },
+			wantCall: alertCall{"List", req.AccountId},
+			want:     &pb.AlertsResponse{Alerts: want},
+		}
+	}
 	otherAccountAlert := alertWith(func(a *pb.AlertMessage) { a.Id = testOtherAlertID; a.AccountId = testOtherAccountID })
-	triggeredOtherAlert := alertWith(func(a *pb.AlertMessage) { a.Id = testOtherAlertID; markTriggered(a) })
+	// hoursLater is fakeTime plus n hours
+	hoursLater := func(n int) *timestamppb.Timestamp { return timestamppb.New(fakeTime.Add(time.Duration(n) * time.Hour)) }
+	// Ids differing only in the last hex digit order alike on PostgreSQL and SQL Server
+	lowerID, higherID := "8b5e2f9c-4d1a-4e7b-9c3d-2a6f7e8d9c10", "8b5e2f9c-4d1a-4e7b-9c3d-2a6f7e8d9c1f"
+	lowerIDAlert := alertWith(func(a *pb.AlertMessage) { a.Id = lowerID })
+	higherIDAlert := alertWith(func(a *pb.AlertMessage) { a.Id = higherID })
+	// The newer alert has the lower id, so id order alone is the wrong answer
+	newerAlert := alertWith(func(a *pb.AlertMessage) { a.Id = lowerID; a.CreatedAt = hoursLater(1) })
+	// Two notifications triggered in the reverse of their creation and id orders
+	laterTriggered := alertWith(func(a *pb.AlertMessage) { a.Id = lowerID; markTriggered(a); a.TriggeredAt = hoursLater(3) })
+	earlierTriggered := alertWith(func(a *pb.AlertMessage) {
+		a.Id = higherID
+		a.CreatedAt = hoursLater(1)
+		markTriggered(a)
+		a.TriggeredAt = hoursLater(2)
+	})
+	notificationsRequest := &pb.ListAlertsRequest{AccountId: testAccountID, TriggeredOnly: true, UnacknowledgedOnly: true}
 	largestTriggerValue := strings.Repeat("9", 20) + ".99999999"
 	cases := []delegatedCase{
 		createCase("targetPrice", func(*pb.CreateAlertRequest) {}),
@@ -471,6 +529,10 @@ func TestAlertRPCs_validInput_delegated(t *testing.T) {
 		createCase("negativeProfitLoss", func(r *pb.CreateAlertRequest) {
 			r.Type = repository.AlertTypeProfitLoss
 			r.Threshold = "-9999999999.99999999"
+		}),
+		createCase("negativeZeroProfitLoss", func(r *pb.CreateAlertRequest) {
+			r.Type = repository.AlertTypeProfitLoss
+			r.Threshold = "-0"
 		}),
 		{
 			name: "ListAlerts/account",
@@ -491,15 +553,20 @@ func TestAlertRPCs_validInput_delegated(t *testing.T) {
 			wantCall: alertCall{"List", ""},
 			want:     &pb.AlertsResponse{Alerts: []*pb.AlertMessage{otherAccountAlert, armedAlert()}},
 		},
-		{
-			name: "ListAlerts/unacknowledgedNotifications",
-			seed: []*pb.AlertMessage{armedAlert(), triggeredOtherAlert},
-			call: func(ctx context.Context, s *AlertServer) (proto.Message, error) {
-				return s.ListAlerts(ctx, &pb.ListAlertsRequest{AccountId: testAccountID, TriggeredOnly: true, UnacknowledgedOnly: true})
-			},
-			wantCall: alertCall{"List", testAccountID},
-			want:     &pb.AlertsResponse{Alerts: []*pb.AlertMessage{triggeredOtherAlert}},
-		},
+		// Each ordering case is seeded both ways round, so no insertion order passes in place of the
+		// contract's: notifications newest trigger first, other lists newest CreatedAt then higher id first
+		listCase("unacknowledgedNotifications/laterTriggerSeededFirst", notificationsRequest,
+			[]*pb.AlertMessage{armedAlert(), laterTriggered, earlierTriggered}, laterTriggered, earlierTriggered),
+		listCase("unacknowledgedNotifications/earlierTriggerSeededFirst", notificationsRequest,
+			[]*pb.AlertMessage{earlierTriggered, laterTriggered, armedAlert()}, laterTriggered, earlierTriggered),
+		listCase("sameCreatedAt/lowerIDSeededFirst", &pb.ListAlertsRequest{AccountId: testAccountID},
+			[]*pb.AlertMessage{lowerIDAlert, higherIDAlert}, higherIDAlert, lowerIDAlert),
+		listCase("sameCreatedAt/higherIDSeededFirst", &pb.ListAlertsRequest{AccountId: testAccountID},
+			[]*pb.AlertMessage{higherIDAlert, lowerIDAlert}, higherIDAlert, lowerIDAlert),
+		listCase("distinctCreatedAt/olderSeededFirst", &pb.ListAlertsRequest{AccountId: testAccountID},
+			[]*pb.AlertMessage{higherIDAlert, newerAlert}, newerAlert, higherIDAlert),
+		listCase("distinctCreatedAt/newerSeededFirst", &pb.ListAlertsRequest{AccountId: testAccountID},
+			[]*pb.AlertMessage{newerAlert, higherIDAlert}, newerAlert, higherIDAlert),
 		{
 			name: "GetAlert",
 			seed: []*pb.AlertMessage{armedAlert()},
@@ -683,17 +750,35 @@ func TestAlertRPCs_alternateUUIDSpelling_canonicalDelegated(t *testing.T) {
 	}
 }
 
-// CreateAlert passes its request on as sent: the repository binds the parsed UUIDs
-func TestCreateAlert_alternateUUIDSpelling_accepted(t *testing.T) {
+// CreateAlert passes its request on as sent, so the repository records the account id as spelled. The
+// repository binds the parsed UUIDs: the alert it replies with carries their canonical text, and a
+// list by the canonical account id finds it
+func TestCreateAlert_alternateUUIDSpelling_canonicalAlertCreated(t *testing.T) {
+	fields := []struct {
+		name string
+		set  func(r *pb.CreateAlertRequest, id string)
+	}{
+		{createAccountField.name, func(r *pb.CreateAlertRequest, id string) { r.AccountId = id }},
+		{createInstrumentField.name, func(r *pb.CreateAlertRequest, id string) { r.InstrumentId = id }},
+	}
 	for _, spelling := range alternateSpellings {
-		for _, field := range createUUIDFields {
+		for _, field := range fields {
 			t.Run(spelling.name+"/"+field.name, func(t *testing.T) {
+				sent := createRequest(func(r *pb.CreateAlertRequest) { field.set(r, spelling.value) })
+				// Every alternate spelling is one of testAlertID
+				want := createdAlert(createRequest(func(r *pb.CreateAlertRequest) { field.set(r, testAlertID) }))
 				repo := newFakeAlertRepository()
+				srv := NewAlertServer(repo)
 
-				err := field.call(t.Context(), NewAlertServer(repo), spelling.value)
+				created, createErr := srv.CreateAlert(t.Context(), sent)
+				listed, listErr := srv.ListAlerts(t.Context(), &pb.ListAlertsRequest{AccountId: want.AccountId})
 
-				if got := repo.recorded(); err != nil || len(got) != 1 || got[0].method != "Create" {
-					t.Errorf("%s(%q) = %v with repository calls %v, want one Create", field.name, spelling.value, err, got)
+				wantListed := &pb.AlertsResponse{Alerts: []*pb.AlertMessage{want}}
+				wantCalls := []alertCall{{"Create", sent.AccountId}, {"List", want.AccountId}}
+				if calls := repo.recorded(); createErr != nil || listErr != nil || !proto.Equal(created, want) ||
+					!proto.Equal(listed, wantListed) || !slices.Equal(calls, wantCalls) {
+					t.Errorf("%s(%q) = %v, %v and ListAlerts(%s) = %v, %v with repository calls %v, want %v, nil and %v, nil with %v",
+						field.name, spelling.value, created, createErr, want.AccountId, listed, listErr, calls, want, wantListed, wantCalls)
 				}
 			})
 		}
@@ -825,8 +910,9 @@ func TestAlertStatus_repositoryError_mappedStatus(t *testing.T) {
 	}
 }
 
-// A storage failure is logged once as an error and an unknown account or instrument once as a
-// warning, each with the error the repository returned; no other outcome is logged
+// A storage failure is logged once as an error, with the error the repository returned. Every other
+// outcome, an unknown account or instrument included, is not logged by the handler: the repository's
+// statement log is the one warning for an unknown reference
 func TestAlertStatus_repositoryError_loggedOnceAtLevel(t *testing.T) {
 	type logEntry struct {
 		level log.Level
@@ -841,7 +927,7 @@ func TestAlertStatus_repositoryError_loggedOnceAtLevel(t *testing.T) {
 		want []logEntry
 	}{
 		{"storageFailure", storageErr, []logEntry{{log.ErrorLevel, "Alert storage call failed", storageErr}}},
-		{"referenceNotFound", referenceErr, []logEntry{{log.WarnLevel, "Alert references an unknown account or instrument", referenceErr}}},
+		{"referenceNotFound", referenceErr, nil},
 		{"notFound", repository.ErrNotFound, nil},
 		{"canceled", context.Canceled, nil},
 		{"statusKept", status.Error(codes.NotFound, "not found"), nil},
