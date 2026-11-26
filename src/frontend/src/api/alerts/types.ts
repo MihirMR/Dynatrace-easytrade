@@ -56,3 +56,17 @@ export type CreateAlertRequest = {
      */
     threshold: string
 }
+
+/**
+ * A 201 create: the alert the broker returned and the exact threshold token
+ * its request body carried, kept as text so it never passes through a
+ * `Number`.
+ */
+export type CreatedAlert = { alert: Alert; threshold: string }
+
+/**
+ * Form input that passed `utils/alertValidation.ts`: exact enum names, a
+ * listed instrument id and the normalised threshold token. The alerts panel
+ * adds `accountId` to make the create request.
+ */
+export type ValidatedAlertInput = Omit<CreateAlertRequest, "accountId">

@@ -1,6 +1,7 @@
 import { useEffect } from "react"
 import { useQueryClient } from "@tanstack/react-query"
 import type { Alert } from "../../api/alerts/types"
+import { loggableError } from "../../api/http"
 import type { Instrument } from "../../api/instrument/types"
 import { useToast } from "../../contexts/ToastContext/context"
 import { useAuthUser } from "../../contexts/UserContext/context"
@@ -11,21 +12,24 @@ import {
     markShown,
     notificationKey,
 } from "../../utils/alertNotificationTracker"
-import { formatAlertNumber } from "../../utils/alertValidation"
 import {
+    findInstrumentName,
+    formatAlertNumber,
+} from "../../utils/alertValidation"
+import {
+    featureResultContext,
+    isCurrentFeatureContext,
     isFeatureDisabledError,
-    onPortfolioInsightsDisabled,
 } from "../../utils/portfolioInsightsFeature"
-import { instrumentKeys } from "../../utils/queryKeys"
+import { featureFlagKeys, instrumentKeys } from "../../utils/queryKeys"
 
 function toastMessage(
     notification: Alert,
     instruments: Instrument[] | undefined
 ): string {
     const instrument =
-        instruments?.find(
-            (i) => String(i.id) === String(notification.instrumentId)
-        )?.name ?? `instrument ${notification.instrumentId.slice(0, 8)}`
+        findInstrumentName(instruments, notification.instrumentId) ??
+        `instrument ${notification.instrumentId.slice(0, 8)}`
     const kind = notification.type === "TARGET_PRICE" ? "Price" : "P/L"
     const direction = notification.direction === "ABOVE" ? "above" : "below"
     const threshold = formatAlertNumber(notification.threshold)
@@ -38,22 +42,45 @@ function toastMessage(
  * is on and shows one info Toast per triggered arming. Renders no markup.
  *
  * Results that arrive after a logout, an account switch or a shutdown never
- * reach `data`: the shared notifications query discards them. A 403 runs the
- * feature shutdown; any other poll failure is logged and the next poll
- * retries.
+ * reach `data`: the shared notifications query discards them. A poll it did
+ * publish carries the account, session and activation of the request that
+ * produced it, and the Toast effect delivers it only while those still hold.
+ * That covers a change landing after a render commits a poll and before
+ * React runs its effects, and a poll still cached from an earlier session,
+ * shown again after a switch away and back, which is never toasted under the
+ * later one. A current 403 is shut down by the shared feature request guard;
+ * any other poll failure is logged and the next poll retries.
  */
 export function AlertNotificationWatcher(): null {
     const { userId } = useAuthUser()
     const flag = usePortfolioInsightsFlag()
     const queryClient = useQueryClient()
     const { showToast } = useToast()
-    const { data, error } = useAlertNotificationsQuery(
+    const { data, dataUpdatedAt, error } = useAlertNotificationsQuery(
         userId,
         flag && userId !== ""
     )
 
+    // `dataUpdatedAt` re-runs delivery when a poll returns equal
+    // notifications, which keep their reference but carry the context of the
+    // poll that just returned them.
     useEffect(() => {
-        if (!flag || !data) return
+        if (!flag || data === undefined) return
+        // Checked against the poll's own request, through the shared
+        // activation owner, and against the shared flag state, so a poll
+        // that is no longer current for the account shown is neither toasted
+        // nor recorded as shown.
+        const produced = featureResultContext(data)
+        if (
+            produced === undefined ||
+            produced.userId !== userId ||
+            !isCurrentFeatureContext(produced) ||
+            queryClient.getQueryData<boolean>(
+                featureFlagKeys.portfolioInsights
+            ) !== true
+        ) {
+            return
+        }
         // Names come from the instruments query the pages already fill; the
         // watcher never requests them itself.
         const instruments = queryClient.getQueryData<Instrument[]>(
@@ -68,18 +95,18 @@ export function AlertNotificationWatcher(): null {
             markShown(key)
             showToast(toastMessage(notification, instruments), "info")
         }
-    }, [data, flag, userId, queryClient, showToast])
+    }, [data, dataUpdatedAt, flag, userId, queryClient, showToast])
 
+    // A 403 ends in the feature shutdown that the notifications query runs
+    // itself, so only other poll failures are logged here.
     useEffect(() => {
-        if (isFeatureDisabledError(error)) {
-            onPortfolioInsightsDisabled(queryClient)
-        } else if (error) {
+        if (error && !isFeatureDisabledError(error)) {
             console.error(
                 "[AlertNotificationWatcher] notification poll failed",
-                error
+                loggableError(error, userId)
             )
         }
-    }, [error, queryClient])
+    }, [error])
 
     return null
 }

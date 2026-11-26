@@ -122,8 +122,6 @@ function withErrorShape(diagnostic: unknown): unknown {
         : diagnostic
 }
 
-const FLAG_RESPONSE_ERROR = { name: "FlagResponseError", hasCause: false }
-
 afterEach(() => {
     vi.restoreAllMocks()
     vi.useRealTimers()
@@ -230,7 +228,7 @@ const failures: {
         diagnostic: {
             reason: "error",
             errorName: "RangeError",
-            error: FLAG_RESPONSE_ERROR,
+            error: { name: "RangeError", hasCause: false },
         },
     },
     {
@@ -245,7 +243,7 @@ const failures: {
         diagnostic: {
             reason: "error",
             errorName: "string",
-            error: FLAG_RESPONSE_ERROR,
+            error: "unexpected",
         },
     },
     {
@@ -273,8 +271,8 @@ const failures: {
         diagnostic: {
             reason: "unreadable_json",
             status: 200,
-            errorName: "SyntaxError",
-            error: FLAG_RESPONSE_ERROR,
+            errorName: "MalformedJsonError",
+            error: { name: "MalformedJsonError", hasCause: false },
         },
     },
     {
@@ -340,6 +338,87 @@ it.each(failures)(
         }).toEqual({
             enabled: false,
             logged: [[message, expect.objectContaining(diagnostic)]],
+        })
+    }
+)
+
+// Only the parse boundary in http.ts raises unreadable JSON, so a SyntaxError
+// thrown before the body is parsed is an unrecognised error.
+it.each<{ label: string; thrown: Error }>([
+    { label: "RangeError", thrown: new RangeError("unexpected") },
+    {
+        label: "SyntaxError before parsing",
+        thrown: new SyntaxError("Unexpected request setup"),
+    },
+])(
+    "getPortfolioInsightsFlag_unrecognisedError_logsErrorAsThrown ($label)",
+    async ({ thrown }) => {
+        const spies = spyConsole()
+        stubFetch(() => Promise.reject(thrown))
+
+        await getPortfolioInsightsFlag()
+
+        const [[, diagnostic]] = spies.error.mock.calls as [string, unknown][]
+        const logged = diagnostic as { reason?: string; error?: unknown }
+        expect({
+            reason: logged.reason,
+            hasStatus: "status" in logged,
+            sameError: logged.error === thrown,
+        }).toEqual({ reason: "error", hasStatus: false, sameError: true })
+    }
+)
+
+// The parse error's stack is set by hand, so each engine's format is covered
+// on any engine. Blink rejects `Response.json()` with a message that gains a
+// binding prefix its stack header lacks.
+const unreadableBodies: {
+    label: string
+    message: string
+    header: string
+    frames: string
+}[] = [
+    {
+        label: "V8 header repeating the message",
+        message: `Unexpected token '<', "<${LEAK_MARKER}>" is not valid JSON`,
+        header: `SyntaxError: Unexpected token '<', "<${LEAK_MARKER}>" is not valid JSON`,
+        frames: "    at JSON.parse (<anonymous>)\n    at parseJSONFromBytes (undici:1:1)",
+    },
+    {
+        label: "Blink header without the message's binding prefix",
+        message: `Failed to execute 'json' on 'Response': Unexpected token '<', "<${LEAK_MARKER}>" is not valid JSON`,
+        header: `SyntaxError: Unexpected token '<', "<${LEAK_MARKER}>" is not valid JSON`,
+        frames: "    at getJsonWithTimeout (http://localhost/src/api/http.ts:369:37)\n    at async getPortfolioInsightsFlag (http://localhost/src/api/featureFlags/index.ts:165:16)",
+    },
+]
+
+it.each(unreadableBodies)(
+    "getPortfolioInsightsFlag_unreadableJson_logsParseFramesWithoutBody ($label)",
+    async ({ message, header, frames }) => {
+        const spies = spyConsole()
+        const parseError = new SyntaxError(message)
+        parseError.stack = `${header}\n${frames}`
+        const response = jsonResponse(enabledFlag)
+        vi.spyOn(response, "json").mockRejectedValue(parseError)
+        stubFetch(respondWith(response))
+
+        await getPortfolioInsightsFlag()
+
+        const [[, diagnostic]] = spies.error.mock.calls as [string, unknown][]
+        const { error } = diagnostic as { error: Error }
+        expect({
+            isSyntaxError: error instanceof SyntaxError,
+            name: error.name,
+            message: error.message,
+            stack: error.stack,
+            hasCause: "cause" in error,
+            leaked: loggedText(spies).includes(LEAK_MARKER),
+        }).toEqual({
+            isSyntaxError: true,
+            name: "MalformedJsonError",
+            message: "Response body is not valid JSON",
+            stack: `MalformedJsonError: Response body is not valid JSON\n${frames}`,
+            hasCause: false,
+            leaked: false,
         })
     }
 )

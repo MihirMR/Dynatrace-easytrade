@@ -244,13 +244,13 @@ database dialects, with loadgen stopped:
 
 | Limit | Target | Measured, MSSQL | Measured, PostgreSQL |
 | --- | --- | --- | --- |
-| Insights p95, account with 15 holdings | Under 500 ms | 28.083 ms, PASS; server side median 12 ms, p95 18 ms | 39.342 ms, PASS; server side median 8 ms, p95 25 ms |
-| One evaluation cycle, 1,000 armed alerts | Under 10 s | 50 ms, PASS; next two cycles 60 ms, 40 ms | 45 ms, PASS; next two cycles 57 ms, 64 ms |
+| Insights p95, account with 15 holdings | Under 500 ms | 33.506 ms, PASS; server side median 14 ms, p95 17 ms | 25.551 ms, PASS; server side median 6 ms, p95 17 ms |
+| One evaluation cycle, 1,000 armed alerts | Under 10 s | 47 ms, PASS; next two cycles 56 ms, 49 ms | 47 ms, PASS; next two cycles 46 ms, 50 ms |
 
 The targets assume the shipped topology: `background-service` stays a singleton, and
 `feature-flag-service` runs as one instance.
 
-Measured on 2026-11-26 by `perf.sh`, 13 checks passed per dialect, on a Compose dev project
+Measured on 2026-11-26 by `perf.sh`, 14 checks passed per dialect, on a Compose dev project
 of `compose.dev.yaml` with the whole stack on one Docker host, loadgen stopped, the flag on
 and `ALERT_EVALUATION_INTERVAL_SECONDS` at 60. No cycle sample was rejected.
 
@@ -271,7 +271,11 @@ and `ALERT_EVALUATION_INTERVAL_SECONDS` at 60. No cycle sample was rejected.
   sample with a trigger, skip, failure, another outcome or a changed set is rejected: the
   owned alerts missing from the armed set are re-armed, the set is verified again and the
   next cycle is read. Three rejected samples fail the check as `no clean sample`. The value
-  is the accepted sample's `duration [n] ms`; the next two clean cycles are recorded too.
+  is the accepted sample's `duration [n] ms`. The next two clean cycles are then recorded as
+  a check of their own, `cycle follow-ups`. Each must pass the sample's line and owned-set
+  checks, but not the 10 s limit; an unclean one is rejected as a sample is and does not
+  count. The check fails after three unclean follow-ups or when a cycle line does not arrive
+  in time.
 
 To re-measure, run this from the repository root against the running Compose dev stack, one
 dialect and one project at a time, never alongside `e2e.sh` or `loadgen-check.sh`:
@@ -306,7 +310,7 @@ the host, and exits 0 only when every check passes.
 2. A deviation is a defect. Fix it, then re-measure with the same verified workload by
    rerunning `perf.sh` unchanged: it re-runs the input checks (25 presets with 15 positive
    holdings and listed instruments, no armed alert) and the owned-set check before measuring,
-   and repeats the owned-set check after each cycle sample.
+   and repeats the owned-set check after each cycle sample and follow-up cycle.
 3. The concurrency bound of 8 is not changed, and no caching or schema work is added.
 4. If the limit is still missed, record the measured value from the `REPORT` block, its
    database type and its cause in this section, and in the run report, as a known limit.

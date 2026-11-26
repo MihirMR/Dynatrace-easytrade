@@ -1,4 +1,11 @@
-import { type FocusEvent, useEffect, useRef, useState } from "react"
+import {
+    type FocusEvent,
+    type RefObject,
+    useEffect,
+    useLayoutEffect,
+    useRef,
+    useState,
+} from "react"
 import { NavLink } from "react-router"
 import { useQueryClient } from "@tanstack/react-query"
 import {
@@ -14,27 +21,15 @@ import { featureFlagKeys } from "../utils/queryKeys"
 
 const INSIGHTS_AVAILABLE_MESSAGE =
     "Portfolio Insights is now available in the navigation."
-const INSIGHTS_UNAVAILABLE_MESSAGE =
-    "Portfolio Insights is no longer available."
-
-/**
- * How long the status region stays in the document once the removal message
- * is written. It matches the 4 s lifetime of the app's other polite
- * announcements, the Toasts that `ToastProvider` dismisses after 4 s, which
- * gives assistive technology time to read the message before the region
- * leaves.
- */
-const STATUS_HOLD_MS = 4000
 
 /**
  * Text for a polite status region that tells screen-reader users when a flag
- * poll adds or removes the Portfolio Insights link without any navigation,
- * or `null` while the region is not rendered.
+ * poll adds the Portfolio Insights link without any navigation, or `null`
+ * while the region is not rendered.
  *
  * The first settled flag value of the mount, whether read now or already
- * cached, is the baseline and is not announced. Only a later change of the
- * link's visibility is, so a poll that returns the same value announces
- * nothing.
+ * cached, is the baseline and is not announced. Only a later appearance of
+ * the link is, so a poll that returns the same value announces nothing.
  *
  * Assistive technology announces text inserted into a live region that is
  * already in the document. The browser hands it one accessibility update per
@@ -42,22 +37,19 @@ const STATUS_HOLD_MS = 4000
  * inserts the region, or that equals the text already there, is often not
  * announced. The region therefore follows this lifecycle:
  *
- * - It is rendered only while the link is shown or its removal is being
- *   announced. A sidebar whose feature is off, whether it was never on or
- *   has settled off, renders exactly what it rendered without the feature.
- * - It first appears empty, in the same commit as the link.
- * - Each change of the link's visibility clears the text at once and writes
- *   its message two animation frames later, after a frame has rendered the
- *   empty region. Every message is then a fresh insertion, and a superseded
- *   message never stays in the region.
- * - Once the removal message is written, the region stays for
- *   `STATUS_HOLD_MS`, then leaves the document and its text resets to empty.
- *   A return of the link during that time keeps the region, which announces
- *   the return; a return after it inserts the region empty again, as on its
- *   first appearance.
- * - A newer change cancels a write or a hold still waiting, and an unmount
- *   cancels both, so a stale message is never written and nothing runs after
- *   the sidebar has gone.
+ * - It is rendered only while the link is shown. It enters empty in the same
+ *   commit as the link and leaves in the same commit as the link, so with
+ *   the feature off, whether it was never on or has just been disabled, the
+ *   sidebar renders exactly what it rendered without the feature.
+ * - When a later read shows the link, the text is cleared at once and the
+ *   availability message is written two animation frames later, after a
+ *   frame has rendered the empty region. A read that keeps the link shown
+ *   keeps the text.
+ * - When a read hides the link, the region leaves with it, a write still
+ *   waiting is cancelled and the text resets to empty, so a later return of
+ *   the link inserts the region empty again, as on its first appearance.
+ * - A newer change or an unmount cancels a write still waiting, so a stale
+ *   message is never written and nothing runs after the sidebar has gone.
  */
 function useInsightsAvailabilityStatus(linkShown: boolean): string | null {
     const client = useQueryClient()
@@ -65,73 +57,114 @@ function useInsightsAvailabilityStatus(linkShown: boolean): string | null {
     // settled one sets the baseline.
     const settled =
         client.getQueryData(featureFlagKeys.portfolioInsights) !== undefined
-    // The link visibility last accounted for: the baseline, then each change
-    // whose message is written or waiting. `null` until the first read
-    // settles.
+    // The link visibility last accounted for: the baseline, then each change.
+    // `null` until the first read settles.
     const knownShown = useRef<boolean | null>(null)
-    const [regionMounted, setRegionMounted] = useState(false)
     const [message, setMessage] = useState("")
 
     useEffect(() => {
-        if (linkShown) {
-            setRegionMounted(true)
-        }
         if (knownShown.current === null && settled) {
             knownShown.current = linkShown
         }
     }, [linkShown, settled])
 
     // Keyed on the link alone, so this effect, and the cleanup that cancels
-    // its pending write or hold, runs only when the link's visibility changes
-    // or the sidebar unmounts.
+    // its pending write, runs only when the link's visibility changes or the
+    // sidebar unmounts.
     useEffect(() => {
         const previous = knownShown.current
         if (previous === null || previous === linkShown) {
             return
         }
         knownShown.current = linkShown
-        const next = linkShown
-            ? INSIGHTS_AVAILABLE_MESSAGE
-            : INSIGHTS_UNAVAILABLE_MESSAGE
         setMessage("")
-        let hold: ReturnType<typeof setTimeout> | undefined
+        if (!linkShown) {
+            return
+        }
         // The outer callback runs before the next frame renders the region as
         // it stands; the inner one runs a frame later and writes the message.
         let frame = requestAnimationFrame(() => {
             frame = requestAnimationFrame(() => {
-                setMessage(next)
-                if (!linkShown) {
-                    hold = setTimeout(() => {
-                        setRegionMounted(false)
-                        setMessage("")
-                    }, STATUS_HOLD_MS)
-                }
+                setMessage(INSIGHTS_AVAILABLE_MESSAGE)
             })
         })
         return () => {
             cancelAnimationFrame(frame)
-            clearTimeout(hold)
         }
     }, [linkShown])
 
-    return regionMounted || linkShown ? message : null
+    return linkShown ? message : null
 }
 
 /**
- * Scrolls a sidebar link that takes keyboard focus fully into view.
+ * Scrolls the Portfolio Insights link fully into view when it takes keyboard
+ * focus.
  *
  * The browser leaves a partly visible element where it is when it takes
  * keyboard focus, so the horizontally scrolling mobile row would show only a
  * sliver of the focused link. Pointer focus is left alone, so a click never
- * scrolls the link out from under the pointer. It is attached only while the
- * Portfolio Insights link is shown, so with the feature off the sidebar keeps
- * its original focus behaviour.
+ * scrolls the link out from under the pointer. It is attached only to the
+ * Portfolio Insights link, so the five existing links keep their original
+ * focus behaviour with the feature on and off.
  */
-function revealKeyboardFocusedLink(event: FocusEvent<HTMLUListElement>) {
-    const link = event.target
-    if (link instanceof HTMLElement && link.matches(":focus-visible")) {
+function revealKeyboardFocusedLink(event: FocusEvent<HTMLAnchorElement>) {
+    const link = event.currentTarget
+    if (link.matches(":focus-visible")) {
         link.scrollIntoView({ block: "nearest", inline: "nearest" })
     }
+}
+
+/**
+ * The sixth sidebar entry, rendered only while the Portfolio Insights flag is
+ * on.
+ *
+ * When the feature turns off while the link has keyboard focus, focus moves
+ * to the preceding sidebar link instead of dropping to the document body.
+ * Focus held anywhere else is left untouched, and so is focus on the link
+ * when the whole sidebar unmounts, because no sidebar link survives to take
+ * it.
+ */
+function PortfolioInsightsNavItem({
+    sidebarUnmounting,
+}: {
+    /** `true` once the `Navigation` that renders this item is unmounting. */
+    sidebarUnmounting: RefObject<boolean>
+}) {
+    const linkRef = useRef<HTMLAnchorElement>(null)
+
+    // React runs a removed component's layout-effect cleanup before it takes
+    // the component's elements out of the document, so the link is still
+    // connected, and still focused, when this cleanup runs.
+    useLayoutEffect(() => {
+        const link = linkRef.current
+        return () => {
+            if (sidebarUnmounting.current) {
+                return
+            }
+            if (link === null || document.activeElement !== link) {
+                return
+            }
+            const previousItem = link.closest("li")?.previousElementSibling
+            previousItem?.querySelector<HTMLAnchorElement>("a")?.focus()
+        }
+    }, [sidebarUnmounting])
+
+    return (
+        <li>
+            <NavLink
+                ref={linkRef}
+                id="nav-portfolio-insights"
+                to="/insights"
+                className={({ isActive }) =>
+                    "nav-link" + (isActive ? " active" : "")
+                }
+                onFocus={revealKeyboardFocusedLink}
+            >
+                <InsightsIcon />
+                Portfolio Insights
+            </NavLink>
+        </li>
+    )
 }
 
 export default function Navigation() {
@@ -141,17 +174,25 @@ export default function Navigation() {
     const availabilityStatus = useInsightsAvailabilityStatus(
         portfolioInsightsEnabled
     )
+    // Tells the Portfolio Insights item whether it leaves with the whole
+    // sidebar or alone, as on a disable. React runs a deleted component's
+    // layout-effect cleanups before those of its descendants, so when the
+    // sidebar unmounts this cleanup sets the flag before the item's cleanup
+    // reads it. When only the item leaves, this component stays mounted and
+    // the flag stays `false`. Each mount resets it, because a development
+    // remount or a revealed Suspense boundary runs this effect again.
+    const sidebarUnmounting = useRef(false)
+    useLayoutEffect(() => {
+        sidebarUnmounting.current = false
+        return () => {
+            sidebarUnmounting.current = true
+        }
+    }, [])
 
     return (
         <nav className="sidebar">
             <div className="sidebar-nav">
-                <ul
-                    onFocus={
-                        portfolioInsightsEnabled
-                            ? revealKeyboardFocusedLink
-                            : undefined
-                    }
-                >
+                <ul>
                     <li>
                         <NavLink
                             id="nav-home"
@@ -213,18 +254,9 @@ export default function Navigation() {
                         </NavLink>
                     </li>
                     {portfolioInsightsEnabled && (
-                        <li>
-                            <NavLink
-                                id="nav-portfolio-insights"
-                                to="/insights"
-                                className={({ isActive }) =>
-                                    "nav-link" + (isActive ? " active" : "")
-                                }
-                            >
-                                <InsightsIcon />
-                                Portfolio Insights
-                            </NavLink>
-                        </li>
+                        <PortfolioInsightsNavItem
+                            sidebarUnmounting={sidebarUnmounting}
+                        />
                     )}
                 </ul>
                 {availabilityStatus !== null && (

@@ -23,12 +23,19 @@
 # pi-e2e-<epoch>-empty, deposits to and buys on the holder only, creates alerts on them, and
 # toggles no flag but portfolio-insights-enabled. No preset account is used. On exit, normal or
 # not, it deletes every alert it created by id and restores the flag to the value it read at
-# start. The two accounts remain, because no account-deletion endpoint exists.
+# start; a second interrupt during that cleanup abandons it and fails the cleanup check. The two
+# accounts remain, because no account-deletion endpoint exists.
 #
 # Prints one PASS or FAIL line per check, INFO lines (the browser check's own output among them,
-# prefixed) and a final SUMMARY line. Exits 0 when every check passes, 1 when any check fails,
-# and 2 on a usage error or a missing tool. The fixture, which holds the generated passwords,
-# and every working file stay in the run directory printed at start and end.
+# prefixed) and a final SUMMARY line; a FAIL line never shows a fixture password. Exits 0 when
+# every check passes, 1 when any check fails, 2 on a usage error, a missing tool or a private
+# directory it cannot restrict to the current user, and 130 when interrupted. The generated
+# passwords exist only in the fixture, which sits with the raw HTTP responses in a private
+# directory outside the run directory that only the current user can open (an ACL set with
+# icacls on Windows, mode 700 elsewhere). On exit, normal, failed or interrupted, both are
+# removed, and a removal that fails fails the cleanup check. The run directory, printed at start
+# and end, keeps the browser evidence (unless --evidence-dir names another directory) and
+# working files the run derives, never a copy of a response body.
 
 # shellcheck disable=SC2016 # jq filters are single-quoted on purpose: their $names are jq's own.
 set -euo pipefail
@@ -152,8 +159,92 @@ if ! docker compose version >/dev/null 2>&1 </dev/null; then
     exit 2
 fi
 
+# restrict_private_dir: limits PRIVATE_DIR to the current user, and proves it, while it is still
+# empty; every file created inside inherits that. umask 077 alone does not do it on Git Bash,
+# MSYS2 or Cygwin, which only emulate file modes over the Windows ACL a new directory inherits.
+# There, icacls removes the inherited entries and grants full control, inherited by everything
+# created inside, to the SID the system's own whoami reports; the listing must then hold that
+# one entry and no other. Elsewhere the mode must read drwx------ with no access control list.
+# Prints the reason on stderr and fails when either cannot be established.
+restrict_private_dir() {
+    local fault="Could not restrict the private working directory $PRIVATE_DIR to this user"
+    local perms account name sid win out="" listing line entries=0 entry="" found="" expected
+    local account_re='^"([^"]+)","(S-1-[0-9-]+)"$'
+    case "$(uname -s)" in
+        MINGW* | MSYS* | CYGWIN*) ;;
+        *)
+            if ! chmod 700 "$PRIVATE_DIR"; then
+                echo "$fault: chmod 700 failed." >&2
+                return 1
+            fi
+            perms="$(ls -ld "$PRIVATE_DIR")" || perms=""
+            perms="${perms%% *}"
+            if [[ ! "$perms" =~ ^drwx------[.@]?$ ]]; then
+                echo "$fault: it shows [$perms], not drwx------ without an access control list." >&2
+                return 1
+            fi
+            return 0
+            ;;
+    esac
+    # Arguments must reach the Windows tools unchanged, and the whoami on PATH is usually the
+    # coreutils one, which cannot print a SID.
+    account="$(MSYS_NO_PATHCONV=1 MSYS2_ARG_CONV_EXCL='*' "$(cygpath -S)/whoami.exe" /user \
+        /fo csv /nh </dev/null | tr -d '\r')" || account=""
+    if [[ ! "$account" =~ $account_re ]]; then
+        echo "$fault: whoami /user did not report the current user and SID." >&2
+        return 1
+    fi
+    name="${BASH_REMATCH[1]}"
+    sid="${BASH_REMATCH[2]}"
+    if ! win="$(cygpath -w "$PRIVATE_DIR")" || [[ -z "$win" ]]; then
+        echo "$fault: cygpath -w gave no Windows path." >&2
+        return 1
+    fi
+    if ! out="$(MSYS_NO_PATHCONV=1 MSYS2_ARG_CONV_EXCL='*' icacls "$win" /inheritance:r \
+        /grant:r "*$sid:(OI)(CI)F" </dev/null 2>&1)"; then
+        echo "$fault: icacls failed: $(tr -d '\r' <<<"$out" | sed -n '1p')" >&2
+        return 1
+    fi
+    if ! listing="$(MSYS_NO_PATHCONV=1 MSYS2_ARG_CONV_EXCL='*' icacls "$win" </dev/null)"; then
+        echo "$fault: icacls could not list its entries." >&2
+        return 1
+    fi
+    # The listing starts "<path> <entry>", continues with one indented entry per line and ends at
+    # a blank line. The directory's own name is ASCII, so it marks where the path ends.
+    while IFS= read -r line; do
+        line="${line%$'\r'}"
+        if [[ -z "$line" ]]; then
+            break
+        fi
+        if [[ $entries -eq 0 ]]; then
+            line="${line#*"${PRIVATE_DIR##*/} "}"
+        fi
+        entries=$((entries + 1))
+        entry="${line#"${line%%[![:space:]]*}"}"
+        found="${found:+$found, }$entry"
+    done <<<"$listing"
+    # icacls and whoami may spell the domain in different case.
+    entry="$(tr '[:upper:]' '[:lower:]' <<<"$entry")"
+    expected="$(tr '[:upper:]' '[:lower:]' <<<"$name:(OI)(CI)(F)")"
+    if [[ $entries -ne 1 || "$entry" != "$expected" ]]; then
+        echo "$fault: icacls lists [$found], expected only $name:(OI)(CI)(F)." >&2
+        return 1
+    fi
+}
+
 if ! RUN_DIR="$(mktemp -d "${TMPDIR:-/tmp}/pi-e2e.XXXXXX")"; then
     echo "Could not create a run directory under ${TMPDIR:-/tmp}." >&2
+    exit 2
+fi
+# The fixture, the only file that holds the passwords, and the raw response bytes stay out of
+# the run and evidence directories: in a directory only this user can read, removed on exit.
+if ! PRIVATE_DIR="$(umask 077 && mktemp -d "${TMPDIR:-/tmp}/pi-e2e-private.XXXXXX")"; then
+    echo "Could not create a private working directory under ${TMPDIR:-/tmp}." >&2
+    rmdir "$RUN_DIR"
+    exit 2
+fi
+if ! restrict_private_dir; then
+    rmdir "$RUN_DIR" "$PRIVATE_DIR" || true
     exit 2
 fi
 # The browser check runs from src/loadgen, so every path handed to it is absolute.
@@ -162,10 +253,11 @@ if [[ -z "$EVIDENCE_DIR" ]]; then
 fi
 if ! mkdir -p "$EVIDENCE_DIR" || ! EVIDENCE_DIR="$(cd "$EVIDENCE_DIR" && pwd)"; then
     echo "Could not create the evidence directory: $EVIDENCE_DIR" >&2
-    rmdir "$RUN_DIR"
+    rmdir "$RUN_DIR" "$PRIVATE_DIR"
     exit 2
 fi
-FIXTURE="$RUN_DIR/fixture.json"
+FIXTURE="$PRIVATE_DIR/fixture.json"
+PRIVATE_LEFT=""
 : >"$RUN_DIR/owned"
 : >"$RUN_DIR/deleted"
 : >"$RUN_DIR/pairs"
@@ -209,9 +301,19 @@ pass() {
     echo "PASS $1"
 }
 
+# fail CHECK REASON: REASON can carry text a server sent. Every occurrence of a fixture password
+# in it becomes <redacted>, whichever field carried it, and then every byte outside printable
+# ASCII becomes ?, which keeps each FAIL line one line long and free of terminal control
+# sequences.
 fail() {
+    local reason="$2" secret
+    for secret in "$HOLDER_PASSWORD" "$EMPTY_PASSWORD"; do
+        if [[ -n "$secret" ]]; then
+            reason="${reason//"$secret"/"<redacted>"}"
+        fi
+    done
     failed=$((failed + 1))
-    echo "FAIL $1: $2"
+    echo "FAIL $1: $(printf '%s' "$reason" | LC_ALL=C tr -c '\040-\176' '?')"
 }
 
 info() {
@@ -228,35 +330,38 @@ abort() {
 # HTTP and JSON
 
 # http METHOD URL [BODY]: sets HTTP_STATUS (000 on a transport error), HTTP_CTYPE, HTTP_BODY
-# (the response text; the exact bytes stay in $RUN_DIR/body) and HTTP_ERROR (curl's message on
-# a transport error). Never trips set -e. BODY goes through stdin, byte for byte, so neither the
-# process list nor Git Bash path conversion ever sees it.
+# (the response text; the exact bytes stay in $PRIVATE_DIR/body) and HTTP_ERROR (curl's message
+# on a transport error). Never trips set -e. BODY goes through stdin, byte for byte, so neither
+# the process list nor Git Bash path conversion ever sees it. The raw body, headers and curl
+# messages are kept in the private directory only, never in the run directory.
 http() {
     local method="$1" url="$2" out rc=0
     local args=(-sS --max-time "$HTTP_TIMEOUT_SECONDS" -X "$method"
-        -o "$RUN_DIR/body" -D "$RUN_DIR/headers" -w '%{http_code} %{content_type}'
+        -o "$PRIVATE_DIR/body" -D "$PRIVATE_DIR/headers" -w '%{http_code} %{content_type}'
         -H 'Accept: application/json')
-    : >"$RUN_DIR/body"
-    : >"$RUN_DIR/headers"
+    : >"$PRIVATE_DIR/body"
+    : >"$PRIVATE_DIR/headers"
     if [[ $# -ge 3 ]]; then
         args+=(-H 'Content-Type: application/json' --data-binary @-)
-        out="$(printf '%s' "$3" | curl "${args[@]}" "$url" 2>"$RUN_DIR/curl-error")" || rc=$?
+        out="$(printf '%s' "$3" | curl "${args[@]}" "$url" 2>"$PRIVATE_DIR/curl-error")" || rc=$?
     else
         if [[ "$method" != "GET" && "$method" != "DELETE" ]]; then
             args+=(-H 'Content-Length: 0')
         fi
-        out="$(curl "${args[@]}" "$url" 2>"$RUN_DIR/curl-error" </dev/null)" || rc=$?
+        out="$(curl "${args[@]}" "$url" 2>"$PRIVATE_DIR/curl-error" </dev/null)" || rc=$?
     fi
     if [[ $rc -ne 0 ]]; then
         HTTP_STATUS="000"
         HTTP_CTYPE=""
-        HTTP_ERROR="$(tr -d '\r' <"$RUN_DIR/curl-error" | grep -v 'Debug-enabled' | head -c 300)"
+        HTTP_ERROR="$(tr -d '\r' <"$PRIVATE_DIR/curl-error" | grep -v 'Debug-enabled' | head -c 300)"
     else
         HTTP_STATUS="${out%% *}"
         HTTP_CTYPE="${out#* }"
         HTTP_ERROR=""
     fi
-    HTTP_BODY="$(cat "$RUN_DIR/body")"
+    # A shell variable cannot hold NUL, so a body's NUL bytes are dropped here, without bash's
+    # warning; the exact bytes stay in the file.
+    HTTP_BODY="$(tr -d '\000' <"$PRIVATE_DIR/body")"
 }
 
 # jget FILTER JSON: prints jq's raw output, or nothing when the JSON does not parse.
@@ -291,9 +396,53 @@ status_text() {
     fi
 }
 
-# The last response body on one line, cut to 300 characters, for failure reasons.
+# describe_file FILE: what FILE holds, for failure reasons, without any of its bytes: "empty",
+# or its size and either "not JSON" or the type of its one JSON document, with an object's
+# first 10 key names or an array's length. Each key name is cut to 32 characters, with every
+# character but A-Z, a-z, 0-9, _, . and - replaced by ?, and the names are withheld when the
+# file holds a fixture password. So a secret or a terminal control sequence a server reflects
+# never reaches the output.
+describe_file() {
+    local size content secret with_names=true shape
+    local filter='def safe: explode | map(if (. >= 48 and . <= 57) or (. >= 65 and . <= 90)
+            or (. >= 97 and . <= 122) or . == 45 or . == 46 or . == 95 then . else 63 end)
+        | .[0:32] | implode;
+    if length != 1 then "not JSON"
+    else .[0]
+      | if type == "object" then
+          "JSON object with \(length) key\(if length == 1 then "" else "s" end)"
+          + if length == 0 then ""
+            elif $withNames then
+              " [" + (keys_unsorted | .[0:10] | map(safe) | join(","))
+              + (if length > 10 then ",...]" else "]" end)
+            else ", names withheld: the body holds a fixture password" end
+        elif type == "array" then "JSON array of \(length) item\(if length == 1 then "" else "s" end)"
+        else "JSON \(type)" end
+    end'
+    size="$(wc -c <"$1" | tr -d ' \r')" || size=""
+    if [[ ! "$size" =~ ^[0-9]+$ ]]; then
+        echo "unreadable"
+        return 0
+    fi
+    if [[ $size -eq 0 ]]; then
+        echo "empty"
+        return 0
+    fi
+    content="$(tr -d '\000' <"$1")"
+    for secret in "$HOLDER_PASSWORD" "$EMPTY_PASSWORD"; do
+        if [[ -n "$secret" && "$content" == *"$secret"* ]]; then
+            with_names=false
+        fi
+    done
+    shape="$(jq -r -s --argjson withNames "$with_names" "$filter" "$1" 2>/dev/null | tr -d '\r')" ||
+        shape=""
+    echo "$size bytes, ${shape:-not JSON}"
+}
+
+# body_snippet: the last response body, for failure reasons, as describe_file describes it.
+# The exact bytes stay in $PRIVATE_DIR/body, where the checks read them.
 body_snippet() {
-    tr -d '\r\n' <"$RUN_DIR/body" | head -c 300
+    describe_file "$PRIVATE_DIR/body"
 }
 
 # expect_status CHECK STATUS: PASS when the last response has STATUS.
@@ -312,8 +461,11 @@ jcheck() {
     verdict="$(jget "$2" "$3")"
     if [[ "$verdict" == "ok" ]]; then
         pass "$1"
+    elif [[ -n "$verdict" ]]; then
+        fail "$1" "$verdict"
     else
-        fail "$1" "${verdict:-unreadable JSON [$(head -c 300 <<<"$3" | tr -d '\r\n')]}"
+        printf '%s' "$3" >"$PRIVATE_DIR/jcheck-text"
+        fail "$1" "unreadable JSON [$(describe_file "$PRIVATE_DIR/jcheck-text")]"
     fi
 }
 
@@ -327,14 +479,17 @@ expect_json() {
 }
 
 # expect_forbidden CHECK METHOD URL [BODY]: PASS only for a 403 whose body bytes are exactly
-# {"error":"feature_disabled"} and whose content type is application/json.
+# {"error":"feature_disabled"} and whose content type is application/json. read stops at the
+# first NUL, so the body's size must also be the expected body's (ASCII, one byte a character).
 expect_forbidden() {
-    local check="$1" content=""
+    local check="$1" content="" size
     shift
     http "$@"
     own_if_created
-    IFS= read -r -d '' content <"$RUN_DIR/body" || true
-    if [[ "$HTTP_STATUS" == "403" && "$content" == "$FORBIDDEN_BODY" && "$HTTP_CTYPE" == application/json* ]]; then
+    IFS= read -r -d '' content <"$PRIVATE_DIR/body" || true
+    size="$(wc -c <"$PRIVATE_DIR/body" | tr -d ' \r')" || size=""
+    if [[ "$HTTP_STATUS" == "403" && "$size" == "${#FORBIDDEN_BODY}" && "$content" == "$FORBIDDEN_BODY" &&
+        "$HTTP_CTYPE" == application/json* ]]; then
         pass "$check"
     else
         fail "$check" "$(status_text), content type [$HTTP_CTYPE], body [$(body_snippet)]; expected 403 application/json $FORBIDDEN_BODY"
@@ -454,9 +609,15 @@ random_guid() {
         $((RANDOM & 0x0fff)) $(((RANDOM & 0x3fff) | 0x8000)) "$RANDOM" "$RANDOM" "$RANDOM"
 }
 
-# random_secret: a throwaway password for a fixture account. It is written only to the fixture.
+# random_secret: a throwaway password for a fixture account, Pi- and 16 bytes of the operating
+# system's cryptographic random source as 32 hex digits. It is written only to the fixture and
+# sent only in the signup body. Fails, printing nothing, when /dev/urandom cannot supply them.
 random_secret() {
-    printf 'Pi-%s-%04x\n' "$(random_guid)" "$RANDOM"
+    local hex
+    if ! hex="$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')" || [[ ! "$hex" =~ ^[0-9a-f]{32}$ ]]; then
+        return 1
+    fi
+    printf 'Pi-%s\n' "$hex"
 }
 
 now_rfc3339() {
@@ -741,18 +902,27 @@ check_forbidden_endpoints() {
 
 # write_fixture ALERTS_JSON: the fixture the browser check reads, with ALERTS_JSON as its
 # alerts array. Thresholds stay strings and revisions integers, as its reader requires.
+# The passwords reach jq as stdin lines from the printf builtin, never as command arguments,
+# and the file is created readable by this user only. Fails when it cannot write the fixture.
 write_fixture() {
-    jq -n \
-        --argjson interval "$INTERVAL" \
-        --arg holderUser "$HOLDER_USER" --arg holderPassword "$HOLDER_PASSWORD" \
-        --arg holderId "$HOLDER_ID" \
-        --arg emptyUser "$EMPTY_USER" --arg emptyPassword "$EMPTY_PASSWORD" \
-        --arg emptyId "$EMPTY_ID" \
-        --argjson alerts "$1" \
-        '{evaluationIntervalSeconds: $interval,
-          holder: {username: $holderUser, password: $holderPassword, accountId: $holderId},
-          empty: {username: $emptyUser, password: $emptyPassword, accountId: $emptyId},
-          alerts: $alerts}' >"$FIXTURE"
+    if [[ "$HOLDER_PASSWORD$EMPTY_PASSWORD" == *$'\n'* ]]; then
+        return 1
+    fi
+    (
+        umask 077
+        printf '%s\n%s\n' "$HOLDER_PASSWORD" "$EMPTY_PASSWORD" | jq -n -R \
+            --argjson interval "$INTERVAL" \
+            --arg holderUser "$HOLDER_USER" \
+            --arg holderId "$HOLDER_ID" \
+            --arg emptyUser "$EMPTY_USER" \
+            --arg emptyId "$EMPTY_ID" \
+            --argjson alerts "$1" \
+            'input as $holderPassword | input as $emptyPassword
+             | {evaluationIntervalSeconds: $interval,
+                holder: {username: $holderUser, password: $holderPassword, accountId: $holderId},
+                empty: {username: $emptyUser, password: $emptyPassword, accountId: $emptyId},
+                alerts: $alerts}' >"$FIXTURE"
+    )
 }
 
 # prefix_lines LABEL LOG: copies stdin to LOG and prints each line as "INFO LABEL: <line>", so
@@ -821,10 +991,45 @@ delete_remaining() {
     done <"$RUN_DIR/to-delete"
 }
 
+# shellcheck disable=SC2329 # Invoked by cleanup, the EXIT trap, and by its interrupt trap.
+# remove_private: removes the fixture, then the whole private directory, and checks that both
+# are gone. A path counts as removed only when rm succeeded and neither -e nor -L finds it,
+# since -e alone cannot see an entry it is denied access to. Sets PRIVATE_LEFT to what may
+# remain, empty when nothing does.
+remove_private() {
+    PRIVATE_LEFT=""
+    if [[ -n "$FIXTURE" ]]; then
+        if ! rm -f -- "$FIXTURE" || [[ -e "$FIXTURE" || -L "$FIXTURE" ]]; then
+            PRIVATE_LEFT="fixture $FIXTURE"
+        fi
+    fi
+    if [[ -n "$PRIVATE_DIR" ]]; then
+        if ! rm -rf -- "$PRIVATE_DIR" || [[ -e "$PRIVATE_DIR" || -L "$PRIVATE_DIR" ]]; then
+            PRIVATE_LEFT="${PRIVATE_LEFT:+$PRIVATE_LEFT and }private directory $PRIVATE_DIR"
+        fi
+    fi
+}
+
+# shellcheck disable=SC2329 # Invoked by cleanup's INT and TERM trap.
+# on_cleanup_signal: a second interrupt, while cleanup runs. The remaining requests are
+# abandoned, but the private directory is still removed and the run still ends with a cleanup
+# verdict and the SUMMARY line. Further interrupts are ignored, so it runs once.
+on_cleanup_signal() {
+    trap '' INT TERM
+    remove_private
+    fail "cleanup" "interrupted before it finished: owned alerts may be left in place and flag $FLAG_ID may not be restored${PRIVATE_LEFT:+; $PRIVATE_LEFT not removed}"
+    info "run dir $RUN_DIR"
+    echo "SUMMARY $passed passed, $failed failed"
+    exit 130
+}
+
 # shellcheck disable=SC2329 # Invoked by the EXIT trap below.
 cleanup() {
     local rc=$? remaining problems=""
     trap - EXIT
+    # A second interrupt abandons the remaining requests, but never leaves the passwords behind
+    # and still ends the run with a cleanup verdict and the SUMMARY line.
+    trap on_cleanup_signal INT TERM
     set +e
     remaining="$(remaining_owned)"
     if [[ "$remaining" -gt 0 ]]; then
@@ -852,8 +1057,17 @@ cleanup() {
     if [[ -n "$HOLDER_USER" ]]; then
         info "cleanup: fixture accounts $HOLDER_USER and $EMPTY_USER remain (no account-deletion endpoint exists)"
     fi
-    # A check of its own, as in perf.sh: an alert left behind or a flag left changed fails the
-    # run even when every step passed.
+    # Last, once no request needs the private directory: the passwords go with it. Nothing is
+    # left to abandon after that, so a further interrupt cannot cut the verdict short.
+    remove_private
+    trap '' INT TERM
+    if [[ -z "$PRIVATE_LEFT" ]]; then
+        info "cleanup: fixture and private working files removed"
+    else
+        problems="${problems:+$problems; }$PRIVATE_LEFT not removed"
+    fi
+    # A check of its own, as in perf.sh: an alert left behind, a flag left changed or a fixture
+    # left on disk fails the run even when every step passed.
     if [[ -z "$problems" ]]; then
         pass "cleanup"
     else
@@ -966,14 +1180,16 @@ step2_flag_off() {
 # Step 3: fixture (prerequisite, except the browser check)
 
 # signup CHECK USERNAME PASSWORD LAST_NAME: POST /api/auth/signup with every required field.
-# Sets SIGNUP_ID; aborts unless it answers 201 with an id.
+# Sets SIGNUP_ID; aborts unless it answers 201 with an id. PASSWORD reaches jq as its whole
+# stdin, from the printf builtin, never as a command argument.
 signup() {
     local body
-    body="$(jq -cn --arg packageId "$PACKAGE_ID" --arg username "$2" --arg password "$3" \
+    body="$(printf '%s' "$3" | jq -c -R -s --arg packageId "$PACKAGE_ID" --arg username "$2" \
         --arg lastName "$4" \
-        '{packageId: $packageId, firstName: "Portfolio", lastName: $lastName,
-          username: $username, email: "\($username)@example.com", password: $password,
-          origin: "WEB", address: "1 Test Street, Springfield"}')"
+        '. as $password
+         | {packageId: $packageId, firstName: "Portfolio", lastName: $lastName,
+            username: $username, email: "\($username)@example.com", password: $password,
+            origin: "WEB", address: "1 Test Street, Springfield"}')"
     http POST "$U/api/auth/signup" "$body"
     SIGNUP_ID="$(jget '.id // empty' "$HTTP_BODY" | lower)"
     if [[ "$HTTP_STATUS" != "201" || ! "$SIGNUP_ID" =~ $UUID_RE ]]; then
@@ -987,8 +1203,9 @@ step3_fixture() {
     epoch="$(date -u +%s)"
     HOLDER_USER="pi-e2e-$epoch-holder"
     EMPTY_USER="pi-e2e-$epoch-empty"
-    HOLDER_PASSWORD="$(random_secret)"
-    EMPTY_PASSWORD="$(random_secret)"
+    if ! HOLDER_PASSWORD="$(random_secret)" || ! EMPTY_PASSWORD="$(random_secret)"; then
+        abort "step 3 signup holder" "no password generated: /dev/urandom did not supply 16 random bytes"
+    fi
     signup "step 3 signup holder" "$HOLDER_USER" "$HOLDER_PASSWORD" "Holder"
     HOLDER_ID="$SIGNUP_ID"
     signup "step 3 signup empty" "$EMPTY_USER" "$EMPTY_PASSWORD" "Empty"
@@ -1058,7 +1275,6 @@ step4_enable() {
         abort "step 4 first insights request" "$(status_text), expected 200 with no retry; body [$(body_snippet)]"
     fi
     HOLDER_INSIGHTS="$HTTP_BODY"
-    cp "$RUN_DIR/body" "$RUN_DIR/insights-holder.json"
     pass "step 4 first insights request"
 }
 
@@ -1194,7 +1410,7 @@ create_checked() {
     if [[ "$verdict" != "ok" ]]; then
         reason="${verdict:-unreadable body}"
     fi
-    if grep -qi '^location:' "$RUN_DIR/headers"; then
+    if grep -qi '^location:' "$PRIVATE_DIR/headers"; then
         reason="${reason:+$reason; }a Location header was sent"
     fi
     if [[ -z "$reason" ]]; then

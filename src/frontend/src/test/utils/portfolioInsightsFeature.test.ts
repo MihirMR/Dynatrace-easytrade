@@ -1,13 +1,19 @@
 import { CancelledError, QueryClient, QueryKey } from "@tanstack/react-query"
 import { ApiError } from "../../api/http"
 import { SESSION_KEY } from "../../contexts/AuthContext/storage"
+import { alertNotificationsQuery, alertsQuery } from "../../hooks/useAlerts"
+import { portfolioInsightsQuery } from "../../hooks/usePortfolioInsights"
 import {
+    type FeatureContext,
     captureFeatureContext,
     currentActivation,
     featureQueryRetry,
+    featureResultContext,
     isCurrentFeatureContext,
     isFeatureDisabledError,
     onPortfolioInsightsDisabled,
+    recordFeatureResultContext,
+    shareFeatureResult,
 } from "../../utils/portfolioInsightsFeature"
 import {
     alertKeys,
@@ -149,6 +155,54 @@ it("onPortfolioInsightsDisabled_cache_dropsOnlyFeatureQueries", () => {
         kept: kept.map(([, data]) => data),
     })
 })
+
+// The real query factories, so the query's signal must travel through the
+// feature API and the shared transport to reach `fetch`.
+it.each<{ read: string; start: (client: QueryClient) => Promise<unknown> }>([
+    {
+        read: "insights",
+        start: (client) => client.query(portfolioInsightsQuery(ACCOUNT)),
+    },
+    {
+        read: "alert list",
+        start: (client) => client.query(alertsQuery(ACCOUNT)),
+    },
+    {
+        read: "notifications",
+        start: (client) => client.query(alertNotificationsQuery(ACCOUNT)),
+    },
+])(
+    "onPortfolioInsightsDisabled_featureReadInFlight_abortsHttpRequest ($read)",
+    async ({ start }) => {
+        // The tab is signed in to the account read, and the feature is on as
+        // the `/insights` loader publishes it, so the request is sent.
+        sessionStorage.setItem(SESSION_KEY, ACCOUNT)
+        const sent: (AbortSignal | null | undefined)[] = []
+        vi.spyOn(window, "fetch").mockImplementation((_input, init) => {
+            sent.push(init?.signal)
+            return new Promise<Response>((_, reject) => {
+                init?.signal?.addEventListener("abort", () =>
+                    reject(new DOMException("Aborted", "AbortError"))
+                )
+            })
+        })
+        const client = newClient()
+        client.setQueryData<boolean>(featureFlagKeys.portfolioInsights, true)
+        const settled = start(client).catch((error: unknown) => error)
+
+        onPortfolioInsightsDisabled(client)
+
+        expect({
+            requests: sent.length,
+            aborted: sent[0]?.aborted,
+            outcome: await settled,
+        }).toEqual({
+            requests: 1,
+            aborted: true,
+            outcome: expect.any(CancelledError),
+        })
+    }
+)
 
 it("onPortfolioInsightsDisabled_repeated_advancesActivationKeepsCache", () => {
     const client = newClient()
@@ -305,6 +359,101 @@ it("isCurrentFeatureContext_captureAfterSameAccountRelogin_isCurrent", () => {
 
     expect(isCurrentFeatureContext(ctx)).toBe(true)
 })
+
+/** The contexts of two requests, the second in a later session. */
+const EARLIER_REQUEST: FeatureContext = {
+    userId: "user-1",
+    activation: 0,
+    session: 1,
+}
+const LATER_REQUEST: FeatureContext = {
+    userId: "user-1",
+    activation: 0,
+    session: 2,
+}
+
+// `record` says whether the context is recorded for the value; only an
+// object or array can carry it.
+it.each([
+    { result: "object", value: { id: 1 }, record: true, carries: true },
+    { result: "array", value: [{ id: 1 }], record: true, carries: true },
+    {
+        result: "unrecorded object",
+        value: { id: 1 },
+        record: false,
+        carries: false,
+    },
+    { result: "string", value: "user-1", record: true, carries: false },
+    { result: "null", value: null, record: true, carries: false },
+    { result: "undefined", value: undefined, record: true, carries: false },
+])(
+    "featureResultContext_result_returnsContextRecordedOnlyForObjects ($result)",
+    ({ value, record, carries }) => {
+        if (record) {
+            recordFeatureResultContext(value, EARLIER_REQUEST)
+        }
+
+        expect(featureResultContext(value)).toEqual(
+            carries ? EARLIER_REQUEST : undefined
+        )
+    }
+)
+
+it.each([
+    {
+        write: "equal refetch",
+        previous: { value: { id: 1 }, ctx: EARLIER_REQUEST },
+        next: { value: { id: 1 }, ctx: LATER_REQUEST },
+        expected: { kept: "previous", ctx: LATER_REQUEST },
+    },
+    {
+        write: "changed refetch",
+        previous: { value: { id: 1, items: [1] }, ctx: EARLIER_REQUEST },
+        next: { value: { id: 2, items: [1] }, ctx: LATER_REQUEST },
+        expected: { kept: "copy", ctx: LATER_REQUEST },
+    },
+    {
+        write: "first result",
+        previous: { value: undefined, ctx: undefined },
+        next: { value: { id: 1 }, ctx: LATER_REQUEST },
+        expected: { kept: "next", ctx: LATER_REQUEST },
+    },
+    {
+        write: "equal manual write",
+        previous: { value: { id: 1 }, ctx: EARLIER_REQUEST },
+        next: { value: { id: 1 }, ctx: undefined },
+        expected: { kept: "previous", ctx: EARLIER_REQUEST },
+    },
+    {
+        write: "changed manual write",
+        previous: { value: { id: 1 }, ctx: EARLIER_REQUEST },
+        next: { value: { id: 2 }, ctx: undefined },
+        expected: { kept: "copy", ctx: undefined },
+    },
+])(
+    "shareFeatureResult_write_sharesDataAndCarriesNextContext ($write)",
+    ({ previous, next, expected }) => {
+        if (previous.ctx !== undefined) {
+            recordFeatureResultContext(previous.value, previous.ctx)
+        }
+        if (next.ctx !== undefined) {
+            recordFeatureResultContext(next.value, next.ctx)
+        }
+
+        const shared = shareFeatureResult(previous.value, next.value)
+
+        expect({
+            kept:
+                shared === previous.value
+                    ? "previous"
+                    : shared === next.value
+                      ? "next"
+                      : "copy",
+            data: shared,
+            ctx: featureResultContext(shared),
+        }).toEqual({ ...expected, data: next.value })
+    }
+)
 
 it("invalidateOnLogout_cachedQueries_removesAccountQueriesAndCountsLogout", () => {
     const client = newClient()

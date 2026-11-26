@@ -10,6 +10,192 @@ export class ApiError extends Error {
     }
 }
 
+/**
+ * A V8 stack frame line: indentation and `at`, then text ending in a
+ * location, which is a line and column or one V8 writes for code without a
+ * source position, and in `)` when the location is in parentheses after a
+ * function name. Matching from the end keeps a long line linear to test.
+ */
+const V8_FRAME_LINE =
+    /^[ \t]+at (?=\S).*(?::\d+:\d+\)?|<anonymous>\)?|\((?:native|index \d+)\))$/
+
+/**
+ * Index just past the part of the header V8 writes at the start of `stack`
+ * (the error's name and message, which may span lines) that the message
+ * identifies, or 0 when it identifies none. It cuts through the line holding
+ * the last occurrence of the message, so no copy of the message is left in
+ * what follows. An engine may rewrite the first line of the message after
+ * writing the header, as Blink prefixes the one `Response.json()` rejects
+ * with; the message's later lines then still mark where the header ends.
+ */
+function stackHeaderEnd(error: Error, stack: string): number {
+    const { message } = error
+    const lineBreak = message.indexOf("\n")
+    const texts =
+        lineBreak < 0 ? [message] : [message, message.slice(lineBreak)]
+    for (const text of texts) {
+        const start = text.trim() === "" ? -1 : stack.lastIndexOf(text)
+        if (start >= 0) {
+            const lineEnd = stack.indexOf("\n", start + text.length)
+            return lineEnd < 0 ? stack.length : lineEnd + 1
+        }
+    }
+    return 0
+}
+
+/**
+ * True for a stack in the Firefox and Safari format, which has no header:
+ * every line is a frame, a function name, which may be empty, then `@` and a
+ * location. A stack holding the error's message or a V8 frame line is not
+ * one, nor is one with a line that has a `:` before its first `@`, as a
+ * `Name: message` header has.
+ */
+function isAtSignFramesStack(error: Error, stack: string): boolean {
+    if (error.message !== "" && stack.includes(error.message)) return false
+    const lines = stack.split("\n").filter((line) => line !== "")
+    return (
+        lines.length > 0 &&
+        lines.every((line) => {
+            const at = line.indexOf("@")
+            return (
+                at >= 0 &&
+                !line.slice(0, at).includes(":") &&
+                !V8_FRAME_LINE.test(line)
+            )
+        })
+    )
+}
+
+/**
+ * The V8 frame lines that end `stack` after the header `stackHeaderEnd`
+ * finds: the lines after the last one that is not a frame, and none when the
+ * last line is not one. A header the message did not identify is thus
+ * dropped whole, including any line inside it that only looks like a frame,
+ * unless its last line, which ends the message, is itself shaped like one.
+ */
+function trailingV8Frames(error: Error, stack: string): string {
+    const lines = stack.slice(stackHeaderEnd(error, stack)).split("\n")
+    let end = lines.length
+    while (end > 0 && lines[end - 1] === "") end--
+    let start = end
+    while (start > 0 && V8_FRAME_LINE.test(lines[start - 1])) start--
+    return lines.slice(start, end).join("\n")
+}
+
+/**
+ * Gives `replacement` the stack frames of `original`, under the header of
+ * `replacement` where the engine writes one. A content-safe stand-in for an
+ * error thereby keeps that error's provenance without its message, which may
+ * quote a request URL or response text. Only text identified as frames is
+ * copied: a Firefox or Safari stack (see `isAtSignFramesStack`) is copied as
+ * it is; any other contributes only the V8 frame lines that end it (see
+ * `trailingV8Frames`), so a header without frames contributes nothing.
+ * Returns `replacement`.
+ */
+export function withStackFramesOf<E extends Error>(
+    replacement: E,
+    original: Error
+): E {
+    const stack = original.stack ?? ""
+    if (isAtSignFramesStack(original, stack)) {
+        replacement.stack = stack
+        return replacement
+    }
+    const frames = trailingV8Frames(original, stack)
+    replacement.stack =
+        frames === ""
+            ? String(replacement)
+            : `${String(replacement)}\n${frames}`
+    return replacement
+}
+
+/** A path segment shaped like a GUID, with or without dashes or braces. */
+const GUID_SEGMENT =
+    /^[{(]?[0-9a-f]{8}-?[0-9a-f]{4}-?[0-9a-f]{4}-?[0-9a-f]{4}-?[0-9a-f]{12}[})]?$/i
+
+function decodedUrlPart(part: string): string {
+    try {
+        return decodeURIComponent(part)
+    } catch {
+        return part
+    }
+}
+
+/**
+ * The request URL without anything that identifies whom it was for: no
+ * origin or fragment, `{id}` for each path segment or query name that is
+ * GUID-shaped or equals one of `identifiers`, and `{value}` for every query
+ * value. Query names are kept, so the template still names the endpoint.
+ */
+function endpointTemplate(url: string, identifiers: readonly string[]): string {
+    let parsed: URL
+    try {
+        parsed = new URL(url, window.location.origin)
+    } catch {
+        return "{unparsed url}"
+    }
+    const named = new Set(identifiers.filter((id) => id !== ""))
+    const redact = (part: string): string =>
+        GUID_SEGMENT.test(part) ||
+        named.has(part) ||
+        named.has(decodedUrlPart(part))
+            ? "{id}"
+            : part
+    const path = parsed.pathname.split("/").map(redact).join("/")
+    if (parsed.search === "") return path
+    const query = parsed.search
+        .slice(1)
+        .split("&")
+        .map((pair) => {
+            const equals = pair.indexOf("=")
+            return equals < 0
+                ? redact(pair)
+                : `${redact(pair.slice(0, equals))}={value}`
+        })
+        .join("&")
+    return `${path}?${query}`
+}
+
+/**
+ * The `ApiError` that is logged in place of one whose URL may carry the
+ * session account id: same name and status, the endpoint template in
+ * `endpoint` and the message, and the original stack frames.
+ */
+class RedactedApiError extends Error {
+    readonly status: number
+    readonly endpoint: string
+
+    constructor(status: number, endpoint: string) {
+        super(`HTTP ${status} for ${endpoint}`)
+        this.name = "ApiError"
+        this.status = status
+        this.endpoint = endpoint
+    }
+}
+
+/**
+ * The value to log for a failed request. An `ApiError` becomes a new error
+ * that names its endpoint by template (see `endpointTemplate`), since its
+ * URL, message and stack header can carry the session account id; pass that
+ * id, and any other identifier the URL may hold, as `identifiers` so it is
+ * redacted even when it is not GUID-shaped. The original error is left
+ * unchanged, so query state and status checks still see it. Any other value
+ * is returned as it is.
+ */
+export function loggableError(
+    error: unknown,
+    ...identifiers: string[]
+): unknown {
+    if (!(error instanceof ApiError)) return error
+    return withStackFramesOf(
+        new RedactedApiError(
+            error.status,
+            endpointTemplate(error.url, identifiers)
+        ),
+        error
+    )
+}
+
 export const services = {
     featureFlag: () => `${window.location.origin}/feature-flag-service/v1`,
     user: () => `${window.location.origin}/user-service/api`,
@@ -46,6 +232,75 @@ export async function getJson<T>(url: string): Promise<T> {
     return (await response.json()) as T
 }
 
+/**
+ * The JSON body of `response`. A body that is not valid JSON rejects with a
+ * `MalformedJsonError` that keeps the parse error's stack frames without its
+ * message; when the engine gives the parse error no frames, as Chrome does
+ * for a fetched body, it keeps the frames of this call instead, so the error
+ * still names where it was read. Any other rejection of the read, such as
+ * the `AbortError` of an aborted request, is rethrown as it is.
+ */
+async function readJsonBody<T>(response: Response): Promise<T> {
+    try {
+        return (await response.json()) as T
+    } catch (error) {
+        if (!(error instanceof SyntaxError)) throw error
+        const parseFailure = new MalformedJsonError()
+        const callSite = parseFailure.stack
+        withStackFramesOf(parseFailure, error)
+        // Only the header is left when the parse error had no frames.
+        if (parseFailure.stack === String(parseFailure)) {
+            parseFailure.stack = callSite
+        }
+        throw parseFailure
+    }
+}
+
+/**
+ * GET JSON as `getJson` does, with `signal` passed to `fetch`, so aborting it
+ * cancels the request and its body read; the rejection is then the standard
+ * `AbortError`. Lets a query hand its cancellation signal to the transport.
+ * A body that is not valid JSON rejects with `MalformedJsonError`.
+ */
+export async function getJsonWithSignal<T>(
+    url: string,
+    signal?: AbortSignal
+): Promise<T> {
+    const response = await request(url, { headers: JSON_HEADERS, signal })
+    return await readJsonBody<T>(response)
+}
+
+/**
+ * A successful response whose JSON body does not match the contract its
+ * reader decodes. `field` is the path of the first value that failed, such as
+ * `allocations[2].percent`, or `body` for the body itself. Neither it nor the
+ * message holds the request URL or any response value, so the error can be
+ * logged whole without exposing an account id or upstream data.
+ */
+export class InvalidResponseError extends Error {
+    readonly field: string
+
+    constructor(field: string) {
+        super(`Invalid response body at ${field}`)
+        this.name = "InvalidResponseError"
+        this.field = field
+    }
+}
+
+/**
+ * A successful response whose body is not valid JSON, raised in place of the
+ * parser's error, whose message and stack header quote the body. Its message
+ * is fixed and holds neither the body nor the request URL, so the error can
+ * be logged whole. It extends `SyntaxError`, the type the parser rejects
+ * with, so a caller that checks for that type still sees one.
+ */
+export class MalformedJsonError extends SyntaxError {
+    constructor() {
+        super("Response body is not valid JSON")
+        this.name = "MalformedJsonError"
+    }
+}
+
 export async function postJson<T>(url: string, body: unknown): Promise<T> {
     const response = await request(url, {
         method: "POST",
@@ -68,16 +323,24 @@ export async function post(url: string, body: unknown): Promise<void> {
  * POST a body that is already serialised JSON text, sent unchanged. Lets a
  * caller send a number token exactly as typed, without a round trip through a
  * JavaScript number; the caller is responsible for producing valid JSON.
+ * Given `status`, only a 2xx equal to it resolves: any other response, 2xx
+ * included, rejects with `ApiError` before the body is read, and so does a
+ * non-2xx `status`; without it, any 2xx resolves.
  */
 export async function postJsonText<T>(
     url: string,
-    bodyText: string
+    bodyText: string,
+    status?: number
 ): Promise<T> {
-    const response = await request(url, {
+    const init: RequestInit = {
         method: "POST",
         headers: JSON_HEADERS,
         body: bodyText,
-    })
+    }
+    const response =
+        status === undefined
+            ? await request(url, init)
+            : await requestExactStatus(url, init, status)
     return (await response.json()) as T
 }
 
@@ -107,6 +370,40 @@ export async function del(url: string): Promise<void> {
     await request(url, { method: "DELETE", headers: JSON_HEADERS })
 }
 
+/**
+ * `request` for a call whose one success is a 2xx equal to `status`. A
+ * non-2xx response rejects with `ApiError` as `request` rejects it, even when
+ * it equals `status`, and a 2xx other than `status` rejects the same way;
+ * either rejection comes before the body is read.
+ */
+async function requestExactStatus(
+    url: string,
+    init: RequestInit,
+    status: number
+): Promise<Response> {
+    const response = await request(url, init)
+    if (response.status !== status) {
+        throw new ApiError(response.status, url)
+    }
+    return response
+}
+
+/**
+ * DELETE whose one success is a 2xx equal to `status`: any other response,
+ * 2xx included, rejects with `ApiError`, and so does a non-2xx `status`. The
+ * body is never read.
+ */
+export async function delExactStatus(
+    url: string,
+    status: number
+): Promise<void> {
+    await requestExactStatus(
+        url,
+        { method: "DELETE", headers: JSON_HEADERS },
+        status
+    )
+}
+
 /** Returns the raw body so the caller can hand it to its own XML parser. */
 export async function getXml(
     url: string,
@@ -114,36 +411,6 @@ export async function getXml(
 ): Promise<string> {
     const response = await request(url, { headers: XML_HEADERS }, allowStatus)
     return await response.text()
-}
-
-/**
- * GET JSON, aborted after `timeoutMs` or when the optional caller `signal`
- * aborts, whichever comes first. Both paths abort one internal controller, so
- * the rejection is always the standard `AbortError`; `isReadDeadlineAbort`
- * tells which one aborted it. The caller signal is linked by hand because
- * `AbortSignal.any` is missing from older browsers; its listener is removed
- * once the request settles.
- */
-export async function getJsonWithTimeout<T>(
-    url: string,
-    timeoutMs: number,
-    signal?: AbortSignal
-): Promise<T> {
-    return await readJsonWithTimeout<T>(url, timeoutMs, signal, undefined)
-}
-
-/**
- * GET JSON with the same deadline and caller-signal handling as
- * `getJsonWithTimeout`, but any status other than `status`, 2xx included,
- * rejects with `ApiError` before the body is read.
- */
-export async function getJsonWithTimeoutExactStatus<T>(
-    url: string,
-    timeoutMs: number,
-    status: number,
-    signal?: AbortSignal
-): Promise<T> {
-    return await readJsonWithTimeout<T>(url, timeoutMs, signal, status)
 }
 
 /** Rejections of timed reads that their own deadline aborted first. */
@@ -156,12 +423,22 @@ export function isReadDeadlineAbort(error: unknown): boolean {
     )
 }
 
-/** Shared timed read; a given `requiredStatus` narrows `response.ok`. */
-async function readJsonWithTimeout<T>(
+/**
+ * GET JSON, aborted after `timeoutMs` or when the optional caller `signal`
+ * aborts, whichever comes first. Both paths abort one internal controller, so
+ * the rejection is always the standard `AbortError`; `isReadDeadlineAbort`
+ * tells which one aborted it. The caller signal is linked by hand because
+ * `AbortSignal.any` is missing from older browsers; its listener is removed
+ * once the request settles. Given `requiredStatus`, any other status, 2xx
+ * included, rejects with `ApiError` before the body is read; without it, any
+ * 2xx resolves. A body that is not valid JSON rejects with
+ * `MalformedJsonError`.
+ */
+export async function getJsonWithTimeout<T>(
     url: string,
     timeoutMs: number,
-    signal: AbortSignal | undefined,
-    requiredStatus: number | undefined
+    signal?: AbortSignal,
+    requiredStatus?: number
 ): Promise<T> {
     const controller = new AbortController()
     // Decided when the deadline fires, since the caller may also abort before
@@ -188,7 +465,7 @@ async function readJsonWithTimeout<T>(
         ) {
             throw new ApiError(response.status, url)
         }
-        return (await response.json()) as T
+        return await readJsonBody<T>(response)
     } catch (error) {
         if (
             deadlineAbortedFirst &&

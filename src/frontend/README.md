@@ -123,7 +123,7 @@ Bound by `selectors.ts`, so the element tag matters:
 - `input#alert-threshold` (`type="text"`, `inputMode="decimal"`)
 - `button#alert-submit`
 - `output#alert-created-id`, rendered after each 201: `value` is the new alert
-  id and `data-threshold` the submitted threshold text
+  id and `data-threshold` the normalised threshold token the create request sent
 - `output#alert-deleted-id`, rendered after each DELETE 204: `value` is the
   deleted id
 - `li[data-alert-id="<id>"]` alert rows, and their `button.alert-delete`

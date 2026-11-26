@@ -2,7 +2,11 @@ import "@testing-library/jest-dom/vitest"
 import type { ComponentProps } from "react"
 import { render, screen, within } from "@testing-library/react"
 import userEvent from "@testing-library/user-event"
-import { AlertList } from "../../components/insights/AlertList"
+import {
+    AlertList,
+    DeletedAlertOutput,
+    alertSummaryText,
+} from "../../components/insights/AlertList"
 import { AlertNotifications } from "../../components/insights/AlertNotifications"
 import { FormatterWrapper } from "../providers"
 import type { Alert } from "../../api/alerts/types"
@@ -77,8 +81,7 @@ function renderList(overrides: Partial<AlertListProps> = {}): void {
                 onSetEnabled={vi.fn()}
                 onDelete={vi.fn()}
                 pendingIds={new Set<string>()}
-                rowErrors={{}}
-                deletedId={null}
+                rowErrors={new Map<string, readonly string[]>()}
                 {...overrides}
             />
         </FormatterWrapper>
@@ -95,6 +98,7 @@ function renderNotifications(
                 instruments={instruments}
                 onAcknowledge={vi.fn()}
                 pendingIds={new Set<string>()}
+                errors={new Map<string, string>()}
                 {...overrides}
             />
         </FormatterWrapper>
@@ -111,7 +115,10 @@ function row(id: string): HTMLElement {
     return element
 }
 
-afterEach(() => vi.restoreAllMocks())
+afterEach(() => {
+    vi.useRealTimers()
+    vi.restoreAllMocks()
+})
 
 it.each<{
     state: string
@@ -208,18 +215,111 @@ it("alertList_delete_callsHandler", async () => {
     expect(onDelete.mock.calls).toEqual([[triggered.id]])
 })
 
-it.each<{ scenario: string; alerts: Alert[] }>([
-    { scenario: "rows remain", alerts: [triggered, disabled] },
-    { scenario: "last row deleted", alerts: [] },
-])("alertList_deleted_rendersDeletedIdOutput ($scenario)", ({ alerts }) => {
-    renderList({ alerts, deletedId: armed.id })
+it("alertList_deleted_rendersDeletedIdOutput", () => {
+    render(<DeletedAlertOutput deletedId={armed.id} />)
 
     // Loadgen's `//output[@id="alert-deleted-id"][@value="<id>"]` reads the
-    // attribute, not the element's text.
-    expect(document.querySelector("output#alert-deleted-id")).toHaveAttribute(
-        "value",
-        armed.id
+    // attribute, not the element's text; exactly one such output exists.
+    const outputs = Array.from(
+        document.querySelectorAll("output#alert-deleted-id")
     )
+    expect(
+        outputs.map((output) => ({
+            value: output.getAttribute("value"),
+            text: output.textContent,
+        }))
+    ).toEqual([{ value: armed.id, text: armed.id }])
+})
+
+it("deletedAlertOutput_noDelete_rendersNothing", () => {
+    const { container } = render(<DeletedAlertOutput deletedId={null} />)
+
+    expect(container).toBeEmptyDOMElement()
+})
+
+it("alertList_rowErrors_showsEachMessageBesideItsRow", () => {
+    renderList({
+        rowErrors: new Map([
+            [armed.id, ["This alert no longer exists."]],
+            [triggered.id, ["Something went wrong. Please try again later."]],
+        ]),
+    })
+
+    const messagesOf = (id: string) =>
+        within(row(id))
+            .queryAllByRole("alert")
+            .map((message) => message.textContent)
+    expect({
+        armed: messagesOf(armed.id),
+        triggered: messagesOf(triggered.id),
+        disabled: messagesOf(disabled.id),
+    }).toEqual({
+        armed: ["This alert no longer exists."],
+        triggered: ["Something went wrong. Please try again later."],
+        disabled: [],
+    })
+})
+
+it.each<{ scenario: string; messages: string[]; shown: string[] }>([
+    {
+        scenario: "two messages",
+        messages: [
+            "Something went wrong. Please try again later.",
+            "This alert no longer exists.",
+        ],
+        shown: [
+            "Something went wrong. Please try again later.",
+            "This alert no longer exists.",
+        ],
+    },
+    {
+        scenario: "two messages, other order",
+        messages: [
+            "This alert no longer exists.",
+            "Something went wrong. Please try again later.",
+        ],
+        shown: [
+            "This alert no longer exists.",
+            "Something went wrong. Please try again later.",
+        ],
+    },
+    {
+        scenario: "one message twice",
+        messages: [
+            "Something went wrong. Please try again later.",
+            "Something went wrong. Please try again later.",
+        ],
+        shown: ["Something went wrong. Please try again later."],
+    },
+])(
+    "alertList_rowWithSeveralErrors_showsEachDistinctMessageInOrder ($scenario)",
+    ({ messages, shown }) => {
+        renderList({ rowErrors: new Map([[armed.id, messages]]) })
+
+        expect(
+            Array.from(
+                row(armed.id).querySelectorAll(
+                    'span.field-error[role="alert"]'
+                ),
+                (message) => message.textContent
+            )
+        ).toEqual(shown)
+    }
+)
+
+it("alertSummaryText_alert_matchesRowWording", () => {
+    expect([
+        alertSummaryText(armed, instruments),
+        alertSummaryText(
+            makeAlert({
+                type: "PROFIT_LOSS",
+                direction: "BELOW",
+                threshold: 2.5,
+                instrumentId: "9f3c2b1a-0000-4000-8000-000000000009",
+            }),
+            instruments
+        ),
+    ]).toEqual(["EasyTravel Price Above 10", "9f3c2b1a P/L % Below 2.5"])
 })
 
 it("alertList_noAlerts_showsEmpty", () => {
@@ -230,13 +330,29 @@ it("alertList_noAlerts_showsEmpty", () => {
     )
 })
 
+// Ten minutes after `triggered`, the age `formatDate` would print as
+// "10 minutes ago".
+const STATUS_CLOCK = "2026-01-01T10:10:00Z"
+
+// en-US short time of the trigger, never a relative phrase or a date; the
+// hour depends on the host time zone.
+const TRIGGERED_AT_CLOCK_TIME = /^Triggered at \d{1,2}:\d{2} [AP]M \(10\.5\)$/
+
 it.each<{ state: string; alert: Alert; status: string | RegExp }>([
     { state: "armed", alert: armed, status: "Armed" },
     {
-        state: "triggered",
+        state: "triggered minutes ago",
         alert: triggered,
-        // en-US short date and time; the hour depends on the host time zone.
-        status: /^Triggered at \d{1,2}\/\d{1,2}\/\d{2}, \d{1,2}:\d{2} [AP]M \(10\.5\)$/,
+        status: TRIGGERED_AT_CLOCK_TIME,
+    },
+    {
+        state: "triggered on an earlier day",
+        alert: makeAlert({
+            id: "a1000000-0000-4000-8000-000000000007",
+            triggeredAt: "2025-12-29T10:00:00Z",
+            triggerValue: 10.5,
+        }),
+        status: TRIGGERED_AT_CLOCK_TIME,
     },
     {
         state: "triggered, unparsable time",
@@ -254,6 +370,8 @@ it.each<{ state: string; alert: Alert; status: string | RegExp }>([
         status: "Disabled",
     },
 ])("alertList_rowState_showsStatus ($state)", ({ alert, status }) => {
+    // Mocks only `Date`, so each row's age is fixed whatever the host clock.
+    vi.setSystemTime(STATUS_CLOCK)
     renderList({ alerts: [alert] })
 
     expect(within(row(alert.id)).getByText(status)).toBeInTheDocument()
@@ -283,6 +401,20 @@ it("alertNotifications_acknowledge_callsHandler", async () => {
     await user.click(screen.getByRole("button", { name: "Acknowledge" }))
 
     expect(onAcknowledge.mock.calls).toEqual([[triggered.id]])
+})
+
+it("alertNotifications_error_showsMessageInsideItem", () => {
+    renderNotifications({
+        errors: new Map([[triggered.id, "This alert no longer exists."]]),
+    })
+
+    const item = document.querySelector<HTMLElement>(
+        `li.alert-notification[data-notification-id="${triggered.id}"]`
+    )
+    if (item === null) throw new Error("No notification item rendered")
+    expect(within(item).getByRole("alert")).toHaveTextContent(
+        /^This alert no longer exists\.$/
+    )
 })
 
 it("alertNotifications_item_hasNoAlertRowAttribute", () => {

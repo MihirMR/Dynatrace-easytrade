@@ -1,8 +1,9 @@
 import {
     ApiError,
     getJson,
-    getJsonWithTimeoutExactStatus,
+    getJsonWithTimeout,
     isReadDeadlineAbort,
+    MalformedJsonError,
     put,
     services,
 } from "../http"
@@ -100,19 +101,13 @@ function isAbortError(error: unknown): boolean {
     )
 }
 
-/** A content-free error logged in place of one that may quote the response. */
-class FlagResponseError extends Error {
-    constructor(message: string) {
-        super(message)
-        this.name = "FlagResponseError"
-    }
-}
-
-// The diagnostic logged for an exception caught during the read. Errors that
-// carry no upstream content are kept as thrown. A JSON parse error's message
-// is built from the response bytes, and the body is untrusted, so that error
-// and any unrecognised thrown value are replaced by a content-free
-// FlagResponseError without a cause.
+// The diagnostic logged for an exception caught during the read. Every error
+// is kept as thrown. Within this read only parsing builds a message from the
+// response bytes, which are untrusted, and the parse boundary in http.ts
+// already makes that error content-safe: a `MalformedJsonError`, whose
+// message is fixed and whose stack holds frames but no body text. Only that
+// error counts as unreadable JSON; a SyntaxError raised anywhere else is
+// unrecognised.
 function describeFlagReadFailure(
     error: unknown,
     signal?: AbortSignal
@@ -127,22 +122,18 @@ function describeFlagReadFailure(
     if (error instanceof TypeError) {
         return { reason: "network", error }
     }
-    if (error instanceof SyntaxError) {
+    if (error instanceof MalformedJsonError) {
         return {
             reason: "unreadable_json",
             status: PORTFOLIO_INSIGHTS_FLAG_STATUS,
-            errorName: "SyntaxError",
-            error: new FlagResponseError(
-                "Flag response body is not valid JSON"
-            ),
+            errorName: error.name,
+            error,
         }
     }
     return {
         reason: "error",
         errorName: error instanceof Error ? error.name : typeof error,
-        error: new FlagResponseError(
-            "Flag read failed with an unrecognised error"
-        ),
+        error,
     }
 }
 
@@ -162,11 +153,11 @@ export async function getPortfolioInsightsFlag(
 ): Promise<boolean> {
     let body: unknown
     try {
-        body = await getJsonWithTimeoutExactStatus<unknown>(
+        body = await getJsonWithTimeout<unknown>(
             `${services.featureFlag()}/flags/${PortfolioInsightsFlagId}`,
             PORTFOLIO_INSIGHTS_FLAG_TIMEOUT_MS,
-            PORTFOLIO_INSIGHTS_FLAG_STATUS,
-            signal
+            signal,
+            PORTFOLIO_INSIGHTS_FLAG_STATUS
         )
     } catch (error) {
         const diagnostic = describeFlagReadFailure(error, signal)

@@ -2,8 +2,11 @@
 /**
  * Browser check of the Portfolio Insights page against the broker responses
  * the page itself received: the figures and allocations it shows, its empty
- * state, one Toast per triggered alert arming, re-arming, acknowledging, and
- * the shutdown once the `portfolio-insights-enabled` flag turns off.
+ * state, one Toast per triggered alert arming, re-arming, acknowledging, the
+ * five existing sidebar links' layout with the feature on and off, and the
+ * shutdown once the `portfolio-insights-enabled` flag turns off. One Toast
+ * per arming is also held to the check's own notifications read through the
+ * broker API, apart from the page.
  *
  * Usage, from src/loadgen after `npm ci`:
  *
@@ -12,7 +15,8 @@
  *
  * Every option is required, and no environment variable is read. The flag
  * must already be in the state the mode names: `false` for flag-off and
- * `true` for flag-on. flag-on turns it off for its last check and on again.
+ * `true` for flag-on. flag-on turns it off and on again for its sidebar
+ * continuity check and for its last check.
  *
  * Fixture, written by scripts/portfolio-insights/e2e.sh:
  *
@@ -29,11 +33,23 @@
  *   `target_price` (type `TARGET_PRICE`) and `profit_loss` (`PROFIT_LOSS`),
  *   one `ABOVE` and one `BELOW` member.
  *
- * Passwords are never printed or written.
+ * Passwords are never printed or written. Neither are response bodies, JSON
+ * parser messages, response fields the checks do not know, or the text of
+ * any Toast: a failure names the method, path, HTTP status and a fixed
+ * reason, a value from a response or the page is printed only in its defined
+ * form, escaped and bounded, and otherwise described by kind and size, error
+ * messages are escaped and bounded, and the evidence keeps validated fields
+ * only: the parsed fields of each Toast matched to a fixture arming, the
+ * alert, type, direction and time of each other fixture-alert Toast, and
+ * every remaining Toast counted by variant.
  *
  * Output: one `PASS <check>` or `FAIL <check>: <reason>` line per check, and
  * `portfolio-insights-page-check-<mode>.json` plus screenshots in the
  * evidence directory.
+ *
+ * Every wait ends at its deadline. A page that leaves a read unanswered then
+ * is closed, which ends the read at once; that check and every later check
+ * on the same page fail.
  *
  * Exit codes: 0 when every check passed; 1 when a check or the setup failed;
  * 2 on a usage or fixture error.
@@ -74,20 +90,74 @@ const DIRECTIONS = ["ABOVE", "BELOW"]
 const DEFAULT_EVALUATION_INTERVAL_S = 60
 
 const RISK_LABELS = { LOW: "Low", MEDIUM: "Medium", HIGH: "High" }
+/** Money as `formatInPage` writes it, its small-value format included. */
+const CURRENCY_TEXT_PATTERN = /^-?\$\d{1,3}(,\d{3})*(\.\d+)?$/
+/** A percent as `formatInPage` writes it: two places, signed unless zero. */
+const PERCENT_TEXT_PATTERN = /^[+-]?\d{1,3}(,\d{3})*\.\d{2}%$/
+/** Longest compared value, in characters, a problem or the evidence repeats. */
+const MAX_COMPARED_CHARS = 160
 
 /** The text `AlertNotificationWatcher` gives a triggered-alert Toast. */
 const TOAST_PATTERN =
     /^Alert triggered: (.+) (Price|P\/L) (above|below) (\S+) \(now (\S+)\)$/
 const TOAST_TYPES = { Price: "TARGET_PRICE", "P/L": "PROFIT_LOSS" }
 const TOAST_DIRECTIONS = { above: "ABOVE", below: "BELOW" }
+/**
+ * A threshold or "now" value as `formatAlertNumber` writes it: en-US digit
+ * grouping, at most 8 fractional digits and no exponent.
+ */
+const ALERT_NUMBER_PATTERN = /^-?\d{1,3}(,\d{3})*(\.\d{1,8})?$/
 /** A Toast threshold is the 8-place display rounding of the alert's. */
 const THRESHOLD_TOLERANCE = 1e-8
+/** The only form of page path the Toast evidence repeats. */
+const TOAST_PATH_PATTERN = /^\/[A-Za-z0-9/_-]{0,64}$/
 
 const TRACE_HEADERS = ["traceparent", "x-dynatrace"]
 const TRACE_CORRELATION_NOTE =
     "Browser-to-broker trace correlation needs a deployment monitored by OneAgent with RUM injected into the frontend. traceHeaders records what the browser sent on each insights request and is not asserted."
+/** Longest trace header value, in characters, the evidence keeps. */
+const MAX_TRACE_HEADER_CHARS = 256
+
+/** The variants `ToastContext` gives a Toast, as its `toast-<variant>` class. */
+const TOAST_VARIANTS = ["success", "error", "info"]
+const TOAST_VARIANT_CLASS = /\btoast-(\w+)\b/g
+
+/** A timestamp as the broker serialises one. */
+const TIMESTAMP_PATTERN =
+    /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,9})?(Z|[+-]\d{2}:\d{2})$/
+
+/** Longest error message, in characters, a diagnostic repeats. */
+const MAX_DIAGNOSTIC_CHARS = 500
+/** Causes of an error that a diagnostic names. */
+const MAX_CAUSE_DEPTH = 5
+/** The only forms in which an error's name or code is printed. */
+const ERROR_NAME_PATTERN = /^\w{1,64}$/
+const ERROR_CODE_PATTERN = /^[A-Z][A-Z0-9_]{0,63}$/
 
 const VIEWPORT = { width: 1366, height: 900 }
+
+/** The five sidebar links that predate Portfolio Insights, in their order. */
+const LEGACY_NAV_IDS = [
+    "nav-home",
+    "nav-instruments",
+    "nav-deposit",
+    "nav-withdraw",
+    "nav-credit-card",
+]
+/**
+ * Viewport widths of the sidebar continuity check: the mobile row whose
+ * labels wrap, the mobile row where the five links fit on one line and a
+ * sixth would not, and the desktop column.
+ */
+const CONTINUITY_WIDTHS = [375, 668, 1366]
+/** The width whose sidebar the continuity check screenshots. */
+const CONTINUITY_SCREENSHOT_WIDTH = 668
+/**
+ * The defined form of a computed style value the continuity check reads: a
+ * CSS keyword, a number or a pixel length.
+ */
+const CSS_VALUE_PATTERN =
+    /^(?:[a-z][a-z-]{0,31}|-?\d{1,6}(?:\.\d{1,6})?(?:px)?)$/
 
 /** Deadline of every navigation, login step and page selector wait. */
 const PAGE_TIMEOUT_MS = 30_000
@@ -119,11 +189,21 @@ const ACKNOWLEDGE_TIMEOUT_MS = 20_000
 const NEXT_POLL_TIMEOUT_MS = 25_000
 /** Added to two evaluation intervals while re-armed alerts are awaited. */
 const REARM_MARGIN_S = 30
-/** Covers the page's 15 s flag poll and 2 s read deadline, with margin. */
+/**
+ * Counted from the start of the flag PUT; covers the page's 15 s flag poll
+ * and 2 s read deadline, with margin.
+ */
 const SHUTDOWN_TIMEOUT_MS = 30_000
 /** After the shutdown, no notification request or Toast may occur for this. */
 const ABSENCE_WINDOW_MS = 20_000
 const POLL_INTERVAL_MS = 250
+/**
+ * Bound of every single DevTools protocol call, such as a `page.evaluate`
+ * probe. A selector wait holds one call open for up to its own timeout, at
+ * most `PAGE_TIMEOUT_MS`, so the bound must exceed that. A probe call still
+ * running when its wait times out ends sooner: `probePage` closes its page.
+ */
+const PROTOCOL_TIMEOUT_MS = 2 * PAGE_TIMEOUT_MS
 
 /** A bad command line or fixture; the run stops with exit code 2. */
 class UsageError extends Error {
@@ -133,63 +213,232 @@ class UsageError extends Error {
     }
 }
 
-/** A bounded wait that ran out of time. */
-class WaitTimeoutError extends Error {
-    constructor(message) {
-        super(message)
+/**
+ * A bounded wait that ran out of time, or whose probe did not answer by its
+ * deadline. `options.cause` holds an error the probe threw too late to count.
+ */
+export class WaitTimeoutError extends Error {
+    constructor(message, options) {
+        super(message, options)
         this.name = "WaitTimeoutError"
     }
 }
 
+/**
+ * Longest delay a single `setTimeout` keeps. Node runs a longer one after
+ * 1 ms with a TimeoutOverflowWarning, so longer delays are taken in steps.
+ */
+const MAX_TIMER_MS = 2 ** 31 - 1
+
+/** Resolves once `ms` have passed, in timer steps of at most MAX_TIMER_MS. */
 function pause(ms) {
-    return new Promise((resolve) => setTimeout(resolve, ms))
+    return new Promise((resolve) => {
+        const wait = (leftMs) => {
+            if (leftMs > MAX_TIMER_MS) {
+                setTimeout(wait, MAX_TIMER_MS, leftMs - MAX_TIMER_MS)
+            } else {
+                setTimeout(resolve, leftMs)
+            }
+        }
+        wait(ms)
+    })
 }
 
-/**
- * Polls `predicate` every `intervalMs` until it returns a truthy value, which
- * it resolves with, and throws a `WaitTimeoutError` naming `what` once
- * `timeoutMs` has passed without one. An error the predicate throws ends the
- * wait at once.
- */
-async function waitFor(
-    predicate,
-    { timeoutMs, intervalMs = POLL_INTERVAL_MS, what }
-) {
-    const deadline = Date.now() + timeoutMs
-    for (;;) {
-        const value = await predicate()
-        if (value) {
-            return value
-        }
-        const remainingMs = deadline - Date.now()
-        if (remainingMs <= 0) {
-            throw new WaitTimeoutError(
-                `timed out after ${timeoutMs} ms waiting for ${what}`
-            )
-        }
-        await pause(Math.min(intervalMs, remainingMs))
+/** Rejects a duration that would leave a wait without a finite deadline. */
+function requireDuration(name, ms) {
+    if (!Number.isFinite(ms) || ms <= 0) {
+        throw new RangeError(
+            `${name} must be a positive number of milliseconds, not ${ms}`
+        )
     }
 }
 
 /**
- * Polls `violation` for `windowMs` and throws as soon as it returns the
- * description of something that must not happen in that window.
+ * Runs `probe(signal)` and settles with `{ late, failed, value, error }` by
+ * `deadline`, a `performance.now()` time. `late` is true when the probe has
+ * not answered by the deadline or answered after it. A probe left without an
+ * answer keeps running unobserved: its later value or rejection is consumed
+ * here, so it never becomes an unhandled rejection. The expiry timer is
+ * re-armed in steps of at most MAX_TIMER_MS until `performance.now()`
+ * reaches the deadline, so any finite deadline holds.
  */
-async function observeAbsence(
+async function answerBy(probe, signal, deadline) {
+    const answer = new Promise((resolve) => resolve(probe(signal))).then(
+        (value) => ({
+            late: performance.now() > deadline,
+            failed: false,
+            value,
+        }),
+        (error) => ({
+            late: performance.now() > deadline,
+            failed: true,
+            error,
+        })
+    )
+    let timer
+    const expiry = new Promise((resolve) => {
+        const arm = () => {
+            timer = setTimeout(
+                () => {
+                    if (performance.now() >= deadline) {
+                        resolve({ late: true, failed: false, value: undefined })
+                    } else {
+                        arm()
+                    }
+                },
+                Math.min(
+                    Math.max(deadline - performance.now(), 0),
+                    MAX_TIMER_MS
+                )
+            )
+        }
+        arm()
+    })
+    try {
+        return await Promise.race([answer, expiry])
+    } finally {
+        clearTimeout(timer)
+    }
+}
+
+/**
+ * Polls `predicate(signal)` every `intervalMs` until it answers a truthy
+ * value, which it resolves with, and throws a `WaitTimeoutError` naming
+ * `what` once `timeoutMs` has passed without one. A wait whose window opened
+ * before the call passes the window's end as `deadline`, a
+ * `performance.now()` time, which replaces `timeoutMs` from now; `timeoutMs`
+ * then gives the window's length for the message.
+ *
+ * The deadline comes from the monotonic `performance.now()` clock and bounds
+ * every probe as well as the wait: a truthy answer counts only if it arrives
+ * by the deadline, no probe starts at or after it, so a deadline already
+ * past ends the wait without one, and a probe that has not answered by then
+ * ends the wait. On a timeout `signal` is aborted with the thrown error. An
+ * error the predicate throws by the deadline ends the wait at once; one
+ * thrown later becomes the timeout's `cause`.
+ */
+export async function waitFor(
+    predicate,
+    { timeoutMs, deadline: endsAt, intervalMs = POLL_INTERVAL_MS, what }
+) {
+    requireDuration("timeoutMs", timeoutMs)
+    requireDuration("intervalMs", intervalMs)
+    if (endsAt !== undefined && !Number.isFinite(endsAt)) {
+        throw new RangeError(
+            `deadline must be a finite performance.now() time, not ${endsAt}`
+        )
+    }
+    const deadline = endsAt ?? performance.now() + timeoutMs
+    const controller = new AbortController()
+    const timedOut = (answer) => {
+        const error = new WaitTimeoutError(
+            `timed out after ${timeoutMs} ms waiting for ${what}` +
+                (answer === null
+                    ? ""
+                    : "; its last probe did not answer in time"),
+            answer?.failed ? { cause: answer.error } : undefined
+        )
+        controller.abort(error)
+        return error
+    }
+    for (;;) {
+        if (performance.now() >= deadline) {
+            throw timedOut(null)
+        }
+        const answer = await answerBy(predicate, controller.signal, deadline)
+        if (answer.late) {
+            throw timedOut(answer)
+        }
+        if (answer.failed) {
+            throw answer.error
+        }
+        if (answer.value) {
+            return answer.value
+        }
+        const remainingMs = deadline - performance.now()
+        if (remainingMs > 0) {
+            await pause(Math.min(intervalMs, remainingMs))
+        }
+    }
+}
+
+/**
+ * Polls `violation(signal)` every `intervalMs` for `windowMs` and throws as
+ * soon as it answers the description of something that must not happen in
+ * that window. A violation is reported whenever its answer arrives.
+ *
+ * It resolves only on a clean answer from a probe that started at or after
+ * the end of the window, so the whole window was observed. By the monotonic
+ * `performance.now()` clock, every probe must answer within one poll
+ * interval after the window ends; one that does not ends the observation
+ * with a `WaitTimeoutError` and aborts `signal` with it, because the window
+ * was not fully observed. An error the probe throws by then ends the wait
+ * at once; one thrown later becomes the timeout's `cause`.
+ */
+export async function observeAbsence(
     violation,
     { windowMs, intervalMs = POLL_INTERVAL_MS }
 ) {
-    const deadline = Date.now() + windowMs
+    requireDuration("windowMs", windowMs)
+    requireDuration("intervalMs", intervalMs)
+    const windowEnd = performance.now() + windowMs
+    // The probe that closes the window starts at its end and needs time to
+    // answer; one poll interval is the most any probe may run beyond it.
+    const answerDeadline = windowEnd + intervalMs
+    const controller = new AbortController()
     for (;;) {
-        const found = await violation()
-        if (found) {
-            throw new Error(found)
+        const closing = performance.now() >= windowEnd
+        const answer = await answerBy(
+            violation,
+            controller.signal,
+            answerDeadline
+        )
+        if (!answer.failed && answer.value) {
+            throw new Error(answer.value)
         }
-        const remainingMs = deadline - Date.now()
-        if (remainingMs <= 0) {
+        if (answer.late) {
+            const error = new WaitTimeoutError(
+                `timed out after ${windowMs + intervalMs} ms waiting for the absence probe to answer; the ${windowMs} ms window was not fully observed`,
+                answer.failed ? { cause: answer.error } : undefined
+            )
+            controller.abort(error)
+            throw error
+        }
+        if (answer.failed) {
+            throw answer.error
+        }
+        if (closing) {
             return
         }
-        await pause(Math.min(intervalMs, remainingMs))
+        const remainingMs = windowEnd - performance.now()
+        if (remainingMs > 0) {
+            await pause(Math.min(intervalMs, remainingMs))
+        }
+    }
+}
+
+/**
+ * Runs `probe()`, a read that awaits `page`, as the probe of a wait whose
+ * `signal` aborts when the wait times out. `page.evaluate` takes no signal,
+ * so a call still pending then would keep the page busy until
+ * PROTOCOL_TIMEOUT_MS. The page is closed at the abort instead, which ends
+ * every pending call on it at once: a stalled page is closed, and the later
+ * checks that use it fail. A probe that settles first leaves the page open,
+ * and an already aborted `signal` throws its reason before any call.
+ */
+export async function probePage(page, signal, probe) {
+    signal.throwIfAborted()
+    const closePage = () => {
+        new Promise((resolve) => resolve(page.close())).catch((error) => {
+            // The page may already be closing or gone.
+            console.error(describeError(error))
+        })
+    }
+    signal.addEventListener("abort", closePage, { once: true })
+    try {
+        return await probe()
+    } finally {
+        signal.removeEventListener("abort", closePage)
     }
 }
 
@@ -417,16 +666,175 @@ async function readFixture(fixturePath, mode) {
     }
 }
 
+/** Whether `code` is a C0 or C1 control, or a line or paragraph separator. */
+function isControlCode(code) {
+    return (
+        code < 0x20 ||
+        (code >= 0x7f && code <= 0x9f) ||
+        code === 0x2028 ||
+        code === 0x2029
+    )
+}
+
+/**
+ * `text` with every control character and line or paragraph separator
+ * written as a `\uXXXX` escape, so text this script did not write cannot
+ * start a forged line in a log (CWE-117).
+ */
+function escapeControl(text) {
+    let escaped = ""
+    for (const character of String(text)) {
+        const code = character.codePointAt(0)
+        escaped += isControlCode(code)
+            ? `\\u${code.toString(16).padStart(4, "0")}`
+            : character
+    }
+    return escaped
+}
+
+/** `text` cut to at most `maxChars` characters, ending in "…" when cut. */
+function boundText(text, maxChars) {
+    if (text.length <= maxChars) {
+        return text
+    }
+    let end = maxChars - 1
+    const last = text.charCodeAt(end - 1)
+    // Never keep half of a surrogate pair.
+    if (last >= 0xd800 && last <= 0xdbff) {
+        end -= 1
+    }
+    return `${text.slice(0, end)}…`
+}
+
+function plural(count, noun) {
+    return `${count} ${noun}${count === 1 ? "" : "s"}`
+}
+
+/**
+ * A description of a value from a response or the page that is safe to
+ * print: `null`, booleans, numbers and the strings in `known` as JSON, any
+ * other value by its kind and size only, never its content.
+ */
+export function describeValue(value, known = []) {
+    if (value === null || typeof value === "boolean" || isFiniteNumber(value)) {
+        return JSON.stringify(value)
+    }
+    if (typeof value === "number") {
+        // JSON would write NaN or an infinity as null.
+        return String(value)
+    }
+    if (typeof value === "string") {
+        return known.includes(value)
+            ? JSON.stringify(value)
+            : `a string of ${plural(value.length, "character")}`
+    }
+    if (Array.isArray(value)) {
+        return value.length === 0
+            ? "an empty array"
+            : `an array of ${plural(value.length, "item")}`
+    }
+    if (typeof value === "object") {
+        return "an object"
+    }
+    return typeof value
+}
+
+function errorName(error) {
+    return typeof error.name === "string" && ERROR_NAME_PATTERN.test(error.name)
+        ? error.name
+        : "Error"
+}
+
+function errorCode(error) {
+    return typeof error.code === "string" && ERROR_CODE_PATTERN.test(error.code)
+        ? error.code
+        : null
+}
+
+/**
+ * The message of `error`, escaped and bounded, for a `FAIL` reason or the
+ * evidence. A thrown value that is not an `Error` is described by its kind.
+ */
+function errorMessage(error) {
+    if (!(error instanceof Error)) {
+        return `a non-Error value was thrown: ${describeValue(error)}`
+    }
+    return boundText(escapeControl(error.message), MAX_DIAGNOSTIC_CHARS)
+}
+
+/**
+ * One line describing `error` for stderr: its name, code and bounded,
+ * escaped message, then the name and code of each cause. A cause's message
+ * and every stack are left out: a cause can come from a library that quotes
+ * the input it failed on.
+ */
+export function describeError(error) {
+    if (!(error instanceof Error)) {
+        return errorMessage(error)
+    }
+    const label = (cause) => {
+        const code = errorCode(cause)
+        return code === null
+            ? errorName(cause)
+            : `${errorName(cause)} [${code}]`
+    }
+    let text = `${label(error)}: ${errorMessage(error)}`
+    let cause = error.cause
+    for (
+        let depth = 0;
+        cause !== undefined && cause !== null && depth < MAX_CAUSE_DEPTH;
+        depth += 1
+    ) {
+        if (!(cause instanceof Error)) {
+            text += `; caused by a non-Error ${typeof cause}`
+            break
+        }
+        text += `; caused by ${label(cause)}`
+        cause = cause.cause
+    }
+    return text
+}
+
+/**
+ * The first system error code, such as `ECONNREFUSED`, that `error` or its
+ * causes carry, or `null`. An `AggregateError`'s errors count as causes.
+ */
+function firstErrorCode(error) {
+    const pending = [error]
+    for (
+        let visited = 0;
+        pending.length > 0 && visited <= MAX_CAUSE_DEPTH;
+        visited += 1
+    ) {
+        const current = pending.shift()
+        if (!(current instanceof Error)) {
+            continue
+        }
+        const code = errorCode(current)
+        if (code !== null) {
+            return code
+        }
+        if (current instanceof AggregateError) {
+            pending.push(...current.errors)
+        }
+        pending.push(current.cause)
+    }
+    return null
+}
+
 /** Prints a check's `PASS` or `FAIL` line and records it in the report. */
 function recordCheck(report, name, ok, reason, details) {
+    // A reason quotes no response, yet an error message it repeats may come
+    // from a library, so it is escaped before it is printed.
+    const safeReason = ok ? null : escapeControl(reason)
     report.checks.push({
         name,
         status: ok ? "PASS" : "FAIL",
-        reason: ok ? null : reason,
+        reason: safeReason,
         details,
         at: new Date().toISOString(),
     })
-    console.log(ok ? `PASS ${name}` : `FAIL ${name}: ${reason}`)
+    console.log(ok ? `PASS ${name}` : `FAIL ${name}: ${safeReason}`)
     return ok
 }
 
@@ -435,14 +843,14 @@ function recordCheck(report, name, ok, reason, details) {
  * measured to `details`. An error it throws is one more problem, and the
  * details gathered up to then are kept. Never throws.
  */
-async function runCheck(report, name, check) {
+export async function runCheck(report, name, check) {
     const problems = []
     const details = {}
     try {
         await check(problems, details)
     } catch (error) {
-        console.error(error)
-        problems.push(error.message)
+        console.error(describeError(error))
+        problems.push(errorMessage(error))
     }
     return recordCheck(
         report,
@@ -453,59 +861,100 @@ async function runCheck(report, name, check) {
     )
 }
 
-/** Adds a problem to `problems` unless `actual` equals `expected`. */
-function expectEqual(problems, label, actual, expected) {
+/**
+ * Adds a problem to `problems` unless `actual` equals `expected`. Both are
+ * described by `describeValue`, so a string is printed only when it is one
+ * of `known`.
+ */
+function expectEqual(problems, label, actual, expected, known = []) {
     if (JSON.stringify(actual) !== JSON.stringify(expected)) {
         problems.push(
-            `${label} is ${JSON.stringify(actual)}, expected ${JSON.stringify(expected)}`
+            `${label} is ${describeValue(actual, known)}, expected ${describeValue(expected, known)}`
         )
     }
 }
 
-/** The flag in a flag-service response body, or `null` when it holds none. */
+/**
+ * The flag a flag-service response body holds, projected to its `id` and
+ * `enabled`, or why the body holds none as a fixed phrase. A field the check
+ * does not know never leaves this function.
+ */
 function parseFlagBody(text) {
-    let flag
+    let body
     try {
-        flag = JSON.parse(text)
+        body = JSON.parse(text)
     } catch {
-        // Not JSON, so not a flag; the caller reports the body.
-        return null
+        // The parser's message quotes the body, so it is not kept.
+        return { flag: null, problem: "with a body that is not JSON" }
     }
-    return isPlainObject(flag) &&
-        flag.id === FLAG_ID &&
-        typeof flag.enabled === "boolean"
-        ? flag
-        : null
+    if (
+        !isPlainObject(body) ||
+        body.id !== FLAG_ID ||
+        typeof body.enabled !== "boolean"
+    ) {
+        return {
+            flag: null,
+            problem: `without "${FLAG_ID}" and a boolean "enabled"`,
+        }
+    }
+    return { flag: { id: FLAG_ID, enabled: body.enabled }, problem: null }
 }
 
-async function flagRequest(baseUrl, init) {
+/**
+ * Why a request failed in transport, as a fixed phrase: its `timeoutMs`
+ * deadline, else the system error code it or a cause carries. The messages
+ * are left out: fetch's say only "fetch failed", and a cause's may quote its
+ * input.
+ */
+export function transportFailure(error, timeoutMs = FLAG_REQUEST_TIMEOUT_MS) {
+    let current = error
+    for (
+        let depth = 0;
+        current instanceof Error && depth <= MAX_CAUSE_DEPTH;
+        depth += 1
+    ) {
+        if (current.name === "TimeoutError" || current.name === "AbortError") {
+            return `timed out after ${timeoutMs} ms`
+        }
+        current = current.cause
+    }
+    return firstErrorCode(error) ?? "transport error"
+}
+
+/**
+ * Sends one request to the flag service and returns the flag it answers
+ * with, as `{ id, enabled }` only. A failure names the method, URL, HTTP
+ * status and a fixed reason, never the body: the flag service, or a proxy in
+ * front of it, may answer with any text.
+ */
+export async function flagRequest(baseUrl, init) {
     const url = `${baseUrl}${FLAG_PATH}`
     const method = init.method ?? "GET"
+    const signal = AbortSignal.timeout(FLAG_REQUEST_TIMEOUT_MS)
     let response
+    try {
+        response = await fetch(url, { ...init, signal })
+    } catch (error) {
+        throw new Error(`${method} ${url} failed: ${transportFailure(error)}`, {
+            cause: error,
+        })
+    }
     let text
     try {
-        response = await fetch(url, {
-            ...init,
-            signal: AbortSignal.timeout(FLAG_REQUEST_TIMEOUT_MS),
-        })
         text = await response.text()
     } catch (error) {
-        // fetch reports a refused connection only as "fetch failed"; the
-        // reason is its cause.
         throw new Error(
-            `${method} ${url} failed: ${error.cause?.message ?? error.message}`,
+            `${method} ${url} answered HTTP ${response.status} with a body that could not be read: ${transportFailure(error)}`,
             { cause: error }
         )
     }
     if (!response.ok) {
-        throw new Error(
-            `${method} ${url} answered HTTP ${response.status}: ${text}`
-        )
+        throw new Error(`${method} ${url} answered HTTP ${response.status}`)
     }
-    const flag = parseFlagBody(text)
+    const { flag, problem } = parseFlagBody(text)
     if (flag === null) {
         throw new Error(
-            `${method} ${url} answered HTTP ${response.status} without "${FLAG_ID}" and a boolean "enabled": ${text}`
+            `${method} ${url} answered HTTP ${response.status} ${problem}`
         )
     }
     return flag
@@ -593,10 +1042,26 @@ function classifyResponse(method, url) {
 }
 
 /**
- * Records a response in arrival order at once and reads its JSON body in the
- * background; consumers use an entry once `parsed` is set or it is a 204.
+ * Why a response body could not be read as JSON, as a fixed phrase. The
+ * error's message is not kept: the JSON parser's quotes the body around the
+ * position it failed at.
  */
-function recordResponse(session, response) {
+function bodyReadFailure(error) {
+    if (error instanceof SyntaxError) {
+        return "the body is not valid JSON"
+    }
+    const name = error instanceof Error ? errorName(error) : "Error"
+    return name === "Error"
+        ? "the body could not be read"
+        : `the body could not be read (${name})`
+}
+
+/**
+ * Records a response in arrival order at once and reads its JSON body in the
+ * background; consumers use an entry once `parsed` is set or it is a 204. A
+ * body that cannot be read leaves `bodyError`, a fixed phrase.
+ */
+export function recordResponse(session, response) {
     const url = new URL(response.url())
     const method = response.request().method()
     const classified = classifyResponse(method, url)
@@ -626,7 +1091,7 @@ function recordResponse(session, response) {
                 entry.parsed = true
             },
             (error) => {
-                entry.bodyError = error.message
+                entry.bodyError = bodyReadFailure(error)
             }
         )
         .finally(() => session.pendingBodies.delete(reading))
@@ -635,9 +1100,10 @@ function recordResponse(session, response) {
 
 /**
  * Records when the page asks for notifications, and the trace headers of each
- * insights request as observed data only.
+ * insights request as observed data only. A header value is escaped and cut
+ * to `MAX_TRACE_HEADER_CHARS`, which a W3C or Dynatrace value never needs.
  */
-function recordRequest(session, report, request) {
+export function recordRequest(session, report, request) {
     const url = new URL(request.url())
     if (url.pathname === NOTIFICATIONS_PATH) {
         session.notificationRequests.push({
@@ -652,7 +1118,13 @@ function recordRequest(session, report, request) {
             at: new Date().toISOString(),
             headers: Object.fromEntries(
                 TRACE_HEADERS.filter((name) => headers[name] !== undefined).map(
-                    (name) => [name, headers[name]]
+                    (name) => [
+                        name,
+                        boundText(
+                            escapeControl(headers[name]),
+                            MAX_TRACE_HEADER_CHARS
+                        ),
+                    ]
                 )
             ),
         })
@@ -708,7 +1180,9 @@ function installToastRecorder() {
 /**
  * Opens a browser context and page of their own for `account`, so session
  * storage, the login and the notification tracker never leak between
- * accounts, and instruments the page before its first navigation.
+ * accounts, and instruments the page before its first navigation. Every
+ * Toast is kept in `session.toasts` for the checks; the evidence receives
+ * only what `summariseToasts` keeps of them.
  */
 async function openSession(browser, report, label, account) {
     const context = await browser.createBrowserContext()
@@ -739,24 +1213,36 @@ async function openSession(browser, report, label, account) {
             key: null,
         }
         session.toasts.push(toast)
-        report.toasts.push(toast)
     })
     await page.evaluateOnNewDocument(installToastRecorder)
     page.on("response", (response) => {
         try {
             recordResponse(session, response)
         } catch (error) {
-            console.error(error)
+            console.error(describeError(error))
         }
     })
     page.on("request", (request) => {
         try {
             recordRequest(session, report, request)
         } catch (error) {
-            console.error(error)
+            console.error(describeError(error))
         }
     })
     return session
+}
+
+/**
+ * A Toast's variant from its class list: one of `TOAST_VARIANTS`, else
+ * "unknown". The class list itself is page text and is never printed.
+ */
+function toastVariant(className) {
+    for (const match of className.matchAll(TOAST_VARIANT_CLASS)) {
+        if (TOAST_VARIANTS.includes(match[1])) {
+            return match[1]
+        }
+    }
+    return "unknown"
 }
 
 async function launchBrowser(state) {
@@ -766,12 +1252,15 @@ async function launchBrowser(state) {
     state.browser = await puppeteer.launch({
         headless: true,
         args: ["--no-sandbox"],
+        // Puppeteer's default leaves a stalled call open for 180 s; this
+        // bound stays above every single-call deadline the check sets.
+        protocolTimeout: PROTOCOL_TIMEOUT_MS,
     })
     return state.browser
 }
 
 /** Signs `session`'s account in through the login form, landing on /home. */
-async function login(session, baseUrl) {
+export async function login(session, baseUrl) {
     const { page, account } = session
     await page.goto(baseUrl, { waitUntil: "domcontentloaded" })
     await page.waitForSelector("#login", { timeout: PAGE_TIMEOUT_MS })
@@ -781,13 +1270,14 @@ async function login(session, baseUrl) {
     try {
         await page.waitForSelector("#nav-home", { timeout: PAGE_TIMEOUT_MS })
     } catch (error) {
-        const errorToasts = session.toasts
-            .filter((toast) => toast.className.includes("toast-error"))
-            .map((toast) => toast.text)
+        // Only their number: an error Toast's text is the service's answer.
+        const errorToasts = session.toasts.filter(
+            (toast) => toastVariant(toast.className) === "error"
+        ).length
         throw new Error(
-            `login as ${account.username} never reached #nav-home: ${error.message}` +
-                (errorToasts.length > 0
-                    ? `; error Toasts: ${errorToasts.join(" | ")}`
+            `login as ${account.username} never reached #nav-home: ${errorMessage(error)}` +
+                (errorToasts > 0
+                    ? `; the page showed ${plural(errorToasts, "error Toast")}`
                     : ""),
             { cause: error }
         )
@@ -861,11 +1351,15 @@ function isClickable(selector) {
  * Toast stack in the bottom-right corner can cover an alert button, and a
  * click there would land on the Toast instead.
  */
-async function clickWhenClear(page, selector, timeoutMs) {
-    await waitFor(() => page.evaluate(isClickable, selector), {
-        timeoutMs,
-        what: `${selector} to be enabled and uncovered`,
-    })
+export async function clickWhenClear(page, selector, timeoutMs) {
+    await waitFor(
+        (signal) =>
+            probePage(page, signal, () => page.evaluate(isClickable, selector)),
+        {
+            timeoutMs,
+            what: `${selector} to be enabled and uncovered`,
+        }
+    )
     await page.click(selector)
 }
 
@@ -881,8 +1375,8 @@ async function captureScreenshot(
         await page.screenshot({ path: file, fullPage: true })
         report.screenshots.push(file)
     } catch (error) {
-        console.error(error)
-        problems.push(`screenshot ${fileName} failed: ${error.message}`)
+        console.error(describeError(error))
+        problems.push(`screenshot ${fileName} failed: ${errorMessage(error)}`)
     }
 }
 
@@ -943,6 +1437,44 @@ function armingKey(id, armingRevision) {
     return `${id}:${armingRevision}`
 }
 
+// The evidence keeps a response field only in the form the broker defines
+// for it; anything else becomes `null`, or, where `null` has a meaning of its
+// own, a description that does not repeat the value.
+
+function booleanOrNull(value) {
+    return typeof value === "boolean" ? value : null
+}
+
+function integerOrNull(value) {
+    return Number.isInteger(value) ? value : null
+}
+
+function finiteOrNull(value) {
+    return isFiniteNumber(value) ? value : null
+}
+
+function uuidOrNull(value) {
+    return typeof value === "string" && UUID_PATTERN.test(value)
+        ? value.toLowerCase()
+        : null
+}
+
+function isTimestamp(value) {
+    return typeof value === "string" && TIMESTAMP_PATTERN.test(value)
+}
+
+/** A timestamp or `null` as received; anything else only described. */
+function projectTimestamp(value) {
+    return value === null || isTimestamp(value)
+        ? value
+        : `not a timestamp: ${describeValue(value)}`
+}
+
+/** `describeValue`, which also prints a well-formed timestamp. */
+export function describeTimestamp(value) {
+    return isTimestamp(value) ? JSON.stringify(value) : describeValue(value)
+}
+
 /** The account's own notification responses whose body was read. */
 function notificationEntries(session) {
     return session.responses.filter(
@@ -953,22 +1485,32 @@ function notificationEntries(session) {
     )
 }
 
-/** Every fixture arming a notification response showed as triggered. */
-function triggeredArmings(session, alerts) {
+/**
+ * Every fixture arming a notification response showed as triggered. An item
+ * without an integer `armingRevision` names no arming and is skipped.
+ */
+export function triggeredArmings(session, alerts) {
     const ids = new Set(alerts.map((alert) => alert.id))
     const armings = new Map()
     for (const entry of notificationEntries(session)) {
         for (const item of resultsOf(entry)) {
             const id = idOf(item)
+            if (
+                !ids.has(id) ||
+                !Number.isInteger(item.armingRevision) ||
+                !isTriggered(item)
+            ) {
+                continue
+            }
             const key = armingKey(id, item.armingRevision)
-            if (!ids.has(id) || !isTriggered(item) || armings.has(key)) {
+            if (armings.has(key)) {
                 continue
             }
             armings.set(key, {
                 key,
                 id,
                 armingRevision: item.armingRevision,
-                triggeredAt: item.triggeredAt,
+                triggeredAt: projectTimestamp(item.triggeredAt),
                 firstSeenAt: new Date(entry.at).toISOString(),
             })
         }
@@ -976,15 +1518,38 @@ function triggeredArmings(session, alerts) {
     return armings
 }
 
-/** The fixture alert a Toast names, or `null` for any other Toast. */
-function fixtureAlertOf(text, alerts) {
+/**
+ * What the checks read from a triggered-alert Toast's text, or `null` for
+ * any other text: the alert type and direction, and the threshold and "now"
+ * value where each is in the form `formatAlertNumber` gives it, else `null`.
+ * The instrument part is page text and is never kept.
+ */
+function parseAlertToast(text) {
     const match = TOAST_PATTERN.exec(text)
     if (match === null) {
         return null
     }
-    const type = TOAST_TYPES[match[2]]
-    const direction = TOAST_DIRECTIONS[match[3]]
-    const threshold = Number(match[4].replaceAll(",", ""))
+    const alertNumberOrNull = (value) =>
+        ALERT_NUMBER_PATTERN.test(value) ? value : null
+    return {
+        type: TOAST_TYPES[match[2]],
+        direction: TOAST_DIRECTIONS[match[3]],
+        threshold: alertNumberOrNull(match[4]),
+        now: alertNumberOrNull(match[5]),
+    }
+}
+
+/**
+ * The fixture alert a Toast names, or `null` for any other Toast. A
+ * threshold outside the form `formatAlertNumber` gives it names no alert.
+ */
+function fixtureAlertOf(text, alerts) {
+    const parsed = parseAlertToast(text)
+    if (parsed === null || parsed.threshold === null) {
+        return null
+    }
+    const { type, direction } = parsed
+    const threshold = Number(parsed.threshold.replaceAll(",", ""))
     return (
         alerts.find((alert) => {
             const expected = Number(alert.threshold)
@@ -1004,8 +1569,8 @@ function fixtureAlertOf(text, alerts) {
 /**
  * Gives every Toast that names a fixture alert the arming it announced: the
  * revision of that alert in the last notification response, sequenced before
- * the Toast, that showed it triggered. A Toast no response explains keeps a
- * `null` key.
+ * the Toast, that showed it triggered under an integer revision. A Toast no
+ * response explains keeps a `null` key.
  */
 function attributeToasts(session, alerts) {
     const entries = notificationEntries(session)
@@ -1021,7 +1586,9 @@ function attributeToasts(session, alerts) {
             }
             const item = resultsOf(entry).find(
                 (candidate) =>
-                    idOf(candidate) === alert.id && isTriggered(candidate)
+                    idOf(candidate) === alert.id &&
+                    Number.isInteger(candidate.armingRevision) &&
+                    isTriggered(candidate)
             )
             if (item !== undefined) {
                 armingRevision = item.armingRevision
@@ -1042,6 +1609,32 @@ function toastCounts(session) {
         }
     }
     return counts
+}
+
+/**
+ * What the evidence and the problems keep of a Toast that names a fixture
+ * alert: this check's own account label, alert id, arming and time, the
+ * type, direction, threshold and "now" value `parseAlertToast` validates,
+ * and the page path only when it is a plain path. Its text, the instrument
+ * name included, is never kept.
+ */
+function projectAlertToast(toast) {
+    const parsed = parseAlertToast(toast.text)
+    return {
+        account: toast.account,
+        alertId: toast.alertId,
+        armingRevision: toast.armingRevision,
+        key: toast.key,
+        at: isTimestamp(toast.at) ? toast.at : null,
+        type: parsed?.type ?? null,
+        direction: parsed?.direction ?? null,
+        threshold: parsed?.threshold ?? null,
+        now: parsed?.now ?? null,
+        url:
+            typeof toast.url === "string" && TOAST_PATH_PATTERN.test(toast.url)
+                ? toast.url
+                : null,
+    }
 }
 
 /**
@@ -1083,22 +1676,26 @@ async function waitForArmingToasts(session, alerts) {
 /**
  * Adds a problem for every triggered fixture arming without exactly one
  * Toast, and for every fixture Toast no notification response explains.
+ * Each of the `expected` armings, which an authoritative notification read
+ * showed triggered, must also be in the page's notification responses and
+ * have exactly one Toast (`reconcileArmings`).
  */
-async function expectOneToastPerArming(problems, session, alerts) {
+async function expectOneToastPerArming(
+    problems,
+    session,
+    alerts,
+    expected = []
+) {
     await settleBodies(session)
     attributeToasts(session, alerts)
     const armings = triggeredArmings(session, alerts)
-    const counts = toastCounts(session)
-    for (const key of armings.keys()) {
-        const count = counts.get(key) ?? 0
-        if (count !== 1) {
-            problems.push(`arming ${key} has ${count} Toasts, expected 1`)
-        }
-    }
+    problems.push(...reconcileArmings(expected, armings, toastCounts(session)))
     for (const toast of session.toasts) {
         if (toast.alertId !== null && toast.key === null) {
+            // Described by validated fields: a Toast's text is page text.
+            const { alertId, type, direction, at } = projectAlertToast(toast)
             problems.push(
-                `the Toast "${toast.text}" of alert ${toast.alertId} follows no notification showing it triggered`
+                `a ${type} ${direction} Toast of alert ${alertId}, shown at ${at}, follows no notification showing it triggered`
             )
         }
     }
@@ -1174,23 +1771,109 @@ function insightsShapeProblem(body) {
         body.riskLevel !== null &&
         !Object.hasOwn(RISK_LABELS, body.riskLevel)
     ) {
-        return `the insights response has an unknown riskLevel ${JSON.stringify(body.riskLevel)}`
+        return `the insights response has an unknown riskLevel, ${describeValue(body.riskLevel)}`
     }
     return null
 }
 
+/** An allocation as the evidence keeps it, or `null` for a non-object. */
+function projectAllocation(value) {
+    if (!isPlainObject(value)) {
+        return null
+    }
+    return {
+        instrumentId: uuidOrNull(value.instrumentId),
+        name:
+            typeof value.name === "string"
+                ? boundText(escapeControl(value.name), MAX_COMPARED_CHARS)
+                : null,
+        quantity: finiteOrNull(value.quantity),
+        value: finiteOrNull(value.value),
+        percent: finiteOrNull(value.percent),
+    }
+}
+
+/**
+ * What the evidence keeps of an insights response: each field the page
+ * shows, in the form the broker defines for it, and no other field.
+ */
+export function projectInsights(body) {
+    if (!isPlainObject(body)) {
+        return null
+    }
+    return {
+        totalValue: finiteOrNull(body.totalValue),
+        totalInvested: finiteOrNull(body.totalInvested),
+        unrealizedPnl: finiteOrNull(body.unrealizedPnl),
+        unrealizedPnlPercent: finiteOrNull(body.unrealizedPnlPercent),
+        allocations: Array.isArray(body.allocations)
+            ? body.allocations.map(projectAllocation)
+            : null,
+        largestPosition: projectAllocation(body.largestPosition),
+        riskLevel:
+            typeof body.riskLevel === "string" &&
+            Object.hasOwn(RISK_LABELS, body.riskLevel)
+                ? body.riskLevel
+                : null,
+    }
+}
+
+/**
+ * The defined form of each kind of page text `compareInsights` reads, as
+ * `formatInPage`, `String(quantity)` and `InsightsSummary` write it. Text in
+ * its element's form carries no free text, so a problem and the evidence may
+ * repeat it even where it differs from the expected value.
+ */
+const DOM_TEXT_FORMS = {
+    currency: (text) => CURRENCY_TEXT_PATTERN.test(text),
+    percent: (text) => PERCENT_TEXT_PATTERN.test(text),
+    quantity: (text) => {
+        const quantity = Number(text)
+        return Number.isFinite(quantity) && String(quantity) === text
+    },
+    riskLabel: (text) => Object.values(RISK_LABELS).includes(text),
+    noValue: (text) => text === "\u2014",
+    none: () => false,
+}
+
+/**
+ * A value `compareInsights` compared, as the evidence keeps it (`shown`) and
+ * a problem prints it (`text`): `null`, a boolean or a finite number as it
+ * is; a string, escaped and bounded, when `verbatim`; any other value only
+ * by its kind and size (`describeValue`).
+ */
+function comparedValue(value, verbatim) {
+    if (typeof value === "string" && verbatim) {
+        const shown = boundText(escapeControl(value), MAX_COMPARED_CHARS)
+        return { shown, text: JSON.stringify(shown) }
+    }
+    if (value === null || typeof value === "boolean" || isFiniteNumber(value)) {
+        return { shown: value, text: JSON.stringify(value) }
+    }
+    const description = describeValue(value)
+    return { shown: description, text: description }
+}
+
 /**
  * Compares what the page shows with the insights response `body`. Each
- * figure span and table cell holds only its formatted value, so their text
- * must equal it, which also rules out a missing sign that containment would
- * let through. The largest position holds a name and a percent, which must
- * both appear in it.
+ * figure span and table cell holds only its value as `InsightsSummary` and
+ * `AllocationTable` render it, so its trimmed text must equal that string
+ * exactly: money and percents formatted as `FormatterContext` does, the
+ * quantity as `String(quantity)`, and the largest position as
+ * `name (percent)`, or the no-value dash when the response has none.
+ *
+ * A pair and a problem repeat the page's text only where it equals the
+ * expected value or is in its element's defined form (`DOM_TEXT_FORMS`),
+ * escaped and bounded; other page text is described by its kind and size.
+ * Expected values, which come from the response, are escaped and bounded.
  */
-async function compareInsights(page, dom, body) {
+export async function compareInsights(page, dom, body) {
     const shapeProblem = insightsShapeProblem(body)
     if (shapeProblem !== null) {
         return { problems: [shapeProblem], pairs: [], response: body }
     }
+    /** What `InsightsSummary` shows where the broker reports no value. */
+    const noValue = "\u2014"
     const { allocations, largestPosition } = body
     const formats = await page.evaluate(formatInPage, {
         currency: [
@@ -1207,46 +1890,57 @@ async function compareInsights(page, dom, body) {
     })
     const problems = []
     const pairs = []
-    const compare = (
-        element,
-        actual,
-        expected,
-        matches = (a, e) => a === e
-    ) => {
-        const ok = matches(actual, expected)
-        pairs.push({ element, dom: actual, expected, ok })
+    const compare = (element, actual, expected, form = DOM_TEXT_FORMS.none) => {
+        const ok = actual === expected
+        const shown = comparedValue(
+            actual,
+            ok || (typeof actual === "string" && form(actual))
+        )
+        const wanted = comparedValue(expected, true)
+        pairs.push({ element, dom: shown.shown, expected: wanted.shown, ok })
         if (!ok) {
             problems.push(
-                `${element} shows ${JSON.stringify(actual)}, expected ${JSON.stringify(expected)}`
+                `${element} shows ${shown.text}, expected ${wanted.text}`
             )
         }
     }
-    compare("#insights-total-value", dom.totalValue, formats.currency[0])
-    compare("#insights-total-invested", dom.totalInvested, formats.currency[1])
-    compare("#insights-unrealized-pnl", dom.unrealizedPnl, formats.currency[2])
+    compare(
+        "#insights-total-value",
+        dom.totalValue,
+        formats.currency[0],
+        DOM_TEXT_FORMS.currency
+    )
+    compare(
+        "#insights-total-invested",
+        dom.totalInvested,
+        formats.currency[1],
+        DOM_TEXT_FORMS.currency
+    )
+    compare(
+        "#insights-unrealized-pnl",
+        dom.unrealizedPnl,
+        formats.currency[2],
+        DOM_TEXT_FORMS.currency
+    )
     compare(
         "#insights-unrealized-pnl-percent",
         dom.unrealizedPnlPercent,
-        formats.percent[0]
+        formats.percent[0],
+        DOM_TEXT_FORMS.percent
     )
-    if (largestPosition !== null) {
-        compare(
-            "#insights-largest-position",
-            dom.largestPosition,
-            {
-                name: largestPosition.name,
-                percent: formats.percent[formats.percent.length - 1],
-            },
-            (actual, expected) =>
-                typeof actual === "string" &&
-                actual.includes(expected.name) &&
-                actual.includes(`(${expected.percent})`)
-        )
-    }
+    compare(
+        "#insights-largest-position",
+        dom.largestPosition,
+        largestPosition === null
+            ? noValue
+            : `${largestPosition.name} (${formats.percent[formats.percent.length - 1]})`.trim(),
+        DOM_TEXT_FORMS.noValue
+    )
     compare(
         "#insights-risk-badge",
         dom.riskBadge,
-        body.riskLevel === null ? null : RISK_LABELS[body.riskLevel]
+        body.riskLevel === null ? null : RISK_LABELS[body.riskLevel],
+        DOM_TEXT_FORMS.riskLabel
     )
     compare(
         "#insights-empty-state shown",
@@ -1264,25 +1958,28 @@ async function compareInsights(page, dom, body) {
         allocations.forEach((allocation, index) => {
             const cells = dom.rows?.[index] ?? []
             const row = `#insights-allocations row ${index + 1}`
-            compare(`${row} instrument`, cells[0] ?? null, allocation.name)
+            compare(
+                `${row} instrument`,
+                cells[0] ?? null,
+                allocation.name.trim()
+            )
             compare(
                 `${row} quantity`,
                 cells[1] ?? null,
-                allocation.quantity,
-                (actual, expected) =>
-                    typeof actual === "string" &&
-                    actual !== "" &&
-                    Number(actual.replaceAll(",", "")) === expected
+                String(allocation.quantity),
+                DOM_TEXT_FORMS.quantity
             )
             compare(
                 `${row} value`,
                 cells[2] ?? null,
-                formats.currency[3 + index]
+                formats.currency[3 + index],
+                DOM_TEXT_FORMS.currency
             )
             compare(
                 `${row} allocation`,
                 cells[3] ?? null,
-                formats.percent[1 + index]
+                formats.percent[1 + index],
+                DOM_TEXT_FORMS.percent
             )
         })
     }
@@ -1300,65 +1997,102 @@ function insightsEntries(session) {
 
 /**
  * Compares the page with the last insights response it received, polling
- * until the page has rendered that response. A read during which a newer
- * response arrived is repeated, at most `MAX_UNSTABLE_READS` times.
+ * until the page has rendered that response. A read, from the DOM read to
+ * the end of the formatting, during which a newer response arrived compared
+ * an outdated response; it is discarded and repeated, at most
+ * `MAX_UNSTABLE_READS` times.
+ *
+ * Only a read the wait accepted is returned: a matching read once the wait
+ * resolves with it, and on a timeout the last mismatch that answered by the
+ * deadline. A read answering later never counts; without an accepted read,
+ * a timeout reports the missing response, or else the timeout itself.
  */
-async function compareWithLastInsights(session) {
+export async function compareWithLastInsights(session) {
     let unstableReads = 0
-    let last = {
-        problems: ["the page received no insights response"],
-        pairs: [],
-        response: null,
-    }
+    let last = null
+    const deadline = performance.now() + RENDER_TIMEOUT_MS
     try {
-        await waitFor(
-            async () => {
-                const entries = insightsEntries(session)
-                const latest = entries[entries.length - 1]
-                if (
-                    latest === undefined ||
-                    (!latest.parsed && latest.bodyError === undefined)
-                ) {
-                    return false
-                }
-                if (latest.status !== 200 || !latest.parsed) {
-                    last = {
-                        problems: [
-                            `the last insights response answered HTTP ${latest.status}` +
-                                (latest.bodyError === undefined
-                                    ? ""
-                                    : ` with an unreadable body: ${latest.bodyError}`),
-                        ],
-                        pairs: [],
-                        response: null,
+        const matched = await waitFor(
+            (signal) =>
+                probePage(session.page, signal, async () => {
+                    const publish = (read) => {
+                        if (!signal.aborted && performance.now() <= deadline) {
+                            last = read
+                        }
                     }
-                    return false
-                }
-                const dom = await session.page.evaluate(readInsightsDom)
-                if (insightsEntries(session).length !== entries.length) {
-                    unstableReads += 1
-                    if (unstableReads >= MAX_UNSTABLE_READS) {
-                        throw new Error(
-                            `unstable: a newer insights response arrived during each of ${unstableReads} reads`
-                        )
+                    const entries = insightsEntries(session)
+                    const latest = entries[entries.length - 1]
+                    if (
+                        latest === undefined ||
+                        (!latest.parsed && latest.bodyError === undefined)
+                    ) {
+                        return false
                     }
-                    return false
-                }
-                last = await compareInsights(session.page, dom, latest.body)
-                return last.problems.length === 0
-            },
+                    if (latest.status !== 200 || !latest.parsed) {
+                        publish({
+                            problems: [
+                                `the last insights response answered HTTP ${latest.status}` +
+                                    (latest.bodyError === undefined
+                                        ? ""
+                                        : ` with an unreadable body: ${latest.bodyError}`),
+                            ],
+                            pairs: [],
+                            response: null,
+                        })
+                        return false
+                    }
+                    const dom = await session.page.evaluate(readInsightsDom)
+                    const comparison = await compareInsights(
+                        session.page,
+                        dom,
+                        latest.body
+                    )
+                    // Both the DOM read and the formatting await the page, so
+                    // a newer response can arrive during either.
+                    const current = insightsEntries(session)
+                    if (
+                        current.length !== entries.length ||
+                        current[current.length - 1] !== latest
+                    ) {
+                        unstableReads += 1
+                        if (unstableReads >= MAX_UNSTABLE_READS) {
+                            throw new Error(
+                                `unstable: a newer insights response arrived during each of ${unstableReads} reads`
+                            )
+                        }
+                        return false
+                    }
+                    if (comparison.problems.length > 0) {
+                        publish(comparison)
+                        return false
+                    }
+                    return comparison
+                }),
             {
                 timeoutMs: RENDER_TIMEOUT_MS,
+                deadline,
                 what: "the page to show its last insights response",
             }
         )
+        return { ...matched, unstableReads }
     } catch (error) {
-        // On a timeout, `last` holds the mismatches of the final read.
         if (!(error instanceof WaitTimeoutError)) {
             throw error
         }
+        if (last !== null) {
+            return { ...last, unstableReads }
+        }
+        return {
+            problems: [
+                insightsEntries(session).length === 0
+                    ? "the page received no insights response"
+                    : error.message,
+            ],
+            pairs: [],
+            response: null,
+            unstableReads,
+        }
     }
-    return { ...last, unstableReads }
 }
 
 async function checkPageEqualsResponse(
@@ -1377,7 +2111,10 @@ async function checkPageEqualsResponse(
         timeout: PAGE_TIMEOUT_MS,
     })
     const comparison = await compareWithLastInsights(holder)
-    report.compared.pageEqualsResponse = comparison
+    report.compared.pageEqualsResponse = {
+        ...comparison,
+        response: projectInsights(comparison.response),
+    }
     details.unstableReads = comparison.unstableReads
     details.compared = comparison.pairs.length
     problems.push(...comparison.problems)
@@ -1408,10 +2145,15 @@ async function checkEmptyState(
             timeout: PAGE_TIMEOUT_MS,
         })
         const comparison = await compareWithLastInsights(session)
-        report.compared.emptyState = comparison
+        // The assertions below read the response as received; the evidence
+        // keeps its projection.
+        const body = comparison.response
+        report.compared.emptyState = {
+            ...comparison,
+            response: projectInsights(body),
+        }
         details.unstableReads = comparison.unstableReads
         problems.push(...comparison.problems)
-        const body = comparison.response
         if (isPlainObject(body)) {
             for (const field of [
                 "totalValue",
@@ -1428,7 +2170,13 @@ async function checkEmptyState(
                 body.largestPosition,
                 null
             )
-            expectEqual(problems, "response riskLevel", body.riskLevel, null)
+            expectEqual(
+                problems,
+                "response riskLevel",
+                body.riskLevel,
+                null,
+                Object.keys(RISK_LABELS)
+            )
         }
         expectEqual(
             problems,
@@ -1447,16 +2195,232 @@ async function checkEmptyState(
         try {
             await session.context.close()
         } catch (error) {
-            console.error(error)
+            console.error(describeError(error))
             problems.push(
-                `closing the empty account's page failed: ${error.message}`
+                `closing the empty account's page failed: ${errorMessage(error)}`
             )
         }
     }
 }
 
-async function checkOneToastPerArming(problems, details, holder, alerts) {
+/** Deadline of the check's own notification read, its body included. */
+const NOTIFICATION_READ_TIMEOUT_MS = 10_000
+
+/**
+ * A failed notification read. Its message names only the method, the path,
+ * the HTTP status and a fixed classification, never response text, a parser
+ * message or a field value, since it reaches the FAIL line, stderr and the
+ * evidence. `status` is the HTTP status, or `null` when none arrived.
+ */
+export class NotificationReadError extends Error {
+    constructor(message, status) {
+        super(message)
+        this.name = "NotificationReadError"
+        this.status = status
+    }
+}
+
+/**
+ * Reads the notifications of `accountId` through the broker API, apart from
+ * any page: every alert whose current arming has triggered, acknowledged or
+ * not. Resolves with the HTTP status and the `results` list; any other
+ * outcome throws a `NotificationReadError`. An invalid `timeoutMs` is not
+ * one: `AbortSignal.timeout` throws for it before any request is sent.
+ */
+export async function readNotifications(
+    baseUrl,
+    accountId,
+    { timeoutMs = NOTIFICATION_READ_TIMEOUT_MS } = {}
+) {
+    if (typeof accountId !== "string" || !UUID_PATTERN.test(accountId)) {
+        throw new NotificationReadError(
+            `GET ${NOTIFICATIONS_PATH} needs a UUID accountId`,
+            null
+        )
+    }
+    const target = `${NOTIFICATIONS_PATH}?accountId=${accountId.toLowerCase()}`
+    // Created outside the try: a bad deadline is no transport failure.
+    const signal = AbortSignal.timeout(timeoutMs)
+    let response
+    let text
+    try {
+        response = await fetch(`${baseUrl}${target}`, {
+            headers: { Accept: "application/json" },
+            signal,
+        })
+        text = await response.text()
+    } catch (error) {
+        throw new NotificationReadError(
+            `GET ${target} failed: ${transportFailure(error, timeoutMs)}`,
+            response?.status ?? null
+        )
+    }
+    if (!response.ok) {
+        throw new NotificationReadError(
+            `GET ${target} answered HTTP ${response.status}`,
+            response.status
+        )
+    }
+    let body
+    try {
+        body = JSON.parse(text)
+    } catch {
+        // The parser's message quotes the body, so it is not repeated.
+        throw new NotificationReadError(
+            `GET ${target} answered HTTP ${response.status} with a body that is not JSON`,
+            response.status
+        )
+    }
+    if (!isPlainObject(body) || !Array.isArray(body.results)) {
+        throw new NotificationReadError(
+            `GET ${target} answered HTTP ${response.status} without a results list`,
+            response.status
+        )
+    }
+    return { status: response.status, results: body.results }
+}
+
+/**
+ * The fixture armings an authoritative notification read shows triggered,
+ * which the page must each toast once, and what is wrong with that read.
+ * An arming is keyed by the read's revision, which must be an integer equal
+ * to the fixture's, since nothing re-arms a fixture alert between e2e.sh
+ * writing the fixture and this check. Each pair needs an expected arming,
+ * because step 9 of e2e.sh saw one per pair trigger. Only validated values
+ * reach the armings and the problems.
+ */
+export function expectedArmings(results, alerts) {
+    const fixtureAlerts = new Map(alerts.map((alert) => [alert.id, alert]))
+    const expected = []
+    const problems = []
+    const listed = new Set()
+    const repeated = new Set()
+    results.forEach((item, index) => {
+        const id = idOf(item)
+        if (id === null || !UUID_PATTERN.test(id)) {
+            problems.push(
+                `the notifications read gives results[${index}] no UUID id`
+            )
+            return
+        }
+        const alert = fixtureAlerts.get(id)
+        if (alert === undefined) {
+            return
+        }
+        if (listed.has(id)) {
+            repeated.add(id)
+            return
+        }
+        listed.add(id)
+        if (!isTriggered(item)) {
+            problems.push(
+                `the notifications read lists alert ${id} without a triggeredAt`
+            )
+            return
+        }
+        if (!Number.isInteger(item.armingRevision)) {
+            problems.push(
+                `the notifications read gives alert ${id} no integer armingRevision`
+            )
+            return
+        }
+        if (item.armingRevision !== alert.armingRevision) {
+            problems.push(
+                `the notifications read gives alert ${id} armingRevision ${item.armingRevision}, but the fixture holds ${alert.armingRevision}`
+            )
+        }
+        expected.push({
+            key: armingKey(id, item.armingRevision),
+            id,
+            armingRevision: item.armingRevision,
+            pair: alert.pair,
+            direction: alert.direction,
+        })
+    })
+    for (const id of repeated) {
+        problems.push(`the notifications read lists alert ${id} more than once`)
+    }
+    for (const pair of Object.keys(PAIR_TYPES)) {
+        if (!expected.some((arming) => arming.pair === pair)) {
+            problems.push(
+                `the notifications read shows no ${pair} fixture alert triggered, though step 9 of e2e.sh saw one per pair trigger`
+            )
+        }
+    }
+    return { expected, problems }
+}
+
+/**
+ * The problems of the one-Toast-per-arming rule. `observed` maps the key of
+ * every fixture arming the page's notification responses showed triggered,
+ * and `counts` maps a key to the Toasts attributed to it. Each `expected`
+ * arming must be among the observed ones, and every expected or observed
+ * arming must have exactly one Toast. Without expected armings, only the
+ * observed ones are judged.
+ */
+export function reconcileArmings(expected, observed, counts) {
+    const problems = []
+    for (const arming of expected) {
+        if (!observed.has(arming.key)) {
+            problems.push(
+                `no notification response of the page shows arming ${arming.key} (${arming.pair} ${arming.direction}) triggered, though the notifications read does`
+            )
+        }
+    }
+    const keys = new Set([
+        ...expected.map((arming) => arming.key),
+        ...observed.keys(),
+    ])
+    for (const key of keys) {
+        const count = counts.get(key) ?? 0
+        if (count !== 1) {
+            problems.push(`arming ${key} has ${count} Toasts, expected 1`)
+        }
+    }
+    return problems
+}
+
+/**
+ * One Toast per arming. Before the page's polls are awaited, the holder's
+ * notifications are read through the API, apart from the page; the fixture
+ * armings that read shows triggered are the expected ones, one per pair at
+ * least (`expectedArmings`). After four notification responses, a reload
+ * and two more, each expected arming must be in the page's responses, and
+ * it and every other triggered fixture arming the page saw must have
+ * exactly one Toast over the whole session, the reload included. A failed
+ * read is a problem, and the page is still judged on the armings it saw.
+ */
+export async function checkOneToastPerArming(
+    problems,
+    details,
+    baseUrl,
+    holder,
+    alerts
+) {
     const { page } = holder
+    let expected = []
+    try {
+        const read = await readNotifications(baseUrl, holder.account.accountId)
+        const authoritative = expectedArmings(read.results, alerts)
+        expected = authoritative.expected
+        problems.push(...authoritative.problems)
+        details.authoritativeRead = {
+            path: NOTIFICATIONS_PATH,
+            status: read.status,
+            results: read.results.length,
+        }
+    } catch (error) {
+        if (!(error instanceof NotificationReadError)) {
+            throw error
+        }
+        problems.push(error.message)
+        details.authoritativeRead = {
+            path: NOTIFICATIONS_PATH,
+            status: error.status,
+            error: error.message,
+        }
+    }
+    details.expected = expected
     await openInsightsPage(holder)
     await waitFor(
         () => notificationEntries(holder).length >= POLLS_BEFORE_RELOAD,
@@ -1484,7 +2448,12 @@ async function checkOneToastPerArming(problems, details, holder, alerts) {
     // member that triggers during the check shows up in a later response
     // than the one read before its Toast.
     await waitForArmingToasts(holder, alerts)
-    const armings = await expectOneToastPerArming(problems, holder, alerts)
+    const armings = await expectOneToastPerArming(
+        problems,
+        holder,
+        alerts,
+        expected
+    )
     details.triggered = [...armings.values()]
     if (armings.size === 0) {
         problems.push(
@@ -1511,12 +2480,11 @@ function readRowToggle(selector) {
 }
 
 /** Waits until the row's toggle is enabled, and for `label` when given. */
-async function waitForToggle(page, alertId, label) {
+export async function waitForToggle(page, alertId, label) {
     return await waitFor(
-        async () => {
-            const toggle = await page.evaluate(
-                readRowToggle,
-                rowSelector(alertId)
+        async (signal) => {
+            const toggle = await probePage(page, signal, () =>
+                page.evaluate(readRowToggle, rowSelector(alertId))
             )
             return toggle !== null &&
                 !toggle.disabled &&
@@ -1595,10 +2563,10 @@ async function clickToggle(session, report, member, label) {
         clicked: label,
         clickedAt,
         status: entry.status,
-        enabled: entry.body.enabled,
-        armingRevision: entry.body.armingRevision,
-        triggeredAt: entry.body.triggeredAt,
-        acknowledged: entry.body.acknowledged,
+        enabled: booleanOrNull(entry.body.enabled),
+        armingRevision: integerOrNull(entry.body.armingRevision),
+        triggeredAt: projectTimestamp(entry.body.triggeredAt),
+        acknowledged: booleanOrNull(entry.body.acknowledged),
     }
     member.patches.push(snapshot)
     report.patches.push(snapshot)
@@ -1626,7 +2594,8 @@ async function rearmMember(session, report, alert) {
         enablingSeq: null,
     }
     if (!["Re-arm", "Enable", "Disable"].includes(label)) {
-        throw new Error(`the row toggle reads "${label}"`)
+        // Page text other than a known label is described, not repeated.
+        throw new Error(`the row toggle reads ${describeValue(label)}`)
     }
     let click = await clickToggle(session, report, member, label)
     if (click.entry.body.enabled === false) {
@@ -1641,7 +2610,7 @@ async function rearmMember(session, report, alert) {
         body.armingRevision <= member.previousRevision
     ) {
         throw new Error(
-            `the enabling PATCH answered enabled ${body.enabled}, triggeredAt ${JSON.stringify(body.triggeredAt)} and armingRevision ${body.armingRevision}, expected true, null and above ${member.previousRevision}`
+            `the enabling PATCH answered enabled ${describeValue(body.enabled)}, triggeredAt ${describeTimestamp(body.triggeredAt)} and armingRevision ${describeValue(body.armingRevision)}, expected true, null and above ${member.previousRevision}`
         )
     }
     member.newRevision = body.armingRevision
@@ -1677,9 +2646,9 @@ async function checkRearmBothMembers(
         try {
             members.push(await rearmMember(holder, report, alert))
         } catch (error) {
-            console.error(error)
+            console.error(describeError(error))
             problems.push(
-                `re-arming ${alert.pair} ${alert.direction} alert ${alert.id}: ${error.message}`
+                `re-arming ${alert.pair} ${alert.direction} alert ${alert.id}: ${errorMessage(error)}`
             )
         }
     }
@@ -1752,29 +2721,61 @@ function readNotificationIds() {
     )
 }
 
-async function checkAcknowledge(problems, details, report, holder, alerts) {
+/**
+ * What a problem and the evidence repeat of the ids `#alert-notifications`
+ * lists: each canonical UUID, and only the number of any other id, since an
+ * id there is a page attribute.
+ */
+export function summariseListedIds(listed) {
+    const ids = listed.filter((id) => UUID_PATTERN.test(id))
+    const withoutUuid = listed.length - ids.length
+    const named =
+        withoutUuid > 0
+            ? [...ids, `${plural(withoutUuid, "item")} without a UUID id`]
+            : ids
+    return { ids, withoutUuid, text: named.join(", ") }
+}
+
+export async function checkAcknowledge(
+    problems,
+    details,
+    report,
+    holder,
+    alerts
+) {
     const { page } = holder
     await openInsightsPage(holder)
     const ids = new Set(alerts.map((alert) => alert.id))
+    // Only a listing the wait accepts is reported: one read after the
+    // deadline, or after the wait gave up, never counts.
     let listed = []
+    const deadline = performance.now() + ACKNOWLEDGE_TIMEOUT_MS
     const alertId = await waitOrReport(problems, () =>
         waitFor(
-            async () => {
-                listed = await page.evaluate(readNotificationIds)
-                return listed.find((id) => ids.has(id)) ?? false
+            async (signal) => {
+                const read = await probePage(page, signal, () =>
+                    page.evaluate(readNotificationIds)
+                )
+                if (!signal.aborted && performance.now() <= deadline) {
+                    listed = read
+                }
+                return read.find((id) => ids.has(id)) ?? false
             },
             {
                 timeoutMs: ACKNOWLEDGE_TIMEOUT_MS,
+                deadline,
                 what: "a fixture alert in #alert-notifications",
             }
         )
     )
-    details.listed = listed
+    const listing = summariseListedIds(listed)
+    details.listed = listing.ids
+    details.listedWithoutUuid = listing.withoutUuid
     if (alertId === null) {
         problems.push(
             listed.length === 0
                 ? "#alert-notifications lists no notification"
-                : `#alert-notifications lists only non-fixture alerts: ${listed.join(", ")}`
+                : `#alert-notifications lists only non-fixture alerts: ${listing.text}`
         )
         return
     }
@@ -1812,7 +2813,10 @@ async function checkAcknowledge(problems, details, report, holder, alerts) {
     }
     await waitOrReport(problems, () =>
         waitFor(
-            async () => !(await isPresent(page, notificationSelector(alertId))),
+            async (signal) =>
+                !(await probePage(page, signal, () =>
+                    isPresent(page, notificationSelector(alertId))
+                )),
             {
                 timeoutMs: ACKNOWLEDGE_TIMEOUT_MS,
                 what: `alert ${alertId} to leave #alert-notifications`,
@@ -1849,6 +2853,280 @@ async function checkAcknowledge(problems, details, report, holder, alerts) {
     details.acknowledged = { id: alertId, armingRevision }
 }
 
+/**
+ * In the page: the layout of each sidebar link in `ids`, and the sidebar's
+ * height, or `null` without a sidebar. A link's position is its offset in
+ * the sidebar's scrolled content, so a scrolled row reads the same, and its
+ * line count is the number of line boxes its label text occupies.
+ */
+function readLegacySidebar(ids) {
+    const sidebar = document.querySelector(".sidebar")
+    if (sidebar === null) {
+        return null
+    }
+    const sidebarBox = sidebar.getBoundingClientRect()
+    const lineCount = (link) => {
+        const lineTops = new Set()
+        for (const node of link.childNodes) {
+            if (
+                node.nodeType !== node.TEXT_NODE ||
+                node.textContent.trim() === ""
+            ) {
+                continue
+            }
+            const range = document.createRange()
+            range.selectNodeContents(node)
+            for (const box of range.getClientRects()) {
+                lineTops.add(Math.round(box.top))
+            }
+        }
+        return lineTops.size
+    }
+    return {
+        sidebarHeight: sidebarBox.height,
+        links: ids.map((id) => {
+            const link = document.getElementById(id)
+            if (link === null) {
+                return { id, present: false }
+            }
+            const box = link.getBoundingClientRect()
+            const style = window.getComputedStyle(link)
+            return {
+                id,
+                present: true,
+                left: box.left - sidebarBox.left + sidebar.scrollLeft,
+                top: box.top - sidebarBox.top + sidebar.scrollTop,
+                width: box.width,
+                height: box.height,
+                lines: lineCount(link),
+                whiteSpace: style.whiteSpace,
+                itemFlexShrink:
+                    link.parentElement === null
+                        ? null
+                        : window.getComputedStyle(link.parentElement)
+                              .flexShrink,
+                scrollMarginInlineStart: style.scrollMarginInlineStart,
+                scrollMarginInlineEnd: style.scrollMarginInlineEnd,
+            }
+        }),
+    }
+}
+
+/**
+ * A `readLegacySidebar` result with every value in its defined form: finite
+ * numbers, booleans and `null` as read, a computed style value only when it
+ * matches `CSS_VALUE_PATTERN`, and any other value by its kind and size.
+ */
+function projectLegacySidebar(layout) {
+    if (!isPlainObject(layout) || !Array.isArray(layout.links)) {
+        return null
+    }
+    const defined = (value) =>
+        value === null ||
+        typeof value === "boolean" ||
+        isFiniteNumber(value) ||
+        (typeof value === "string" && CSS_VALUE_PATTERN.test(value))
+            ? value
+            : describeValue(value)
+    return {
+        sidebarHeight: defined(layout.sidebarHeight),
+        links: LEGACY_NAV_IDS.map((id, index) => {
+            const link = layout.links[index]
+            if (!isPlainObject(link) || link.present !== true) {
+                return { id, present: false }
+            }
+            const projected = { id }
+            for (const [field, value] of Object.entries(link)) {
+                if (field !== "id") {
+                    projected[field] = defined(value)
+                }
+            }
+            return projected
+        }),
+    }
+}
+
+/** In the page: how many status regions the sidebar holds. */
+function countSidebarStatusRegions() {
+    return document.querySelectorAll('.sidebar-nav [role="status"]').length
+}
+
+/**
+ * Reads `readLegacySidebar` at each width of `CONTINUITY_WIDTHS`, at the
+ * check's viewport height, projected by `projectLegacySidebar`, and
+ * screenshots the page at `CONTINUITY_SCREENSHOT_WIDTH` as
+ * `legacy-sidebar-<width>-<label>.png`. Leaves the viewport at the last
+ * width.
+ */
+async function readLegacySidebarLayouts(
+    problems,
+    { report, page, evidenceDir, label }
+) {
+    const layouts = {}
+    for (const width of CONTINUITY_WIDTHS) {
+        await page.setViewport({ ...VIEWPORT, width })
+        layouts[width] = projectLegacySidebar(
+            await page.evaluate(readLegacySidebar, LEGACY_NAV_IDS)
+        )
+        if (width === CONTINUITY_SCREENSHOT_WIDTH) {
+            await captureScreenshot(
+                report,
+                page,
+                evidenceDir,
+                `legacy-sidebar-${width}-${label}.png`,
+                problems
+            )
+        }
+    }
+    return layouts
+}
+
+/**
+ * Adds a problem for every sidebar value read with the feature on that
+ * differs from the one read at the same width with the feature off. A
+ * computed style value is named in the problem only in its defined form.
+ */
+function compareLegacySidebarLayouts(problems, withFeature, withoutFeature) {
+    for (const width of CONTINUITY_WIDTHS) {
+        const shown = withFeature[width]
+        const reference = withoutFeature[width]
+        if (shown === null || reference === null) {
+            problems.push(
+                `at ${width} px the page shows no .sidebar with the feature ${shown === null ? "on" : "off"}`
+            )
+            continue
+        }
+        expectEqual(
+            problems,
+            `with the feature on at ${width} px, the .sidebar height`,
+            shown.sidebarHeight,
+            reference.sidebarHeight
+        )
+        reference.links.forEach((link, index) => {
+            for (const [field, value] of Object.entries(link)) {
+                if (field !== "id") {
+                    const actual = shown.links[index][field]
+                    expectEqual(
+                        problems,
+                        `with the feature on at ${width} px, #${link.id} ${field}`,
+                        actual,
+                        value,
+                        [actual, value].filter(
+                            (candidate) =>
+                                typeof candidate === "string" &&
+                                CSS_VALUE_PATTERN.test(candidate)
+                        )
+                    )
+                }
+            }
+        })
+    }
+}
+
+/**
+ * Holds the five sidebar links that predate Portfolio Insights to the layout
+ * they have without it. With the feature on, it reads their layout on /home
+ * at each width of `CONTINUITY_WIDTHS`, turns the flag off, waits without a
+ * reload until the page has removed the Portfolio Insights link, requires
+ * that no sidebar status region remains, reads the layout again at the same
+ * widths and reports every difference.
+ *
+ * Once the flag was turned off it is turned on again and the link awaited,
+ * also when a step failed, so the checks after this one start with the
+ * feature shown. The check's viewport is restored last.
+ */
+async function checkLegacySidebarContinuity(
+    problems,
+    details,
+    { report, holder, baseUrl, evidenceDir }
+) {
+    const { page } = holder
+    await page.bringToFront()
+    if (currentPath(page) !== "/home") {
+        await page.click("#nav-home")
+        await waitForPath(page, "/home", PAGE_TIMEOUT_MS)
+    }
+    await page.waitForSelector("#nav-portfolio-insights", {
+        timeout: PAGE_TIMEOUT_MS,
+    })
+    details.widths = CONTINUITY_WIDTHS
+    let disableSent = false
+    try {
+        details.withFeature = await readLegacySidebarLayouts(problems, {
+            report,
+            page,
+            evidenceDir,
+            label: "on",
+        })
+        disableSent = true
+        // The window opens as the PUT starts, so the time the PUT takes counts.
+        const offStartedAt = performance.now()
+        details.flagOff = await setFlag(baseUrl, false)
+        await waitFor(
+            async (signal) =>
+                !(await probePage(page, signal, () =>
+                    isPresent(page, "#nav-portfolio-insights")
+                )),
+            {
+                timeoutMs: SHUTDOWN_TIMEOUT_MS,
+                deadline: offStartedAt + SHUTDOWN_TIMEOUT_MS,
+                what: `the page to remove #nav-portfolio-insights without a reload within ${SHUTDOWN_TIMEOUT_MS} ms of the flag PUT`,
+            }
+        )
+        details.linkRemovedAfterMs = Math.round(
+            performance.now() - offStartedAt
+        )
+        details.statusRegionsAfterRemoval = await page.evaluate(
+            countSidebarStatusRegions
+        )
+        expectEqual(
+            problems,
+            '.sidebar-nav [role="status"] regions once the link is gone',
+            details.statusRegionsAfterRemoval,
+            0
+        )
+        details.withoutFeature = await readLegacySidebarLayouts(problems, {
+            report,
+            page,
+            evidenceDir,
+            label: "off",
+        })
+        compareLegacySidebarLayouts(
+            problems,
+            details.withFeature,
+            details.withoutFeature
+        )
+    } finally {
+        try {
+            if (disableSent) {
+                const onStartedAt = performance.now()
+                details.flagRestored = await setFlag(baseUrl, true)
+                await waitFor(
+                    (signal) =>
+                        probePage(page, signal, () =>
+                            isPresent(page, "#nav-portfolio-insights")
+                        ),
+                    {
+                        timeoutMs: SHUTDOWN_TIMEOUT_MS,
+                        deadline: onStartedAt + SHUTDOWN_TIMEOUT_MS,
+                        what: `#nav-portfolio-insights to return within ${SHUTDOWN_TIMEOUT_MS} ms of the flag PUT that turned it on again`,
+                    }
+                )
+                details.linkReturnedAfterMs = Math.round(
+                    performance.now() - onStartedAt
+                )
+            }
+        } catch (error) {
+            // Recorded rather than thrown, so an error that ended the steps
+            // above still reaches the report as well.
+            console.error(describeError(error))
+            problems.push(errorMessage(error))
+        } finally {
+            await page.setViewport(VIEWPORT)
+        }
+    }
+}
+
 /** In the page: where it is and whether the feature's elements remain. */
 function readShutdownState() {
     return {
@@ -1859,20 +3137,30 @@ function readShutdownState() {
     }
 }
 
-async function checkLiveShutdown(
+/**
+ * Turns the flag off with the page visible and expects the shutdown within
+ * `SHUTDOWN_TIMEOUT_MS` of the PUT's start, then a quiet window and a
+ * redirected direct visit.
+ */
+export async function checkLiveShutdown(
     problems,
     details,
     { report, holder, baseUrl, evidenceDir }
 ) {
     const { page } = holder
     await openInsightsPage(holder)
-    const offAt = Date.now()
+    // The window opens as the PUT starts, so the time the PUT takes counts:
+    // the wait ends at this one deadline, however long the PUT took.
+    const offStartedAt = performance.now()
     details.flagOff = await setFlag(baseUrl, false)
+    const putMs = Math.ceil(performance.now() - offStartedAt)
     let shutdownState = null
     try {
         await waitFor(
-            async () => {
-                shutdownState = await page.evaluate(readShutdownState)
+            async (signal) => {
+                shutdownState = await probePage(page, signal, () =>
+                    page.evaluate(readShutdownState)
+                )
                 return (
                     shutdownState.path === "/home" &&
                     !shutdownState.insightsLink &&
@@ -1881,18 +3169,24 @@ async function checkLiveShutdown(
             },
             {
                 timeoutMs: SHUTDOWN_TIMEOUT_MS,
-                what: "/home without #nav-portfolio-insights and #alerts-panel",
+                deadline: offStartedAt + SHUTDOWN_TIMEOUT_MS,
+                what: `/home without #nav-portfolio-insights and #alerts-panel within ${SHUTDOWN_TIMEOUT_MS} ms of the flag PUT`,
             }
         )
     } catch (error) {
         if (error instanceof WaitTimeoutError) {
-            error.message += `; the page shows ${JSON.stringify(shutdownState)}`
+            error.message +=
+                `; the flag PUT took ${putMs} ms` +
+                (shutdownState === null
+                    ? " and no read of the page answered"
+                    : `, and the page shows ${JSON.stringify(shutdownState)}`)
         }
         throw error
     }
     const shutdownSeq = nextSequence()
+    details.shutdownAfterMs = Math.round(performance.now() - offStartedAt)
+    // Wall-clock, as the recorded request and Toast times are.
     const shutdownAt = Date.now()
-    details.shutdownAfterMs = shutdownAt - offAt
     await observeAbsence(
         () => {
             const request = holder.notificationRequests.find(
@@ -1905,7 +3199,8 @@ async function checkLiveShutdown(
                 (candidate) => candidate.seq > shutdownSeq
             )
             if (toast !== undefined) {
-                return `the Toast "${toast.text}" appeared after the shutdown`
+                // Described by its variant: a Toast's text is page text.
+                return `a Toast of variant ${toastVariant(toast.className)} appeared ${Date.parse(toast.at) - shutdownAt} ms after the shutdown`
             }
             return null
         },
@@ -1962,9 +3257,11 @@ async function runFlagOff(report, state, { baseUrl, evidenceDir }, fixture) {
                 .filter((entry) => entry.kind === "flag" && entry.parsed)
                 .map((entry) => ({
                     status: entry.status,
-                    enabled: isPlainObject(entry.body)
-                        ? entry.body.enabled
-                        : null,
+                    enabled:
+                        isPlainObject(entry.body) &&
+                        typeof entry.body.enabled === "boolean"
+                            ? entry.body.enabled
+                            : null,
                 }))
             expectEqual(
                 problems,
@@ -2041,13 +3338,30 @@ async function runFlagOn(report, state, { baseUrl, evidenceDir }, fixture) {
         report,
         "flag-on:one-toast-per-arming",
         (problems, details) =>
-            checkOneToastPerArming(problems, details, holder, fixture.alerts)
+            checkOneToastPerArming(
+                problems,
+                details,
+                baseUrl,
+                holder,
+                fixture.alerts
+            )
     )
     await runCheck(report, "flag-on:rearm-both-members", (problems, details) =>
         checkRearmBothMembers(problems, details, report, holder, fixture)
     )
     await runCheck(report, "flag-on:acknowledge", (problems, details) =>
         checkAcknowledge(problems, details, report, holder, fixture.alerts)
+    )
+    await runCheck(
+        report,
+        "flag-on:legacy-sidebar-continuity",
+        (problems, details) =>
+            checkLegacySidebarContinuity(problems, details, {
+                report,
+                holder,
+                baseUrl,
+                evidenceDir,
+            })
     )
     try {
         await runCheck(report, "flag-on:live-shutdown", (problems, details) =>
@@ -2066,8 +3380,12 @@ async function runFlagOn(report, state, { baseUrl, evidenceDir }, fixture) {
     }
 }
 
-/** What the evidence keeps of every notification response the pages read. */
-function summariseNotifications(sessions) {
+/**
+ * What the evidence keeps of every notification response the pages read:
+ * per item, the fields the checks judge, each in its defined form, and
+ * `null` for an item that is not an object.
+ */
+export function summariseNotifications(sessions) {
     return sessions.flatMap((session) =>
         session.responses
             .filter((entry) => entry.kind === "notifications")
@@ -2076,17 +3394,69 @@ function summariseNotifications(sessions) {
                 at: new Date(entry.at).toISOString(),
                 status: entry.status,
                 results: entry.parsed
-                    ? resultsOf(entry).map((item) => ({
-                          id: idOf(item),
-                          armingRevision: item.armingRevision,
-                          triggeredAt: item.triggeredAt,
-                          triggerValue: item.triggerValue,
-                          acknowledged: item.acknowledged,
-                      }))
+                    ? resultsOf(entry).map((item) =>
+                          isPlainObject(item)
+                              ? {
+                                    id: uuidOrNull(item.id),
+                                    armingRevision: integerOrNull(
+                                        item.armingRevision
+                                    ),
+                                    triggeredAt: projectTimestamp(
+                                        item.triggeredAt
+                                    ),
+                                    triggerValue: finiteOrNull(
+                                        item.triggerValue
+                                    ),
+                                    acknowledged: booleanOrNull(
+                                        item.acknowledged
+                                    ),
+                                }
+                              : null
+                      )
                     : null,
                 bodyError: entry.bodyError ?? null,
             }))
     )
+}
+
+/**
+ * What the evidence keeps of the Toasts, each list in the order the Toasts
+ * appeared: the Toast log, which holds every Toast matched to a fixture
+ * arming in its validated fields (`projectAlertToast`); the account, alert,
+ * type, direction and time of each Toast that names a fixture alert but no
+ * arming explains; and of every other Toast only how many of each variant
+ * there were. No Toast's text, a login error's included, is ever written.
+ */
+export function summariseToasts(sessions, alerts) {
+    const toasts = []
+    const unexplained = []
+    const otherToasts = {}
+    for (const session of sessions) {
+        attributeToasts(session, alerts)
+        for (const toast of session.toasts) {
+            if (toast.key !== null) {
+                toasts.push(toast)
+                continue
+            }
+            if (toast.alertId !== null) {
+                unexplained.push(toast)
+                continue
+            }
+            const variant = toastVariant(toast.className)
+            const key = variant === "unknown" ? variant : `toast-${variant}`
+            otherToasts[key] = (otherToasts[key] ?? 0) + 1
+        }
+    }
+    const bySeq = (a, b) => a.seq - b.seq
+    return {
+        toasts: toasts.sort(bySeq).map(projectAlertToast),
+        unexplainedAlertToasts: unexplained.sort(bySeq).map((toast) => {
+            const { account, alertId, type, direction, at } =
+                projectAlertToast(toast)
+            return { account, alertId, type, direction, at }
+        }),
+        otherToasts,
+    }
 }
 
 function summariseBodyErrors(sessions) {
@@ -2121,7 +3491,7 @@ async function main() {
             throw error
         }
         console.error(USAGE)
-        console.error(error.message)
+        console.error(errorMessage(error))
         process.exitCode = 2
         return
     }
@@ -2138,6 +3508,8 @@ async function main() {
         checks: [],
         compared: {},
         toasts: [],
+        unexplainedAlertToasts: [],
+        otherToasts: {},
         patches: [],
         acknowledged: null,
         notifications: [],
@@ -2157,18 +3529,19 @@ async function main() {
             await runFlagOff(report, state, options, fixture)
         }
     } catch (error) {
-        console.error(error)
-        recordCheck(report, "setup", false, error.message, {})
+        console.error(describeError(error))
+        recordCheck(report, "setup", false, errorMessage(error), {})
     } finally {
         if (state.browser !== null) {
             try {
                 await state.browser.close()
             } catch (error) {
                 failed = true
-                console.log(`FAIL teardown: ${error.message}`)
-                console.error(error)
+                console.log(`FAIL teardown: ${errorMessage(error)}`)
+                console.error(describeError(error))
             }
         }
+        Object.assign(report, summariseToasts(state.sessions, fixture.alerts))
         report.notifications = summariseNotifications(state.sessions)
         report.bodyErrors = summariseBodyErrors(state.sessions)
         report.finishedAt = new Date().toISOString()
@@ -2183,12 +3556,16 @@ async function main() {
             )
         } catch (error) {
             failed = true
-            console.log(`FAIL evidence: ${error.message}`)
-            console.error(error)
+            console.log(`FAIL evidence: ${errorMessage(error)}`)
+            console.error(describeError(error))
         }
     }
     process.exitCode =
         failed || report.checks.some((check) => check.status === "FAIL") ? 1 : 0
 }
 
-await main()
+// The check runs when this file is the entry point, and not when a unit test
+// imports its helpers. A Node without `import.meta.main` runs it as well.
+if (import.meta.main !== false) {
+    await main()
+}

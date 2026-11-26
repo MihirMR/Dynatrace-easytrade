@@ -6,19 +6,23 @@ import {
     useQuery,
 } from "@tanstack/react-query"
 import {
+    act,
     cleanup,
     render,
+    renderHook,
     screen,
     waitFor,
     within,
 } from "@testing-library/react"
 import userEvent from "@testing-library/user-event"
+import type { PropsWithChildren } from "react"
 import type { MockInstance } from "vitest"
-import type { Alert } from "../../api/alerts/types"
+import type { Alert, CreateAlertRequest } from "../../api/alerts/types"
 import { BizEvents } from "../../api/bizEvents"
 import type { Instrument } from "../../api/instrument/types"
 import { AlertsPanel } from "../../components/insights/AlertsPanel"
 import { SESSION_KEY } from "../../contexts/AuthContext/storage"
+import { useCreateAlertMutation } from "../../hooks/useAlerts"
 import { portfolioInsightsQuery } from "../../hooks/usePortfolioInsights"
 import {
     alertKeys,
@@ -31,8 +35,9 @@ import {
     UserContextWrapper,
 } from "../providers"
 
-// Covers the outcomes of the create, update-enabled and delete mutations as
-// the alerts panel shows them. The panel's own query states are covered by
+// Covers the outcomes of the create, update-enabled, delete and acknowledge
+// mutations as the alerts panel shows them, and the create receipt at the
+// hook itself. The panel's own query states are covered by
 // AlertsPanel.test.tsx.
 
 /** The account `UserContextWrapper` provides. */
@@ -90,6 +95,14 @@ const createdAlert: Alert = {
     createdAt: "2026-01-01T09:30:00Z",
 }
 
+/** The unacknowledged notification the notifications poll serves. */
+const triggeredAlert: Alert = {
+    ...armedAlert,
+    id: "a1000000-0000-4000-8000-000000000002",
+    triggeredAt: "2026-01-01T10:00:00Z",
+    triggerValue: 10.75,
+}
+
 const BROKER = `${window.location.origin}/broker-service/v1`
 
 /** Requests, keyed as `METHOD url`. */
@@ -98,6 +111,7 @@ const NOTIFICATIONS = `GET ${BROKER}/alerts/notifications?accountId=${ACCOUNT_ID
 const CREATE = `POST ${BROKER}/alerts`
 const UPDATE = `PATCH ${BROKER}/alerts/${armedAlert.id}`
 const DELETE = `DELETE ${BROKER}/alerts/${armedAlert.id}`
+const ACKNOWLEDGE = `POST ${BROKER}/alerts/${triggeredAlert.id}/acknowledge`
 
 type StubResponse = { status: number; body?: unknown }
 type Handler = () => StubResponse | Promise<StubResponse>
@@ -119,6 +133,8 @@ type MutationAction = {
 let client: QueryClient
 /** Every request sent in the current case, in order. */
 let requests: string[] = []
+/** The raw body of every create request sent in the current case, in order. */
+let createBodies: unknown[] = []
 /** Releases the held responses still waiting. */
 let releases: (() => void)[] = []
 let createSpy: MockInstance<(typeof BizEvents)["alertCreate"]>
@@ -140,10 +156,23 @@ function countOf(request: string): number {
  */
 function stubFetch(handlers: Partial<Record<string, Handler>> = {}): void {
     const defaults: Partial<Record<string, Handler>> = {
-        [LIST]: () => ({ status: 200, body: { results: [armedAlert] } }),
-        [NOTIFICATIONS]: () => ({ status: 200, body: { results: [] } }),
+        // The list holds the triggered alert the poll serves, as the broker
+        // does, so the panel's trigger check adds no list read of its own.
+        [LIST]: () => ({
+            status: 200,
+            body: { results: [armedAlert, triggeredAlert] },
+        }),
+        [NOTIFICATIONS]: () => ({
+            status: 200,
+            body: { results: [triggeredAlert] },
+        }),
     }
-    for (const action of [createAction, updateAction, deleteAction]) {
+    for (const action of [
+        createAction,
+        updateAction,
+        deleteAction,
+        acknowledgeAction,
+    ]) {
         defaults[action.request] = () => action.success
     }
     vi.spyOn(window, "fetch").mockImplementation(
@@ -159,6 +188,7 @@ function stubFetch(handlers: Partial<Record<string, Handler>> = {}): void {
                       : input.url
             const key = `${init?.method ?? "GET"} ${url}`
             requests.push(key)
+            if (key === CREATE) createBodies.push(init?.body)
             const handler = handlers[key] ?? defaults[key]
             if (handler === undefined) {
                 throw new Error(`Unexpected request ${key}`)
@@ -195,6 +225,12 @@ function elementBySelector(selector: string): HTMLElement {
 
 function armedRow(): HTMLElement {
     return elementBySelector(`li[data-alert-id="${armedAlert.id}"]`)
+}
+
+const NOTIFICATION_ITEM = `li.alert-notification[data-notification-id="${triggeredAlert.id}"]`
+
+function notificationItem(): HTMLElement {
+    return elementBySelector(NOTIFICATION_ITEM)
 }
 
 /**
@@ -250,15 +286,40 @@ async function waitForInitialLoad(): Promise<void> {
     )
 }
 
-async function fillAndSubmit(user: User): Promise<void> {
+async function fillAndSubmit(
+    user: User,
+    thresholdText = THRESHOLD_TEXT
+): Promise<void> {
     await user.selectOptions(
         screen.getByLabelText("Alert type"),
         "TARGET_PRICE"
     )
     await user.selectOptions(screen.getByLabelText("Instrument"), INSTRUMENT_ID)
     await user.selectOptions(screen.getByLabelText("Direction"), "ABOVE")
-    await user.type(screen.getByLabelText("Threshold"), THRESHOLD_TEXT)
+    await user.type(screen.getByLabelText("Threshold"), thresholdText)
     await user.click(screen.getByRole("button", { name: "Create alert" }))
+}
+
+/**
+ * Makes the `alertCreate` event throw, as it does when the OneAgent call and
+ * its `reportError` fallback both throw, and returns the thrown error.
+ */
+function failAlertCreateEvent(): Error {
+    const reportingError = new Error("reportError failed")
+    createSpy.mockImplementation(() => {
+        throw reportingError
+    })
+    return reportingError
+}
+
+/** The exact body text of a `TARGET_PRICE` `ABOVE` create carrying `token`. */
+function createBodyWith(token: string): string {
+    return `{"accountId":"${ACCOUNT_ID}","type":"TARGET_PRICE","instrumentId":"${INSTRUMENT_ID}","direction":"ABOVE","threshold":${token}}`
+}
+
+/** Provides the case's client to a hook rendered on its own. */
+function ClientWrapper({ children }: PropsWithChildren) {
+    return <QueryClientProvider client={client}>{children}</QueryClientProvider>
 }
 
 /** Seeds the insights entry a shutdown must drop together with the alerts. */
@@ -313,12 +374,26 @@ const deleteAction: MutationAction = {
     errorRegion: armedRow,
 }
 
+const acknowledgeAction: MutationAction = {
+    request: ACKNOWLEDGE,
+    success: { status: 204 },
+    start: (user) =>
+        user.click(
+            within(notificationItem()).getByRole("button", {
+                name: "Acknowledge",
+            })
+        ),
+    controls: () => within(notificationItem()).getAllByRole("button"),
+    errorRegion: notificationItem,
+}
+
 describe("Alert mutations", () => {
     beforeEach(() => {
         sessionStorage.setItem(SESSION_KEY, ACCOUNT_ID)
         client = new QueryClient()
         client.setQueryData(featureFlagKeys.portfolioInsights, true)
         requests = []
+        createBodies = []
         createSpy = vi
             .spyOn(BizEvents, "alertCreate")
             .mockImplementation(() => undefined)
@@ -375,6 +450,58 @@ describe("Alert mutations", () => {
         })
     })
 
+    // The confirmation reports the token the body carried, not the typed text.
+    it("createAlert_nonCanonicalThreshold_reportsSentToken", async () => {
+        stubFetch()
+        const user = userEvent.setup({ delay: null })
+        renderPanel(client)
+        await waitForInitialLoad()
+
+        await fillAndSubmit(user, "105.500")
+        const output = await waitFor(() =>
+            elementBySelector("output#alert-created-id")
+        )
+
+        expect({
+            dataThreshold: output.getAttribute("data-threshold"),
+            sentBodies: createBodies,
+        }).toEqual({
+            dataThreshold: "105.5",
+            sentBodies: [createBodyWith("105.5")],
+        })
+    })
+
+    // Called directly, the hook still records the token `createAlert` sent,
+    // whatever text the caller passed.
+    it.each([
+        { input: "1.500", sent: "1.5" },
+        { input: "2.", sent: "2" },
+    ])(
+        "useCreateAlertMutation_nonCanonicalThreshold_recordsSentToken ($input)",
+        async ({ input, sent }) => {
+            stubFetch()
+            const { result } = renderHook(
+                () => useCreateAlertMutation(ACCOUNT_ID),
+                { wrapper: ClientWrapper }
+            )
+            const request: CreateAlertRequest = {
+                accountId: ACCOUNT_ID,
+                type: "TARGET_PRICE",
+                instrumentId: INSTRUMENT_ID,
+                direction: "ABOVE",
+                threshold: input,
+            }
+
+            act(() => result.current.mutate(request))
+            await waitFor(() => expect(result.current.isSuccess).toBe(true))
+
+            expect({
+                recorded: result.current.created?.thresholdText,
+                sentBodies: createBodies,
+            }).toEqual({ recorded: sent, sentBodies: [createBodyWith(sent)] })
+        }
+    )
+
     it("createAlert_failure_sendsNoEvent", async () => {
         stubFetch({ [CREATE]: () => ({ status: 400 }) })
         const user = userEvent.setup({ delay: null })
@@ -387,10 +514,147 @@ describe("Alert mutations", () => {
         expect(createSpy).not.toHaveBeenCalled()
     })
 
+    it("createAlert_eventReportingThrows_stillInvalidatesListAndNotifications", async () => {
+        failAlertCreateEvent()
+        stubFetch()
+        const user = userEvent.setup({ delay: null })
+        renderPanel(client)
+        await waitForInitialLoad()
+        const listBefore = countOf(LIST)
+        const notificationsBefore = countOf(NOTIFICATIONS)
+
+        await fillAndSubmit(user)
+
+        await waitFor(() =>
+            expect([
+                countOf(LIST) - listBefore,
+                countOf(NOTIFICATIONS) - notificationsBefore,
+            ]).toEqual([1, 1])
+        )
+    })
+
+    it("createAlert_eventReportingThrows_completesAsSuccess", async () => {
+        failAlertCreateEvent()
+        stubFetch()
+        const user = userEvent.setup({ delay: null })
+        const { container } = renderPanel(client)
+        await waitForInitialLoad()
+
+        await fillAndSubmit(user)
+
+        await waitFor(() =>
+            expect({
+                statuses: client
+                    .getMutationCache()
+                    .getAll()
+                    .map((mutation) => mutation.state.status),
+                createdId:
+                    container.querySelector("output#alert-created-id")
+                        ?.textContent ?? null,
+                formError:
+                    container.querySelector("#alert-form-error")?.textContent ??
+                    null,
+            }).toEqual({
+                statuses: ["success"],
+                createdId: createdAlert.id,
+                formError: null,
+            })
+        )
+    })
+
+    it("createAlert_eventReportingThrows_logsFullError", async () => {
+        const reportingError = failAlertCreateEvent()
+        stubFetch()
+        const user = userEvent.setup({ delay: null })
+        renderPanel(client)
+        await waitForInitialLoad()
+
+        await fillAndSubmit(user)
+
+        await waitFor(() =>
+            expect(console.error).toHaveBeenCalledWith(
+                "[useCreateAlertMutation] alertCreate event failed",
+                reportingError
+            )
+        )
+    })
+
+    it.each<[string, MutationAction]>([
+        ["update-enabled", updateAction],
+        ["delete", deleteAction],
+        ["acknowledge", acknowledgeAction],
+    ])(
+        "alertMutation_success_invalidatesListAndNotifications (%s)",
+        async (_label, action) => {
+            stubFetch()
+            const user = userEvent.setup({ delay: null })
+            renderPanel(client)
+            await waitForInitialLoad()
+            const listBefore = countOf(LIST)
+            const notificationsBefore = countOf(NOTIFICATIONS)
+
+            await action.start(user)
+            // A row mutation stays pending until the refetches it starts
+            // have settled, so every refetch it causes is counted below.
+            await waitFor(() => expect(client.isMutating()).toBe(0))
+
+            expect([
+                countOf(LIST) - listBefore,
+                countOf(NOTIFICATIONS) - notificationsBefore,
+            ]).toEqual([1, 1])
+        }
+    )
+
+    it("deleteAlert_success_rendersDeletedIdOutput", async () => {
+        stubFetch()
+        const user = userEvent.setup({ delay: null })
+        renderPanel(client)
+        await waitForInitialLoad()
+
+        await deleteAction.start(user)
+
+        // Loadgen's `//output[@id="alert-deleted-id"][@value="<id>"]` reads
+        // the attribute, so the one output must carry the deleted id there.
+        await waitFor(() =>
+            expect(
+                Array.from(
+                    document.querySelectorAll("output#alert-deleted-id"),
+                    (output) => output.getAttribute("value")
+                )
+            ).toEqual([armedAlert.id])
+        )
+    })
+
+    it("acknowledgeAlert_success_removesNotification", async () => {
+        // As the broker does, the poll stops serving the notification once
+        // its acknowledge has been answered.
+        let acknowledged = false
+        stubFetch({
+            [ACKNOWLEDGE]: () => {
+                acknowledged = true
+                return acknowledgeAction.success
+            },
+            [NOTIFICATIONS]: () => ({
+                status: 200,
+                body: { results: acknowledged ? [] : [triggeredAlert] },
+            }),
+        })
+        const user = userEvent.setup({ delay: null })
+        renderPanel(client)
+        await waitForInitialLoad()
+
+        await acknowledgeAction.start(user)
+
+        await waitFor(() =>
+            expect(document.querySelector(NOTIFICATION_ITEM)).toBeNull()
+        )
+    })
+
     it.each<[string, MutationAction]>([
         ["create", createAction],
         ["update-enabled", updateAction],
         ["delete", deleteAction],
+        ["acknowledge", acknowledgeAction],
     ])(
         "alertMutation_pending_disablesControls (%s)",
         async (_label, action) => {
@@ -414,6 +678,10 @@ describe("Alert mutations", () => {
         ["update-enabled 500", updateAction, 500, GENERIC_MESSAGE],
         ["delete 404", deleteAction, 404, ROW_NOT_FOUND_MESSAGE],
         ["delete 500", deleteAction, 500, GENERIC_MESSAGE],
+        // The refresh after the 404 still serves the notification, so its
+        // item keeps the message.
+        ["acknowledge 404", acknowledgeAction, 404, ROW_NOT_FOUND_MESSAGE],
+        ["acknowledge 500", acknowledgeAction, 500, GENERIC_MESSAGE],
     ])(
         "alertMutation_errorStatus_showsMessage (%s)",
         async (_label, action, status, message) => {
@@ -430,10 +698,56 @@ describe("Alert mutations", () => {
         }
     )
 
+    // A 2xx other than the specified 201 or 204 confirms nothing, even with
+    // an alert-shaped body.
+    it.each<[string, MutationAction, StubResponse, string]>([
+        [
+            "create 200",
+            createAction,
+            { status: 200, body: createdAlert },
+            "output#alert-created-id",
+        ],
+        [
+            "create 202",
+            createAction,
+            { status: 202, body: createdAlert },
+            "output#alert-created-id",
+        ],
+        [
+            "delete 200",
+            deleteAction,
+            { status: 200, body: armedAlert },
+            "output#alert-deleted-id",
+        ],
+        [
+            "delete 202",
+            deleteAction,
+            { status: 202, body: armedAlert },
+            "output#alert-deleted-id",
+        ],
+    ])(
+        "alertMutation_unexpectedSuccessStatus_showsGenericMessageWithoutConfirmation (%s)",
+        async (_label, action, response, outputSelector) => {
+            stubFetch({ [action.request]: () => response })
+            const user = userEvent.setup({ delay: null })
+            const { container } = renderPanel(client)
+            await waitForInitialLoad()
+
+            await action.start(user)
+            await within(action.errorRegion()).findByText(GENERIC_MESSAGE)
+
+            expect({
+                output: container.querySelector(outputSelector),
+                events: createSpy.mock.calls.length,
+            }).toEqual({ output: null, events: 0 })
+        }
+    )
+
     it.each<[string, MutationAction]>([
         ["create", createAction],
         ["update-enabled", updateAction],
         ["delete", deleteAction],
+        ["acknowledge", acknowledgeAction],
     ])(
         "alertMutation_forbidden_shutsDownFeature (%s)",
         async (_label, action) => {
@@ -471,6 +785,7 @@ describe("Alert mutations", () => {
         ["create", createAction, "output#alert-created-id"],
         ["update-enabled", updateAction, null],
         ["delete", deleteAction, "output#alert-deleted-id"],
+        ["acknowledge", acknowledgeAction, null],
     ])(
         "alertMutation_completesAfterAccountSwitch_discarded (%s)",
         async (_label, action, outputSelector) => {
@@ -483,6 +798,7 @@ describe("Alert mutations", () => {
             await waitFor(() => expect(countOf(action.request)).toBe(1))
             await waitForControls(action, "disabled")
             const listBefore = countOf(LIST)
+            const notificationsBefore = countOf(NOTIFICATIONS)
 
             sessionStorage.setItem(SESSION_KEY, "2")
             held.release()
@@ -495,7 +811,14 @@ describe("Alert mutations", () => {
                         : container.querySelector(outputSelector),
                 events: createSpy.mock.calls.length,
                 listRequests: countOf(LIST) - listBefore,
-            }).toEqual({ output: null, events: 0, listRequests: 0 })
+                notificationsRequests:
+                    countOf(NOTIFICATIONS) - notificationsBefore,
+            }).toEqual({
+                output: null,
+                events: 0,
+                listRequests: 0,
+                notificationsRequests: 0,
+            })
         }
     )
 })

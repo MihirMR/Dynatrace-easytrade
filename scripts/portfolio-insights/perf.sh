@@ -38,8 +38,9 @@ READY_TIMEOUT_SECONDS=300
 READY_STEP_SECONDS=5
 HTTP_TIMEOUT_SECONDS=15
 LOG_STEP_SECONDS=5
-# Log windows start this far back so a host clock ahead of the Docker engine's loses no line;
-# lines already present when a window opens are counted and skipped, never read as new.
+# The insights log window, read for the server-side share, starts this far before the host's
+# clock at the first request, so a host clock ahead of the Docker engine's loses no insights
+# line; the earlier lines it also reads carry other trace ids and are left out.
 LOG_SKEW_MARGIN_SECONDS=30
 PRESET_COUNT=25
 HOLDINGS_EXPECTED=15
@@ -50,10 +51,22 @@ ALERTS_EXPECTED=$((PRESET_COUNT * ALERTS_PER_ACCOUNT))
 MAX_THRESHOLD="9999999999.99999999"
 WARMUP_REQUESTS=10
 TIMED_REQUESTS=200
+# The insights p95 is the nearest-rank 95th percentile of exactly TIMED_REQUESTS valid timings:
+# the 190th sorted value of 200.
+INSIGHTS_P95_RANK=$(((95 * TIMED_REQUESTS + 99) / 100))
+# A readable curl time_total, in seconds.
+TIME_TOTAL_RE='^[0-9]+(\.[0-9]+)?$'
+# The run nonce: the first 16 hex digits of every insights trace id this run sends.
+TRACE_NONCE_RE='^[0-9a-f]{16}$'
+# Failed insights requests named in the FAIL reason; every failure is counted.
+INSIGHTS_REASONS_SHOWN=5
 INSIGHTS_LIMIT_SECONDS="0.5"
 CYCLE_LIMIT_MS="10000"
 MAX_REJECTED_SAMPLES=3
 FOLLOW_UP_CYCLES=2
+# Cycle-line deadlines are whole evaluation intervals plus this margin: two intervals for the
+# first line after T, one for a follow-up read straight after the previous line.
+CYCLE_WAIT_MARGIN_SECONDS=30
 # The broker's interval rule: a whole number from 1 to 4294967 seconds, otherwise 60.
 DEFAULT_INTERVAL_SECONDS=60
 MAX_INTERVAL_SECONDS=4294967
@@ -62,8 +75,10 @@ MAX_CONSECUTIVE_TRANSPORT_ERRORS=5
 
 CYCLE_MARKER="Alert evaluation cycle finished"
 CYCLE_RE='alerts \[([0-9]+)\] triggered \[([0-9]+)\] failed \[([0-9]+)\] skipped \[([0-9]+)\] outcome \[([A-Za-z_]+)\] duration \[([0-9]+(\.[0-9]+)?)\] ms'
-INSIGHTS_DURATION_RE='duration \[([0-9]+(\.[0-9]+)?)\] ms'
+INSIGHTS_TRACE_RE='duration \[([0-9]+(\.[0-9]+)?)\] ms trace \[([0-9a-f]{32})\]'
 UUID_RE='^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+# The armed-set query's time row as db_query prints it, lower-cased: date, time, fraction.
+ARMED_TIME_RE='^at,([0-9]{4}-[0-9]{2}-[0-9]{2})t([0-9]{2}:[0-9]{2}:[0-9]{2})(\.[0-9]{1,9})?z?$'
 
 usage() {
     cat <<'EOF'
@@ -388,18 +403,6 @@ broker_logs() {
         | sed "s/$(printf '\033')\[[0-9;]*m//g" | tr -d '\r'
 }
 
-# open_log_window: starts a cycle-log window. LOG_SINCE is now minus the skew margin and
-# LOG_BASE counts the cycle lines already inside it, which later reads skip.
-open_log_window() {
-    LOG_SINCE="$(epoch_to_rfc3339 $(($(date -u +%s) - LOG_SKEW_MARGIN_SECONDS)))"
-    LOG_BASE=0
-    if broker_logs "$LOG_SINCE" >"$RUN_DIR/broker.log"; then
-        LOG_BASE="$(grep -cF "$CYCLE_MARKER" "$RUN_DIR/broker.log" || true)"
-        return 0
-    fi
-    return 1
-}
-
 # parse_cycle_line LINE: sets C_ALERTS, C_TRIGGERED, C_FAILED, C_SKIPPED, C_OUTCOME and
 # C_DURATION from a cycle summary line. The duration is whole milliseconds today; a decimal
 # is accepted as well.
@@ -483,22 +486,41 @@ db_query() {
     esac 2>>"$RUN_DIR/db-error.log" | tr -d '\r' | tr '[:upper:]' '[:lower:]' | sed '/^[[:space:]]*$/d'
 }
 
-# armed_sql: every armed alert as one "id,revision" column, identical on both dialects.
+# armed_sql: every armed alert as one "id,revision" column, identical on both dialects, plus one
+# "at,<time>" row: the database's own UTC time of the statement, in ISO 8601 with its fraction
+# (PostgreSQL six digits; SQL Server seven, or none when it is zero). "at," never starts an id
+# row, because t is not a hex digit.
 armed_sql() {
     if [[ "$DIALECT" == "mssql" ]]; then
-        echo "SELECT LOWER(CONVERT(varchar(36), [Id])) + ',' + CONVERT(varchar(12), [ArmingRevision]) FROM [dbo].[Alerts] WHERE [Enabled] = 1 AND [TriggeredAt] IS NULL ORDER BY 1"
+        echo "SELECT LOWER(CONVERT(varchar(36), [Id])) + ',' + CONVERT(varchar(12), [ArmingRevision]) FROM [dbo].[Alerts] WHERE [Enabled] = 1 AND [TriggeredAt] IS NULL UNION ALL SELECT 'at,' + CONVERT(varchar(27), SYSUTCDATETIME(), 126) ORDER BY 1"
     else
-        echo "SELECT lower(\"Id\"::text) || ',' || \"ArmingRevision\" FROM \"Alerts\" WHERE \"Enabled\" = true AND \"TriggeredAt\" IS NULL ORDER BY 1"
+        echo "SELECT lower(\"Id\"::text) || ',' || \"ArmingRevision\" FROM \"Alerts\" WHERE \"Enabled\" = true AND \"TriggeredAt\" IS NULL UNION ALL SELECT 'at,' || to_char(statement_timestamp() AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US') ORDER BY 1"
     fi
 }
 
-# read_armed_set: writes the sorted armed set to $RUN_DIR/armed. Sets ARMED_ERROR on failure.
+# read_armed_set: runs the armed-set query once. Its id,revision rows go, sorted, to
+# $RUN_DIR/armed, and its one time row sets ARMED_AT to the database's UTC time of that query in
+# RFC3339: YYYY-MM-DDTHH:MM:SS, the fraction as returned, then Z. Sets ARMED_ERROR on failure,
+# including a time row that is missing, repeated or unreadable.
 read_armed_set() {
-    local rows
+    local rows times stamp
+    ARMED_AT=""
     if ! rows="$(db_query "$(armed_sql)")"; then
         ARMED_ERROR="armed-set query failed: $(tail -n 3 "$RUN_DIR/db-error.log" | tr '\n' ' ')$(head -n 3 <<<"$rows" | tr '\n' ' ')"
         return 1
     fi
+    times="$(grep -ci '^at,' <<<"$rows" || true)"
+    if [[ "$times" != "1" ]]; then
+        ARMED_ERROR="armed-set query returned $times time rows instead of 1"
+        return 1
+    fi
+    stamp="$(grep -i '^at,' <<<"$rows" | tr '[:upper:]' '[:lower:]')"
+    if [[ ! "$stamp" =~ $ARMED_TIME_RE ]]; then
+        ARMED_ERROR="armed-set query returned an unreadable time row [$stamp]"
+        return 1
+    fi
+    ARMED_AT="${BASH_REMATCH[1]}T${BASH_REMATCH[2]}${BASH_REMATCH[3]}Z"
+    rows="$(grep -vi '^at,' <<<"$rows" || true)"
     if [[ -n "$rows" ]]; then
         LC_ALL=C sort <<<"$rows" >"$RUN_DIR/armed"
     else
@@ -830,9 +852,89 @@ insights_profile() {
 # ---------------------------------------------------------------------------------------------
 # Limit 1: insights p95 < 500 ms for 15 holdings
 
+# insights_trace_nonce: 16 lowercase hex digits that start every insights trace id of this run,
+# so its trace ids differ from those of other runs and callers. They are read from
+# /dev/urandom; where that is unreadable they are derived from the clock and the process id.
+# The nonce only keeps trace ids apart and is no secret, so the fallback needs no strength.
+insights_trace_nonce() {
+    local nonce
+    nonce="$(od -An -N8 -tx1 /dev/urandom 2>/dev/null | tr -d ' \n')" || nonce=""
+    if [[ ! "$nonce" =~ $TRACE_NONCE_RE ]]; then
+        printf -v nonce '%08x%08x' $(($(date -u +%s) & 0xffffffff)) $(($$ & 0xffffffff))
+    fi
+    echo "$nonce"
+}
+
+# insights_trace NONCE INDEX: the W3C trace context of insights request INDEX (1-based). Sets
+# INSIGHTS_TRACE_ID to NONCE followed by INDEX as 16 hex digits, and INSIGHTS_TRACEPARENT to
+# "00-<trace id>-<INDEX as 16 hex digits>-01" (version 00, sampled). INDEX is at least 1, so
+# neither id is the all-zero value W3C reserves as invalid. Fails on any other NONCE or INDEX.
+insights_trace() {
+    if [[ ! "$1" =~ $TRACE_NONCE_RE || ! "$2" =~ ^[1-9][0-9]{0,17}$ ]]; then
+        return 1
+    fi
+    printf -v INSIGHTS_TRACE_ID '%s%016x' "$1" "$2"
+    printf -v INSIGHTS_TRACEPARENT '00-%s-%016x-01' "$INSIGHTS_TRACE_ID" "$2"
+}
+
+# classify_insights_request RC OUT: classifies one insights request from curl's exit status RC
+# and its -w output OUT, "<http_code> <time_total>". Sets REQUEST_STATUS, REQUEST_SECONDS and
+# REQUEST_PROBLEM, the reason the request failed or empty. Succeeds only for a complete transfer
+# that answered 200 with a readable time_total. The exit status is checked first: a transfer
+# that breaks after a 200 header (timeout, partial body, write error) still prints 200.
+classify_insights_request() {
+    REQUEST_STATUS="${2%% *}"
+    REQUEST_SECONDS=""
+    if [[ "$2" == *" "* ]]; then
+        REQUEST_SECONDS="${2#* }"
+    fi
+    REQUEST_PROBLEM=""
+    if [[ "$1" != "0" ]]; then
+        REQUEST_PROBLEM="transport error (curl exit $1, status ${REQUEST_STATUS:-none})"
+    elif [[ "$REQUEST_STATUS" != "200" ]]; then
+        REQUEST_PROBLEM="status ${REQUEST_STATUS:-none}"
+    elif [[ ! "$REQUEST_SECONDS" =~ $TIME_TOTAL_RE ]]; then
+        REQUEST_PROBLEM="unreadable time_total [${REQUEST_SECONDS:0:40}]"
+    fi
+    [[ -z "$REQUEST_PROBLEM" ]]
+}
+
+# insights_p95 FILE: the p95 of the timings in FILE, one per line: its INSIGHTS_P95_RANK-th
+# sorted value. FILE must hold exactly TIMED_REQUESTS lines, each a readable time_total;
+# otherwise it fails and prints nothing, so a p95 never comes from a short or damaged sample.
+insights_p95() {
+    local count valid
+    if [[ ! -f "$1" ]]; then
+        return 1
+    fi
+    count=$(($(wc -l <"$1")))
+    valid=$(($(grep -cE "$TIME_TOTAL_RE" "$1" || true)))
+    if [[ $count -ne $TIMED_REQUESTS || $valid -ne $count ]]; then
+        return 1
+    fi
+    LC_ALL=C sort -n "$1" | sed -n "${INSIGHTS_P95_RANK}p"
+}
+
+# insights_trace_durations ACCOUNT LOG TRACES: the durationMs of every insights log line in LOG
+# for ACCOUNT whose rendered trace id is listed in TRACES (one id per line), one per line in log
+# order and each trace id once. Lines of other accounts, lines without a trace id and lines whose
+# trace id is not listed (warm-ups, failed requests, other callers) are left out.
+insights_trace_durations() {
+    local line
+    if [[ ! -s "$3" ]]; then
+        return 0
+    fi
+    while IFS= read -r line; do
+        if [[ "$line" =~ $INSIGHTS_TRACE_RE ]]; then
+            echo "${BASH_REMATCH[3]} ${BASH_REMATCH[1]}"
+        fi
+    done < <(grep -F "Portfolio insights for account [$1]" "$2" || true) \
+        | awk 'NR == FNR { wanted[$1] = 1; next } ($1 in wanted) && !seen[$1]++ { print $2 }' "$3" -
+}
+
 measure_insights() {
-    local account="" id seen="" since i total out status seconds non200=0 timed p95 p95_ms
-    local line lines median_ms server_p95_ms
+    local account="" id seen="" since i total out rc nonce failures=0 reasons="" timed p95 p95_ms
+    local matched median_ms server_p95_ms
 
     if [[ ! -s "$RUN_DIR/presets" ]]; then
         fail "insights p95 account" "GET presets gave $PRESETS_STATUS with no account ids"
@@ -852,35 +954,50 @@ measure_insights() {
     R_INSIGHTS_ACCOUNT="$account"
     pass "insights p95 account"
 
+    # Every request, warm-ups included, must complete with status 200 and a readable time_total.
+    # Any failed one fails the check without a p95: a p95 over fewer than TIMED_REQUESTS timings
+    # would not be the 190th of 200. Each request sends its own traceparent, and each valid timed
+    # request records its trace id beside its time, so the broker's log line for it can be found.
     total=$((WARMUP_REQUESTS + TIMED_REQUESTS))
-    info "timing insights of account [$account]: $WARMUP_REQUESTS warm-up then $TIMED_REQUESTS sequential requests"
+    nonce="$(insights_trace_nonce)"
+    info "timing insights of account [$account]: $WARMUP_REQUESTS warm-up then $TIMED_REQUESTS sequential requests; request n sends trace id $nonce followed by n as 16 hex digits"
     since="$(epoch_to_rfc3339 $(($(date -u +%s) - LOG_SKEW_MARGIN_SECONDS)))"
     : >"$RUN_DIR/insights-times"
+    : >"$RUN_DIR/insights-traces"
     for ((i = 1; i <= total; i++)); do
+        insights_trace "$nonce" "$i"
+        rc=0
         out="$(curl -sS --max-time "$HTTP_TIMEOUT_SECONDS" -o "$RUN_DIR/insights-body" \
-            -w '%{http_code} %{time_total}' "$INSIGHTS_URL/$account" 2>>"$RUN_DIR/curl-error.log")" || true
-        status="${out%% *}"
-        seconds="${out#* }"
-        if [[ "$status" != "200" ]]; then
-            non200=$((non200 + 1))
-        fi
-        if [[ $i -gt $WARMUP_REQUESTS && "$seconds" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
-            echo "$seconds" >>"$RUN_DIR/insights-times"
+            -H "traceparent: $INSIGHTS_TRACEPARENT" -w '%{http_code} %{time_total}' \
+            "$INSIGHTS_URL/$account" 2>>"$RUN_DIR/curl-error.log")" || rc=$?
+        if ! classify_insights_request "$rc" "$out"; then
+            failures=$((failures + 1))
+            if [[ $failures -le $INSIGHTS_REASONS_SHOWN ]]; then
+                reasons="${reasons:+$reasons; }request $i: $REQUEST_PROBLEM"
+            fi
+        elif [[ $i -gt $WARMUP_REQUESTS ]]; then
+            echo "$REQUEST_SECONDS" >>"$RUN_DIR/insights-times"
+            echo "$INSIGHTS_TRACE_ID" >>"$RUN_DIR/insights-traces"
         fi
     done
 
     timed=$(($(wc -l <"$RUN_DIR/insights-times")))
-    p95="$(nearest_rank 95 "$RUN_DIR/insights-times")" || p95=""
-    if [[ -z "$p95" ]] || ! p95_ms="$(seconds_to_ms "$p95")"; then
+    if [[ $failures -gt 0 ]]; then
         R_INSIGHTS_VERDICT="FAIL"
-        fail "insights p95 < 500 ms" "no request timing was recorded; $non200 of $total responses were not 200"
+        if [[ $failures -gt $INSIGHTS_REASONS_SHOWN ]]; then
+            reasons="$reasons; and $((failures - INSIGHTS_REASONS_SHOWN)) more"
+        fi
+        fail "insights p95 < 500 ms" "$failures of $total requests failed, so no p95 is computed: $reasons (curl messages in $RUN_DIR/curl-error.log)"
+    elif ! p95="$(insights_p95 "$RUN_DIR/insights-times")"; then
+        R_INSIGHTS_VERDICT="FAIL"
+        fail "insights p95 < 500 ms" "$timed timing records were kept instead of exactly $TIMED_REQUESTS valid ones, so no p95 is computed"
+    elif ! p95_ms="$(seconds_to_ms "$p95")"; then
+        R_INSIGHTS_VERDICT="FAIL"
+        fail "insights p95 < 500 ms" "the ${INSIGHTS_P95_RANK}th sorted timing [$p95] is beyond the comparable range"
     else
         R_INSIGHTS_P95="$p95_ms ms"
-        info "insights p95 $p95_ms ms over $timed timed requests (curl time_total through the reverse proxy)"
-        if [[ $non200 -gt 0 ]]; then
-            R_INSIGHTS_VERDICT="FAIL"
-            fail "insights p95 < 500 ms" "$non200 of $total responses were not 200 (p95 $p95_ms ms)"
-        elif [[ $(dec_to_units "$p95") -lt $(dec_to_units "$INSIGHTS_LIMIT_SECONDS") ]]; then
+        info "insights p95 $p95_ms ms: the ${INSIGHTS_P95_RANK}th of $TIMED_REQUESTS sorted curl time_total values through the reverse proxy"
+        if [[ $(dec_to_units "$p95") -lt $(dec_to_units "$INSIGHTS_LIMIT_SECONDS") ]]; then
             R_INSIGHTS_VERDICT="PASS"
             pass "insights p95 < 500 ms"
         else
@@ -889,36 +1006,41 @@ measure_insights() {
         fi
     fi
 
-    # Server-side share: the durations the broker logged for the last TIMED_REQUESTS requests.
+    # Server-side share, a report value rather than a check: the durationMs the broker logged for
+    # the valid timed requests, matched by the trace id each one sent. Warm-ups, failed requests
+    # and other callers' requests carry other trace ids and are left out.
     if ! broker_logs "$since" >"$RUN_DIR/insights.log"; then
         info "insights server share: broker-service logs unreadable (see $RUN_DIR/compose.log)"
         return 0
     fi
-    : >"$RUN_DIR/insights-server-all"
-    while IFS= read -r line; do
-        if [[ "$line" =~ $INSIGHTS_DURATION_RE ]]; then
-            echo "${BASH_REMATCH[1]}" >>"$RUN_DIR/insights-server-all"
-        fi
-    done < <(grep -F "Portfolio insights for account [$account]" "$RUN_DIR/insights.log" || true)
-    lines=$(($(wc -l <"$RUN_DIR/insights-server-all")))
-    tail -n "$TIMED_REQUESTS" "$RUN_DIR/insights-server-all" >"$RUN_DIR/insights-server"
-    if [[ $lines -eq 0 ]]; then
-        info "insights server share: no insights log line found for account [$account]"
+    if ! insights_trace_durations "$account" "$RUN_DIR/insights.log" "$RUN_DIR/insights-traces" \
+        >"$RUN_DIR/insights-server"; then
+        info "insights server share: the insights log lines could not be matched to the timed trace ids"
+        return 0
+    fi
+    matched=$(($(wc -l <"$RUN_DIR/insights-server")))
+    if [[ $matched -eq 0 ]]; then
+        info "insights server share: no insights log line of account [$account] carries the trace id of a valid timed request"
         return 0
     fi
     median_ms="$(nearest_rank 50 "$RUN_DIR/insights-server")"
     server_p95_ms="$(nearest_rank 95 "$RUN_DIR/insights-server")"
-    R_SERVER_SHARE="median $median_ms ms, p95 $server_p95_ms ms over $(($(wc -l <"$RUN_DIR/insights-server"))) logged requests"
-    info "insights server share: $lines log lines, last $(($(wc -l <"$RUN_DIR/insights-server"))) used: median $median_ms ms, p95 $server_p95_ms ms"
+    R_SERVER_SHARE="median $median_ms ms, p95 $server_p95_ms ms over $matched of $TIMED_REQUESTS timed requests, matched by trace id"
+    info "insights server share: $R_SERVER_SHARE"
+    if [[ $matched -lt $TIMED_REQUESTS ]]; then
+        info "insights server share: $((TIMED_REQUESTS - matched)) of $TIMED_REQUESTS timed requests are left out, as failed requests or without a log line carrying their trace id"
+    fi
 }
 
 # ---------------------------------------------------------------------------------------------
 # Limit 2: one evaluation cycle < 10 s for 1,000 alerts
 
 # rearm_missing: PATCHes {"enabled":true} on every owned alert missing from the armed set and
-# records the returned armingRevision in the expected set. Sets REARM_ERROR on failure.
+# records the returned armingRevision in the expected set. REARMED counts the alerts re-armed.
+# Sets REARM_ERROR on failure.
 rearm_missing() {
-    local id revision rearmed=0
+    local id revision
+    REARMED=0
     cut -d, -f1 "$RUN_DIR/expected" | LC_ALL=C sort >"$RUN_DIR/expected.ids"
     cut -d, -f1 "$RUN_DIR/armed" | LC_ALL=C sort >"$RUN_DIR/armed.ids"
     LC_ALL=C comm -23 "$RUN_DIR/expected.ids" "$RUN_DIR/armed.ids" >"$RUN_DIR/missing"
@@ -932,9 +1054,9 @@ rearm_missing() {
         awk -F, -v id="$id" -v rev="$revision" 'BEGIN { OFS = "," } $1 == id { $2 = rev } { print }' \
             "$RUN_DIR/expected" >"$RUN_DIR/expected.new"
         mv "$RUN_DIR/expected.new" "$RUN_DIR/expected"
-        rearmed=$((rearmed + 1))
+        REARMED=$((REARMED + 1))
     done <"$RUN_DIR/missing"
-    info "re-armed $rearmed owned alerts missing from the armed set"
+    info "re-armed $REARMED owned alerts missing from the armed set"
 }
 
 # verify_owned_set: the armed set must equal the expected owned set. Sets OWNED_ERROR.
@@ -951,9 +1073,221 @@ verify_owned_set() {
     fi
 }
 
+# open_verified_window: establishes T and opens the cycle-log window that starts at it. The
+# owned set is verified first, and T (CYCLE_T) is the database's own time of the armed-set
+# query that verified it. The window is `compose logs --since T` (LOG_SINCE), so every cycle
+# line in it was logged after T and none is skipped (LOG_BASE is 0). The db container runs on
+# the Docker engine whose clock stamps the log lines, so no host-clock margin applies. One read
+# of the window checks that the logs are readable. Returns 2 with OWNED_ERROR set when the armed
+# set differs from the owned id,revision set, and 1 when the broker-service logs are unreadable.
+open_verified_window() {
+    if ! verify_owned_set; then
+        return 2
+    fi
+    CYCLE_T="$ARMED_AT"
+    LOG_SINCE="$CYCLE_T"
+    LOG_BASE=0
+    if ! broker_logs "$LOG_SINCE" >"$RUN_DIR/broker.log"; then
+        return 1
+    fi
+}
+
+# select_cycle_sample: establishes T over the owned set and reads the accepted sample. The
+# first line of the verified window over ALERTS_EXPECTED alerts is the sample, read within two
+# intervals plus the margin; lines over another count are cycles that began during setup and
+# are skipped. A sample is rejected when its line shows a trigger, skip, failure or another
+# outcome, or when the armed set differs from the owned set after it. Owned alerts missing from
+# the armed set are then re-armed. When any was, a new verified window opens at a new T and its
+# first line over ALERTS_EXPECTED alerts is read. When none was, the owned set is verified
+# again and reading goes on in the same window after the rejected line, so a cycle already
+# logged there is the next one read. Either read waits up to two intervals plus the margin. The
+# workload itself never changes. Returns 0 with the accepted line in CYCLE_INDEX, CYCLE_LINE
+# and the C_* values; otherwise prints the failing check and returns 1, at the latest after
+# MAX_REJECTED_SAMPLES rejected samples.
+select_cycle_sample() {
+    local revisions rc rejected=0 reasons="" reason after
+    local timeout=$((2 * EVAL_INTERVAL + CYCLE_WAIT_MARGIN_SECONDS))
+
+    revisions="$(cut -d, -f2 "$RUN_DIR/expected" | LC_ALL=C sort -u | tr '\n' ' ')"
+    rc=0
+    open_verified_window || rc=$?
+    if [[ $rc -eq 1 ]]; then
+        R_CYCLE_VERDICT="FAIL"
+        fail "cycle < 10 s" "broker-service logs unreadable (see $RUN_DIR/compose.log)"
+        return 1
+    fi
+    if [[ $rc -ne 0 ]]; then
+        fail "cycle owned set" "$OWNED_ERROR"
+        return 1
+    fi
+    if [[ "$revisions" != "1 " ]]; then
+        fail "cycle owned set" "owned alerts carry revisions [${revisions% }], all must be 1"
+        return 1
+    fi
+    pass "cycle owned set"
+    after="$LOG_BASE"
+    info "owned set verified at $CYCLE_T; waiting up to ${timeout}s for a cycle over $ALERTS_EXPECTED alerts"
+
+    while :; do
+        if ! wait_cycle_line "$after" "$timeout" "$ALERTS_EXPECTED"; then
+            R_CYCLE_VERDICT="FAIL"
+            fail "cycle < 10 s" "no cycle line rendered alerts [$ALERTS_EXPECTED] within ${timeout}s after $CYCLE_T${reasons:+; rejected: $reasons}"
+            return 1
+        fi
+        parse_cycle_line "$CYCLE_LINE"
+        reason=""
+        if ! cycle_is_clean; then
+            reason="cycle line shows $(cycle_summary_text)"
+        fi
+        if ! verify_owned_set; then
+            reason="${reason:+$reason, }$OWNED_ERROR"
+        fi
+        if [[ -z "$reason" ]]; then
+            return 0
+        fi
+        rejected=$((rejected + 1))
+        R_CYCLE_REJECTIONS="$rejected"
+        reasons="${reasons:+$reasons; }sample $rejected: $reason"
+        info "cycle sample $rejected rejected: $reason"
+        if [[ $rejected -ge $MAX_REJECTED_SAMPLES ]]; then
+            R_CYCLE_VERDICT="FAIL"
+            fail "cycle < 10 s" "no clean sample: $reasons"
+            return 1
+        fi
+        if ! read_armed_set; then
+            R_CYCLE_VERDICT="FAIL"
+            fail "cycle < 10 s" "no clean sample: $ARMED_ERROR; $reasons"
+            return 1
+        fi
+        if ! rearm_missing; then
+            R_CYCLE_VERDICT="FAIL"
+            fail "cycle < 10 s" "no clean sample: re-arming failed, $REARM_ERROR; $reasons"
+            return 1
+        fi
+        if [[ $REARMED -eq 0 ]]; then
+            if ! verify_owned_set; then
+                R_CYCLE_VERDICT="FAIL"
+                fail "cycle < 10 s" "no clean sample: after re-arming $OWNED_ERROR; $reasons"
+                return 1
+            fi
+            after="$CYCLE_INDEX"
+            info "nothing re-armed and the owned set verified again; waiting up to ${timeout}s for the next cycle over $ALERTS_EXPECTED alerts after line $after of the window since $CYCLE_T"
+            continue
+        fi
+        rc=0
+        open_verified_window || rc=$?
+        if [[ $rc -eq 1 ]]; then
+            R_CYCLE_VERDICT="FAIL"
+            fail "cycle < 10 s" "broker-service logs unreadable (see $RUN_DIR/compose.log)"
+            return 1
+        fi
+        if [[ $rc -ne 0 ]]; then
+            R_CYCLE_VERDICT="FAIL"
+            fail "cycle < 10 s" "no clean sample: after re-arming $OWNED_ERROR; $reasons"
+            return 1
+        fi
+        after="$LOG_BASE"
+        info "owned set verified at $CYCLE_T; waiting up to ${timeout}s for a cycle over $ALERTS_EXPECTED alerts"
+    done
+}
+
+# record_follow_ups: records the FOLLOW_UP_CYCLES clean cycles after the accepted sample as
+# evidence and prints one `cycle follow-ups` check, apart from the `cycle < 10 s` verdict.
+# Reading continues in the sample's window after CYCLE_INDEX, within one interval plus the
+# margin per line. A follow-up is clean when its line is clean and the armed set still equals
+# the owned id,revision set after it, and only a clean one fills a slot. After an unclean one,
+# owned alerts missing from the armed set are re-armed. When any was, a new verified window
+# opens at a new T and its first line over ALERTS_EXPECTED alerts is read within two intervals
+# plus the margin. When none was, the owned set is verified again and reading goes on in the
+# same window after the unclean line, so cycles already logged there are the next follow-ups,
+# each read within one interval plus the margin. Recording stops when FOLLOW_UP_CYCLES clean
+# follow-ups are recorded, after MAX_REJECTED_SAMPLES unclean ones, or when a wait times out or
+# the logs, the database or a re-arm fail; the check then fails with the shortfall and its
+# reasons. Sets R_FOLLOW_UPS to the recorded durations and any shortfall.
+record_follow_ups() {
+    local after="$CYCLE_INDEX" wanted="" attempt=0 clean=0 unclean=0 durations="" problems=""
+    local problem rc timeout=$((EVAL_INTERVAL + CYCLE_WAIT_MARGIN_SECONDS))
+
+    while [[ $clean -lt $FOLLOW_UP_CYCLES ]]; do
+        attempt=$((attempt + 1))
+        if ! wait_cycle_line "$after" "$timeout" "$wanted"; then
+            if [[ -n "$wanted" ]]; then
+                problem="no cycle line rendered alerts [$wanted] within ${timeout}s after $CYCLE_T"
+            else
+                problem="no cycle line within ${timeout}s"
+            fi
+            problems="${problems:+$problems; }follow-up $attempt: $problem"
+            info "follow-up cycle $attempt: $problem"
+            break
+        fi
+        after="$CYCLE_INDEX"
+        wanted=""
+        timeout=$((EVAL_INTERVAL + CYCLE_WAIT_MARGIN_SECONDS))
+        parse_cycle_line "$CYCLE_LINE"
+        problem=""
+        if ! cycle_is_clean; then
+            problem="cycle line shows $(cycle_summary_text)"
+        fi
+        if ! verify_owned_set; then
+            problem="${problem:+$problem, }$OWNED_ERROR"
+        fi
+        if [[ -z "$problem" ]]; then
+            clean=$((clean + 1))
+            durations="${durations:+$durations, }$C_DURATION ms"
+            info "follow-up cycle $attempt: $C_DURATION ms"
+            continue
+        fi
+        unclean=$((unclean + 1))
+        problems="${problems:+$problems; }follow-up $attempt: $problem"
+        info "follow-up cycle $attempt rejected: $problem"
+        if [[ $unclean -ge $MAX_REJECTED_SAMPLES ]]; then
+            problems="$problems; stopped after $unclean unclean follow-up cycles"
+            break
+        fi
+        if ! read_armed_set; then
+            problems="$problems; $ARMED_ERROR"
+            break
+        fi
+        if ! rearm_missing; then
+            problems="$problems; re-arming failed, $REARM_ERROR"
+            break
+        fi
+        if [[ $REARMED -eq 0 ]]; then
+            if ! verify_owned_set; then
+                problems="$problems; after re-arming $OWNED_ERROR"
+                break
+            fi
+            info "nothing re-armed and the owned set verified again; waiting up to ${timeout}s for the next cycle after line $after of the window since $CYCLE_T"
+            continue
+        fi
+        rc=0
+        open_verified_window || rc=$?
+        if [[ $rc -eq 1 ]]; then
+            problems="$problems; broker-service logs unreadable (see $RUN_DIR/compose.log)"
+            break
+        fi
+        if [[ $rc -ne 0 ]]; then
+            problems="$problems; after re-arming $OWNED_ERROR"
+            break
+        fi
+        after="$LOG_BASE"
+        wanted="$ALERTS_EXPECTED"
+        timeout=$((2 * EVAL_INTERVAL + CYCLE_WAIT_MARGIN_SECONDS))
+        info "owned set verified again at $CYCLE_T; waiting up to ${timeout}s for a cycle over $ALERTS_EXPECTED alerts"
+    done
+
+    if [[ $clean -ge $FOLLOW_UP_CYCLES ]]; then
+        R_FOLLOW_UPS="$durations"
+        pass "cycle follow-ups"
+    else
+        R_FOLLOW_UPS="${durations:-none} ($clean of $FOLLOW_UP_CYCLES clean follow-up cycles recorded)"
+        fail "cycle follow-ups" "$clean of $FOLLOW_UP_CYCLES clean follow-up cycles recorded; $problems"
+    fi
+}
+
 measure_cycle() {
     local count id problem listed shortfalls="" armed created=0 k type instrument held
-    local instruments revisions rejected=0 reasons="" reason timeout units limit n after follow=""
+    local instruments units limit
 
     # Inputs: all presets hold every instrument, and every instrument is listed with a price.
     count=$(($(wc -l <"$RUN_DIR/presets")))
@@ -1024,70 +1358,9 @@ measure_cycle() {
     done <"$RUN_DIR/presets"
     pass "cycle workload"
 
-    revisions="$(cut -d, -f2 "$RUN_DIR/expected" | LC_ALL=C sort -u | tr '\n' ' ')"
-    if ! verify_owned_set; then
-        fail "cycle owned set" "$OWNED_ERROR"
+    if ! select_cycle_sample; then
         return 0
     fi
-    if [[ "$revisions" != "1 " ]]; then
-        fail "cycle owned set" "owned alerts carry revisions [${revisions% }], all must be 1"
-        return 0
-    fi
-    pass "cycle owned set"
-
-    # Samples: the first cycle over exactly the owned set. A sample with a trigger, skip,
-    # failure or another outcome, or one after which the set changed, is rejected; triggered
-    # alerts are re-armed and the next cycle is read. The workload itself never changes.
-    timeout=$((2 * EVAL_INTERVAL + 30))
-    while :; do
-        CYCLE_T="$(now_rfc3339)"
-        if ! open_log_window; then
-            R_CYCLE_VERDICT="FAIL"
-            fail "cycle < 10 s" "broker-service logs unreadable (see $RUN_DIR/compose.log)"
-            return 0
-        fi
-        info "owned set verified at $CYCLE_T; waiting up to ${timeout}s for a cycle over $ALERTS_EXPECTED alerts"
-        if ! wait_cycle_line "$LOG_BASE" "$timeout" "$ALERTS_EXPECTED"; then
-            R_CYCLE_VERDICT="FAIL"
-            fail "cycle < 10 s" "no cycle line rendered alerts [$ALERTS_EXPECTED] within ${timeout}s after $CYCLE_T${reasons:+; rejected: $reasons}"
-            return 0
-        fi
-        parse_cycle_line "$CYCLE_LINE"
-        reason=""
-        if ! cycle_is_clean; then
-            reason="cycle line shows $(cycle_summary_text)"
-        fi
-        if ! verify_owned_set; then
-            reason="${reason:+$reason, }$OWNED_ERROR"
-        fi
-        if [[ -z "$reason" ]]; then
-            break
-        fi
-        rejected=$((rejected + 1))
-        R_CYCLE_REJECTIONS="$rejected"
-        reasons="${reasons:+$reasons; }sample $rejected: $reason"
-        info "cycle sample $rejected rejected: $reason"
-        if [[ $rejected -ge $MAX_REJECTED_SAMPLES ]]; then
-            R_CYCLE_VERDICT="FAIL"
-            fail "cycle < 10 s" "no clean sample: $reasons"
-            return 0
-        fi
-        if ! read_armed_set; then
-            R_CYCLE_VERDICT="FAIL"
-            fail "cycle < 10 s" "no clean sample: $ARMED_ERROR; $reasons"
-            return 0
-        fi
-        if ! rearm_missing; then
-            R_CYCLE_VERDICT="FAIL"
-            fail "cycle < 10 s" "no clean sample: re-arming failed, $REARM_ERROR; $reasons"
-            return 0
-        fi
-        if ! verify_owned_set; then
-            R_CYCLE_VERDICT="FAIL"
-            fail "cycle < 10 s" "no clean sample: after re-arming $OWNED_ERROR; $reasons"
-            return 0
-        fi
-    done
 
     R_CYCLE_DURATION="$C_DURATION ms"
     info "accepted cycle sample: $(cycle_summary_text)"
@@ -1102,25 +1375,9 @@ measure_cycle() {
         fail "cycle < 10 s" "duration $C_DURATION ms is not below $CYCLE_LIMIT_MS ms"
     fi
 
-    # Follow-ups: the next cycles after the accepted one, recorded but not judged.
-    after="$CYCLE_INDEX"
-    for ((n = 1; n <= FOLLOW_UP_CYCLES; n++)); do
-        if ! wait_cycle_line "$after" $((EVAL_INTERVAL + 30)); then
-            info "follow-up cycle $n: no cycle line within $((EVAL_INTERVAL + 30))s"
-            follow="${follow:+$follow, }none"
-            break
-        fi
-        after="$CYCLE_INDEX"
-        parse_cycle_line "$CYCLE_LINE"
-        if cycle_is_clean; then
-            info "follow-up cycle $n: $C_DURATION ms"
-            follow="${follow:+$follow, }$C_DURATION ms"
-        else
-            info "follow-up cycle $n not clean: $(cycle_summary_text)"
-            follow="${follow:+$follow, }not clean"
-        fi
-    done
-    R_FOLLOW_UPS="${follow:-n/a}"
+    # Follow-ups are recorded after any verdict on the accepted sample, and are never held to
+    # the 10 s limit.
+    record_follow_ups
 }
 
 # ---------------------------------------------------------------------------------------------

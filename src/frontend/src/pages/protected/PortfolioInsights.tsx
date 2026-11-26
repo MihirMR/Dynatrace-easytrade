@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState, type ReactNode } from "react"
 import { useNavigate } from "react-router"
-import { useQueryClient } from "@tanstack/react-query"
 import { BizEvents } from "../../api/bizEvents"
+import { loggableError } from "../../api/http"
 import { AlertsPanel } from "../../components/insights/AlertsPanel"
 import { InsightsSummary } from "../../components/insights/InsightsSummary"
 import { useAuthUser } from "../../contexts/UserContext/context"
@@ -10,10 +10,9 @@ import { usePortfolioInsightsFlag } from "../../hooks/useFeatureFlags"
 import { useInstrumentsQuery } from "../../hooks/useInstruments"
 import { usePortfolioInsightsQuery } from "../../hooks/usePortfolioInsights"
 import {
-    captureFeatureContext,
+    featureResultContext,
     isCurrentFeatureContext,
     isFeatureDisabledError,
-    onPortfolioInsightsDisabled,
 } from "../../utils/portfolioInsightsFeature"
 
 /**
@@ -35,19 +34,18 @@ function AfterMount({ children }: { children: ReactNode }) {
 /**
  * The `/insights` page: the broker's portfolio figures and the alerts panel,
  * shown only while the Portfolio Insights flag is on. The page holds no
- * shutdown logic of its own: it hands every 403 to the shared shutdown and
- * leaves for `/home` once the flag reads `false`.
+ * shutdown logic: its feature queries run the shared shutdown on a 403
+ * themselves, and the page leaves for `/home` once the flag reads `false`.
  */
 export function PortfolioInsights() {
     const { userId } = useAuthUser()
     const flag = usePortfolioInsightsFlag()
     const navigate = useNavigate()
-    const queryClient = useQueryClient()
     const insights = usePortfolioInsightsQuery(userId, flag)
     const { data: instruments } = useInstrumentsQuery(userId)
-    // Observed only for its 403: `AlertsPanel` renders this cache entry.
-    const alerts = useAlertsQuery(userId, flag)
-    const [mountContext] = useState(() => captureFeatureContext())
+    // Started with the page's other queries; `AlertsPanel` renders this
+    // cache entry.
+    useAlertsQuery(userId, flag)
     const viewSent = useRef(false)
 
     useEffect(() => {
@@ -57,30 +55,33 @@ export function PortfolioInsights() {
     }, [flag, navigate])
 
     useEffect(() => {
-        if (
-            isFeatureDisabledError(insights.error) ||
-            isFeatureDisabledError(alerts.error)
-        ) {
-            onPortfolioInsightsDisabled(queryClient)
-        }
-    }, [insights.error, alerts.error, queryClient])
-
-    useEffect(() => {
         if (insights.error && !isFeatureDisabledError(insights.error)) {
-            console.error("Could not load portfolio insights", insights.error)
+            console.error(
+                "Could not load portfolio insights",
+                loggableError(insights.error, userId)
+            )
         }
     }, [insights.error])
 
-    // Sent once per mount, on the first result that is still current: a
-    // refetch never sends it again, and neither does a result that arrives
-    // after a logout, an account switch or a shutdown since the mount.
-    const data = insights.data
+    // Sent once per mount, on the first result whose own request is still
+    // current for the account shown: the account, session and activation it
+    // was requested under all still hold. A refetch never sends it again.
+    // Data cached under an earlier session or activation, or for another
+    // account, is skipped, and a result loaded afresh after an in-place
+    // account change or a shutdown and resume while the page stays mounted
+    // still sends it. `dataUpdatedAt` re-runs the check when a refetch
+    // returns equal data, which keeps its reference but carries the context
+    // of the request that just returned it.
+    const { data, dataUpdatedAt } = insights
     useEffect(() => {
+        if (viewSent.current || !flag || data === undefined) {
+            return
+        }
+        const produced = featureResultContext(data)
         if (
-            viewSent.current ||
-            !flag ||
-            data === undefined ||
-            !isCurrentFeatureContext(mountContext)
+            produced === undefined ||
+            produced.userId !== userId ||
+            !isCurrentFeatureContext(produced)
         ) {
             return
         }
@@ -90,7 +91,7 @@ export function PortfolioInsights() {
             holdingCount: data.allocations.length,
             riskLevel: data.riskLevel,
         })
-    }, [data, flag, mountContext, userId])
+    }, [data, dataUpdatedAt, flag, userId])
 
     if (!flag) {
         return null

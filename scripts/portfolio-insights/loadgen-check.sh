@@ -4,12 +4,13 @@
 #   - run A: flag portfolio-insights-enabled off, PORTFOLIO_INSIGHTS_ALERT_WEIGHT 0, M minutes;
 #   - run B: flag on, weight N, M minutes, then an audit of every alert the visit created;
 #   - flag off at weight N, for at least 5 minutes.
-# Both runs must complete every existing visit family (deposit_and_buy, deposit_and_long_buy,
+# Every window must complete every existing visit family (deposit_and_buy, deposit_and_long_buy,
 # long_sell, sell_and_withdraw, order_credit_card). Run B must also complete
 # portfolio_insights_alert without a failure, fail no existing visit name that run A did not
 # fail, and leave none of its alerts in the database. With the flag off the visit must skip.
-# The whole run takes roughly 2 x M + 20 minutes; the default M of 35 covers the rare
-# order_credit_card visit, which loadgen schedules every 30 minutes.
+# The whole run takes roughly 2 x M + 20 minutes. Each window recreates loadgen, and a fresh
+# container draws the rare order_credit_card visit first and then every 30 minutes, so the
+# default M of 35 covers two of its draws and the flag-off window one.
 #
 # Usage: scripts/portfolio-insights/loadgen-check.sh --project NAME [--base-url URL]
 #            [--compose-file FILE]... [--weight N] [--minutes M] [--out FILE]
@@ -30,16 +31,23 @@
 # PORTFOLIO_INSIGHTS_ALERT_WEIGHT declaration, set on that one command and never exported. It
 # deletes, by id, only alerts loadgen logged as created and did not delete itself, and reads the
 # Alerts table read-only through the db container's own client. On exit, normal or not, it
-# restores the flag and recreates loadgen with its configured weight, running or stopped as it
-# was at start. Run B's stop waits until no visit is between opening the page and its create
-# outcome. A create cut off before loadgen logs its id by any other stop, such as an interrupt,
-# cannot be tied to an id and is not deleted; an unconfirmed create is printed with its
-# threshold marker.
+# restores the flag and puts loadgen back as it was at start: recreated with the
+# PORTFOLIO_INSIGHTS_ALERT_WEIGHT its container had (set on that one command, or unset when it
+# was unset), running or stopped as it was, or removed when the project had no loadgen
+# container; the cleanup check fails unless the restored container matches. Run B ends at an
+# instant Q when every alert it logged as created is resolved and no visit is between opening
+# the page and its create outcome: loadgen is paused, its frozen output checked again, and
+# killed while paused, so it logs and does nothing after Q. Run B's owned-id checks judge every
+# create seen in any read of run B's output, and fail when the final output lost one, as log
+# rotation can. A create cut off before loadgen logs its id by any other stop, such as an
+# interrupt while loadgen runs, cannot be tied to an id and is not deleted; an unconfirmed
+# create is printed with its threshold marker.
 #
 # Prints one PASS or FAIL line per check, writes the per-family table to --out and ends with a
 # SUMMARY line. Exits 0 when every check passes, 1 when any check fails, 2 on a usage error or a
 # missing tool, and 130 on an interrupt. Working files stay in the run directory printed at
-# start and end.
+# start and end. The loadgen output kept there is reduced to the validated lines the checks
+# read, so no DEBUG line, typed value or error detail is retained.
 
 set -euo pipefail
 
@@ -50,8 +58,6 @@ VISIT="portfolio_insights_alert"
 # A visit name belongs to family f when it is f or starts with f_, so deposit_and_buy never
 # takes in deposit_and_long_buy_*.
 EXISTING_FAMILIES="deposit_and_buy deposit_and_long_buy long_sell sell_and_withdraw order_credit_card"
-# The flag-off window lasts about 5 minutes, too short to wait for the 30-minute rare visit.
-FLAG_OFF_FAMILIES="deposit_and_buy deposit_and_long_buy long_sell sell_and_withdraw"
 # Always required on top of every service the compose files define besides loadgen.
 CORE_SERVICES="broker-service db db-adapter feature-flag-service reverse-proxy"
 READY_TIMEOUT_SECONDS=300
@@ -64,6 +70,10 @@ BREAKDOWN_TIMEOUT_SECONDS=360
 BREAKDOWN_STEP_SECONDS=15
 QUIESCE_TIMEOUT_SECONDS=180
 QUIESCE_STEP_SECONDS=5
+# A paused loadgen's output is read again every QUIESCE_FLUSH_STEP_SECONDS until two reads in a
+# row match, so the log driver has stored every line written before the freeze.
+QUIESCE_FLUSH_TIMEOUT_SECONDS=10
+QUIESCE_FLUSH_STEP_SECONDS=1
 FLAG_OFF_MIN_SECONDS=300
 FLAG_OFF_TIMEOUT_SECONDS=900
 FLAG_OFF_STEP_SECONDS=15
@@ -89,6 +99,21 @@ CREATED_MARKER="Created alert ["
 LEFT_MARKER="] left in place: "
 UNKNOWN_MARKER="outcome unknown"
 UUID_RE='^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+# The visit's other messages, which sanitize_loadgen_log also keeps.
+OPENING_LINE="Opening portfolio insights page"
+NO_OPTIONS_LINE="Alert instrument options did not load, no alert created"
+# The visit's other no-create outcomes: the page did not open, or the feature was lost before
+# submit, each while the feature is verifiably lost.
+PAGE_UNAVAILABLE_LINE="Portfolio insights page unavailable, no alert created"
+FEATURE_LOST_LINE="Portfolio insights feature lost before submit, no alert created"
+UNCONFIRMED_MARKER="Create unconfirmed threshold ["
+DELETED_MARKER="Deleted alert ["
+ALERT_MARKER="Alert ["
+ABSENT_TAIL="] already absent"
+# The two outcome lines run B reports, as sanitize_loadgen_log keeps them: the id and status
+# token of an alert left in place, and the threshold marker of an unconfirmed create.
+LEFT_RE='\]: Alert \[([0-9a-fA-F-]{36})\] left in place: ([0-9]{3}|timeout|error)$'
+UNCONFIRMED_RE='\]: Create unconfirmed threshold \[([0-9]+\.[0-9]+)\], outcome unknown$'
 
 # ---------------------------------------------------------------------------------------------
 # Options
@@ -314,24 +339,58 @@ compose() {
     MSYS_NO_PATHCONV=1 docker compose -p "$PROJECT" "${COMPOSE_ARGS[@]}" "$@" </dev/null
 }
 
-# recreate_loadgen WEIGHT: recreates loadgen alone with PORTFOLIO_INSIGHTS_ALERT_WEIGHT=WEIGHT.
-# The value reaches only this command, where it overrides the shell and .env for Compose's
-# interpolation of the declaration both compose files carry.
+# recreate_loadgen WEIGHT [START]: recreates loadgen alone with
+# PORTFOLIO_INSIGHTS_ALERT_WEIGHT=WEIGHT, started when START is -d (the default) and only created
+# when it is --no-start. The value reaches only this command, where it overrides the shell and
+# .env for Compose's interpolation of the declaration both compose files carry.
 recreate_loadgen() {
     PORTFOLIO_INSIGHTS_ALERT_WEIGHT="$1" MSYS_NO_PATHCONV=1 \
-        docker compose -p "$PROJECT" "${COMPOSE_ARGS[@]}" up -d --no-deps --force-recreate loadgen \
+        docker compose -p "$PROJECT" "${COMPOSE_ARGS[@]}" up "${2:--d}" --no-deps --force-recreate loadgen \
         </dev/null >>"$RUN_DIR/compose.log" 2>&1
 }
 
-# restore_loadgen: recreates loadgen from the script's unmodified environment, so the weight the
-# operator configured in the shell or in .env applies again, and leaves it running or stopped as
-# it was at start. A loadgen stopped at start is recreated without being started rather than
-# started and stopped: a visit run in between could create an alert and be cut off.
+# restore_loadgen: puts loadgen back as setup recorded it in LOADGEN_AT_START and verifies the
+# result; on failure it sets RESTORE_ERROR. A container that existed is recreated alone with the
+# PORTFOLIO_INSIGHTS_ALERT_WEIGHT it had, set or unset on that one command, so neither this shell
+# nor .env replaces a weight the operator set elsewhere. Its other settings come from the same
+# --compose-file files, so the weight is the only interpolated value this run overrides. A loadgen
+# stopped at start is recreated without being started rather than started and stopped: a visit
+# run in between could create an alert and be cut off. Without a container at start, the one this
+# run created is removed.
 restore_loadgen() {
-    if [[ $LOADGEN_WAS_RUNNING -eq 1 ]]; then
-        compose up -d --no-deps --force-recreate loadgen >>"$RUN_DIR/compose.log" 2>&1
+    local start=-d entry actual rc=0
+    RESTORE_ERROR=""
+    if [[ "$LOADGEN_AT_START" == "no container" ]]; then
+        if ! compose rm --force --stop loadgen >>"$RUN_DIR/compose.log" 2>&1; then
+            RESTORE_ERROR="removing the loadgen container this run created failed (see $RUN_DIR/compose.log)"
+            return 1
+        fi
     else
-        compose up --no-start --no-deps --force-recreate loadgen >>"$RUN_DIR/compose.log" 2>&1
+        if [[ $LOADGEN_WAS_RUNNING -eq 0 ]]; then
+            start=--no-start
+        fi
+        entry="${LOADGEN_AT_START#*, }"
+        if [[ "$entry" == PORTFOLIO_INSIGHTS_ALERT_WEIGHT=* ]]; then
+            recreate_loadgen "${entry#PORTFOLIO_INSIGHTS_ALERT_WEIGHT=}" "$start" || rc=$?
+        else
+            # Unset in a subshell, so only this command runs without it.
+            (
+                unset PORTFOLIO_INSIGHTS_ALERT_WEIGHT
+                compose up "$start" --no-deps --force-recreate loadgen >>"$RUN_DIR/compose.log" 2>&1
+            ) || rc=$?
+        fi
+        if [[ $rc -ne 0 ]]; then
+            RESTORE_ERROR="recreating loadgen as [$LOADGEN_AT_START] failed (see $RUN_DIR/compose.log)"
+            return 1
+        fi
+    fi
+    if ! actual="$(loadgen_state)"; then
+        RESTORE_ERROR="loadgen's state after the restore is unreadable (see $RUN_DIR/compose.log)"
+        return 1
+    fi
+    if [[ "$actual" != "$LOADGEN_AT_START" ]]; then
+        RESTORE_ERROR="expected [$LOADGEN_AT_START] as at start, got [$actual]"
+        return 1
     fi
 }
 
@@ -339,9 +398,35 @@ restore_loadgen() {
 # while node keeps running, so during the default 10 s grace every worker logs a browser-context
 # error in a tight loop: hundreds of thousands of lines, enough to rotate the run's own lines out
 # of compose.yaml's json-file logs. The visits a grace period would let finish are covered by the
-# owned-id rules instead.
+# owned-id rules instead. A paused loadgen is killed: compose stop thaws it to deliver SIGTERM, and
+# it then logs, and acts, once more.
 stop_loadgen() {
-    compose stop --timeout 0 loadgen >>"$RUN_DIR/compose.log" 2>&1
+    if [[ $LOADGEN_PAUSED -eq 1 ]]; then
+        kill_loadgen
+    else
+        compose stop --timeout 0 loadgen >>"$RUN_DIR/compose.log" 2>&1
+    fi
+}
+
+# pause_loadgen: freezes every loadgen process, so loadgen neither logs nor acts until it is
+# unpaused or killed. LOADGEN_PAUSED is set first, so a stop that cuts the pause short kills
+# loadgen rather than thawing it.
+pause_loadgen() {
+    LOADGEN_PAUSED=1
+    compose pause loadgen >>"$RUN_DIR/compose.log" 2>&1
+}
+
+# unpause_loadgen: lets a paused loadgen run on.
+unpause_loadgen() {
+    compose unpause loadgen >>"$RUN_DIR/compose.log" 2>&1 || return 1
+    LOADGEN_PAUSED=0
+}
+
+# kill_loadgen: ends loadgen with SIGKILL. A paused loadgen dies without being thawed, so it logs
+# nothing after the freeze. Killing a loadgen that no longer runs succeeds.
+kill_loadgen() {
+    compose kill -s SIGKILL loadgen >>"$RUN_DIR/compose.log" 2>&1 || return 1
+    LOADGEN_PAUSED=0
 }
 
 running_services() {
@@ -360,6 +445,39 @@ container_env() {
         | tr -d '\r' | sed -n "/^$2=/{s/^$2=//p;q;}"
 }
 
+# container_env_entry SERVICE NAME: the NAME=VALUE entry of the service container's environment,
+# read from docker inspect's JSON, so NAME set to an empty value still prints NAME=. Prints
+# nothing when NAME is unset; fails when the service has no container or docker inspect fails.
+container_env_entry() {
+    local cid env
+    cid="$(compose ps -a -q "$1" 2>>"$RUN_DIR/compose.log" | tr -d '\r' | sed -n '1p')" || return 1
+    if [[ -z "$cid" ]]; then
+        return 1
+    fi
+    env="$(MSYS_NO_PATHCONV=1 docker inspect --format '{{json .Config.Env}}' "$cid" </dev/null 2>>"$RUN_DIR/compose.log")" ||
+        return 1
+    jq -r --arg prefix "$2=" '(. // []) | map(select(startswith($prefix))) | .[0] // empty' <<<"$env" \
+        2>>"$RUN_DIR/compose.log" | tr -d '\r'
+}
+
+# loadgen_state: loadgen's container as setup records it and restore_loadgen verifies it, either
+# "no container" or "running" or "stopped" followed by ", PORTFOLIO_INSIGHTS_ALERT_WEIGHT=VALUE"
+# or ", PORTFOLIO_INSIGHTS_ALERT_WEIGHT unset". Fails when Compose or docker inspect fails.
+loadgen_state() {
+    local cid running entry state="stopped"
+    cid="$(compose ps -a -q loadgen 2>>"$RUN_DIR/compose.log" | tr -d '\r' | sed -n '1p')" || return 1
+    if [[ -z "$cid" ]]; then
+        echo "no container"
+        return 0
+    fi
+    running="$(running_services)" || return 1
+    entry="$(container_env_entry loadgen PORTFOLIO_INSIGHTS_ALERT_WEIGHT)" || return 1
+    if grep -qxF loadgen <<<"$running"; then
+        state="running"
+    fi
+    echo "$state, ${entry:-PORTFOLIO_INSIGHTS_ALERT_WEIGHT unset}"
+}
+
 now_rfc3339() {
     date -u +%Y-%m-%dT%H:%M:%SZ
 }
@@ -369,10 +487,173 @@ epoch_to_rfc3339() {
     date -u -d "@$1" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -r "$1" +%Y-%m-%dT%H:%M:%SZ
 }
 
-# loadgen_logs SINCE: loadgen output since SINCE, without colour codes or carriage returns.
+# loadgen_logs SINCE: loadgen output since SINCE, without colour codes or carriage returns,
+# reduced by sanitize_loadgen_log to the lines this script reads.
 loadgen_logs() {
     compose logs --no-color --no-log-prefix --since "$1" loadgen 2>>"$RUN_DIR/compose.log" \
-        | sed "s/$(printf '\033')\[[0-9;]*m//g" | tr -d '\r'
+        | sed "s/$(printf '\033')\[[0-9;]*m//g" | tr -d '\r' | sanitize_loadgen_log
+}
+
+# sanitize_loadgen_log: keeps only the stdin lines this script reads, each rebuilt from validated
+# fields, and drops every other line. Raw loadgen output must never reach the run directory or
+# the report: at DEBUG, loadgen-core logs every value a visit types, the preset users' login
+# passwords included, and visit errors carry free text. A kept line has a validated timestamp,
+# the tags [worker:<n>] with an optional [visit:<name>][id:<uuid>], or [stats:<name>], the level
+# INFO, WARN or ERROR, and one of these messages:
+#   - Running visit [<name>], or Worker had error when running visit without its error detail;
+#   - the visit's skip, opening, no-options, page-unavailable, feature-lost, created,
+#     unconfirmed, deleted and already-absent lines, or Alert [<id>] left in place: <status>, a
+#     status other than a 3-digit HTTP status or timeout becoming error;
+#   - the cumulative or timeframe stats line, whose breakdown holds numeric fields per visit name.
+# Anything else in a kept line is unchanged byte for byte, so a stats line reads the same in
+# every file.
+sanitize_loadgen_log() {
+    LC_ALL=C awk -v stats="$STATS_MARKER" -v timeframe="$TIMEFRAME_MARKER" \
+        -v running="$RUNNING_MARKER" -v visit_error="$ERROR_MARKER" -v skip="$SKIP_LINE" \
+        -v created="$CREATED_MARKER" -v left="$LEFT_MARKER" -v unknown="$UNKNOWN_MARKER" \
+        -v opening="$OPENING_LINE" -v no_options="$NO_OPTIONS_LINE" \
+        -v page_unavailable="$PAGE_UNAVAILABLE_LINE" -v feature_lost="$FEATURE_LOST_LINE" \
+        -v unconfirmed="$UNCONFIRMED_MARKER" -v deleted="$DELETED_MARKER" \
+        -v alert="$ALERT_MARKER" -v absent="$ABSENT_TAIL" '
+        # rep(s, n): s repeated n times. Patterns avoid interval operators, which some awks lack.
+        function rep(s, n,   r) {
+            r = ""
+            while (n-- > 0) {
+                r = r s
+            }
+            return r
+        }
+        function starts(s, p) {
+            return substr(s, 1, length(p)) == p
+        }
+        # after(s, p): s without its first length(p) characters.
+        function after(s, p) {
+            return substr(s, length(p) + 1)
+        }
+        # worker_message(m): m, or its projection, when it is a visit message this script reads.
+        function worker_message(m,   rest, id, status) {
+            if (m == skip || m == opening || m == no_options || m == page_unavailable ||
+                m == feature_lost || m == visit_error) {
+                return m
+            }
+            if (starts(m, visit_error ":")) {
+                return visit_error
+            }
+            if (starts(m, running)) {
+                return after(m, running) ~ ("^" name "[]]$") ? m : ""
+            }
+            if (starts(m, created)) {
+                return after(m, created) ~ ("^" uuid "[]] threshold [[]" marker "[]]$") ? m : ""
+            }
+            if (starts(m, unconfirmed)) {
+                rest = after(m, unconfirmed)
+                if (match(rest, "^" marker "[]], ") && substr(rest, RLENGTH + 1) == unknown) {
+                    return m
+                }
+                return ""
+            }
+            if (starts(m, deleted)) {
+                return after(m, deleted) ~ ("^" uuid "[]] via (ui|api)$") ? m : ""
+            }
+            if (starts(m, alert) && match(after(m, alert), "^" uuid)) {
+                rest = after(m, alert)
+                id = substr(rest, 1, RLENGTH)
+                rest = substr(rest, RLENGTH + 1)
+                if (rest == absent) {
+                    return m
+                }
+                if (starts(rest, left)) {
+                    status = after(rest, left)
+                    if (status !~ ("^" d d d "$") && status != "timeout") {
+                        status = "error"
+                    }
+                    return alert id left status
+                }
+            }
+            return ""
+        }
+        # stats_line(m, rest, head): m when rest is head, then a valid breakdown and "]".
+        function stats_line(m, rest, head,   json) {
+            if (!match(rest, head)) {
+                return ""
+            }
+            json = substr(rest, RLENGTH + 1)
+            if (substr(json, length(json)) != "]") {
+                return ""
+            }
+            return substr(json, 1, length(json) - 1) ~ breakdown ? m : ""
+        }
+        function stats_message(m) {
+            if (starts(m, stats)) {
+                return stats_line(m, after(m, stats), cumulative)
+            }
+            if (starts(m, timeframe)) {
+                return stats_line(m, after(m, timeframe), last)
+            }
+            return ""
+        }
+        BEGIN {
+            d = "[0-9]"
+            h = "[0-9a-fA-F]"
+            uuid = rep(h, 8) "-" rep(h, 4) "-" rep(h, 4) "-" rep(h, 4) "-" rep(h, 12)
+            name = "[a-z0-9_]+"
+            marker = d "+[.]" d "+"
+            level = "[[](INFO|WARN|ERROR)[]]: "
+            stamp = "^[[]" rep(d, 4) "-" rep(d, 2) "-" rep(d, 2) " " rep(d, 2) ":" rep(d, 2) ":" \
+                rep(d, 2) "[-+]" rep(d, 2) ":" rep(d, 2) "[]]"
+            worker_tags = "^[[]worker:" d "+[]]([[]visit:" name "[]][[]id:" uuid "[]])?" level
+            stats_tags = "^[[]stats:[a-z]+[]]" level
+            number = "-?(0|[1-9]" d "*)([.]" d "+)?([eE][-+]?" d "+)?"
+            field = "\"[A-Za-z]+\":" number
+            entry = "\"" name "\":[{]" field "(," field ")*[}]"
+            breakdown = "^[{](" entry "(," entry ")*)?[}]$"
+            counts = d "+[]] visits with fail rate [[]" d "+[.]" d "+[]] and a rate of [[]" \
+                d "+[.]" d "+/[a-z]+[]], detailed breakdown [[]"
+            cumulative = "^[A-Z][a-z][a-z], " d d " [A-Z][a-z][a-z] " d "+ " d d ":" d d ":" d d \
+                " GMT[]] and generated [[]" counts
+            last = "^" d "+([.]" d "+)?[a-z]+[]] loadgen has generated [[]" counts
+        }
+        {
+            if (!match($0, stamp)) {
+                next
+            }
+            prefix = substr($0, 1, RLENGTH)
+            rest = substr($0, RLENGTH + 1)
+            if (match(rest, worker_tags)) {
+                tags = substr(rest, 1, RLENGTH)
+                out = worker_message(substr(rest, RLENGTH + 1))
+            } else if (match(rest, stats_tags)) {
+                tags = substr(rest, 1, RLENGTH)
+                out = stats_message(substr(rest, RLENGTH + 1))
+            } else {
+                next
+            }
+            if (out != "") {
+                print prefix tags out
+            }
+        }
+    '
+}
+
+# report_outcomes FILE: one INFO line per line of FILE, an outcome line of run B. Only parsed
+# fields are printed: the id and status token of an alert left in place, or the threshold marker
+# of an unconfirmed create. A line in neither form gets a fixed notice, never its text.
+report_outcomes() {
+    local line id status
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        if [[ "$line" =~ $LEFT_RE ]]; then
+            status="${BASH_REMATCH[2]}"
+            id="$(lower <<<"${BASH_REMATCH[1]}")"
+            if [[ "$id" =~ $UUID_RE ]]; then
+                info "outcome: alert [$id] left in place: $status"
+                continue
+            fi
+        elif [[ "$line" =~ $UNCONFIRMED_RE ]]; then
+            info "outcome: unconfirmed create, threshold [${BASH_REMATCH[1]}], outcome unknown"
+            continue
+        fi
+        info "outcome: a line in no known outcome form, not printed"
+    done <"$1"
 }
 
 # poll CHECK TIMEOUT STEP COMMAND [ARGS...]: runs COMMAND every STEP seconds until it succeeds or
@@ -519,10 +800,49 @@ unresolved_ids() {
     LC_ALL=C comm -23 "$RUN_DIR/ids.created" "$RUN_DIR/ids.resolved"
 }
 
-# own_unresolved FILE: adds every unresolved created id of FILE that is not owned yet to the owned
-# list, which cleanup deletes through REST, and writes those ids to $RUN_DIR/new-owned.
+# observe_window FILE: adds the created and resolved ids of FILE, one read of the open window's
+# output, to the window's observed sets, so an id stays known after log rotation drops its lines
+# from a later read. The first read holding a line records that line as the window's first line.
+observe_window() {
+    local first="$RUN_DIR/observed-first-$WINDOW_LABEL"
+    created_ids "$1" >>"$RUN_DIR/observed-created-$WINDOW_LABEL"
+    resolved_ids "$1" >>"$RUN_DIR/observed-resolved-$WINDOW_LABEL"
+    if [[ ! -s "$first" ]]; then
+        head -n 1 "$1" >"$first"
+    fi
+}
+
+# observed_ids created|resolved: the ids of that kind any read of the open window's output saw,
+# sorted and unique; none when no read was observed.
+observed_ids() {
+    local file="$RUN_DIR/observed-$1-$WINDOW_LABEL"
+    if [[ -f "$file" ]]; then
+        canonical_ids <"$file"
+    fi
+}
+
+# read_window FILE: the open window's output since WINDOW_SINCE into FILE, observed by
+# observe_window. Fails when the output is unreadable.
+read_window() {
+    loadgen_logs "$WINDOW_SINCE" >"$1" || return 1
+    observe_window "$1"
+}
+
+# window_ids FILE: writes the ids created in FILE, the open window's final output, or in any
+# earlier read of it to $RUN_DIR/ids.created.union, and the ids resolved there to
+# $RUN_DIR/ids.resolved.union.
+window_ids() {
+    { created_ids "$1"; observed_ids created; } | canonical_ids >"$RUN_DIR/ids.created.union"
+    { resolved_ids "$1"; observed_ids resolved; } | canonical_ids >"$RUN_DIR/ids.resolved.union"
+}
+
+# own_unresolved FILE: adds to the owned list, which cleanup deletes through REST, every id not
+# owned yet that FILE, the open window's final output, or an earlier read of that window logged
+# as created and none logged as resolved, and writes those ids to $RUN_DIR/new-owned.
 own_unresolved() {
-    unresolved_ids "$1" >"$RUN_DIR/ids.unresolved"
+    window_ids "$1"
+    LC_ALL=C comm -23 "$RUN_DIR/ids.created.union" "$RUN_DIR/ids.resolved.union" \
+        >"$RUN_DIR/ids.unresolved"
     LC_ALL=C sort -u "$RUN_DIR/owned" >"$RUN_DIR/owned.sorted"
     LC_ALL=C comm -23 "$RUN_DIR/ids.unresolved" "$RUN_DIR/owned.sorted" >"$RUN_DIR/new-owned"
     cat "$RUN_DIR/new-owned" >>"$RUN_DIR/owned"
@@ -648,15 +968,16 @@ open_window() {
     pass "$prefix loadgen weight: $weight"
 }
 
-# close_window: stops loadgen, keeps the phase's whole output in $RUN_DIR/LABEL.log, writes the
-# error-line counts of the stretch its breakdown covers to $RUN_DIR/errors-LABEL, and owns every
-# alert the phase logged as created and never resolved, so cleanup deletes it. Sets CLOSE_ERROR
-# on failure.
+# close_window [STOPPED]: stops loadgen, unless STOPPED is 1 because the caller has already
+# killed it, keeps the phase's whole output in $RUN_DIR/LABEL.log, writes the error-line counts of
+# the stretch its breakdown covers to $RUN_DIR/errors-LABEL, and owns every alert the phase logged
+# as created and never resolved, in that output or an earlier read of it, so cleanup deletes it.
+# Sets CLOSE_ERROR on failure.
 close_window() {
     local label="$WINDOW_LABEL" covered=""
     CLOSE_ERROR=""
-    if ! stop_loadgen; then
-        CLOSE_ERROR="compose stop loadgen failed (see $RUN_DIR/compose.log)"
+    if [[ "${1:-0}" != "1" ]] && ! stop_loadgen; then
+        CLOSE_ERROR="stopping loadgen failed (see $RUN_DIR/compose.log)"
         return 1
     fi
     WINDOW_OPEN=0
@@ -679,9 +1000,9 @@ close_window() {
     own_unresolved "$RUN_DIR/$label.log"
 }
 
-# close_or_abort PREFIX: close_window as the check "PREFIX loadgen stopped".
+# close_or_abort PREFIX [STOPPED]: close_window STOPPED as the check "PREFIX loadgen stopped".
 close_or_abort() {
-    if ! close_window; then
+    if ! close_window "${2:-0}"; then
         abort "$1 loadgen stopped" "$CLOSE_ERROR"
     fi
     pass "$1 loadgen stopped"
@@ -699,7 +1020,7 @@ report_new_owned() {
 # window_started: whether loadgen logged a "Running visit [" line in the open window.
 window_started() {
     local line
-    if ! loadgen_logs "$WINDOW_SINCE" >"$RUN_DIR/start.log"; then
+    if ! read_window "$RUN_DIR/start.log"; then
         POLL_DETAIL="loadgen logs unreadable (see $RUN_DIR/compose.log)"
         return 1
     fi
@@ -722,7 +1043,7 @@ watch_progress() {
         fi
         sleep $((remaining < PROGRESS_STEP_SECONDS ? remaining : PROGRESS_STEP_SECONDS))
         elapsed=$((($(date -u +%s) - WINDOW_START_EPOCH) / 60))
-        if ! loadgen_logs "$WINDOW_SINCE" >"$RUN_DIR/progress.log"; then
+        if ! read_window "$RUN_DIR/progress.log"; then
             info "run $label progress $elapsed/$MINUTES min: loadgen logs unreadable (see $RUN_DIR/compose.log)"
             continue
         fi
@@ -835,7 +1156,11 @@ setup() {
     if [[ -n "$missing" ]]; then
         abort "readiness" "services not running in project [$PROJECT]:$missing"
     fi
-    if grep -qxF loadgen <<<"$running"; then
+    # loadgen as the run found it, before anything recreates it, for cleanup to restore.
+    if ! LOADGEN_AT_START="$(loadgen_state)"; then
+        abort "readiness" "loadgen's container state is unreadable (see $RUN_DIR/compose.log)"
+    fi
+    if [[ "$LOADGEN_AT_START" == running,* ]]; then
         LOADGEN_WAS_RUNNING=1
     fi
     if ! poll "readiness" "$READY_TIMEOUT_SECONDS" "$READY_STEP_SECONDS" readiness_once; then
@@ -848,7 +1173,7 @@ setup() {
         abort "runtime facts" "db-adapter DB_TYPE is [$DIALECT], expected mssql or postgres"
     fi
     pass "runtime facts"
-    info "db type $DIALECT; loadgen running at start: $([[ $LOADGEN_WAS_RUNNING -eq 1 ]] && echo yes || echo no)"
+    info "db type $DIALECT; loadgen at start: $LOADGEN_AT_START"
 
     http GET "$FLAG_URL"
     if [[ "$HTTP_STATUS" != "200" ]]; then
@@ -931,8 +1256,9 @@ run_b() {
 }
 
 # creates_in_flight FILE: how many portfolio_insights_alert visits in FILE have opened the page
-# but logged no create outcome yet (created, unconfirmed, no instrument options, or a visit
-# error). Stopping loadgen inside that stretch could leave an alert whose id was never logged.
+# but logged no create outcome yet (created, unconfirmed, no instrument options, page
+# unavailable, feature lost before submit, or a visit error). Stopping loadgen inside that
+# stretch could leave an alert whose id was never logged.
 creates_in_flight() {
     awk '
         index($0, "[visit:portfolio_insights_alert][id:") && match($0, /\[id:[^]]*\]/) {
@@ -941,6 +1267,8 @@ creates_in_flight() {
                 open[id] = 1
             } else if (index($0, "Created alert [") || index($0, "Create unconfirmed threshold [") ||
                 index($0, "Alert instrument options did not load") ||
+                index($0, "Portfolio insights page unavailable, no alert created") ||
+                index($0, "Portfolio insights feature lost before submit, no alert created") ||
                 index($0, "Worker had error when running visit")) {
                 open[id] = 0
             }
@@ -949,18 +1277,12 @@ creates_in_flight() {
     ' "$1"
 }
 
-# quiescent: whether every alert created in run B so far is resolved in loadgen's output and no
-# visit is between opening the page and its create outcome. The created ids seen are written to
-# $RUN_DIR/audited.
+# quiescent FILE: whether every alert created in FILE is resolved in FILE and no visit in FILE is
+# between opening the page and its create outcome. Sets POLL_DETAIL when not.
 quiescent() {
     local in_flight
-    if ! loadgen_logs "$WINDOW_SINCE" >"$RUN_DIR/quiesce.log"; then
-        POLL_DETAIL="loadgen logs unreadable (see $RUN_DIR/compose.log)"
-        return 1
-    fi
-    created_ids "$RUN_DIR/quiesce.log" >"$RUN_DIR/audited"
-    unresolved_ids "$RUN_DIR/quiesce.log" >"$RUN_DIR/quiesce.unresolved"
-    in_flight="$(creates_in_flight "$RUN_DIR/quiesce.log")"
+    unresolved_ids "$1" >"$RUN_DIR/quiesce.unresolved"
+    in_flight="$(creates_in_flight "$1")"
     if [[ -s "$RUN_DIR/quiesce.unresolved" ]]; then
         POLL_DETAIL="unresolved: $(join_lines <"$RUN_DIR/quiesce.unresolved")"
         return 1
@@ -971,45 +1293,111 @@ quiescent() {
     fi
 }
 
-# audit_owned_ids: run B's owned-id audit. The audited set is fixed at the instant Q when every
-# create seen so far is resolved, and loadgen stops right after Q. Q also waits for no visit to
-# be between opening the page and its create outcome, so the stop cannot cut off a create whose
-# id loadgen never logged.
-audit_owned_ids() {
-    local deadline quiet=0 id line count unresolved lines ok
-    : >"$RUN_DIR/audited"
-    POLL_DETAIL=""
+# frozen_log: reads the output of the paused loadgen into $RUN_DIR/frozen.log, again every
+# QUIESCE_FLUSH_STEP_SECONDS until two reads in a row match. Fails, with POLL_DETAIL, on an
+# unreadable log or when no two reads match within QUIESCE_FLUSH_TIMEOUT_SECONDS.
+frozen_log() {
+    local deadline reads=0
+    deadline=$(($(date -u +%s) + QUIESCE_FLUSH_TIMEOUT_SECONDS))
+    while :; do
+        if ! read_window "$RUN_DIR/frozen.next"; then
+            POLL_DETAIL="loadgen logs unreadable while paused (see $RUN_DIR/compose.log)"
+            return 1
+        fi
+        if [[ $reads -gt 0 ]] && cmp -s "$RUN_DIR/frozen.log" "$RUN_DIR/frozen.next"; then
+            return 0
+        fi
+        mv -f "$RUN_DIR/frozen.next" "$RUN_DIR/frozen.log"
+        reads=$((reads + 1))
+        if [[ $(($(date -u +%s) + QUIESCE_FLUSH_STEP_SECONDS)) -gt $deadline ]]; then
+            POLL_DETAIL="paused loadgen's output still changing after ${QUIESCE_FLUSH_TIMEOUT_SECONDS}s"
+            return 1
+        fi
+        sleep "$QUIESCE_FLUSH_STEP_SECONDS"
+    done
+}
+
+# drain_loadgen: ends run B at an instant Q after which loadgen neither logs nor acts. Every
+# QUIESCE_STEP_SECONDS until the QUIESCE_TIMEOUT_SECONDS deadline, it checks loadgen's running
+# output with quiescent. Once that holds, it pauses loadgen and checks the settled frozen output
+# again, since a visit may have opened the page or created an alert after the running read. When
+# that holds too, it kills the paused loadgen, and that is Q; otherwise it unpauses loadgen and
+# polls on. Returns 0 at Q and 1 when the deadline passes or Compose fails, with DRAIN_DETAIL
+# describing the outcome; loadgen may then still run or be paused, for close_window to stop.
+drain_loadgen() {
+    local deadline
+    DRAIN_DETAIL=""
     deadline=$(($(date -u +%s) + QUIESCE_TIMEOUT_SECONDS))
     while :; do
-        if quiescent; then
-            quiet=1
-            break
+        POLL_DETAIL=""
+        if ! read_window "$RUN_DIR/quiesce.log"; then
+            DRAIN_DETAIL="loadgen logs unreadable (see $RUN_DIR/compose.log)"
+        elif ! quiescent "$RUN_DIR/quiesce.log"; then
+            DRAIN_DETAIL="$POLL_DETAIL"
+        elif ! pause_loadgen; then
+            DRAIN_DETAIL="pausing loadgen failed (see $RUN_DIR/compose.log)"
+            return 1
+        elif frozen_log && quiescent "$RUN_DIR/frozen.log"; then
+            if ! kill_loadgen; then
+                DRAIN_DETAIL="killing the paused loadgen failed (see $RUN_DIR/compose.log)"
+                return 1
+            fi
+            DRAIN_DETAIL="Q at $(now_rfc3339) with $(($(created_ids "$RUN_DIR/frozen.log" | wc -l))) created alerts, all resolved, and no create in flight; loadgen killed while paused"
+            return 0
+        else
+            DRAIN_DETAIL="paused: $POLL_DETAIL"
+            if ! unpause_loadgen; then
+                DRAIN_DETAIL="$DRAIN_DETAIL; unpausing loadgen failed (see $RUN_DIR/compose.log)"
+                return 1
+            fi
         fi
         if [[ $(($(date -u +%s) + QUIESCE_STEP_SECONDS)) -gt $deadline ]]; then
-            break
+            DRAIN_DETAIL="not quiescent within ${QUIESCE_TIMEOUT_SECONDS}s: $DRAIN_DETAIL"
+            return 1
         fi
         sleep "$QUIESCE_STEP_SECONDS"
     done
-    count=$(($(wc -l <"$RUN_DIR/audited")))
-    if [[ $quiet -eq 1 ]]; then
-        info "owned-id audit: Q at $(now_rfc3339) with $count created alerts, all resolved and no create in flight; stopping loadgen"
-    else
-        info "owned-id audit: not quiescent within ${QUIESCE_TIMEOUT_SECONDS}s (${POLL_DETAIL:-no detail}); stopping loadgen"
-    fi
-    close_or_abort "run B"
+}
 
-    # Creates logged after Q are excluded from the audit; close_window owned the unresolved ones.
+# audit_owned_ids: run B's owned-id audit. drain_loadgen stops loadgen at Q, where no create can
+# be cut off before loadgen logs its id. After the stop, "owned-id evidence" fails when run B's
+# final output, $RUN_DIR/B.log, lacks a created id, a resolution or the first line that an earlier
+# read of run B saw, as after log rotation. The audit, created and rows checks then judge every
+# create seen in any read: the final output joined with those earlier reads. The in-flight and
+# outcomes checks judge the final output. Without Q, quiescence fails, loadgen is stopped all the
+# same, and the same checks run.
+audit_owned_ids() {
+    local stopped=0 count unresolved in_flight lines ok lost_created lost_resolved first_line="kept"
+    local first_file="$RUN_DIR/observed-first-$WINDOW_LABEL"
+    if drain_loadgen; then
+        stopped=1
+        check_result "" B "$VISIT" "owned-id quiescence" 1 "$DRAIN_DETAIL"
+    else
+        check_result "" B "$VISIT" "owned-id quiescence" 0 "$DRAIN_DETAIL; ownership cannot be established"
+    fi
+    close_or_abort "run B" "$stopped"
+
     created_ids "$RUN_DIR/B.log" >"$RUN_DIR/ids.created.all"
     resolved_ids "$RUN_DIR/B.log" >"$RUN_DIR/ids.resolved.all"
-    while IFS= read -r id; do
-        if grep -qxF "$id" "$RUN_DIR/ids.resolved.all"; then
-            info "created after Q and resolved before the stop, excluded: $id"
-        else
-            info "interrupted at stop $id"
-        fi
-    done < <(LC_ALL=C comm -13 "$RUN_DIR/audited" "$RUN_DIR/ids.created.all")
+    lost_created=$(($(observed_ids created | LC_ALL=C comm -23 - "$RUN_DIR/ids.created.all" | wc -l)))
+    lost_resolved=$(($(observed_ids resolved | LC_ALL=C comm -23 - "$RUN_DIR/ids.resolved.all" | wc -l)))
+    if [[ -s "$first_file" ]] && ! grep -qxF -f "$first_file" "$RUN_DIR/B.log"; then
+        first_line="missing"
+    fi
+    if [[ $lost_created -eq 0 && $lost_resolved -eq 0 && "$first_line" == "kept" ]]; then
+        check_result "" B "$VISIT" "owned-id evidence" 1 \
+            "the final output keeps every created id, resolution and first line an earlier read saw"
+    else
+        check_result "" B "$VISIT" "owned-id evidence" 0 \
+            "the final output lost lines an earlier read saw (log rotation): $lost_created created ids and $lost_resolved resolutions missing, first line $first_line, so not every create can be proven"
+    fi
 
-    unresolved="$(LC_ALL=C comm -23 "$RUN_DIR/audited" "$RUN_DIR/ids.resolved.all" | join_lines)"
+    # Every later check but in flight and outcomes judges what any read of run B saw, so an id
+    # seen once is never dropped; close_window has owned the unresolved ones.
+    window_ids "$RUN_DIR/B.log"
+    count=$(($(wc -l <"$RUN_DIR/ids.created.union")))
+    unresolved="$(LC_ALL=C comm -23 "$RUN_DIR/ids.created.union" "$RUN_DIR/ids.resolved.union" |
+        join_lines)"
     if [[ -z "$unresolved" ]]; then
         check_result "" B "$VISIT" "owned-id audit" 1 \
             "$count created alerts, each deleted via ui, via api or already absent"
@@ -1018,10 +1406,17 @@ audit_owned_ids() {
             "not resolved by loadgen, deleted on exit: $unresolved"
     fi
 
+    in_flight="$(creates_in_flight "$RUN_DIR/B.log")"
+    if [[ "$in_flight" == "0" ]]; then
+        check_result "" B "$VISIT" "owned-id in flight" 1 \
+            "every visit that opened the page logged a create outcome"
+    else
+        check_result "" B "$VISIT" "owned-id in flight" 0 \
+            "$in_flight visits opened the page and logged no create outcome, so their alerts cannot be tied to an id"
+    fi
+
     { grep -F -e "$LEFT_MARKER" -e "$UNKNOWN_MARKER" "$RUN_DIR/B.log" || true; } >"$RUN_DIR/outcomes"
-    while IFS= read -r line; do
-        info "outcome line: $line"
-    done <"$RUN_DIR/outcomes"
+    report_outcomes "$RUN_DIR/outcomes"
     lines=$(($(wc -l <"$RUN_DIR/outcomes")))
     ok=0
     if [[ $lines -eq 0 ]]; then
@@ -1038,15 +1433,15 @@ audit_owned_ids() {
         "$count alerts created in run B$([[ $ok -eq 0 ]] && echo "; the visit never created an alert")"
 
     if [[ $count -eq 0 ]]; then
-        info "owned-id rows: skipped, no audited id to count"
-    elif ! db_count_ids "$RUN_DIR/audited"; then
+        info "owned-id rows: skipped, no created id to count"
+    elif ! db_count_ids "$RUN_DIR/ids.created.union"; then
         check_result "" B "$VISIT" "owned-id rows" 0 "$DB_ERROR"
     elif [[ $DB_COUNT -eq 0 ]]; then
-        check_result "" B "$VISIT" "owned-id rows" 1 "no Alerts row carries any of the $count audited ids"
+        check_result "" B "$VISIT" "owned-id rows" 1 "no Alerts row carries any of the $count created ids"
     else
-        cat "$RUN_DIR/audited" >>"$RUN_DIR/owned"
+        cat "$RUN_DIR/ids.created.union" >>"$RUN_DIR/owned"
         check_result "" B "$VISIT" "owned-id rows" 0 \
-            "$DB_COUNT of $count audited ids still have an Alerts row; they are deleted on exit"
+            "$DB_COUNT of $count created ids still have an Alerts row; they are deleted on exit"
     fi
 }
 
@@ -1085,8 +1480,10 @@ flag_off_window() {
     if [[ $have -eq 1 ]]; then
         json="$(cat "$RUN_DIR/breakdown-$label.json")"
         check_visit_fail_rate "$prefix" "$label" "$json"
+        # The window opened with a loadgen recreate, and a fresh container draws the rare
+        # order_credit_card visit first, so its breakdown covers every existing family.
         # shellcheck disable=SC2086 # The family list splits into one argument per family.
-        check_families "$prefix" "$label" "$json" $FLAG_OFF_FAMILIES
+        check_families "$prefix" "$label" "$json" $EXISTING_FAMILIES
     else
         info "$prefix: failRate and family checks skipped without a breakdown"
     fi
@@ -1109,12 +1506,12 @@ verdict_of() {
     fi
 }
 
-# phase_families LABEL: the families phase LABEL is checked on.
+# phase_families LABEL: the families phase LABEL is checked on. Run B and the flag-off phase
+# share them.
 phase_families() {
     case "$1" in
         A) echo "$EXISTING_FAMILIES" ;;
-        B) echo "$EXISTING_FAMILIES $VISIT" ;;
-        *) echo "$FLAG_OFF_FAMILIES $VISIT" ;;
+        *) echo "$EXISTING_FAMILIES $VISIT" ;;
     esac
 }
 
@@ -1218,7 +1615,8 @@ cleanup() {
     set +e
     if [[ $WINDOW_OPEN -eq 1 ]]; then
         # A run ended mid-phase: loadgen stops first, so no visit runs while the flag is switched
-        # for deletion, and whatever the phase created and did not resolve is owned.
+        # for deletion, and whatever the phase created and did not resolve is owned. A loadgen
+        # the run B drain left paused is killed without being thawed.
         if close_window; then
             report_new_owned "cleanup"
         else
@@ -1253,9 +1651,9 @@ cleanup() {
     fi
     if [[ $LOADGEN_TOUCHED -eq 1 ]]; then
         if restore_loadgen; then
-            info "cleanup: loadgen recreated with its configured weight [$(container_env loadgen PORTFOLIO_INSIGHTS_ALERT_WEIGHT)], $([[ $LOADGEN_WAS_RUNNING -eq 1 ]] && echo running || echo "not started"), as at start"
+            info "cleanup: loadgen restored as at start: $LOADGEN_AT_START"
         else
-            problems="${problems:+$problems; }loadgen not restored (see $RUN_DIR/compose.log)"
+            problems="${problems:+$problems; }loadgen not restored: $RESTORE_ERROR"
         fi
     fi
     # A check of its own, as in perf.sh and e2e.sh: an alert left behind, a flag left changed or
@@ -1296,10 +1694,13 @@ main() {
     FLAG_TOUCHED=0
     LOADGEN_WAS_RUNNING=0
     LOADGEN_TOUCHED=0
+    LOADGEN_AT_START=""
+    RESTORE_ERROR=""
     DIALECT=""
     WINDOW_OPEN=0
     WINDOW_LABEL=""
     WINDOW_SINCE=""
+    LOADGEN_PAUSED=0
     TABLE_WRITTEN=0
     STARTED_AT="$(now_rfc3339)"
 

@@ -964,7 +964,7 @@ dialog::backdrop {
     --insights-figure-min-width: 180px;
     /* Row divider hairline, as wide as the .card-header and .data-table dividers */
     --insights-divider-width: 1px;
-    /* Keyboard focus ring, as wide as the sidebar link ring */
+    /* Keyboard focus ring of the insights controls */
     --insights-focus-ring-width: 2px;
     /* Gap that keeps the ring visible beside a border of the ring's colour */
     --insights-focus-ring-offset: 2px;
@@ -1048,6 +1048,12 @@ dialog::backdrop {
     border-color: var(--border-focus);
 }
 
+/* Focused .error alert fields keep the error border; the focus shadow still applies */
+#alerts-panel select.error:focus,
+#alerts-panel input[type="text"].error:focus {
+    border-color: var(--danger);
+}
+
 /* Pressed alert fields add the hover surface to the focus border */
 /* Background colour only, so the select arrow image stays */
 #alerts-panel select:not(:disabled):not(.error):active,
@@ -1056,22 +1062,31 @@ dialog::backdrop {
     background-color: var(--bg-hover);
 }
 
-/* Keyboard focus ring shared by every sidebar link while the Portfolio Insights link is shown */
-/* With the feature off the sidebar keeps its original rendering */
-.sidebar-nav ul:has(#nav-portfolio-insights) .nav-link:focus-visible {
-    outline: 2px solid var(--border-focus);
-    outline-offset: 0;
-}
-
-/* Mobile sidebar row while the Portfolio Insights link is shown: one-line labels in a scrolling row */
-/* With the feature off the sidebar keeps its original rendering */
+/* Mobile sidebar row: the Portfolio Insights entry takes no width in the row's flex sizing, so the five existing links keep the sizes and wrapping they have without it */
+/* The entry is laid out after the five links and is reached by the row's existing horizontal scroll */
 @media (max-width: 768px) {
-    .sidebar-nav ul:has(#nav-portfolio-insights) > li {
-        flex-shrink: 0;
+    /* No flex basis and no intrinsic width; the negative start margin cancels the row gap the entry adds (layout.css: .sidebar-nav ul gap) */
+    .sidebar-nav li:has(> #nav-portfolio-insights) {
+        flex: 0 0 0;
+        min-width: 0;
+        contain: inline-size;
+        margin-inline-start: calc(-1 * var(--space-1));
     }
 
-    .sidebar-nav ul:has(#nav-portfolio-insights) .nav-link {
-        white-space: nowrap;
+    /* The link overflows its zero-width item on one line, restores the row gap before it, and keeps the sidebar's end padding in view when keyboard focus scrolls it into the row */
+    #nav-portfolio-insights {
+        position: relative;
+        width: max-content;
+        margin-inline-start: var(--space-1);
         scroll-margin-inline: var(--space-2);
+    }
+
+    /* Extends the row's scroll range past the link by the sidebar's end padding, so its focus ring stays in view at the end of the row */
+    #nav-portfolio-insights::after {
+        content: "";
+        position: absolute;
+        inset-inline-start: 100%;
+        inline-size: var(--space-2);
+        block-size: 1px;
     }
 }

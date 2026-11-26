@@ -1,4 +1,8 @@
-import { CancelledError, QueryClient } from "@tanstack/react-query"
+import {
+    CancelledError,
+    QueryClient,
+    replaceEqualDeep,
+} from "@tanstack/react-query"
 import { ApiError } from "../api/http"
 import { SESSION_KEY } from "../contexts/AuthContext/storage"
 import {
@@ -17,6 +21,11 @@ import {
  * - every feature query and mutation calls `captureFeatureContext()` when it
  *   starts, and applies or toasts its result only while
  *   `isCurrentFeatureContext()` still holds for that capture;
+ * - a feature query's result is cached with the capture of the request that
+ *   produced it (`recordFeatureResultContext`, `shareFeatureResult`), so a
+ *   consumer that acts on cached data later, such as a Toast or a business
+ *   event, checks that capture (`featureResultContext`), never one of its
+ *   own;
  * - the shared flag query records `currentActivation()` before its read and
  *   publishes `true` only if the counter is unchanged when the read returns.
  */
@@ -135,6 +144,60 @@ export function isCurrentFeatureContext(ctx: FeatureContext): boolean {
         now.session === ctx.session &&
         now.activation === ctx.activation
     )
+}
+
+/**
+ * The context of the request that produced each cached feature result, keyed
+ * by the result itself, so an entry lives exactly as long as its data.
+ */
+const resultContexts = new WeakMap<object, FeatureContext>()
+
+/**
+ * Records `ctx` as the context of the request that produced `result`. The
+ * feature request guard calls it for every result it hands back as current.
+ * Only an object or array can carry one, which every feature query's data is.
+ */
+export function recordFeatureResultContext(
+    result: unknown,
+    ctx: FeatureContext
+): void {
+    if (typeof result === "object" && result !== null) {
+        resultContexts.set(result, ctx)
+    }
+}
+
+/**
+ * The context of the request that produced `result`, or `undefined` for data
+ * no current feature request produced, such as a `setQueryData` write. A
+ * consumer that acts on cached feature data acts only while this exists,
+ * `isCurrentFeatureContext` holds for it and its `userId` is the account
+ * shown: data cached under an earlier session, activation or account, even
+ * one that has since come back, is never acted on under a later one.
+ */
+export function featureResultContext(
+    result: unknown
+): FeatureContext | undefined {
+    return typeof result === "object" && result !== null
+        ? resultContexts.get(result)
+        : undefined
+}
+
+/**
+ * `structuralSharing` for the guarded feature queries. It keeps query-core's
+ * default sharing, which caches the previous data when the new data is deeply
+ * equal and otherwise a copy that reuses the equal parts, and moves the
+ * context recorded for the new data onto whichever value is cached. An equal
+ * refetch therefore keeps its reference but carries the context of the
+ * request that just returned it. A write with no recorded context, such as
+ * `setQueryData`, records none, so it never makes data deliverable.
+ */
+export function shareFeatureResult(previous: unknown, next: unknown): unknown {
+    const shared = replaceEqualDeep(previous, next)
+    const ctx = featureResultContext(next)
+    if (ctx !== undefined) {
+        recordFeatureResultContext(shared, ctx)
+    }
+    return shared
 }
 
 /**
