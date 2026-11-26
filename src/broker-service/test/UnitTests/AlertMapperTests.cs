@@ -173,6 +173,33 @@ namespace EasyTrade.BrokerService.Test.UnitTests
             Assert.Equal(alert.CreatedAt, dto.CreatedAt);
         }
 
+        // The three alerts' revisions (3, 1, 2) and thresholds (-2.5, 105.25, 50) follow no sort
+        // order, so a reordering shows; AlertDTO has reference equality, so a copy shows.
+        [Theory]
+        [InlineData(0)]
+        [InlineData(3)]
+        public void ToResult_MappedAlerts_ShouldKeepInstancesInOrder(int count)
+        {
+            // Arrange
+            Alert[] source =
+            [
+                TriggeredAlert,
+                UntriggeredAlert,
+                TriggeredAlert with
+                {
+                    ArmingRevision = 2,
+                    Threshold = 50m,
+                },
+            ];
+            AlertDTO[] alerts = [.. source.Take(count).Select(AlertMapper.ToDto)];
+
+            // Act
+            AlertsResultDTO result = AlertMapper.ToResult(alerts);
+
+            // Assert
+            Assert.Equal(alerts, result.Results);
+        }
+
         // Thresholds are strings because attribute arguments cannot be decimals; parsing keeps
         // the trailing zeros, which the wire form must drop.
         [Theory]

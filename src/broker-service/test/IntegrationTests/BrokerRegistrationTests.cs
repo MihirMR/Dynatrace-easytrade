@@ -1,3 +1,4 @@
+using EasyTrade.BrokerService.Entities.Alerts.Controllers;
 using EasyTrade.BrokerService.Entities.Alerts.Repository;
 using EasyTrade.BrokerService.Entities.Alerts.Scheduler;
 using EasyTrade.BrokerService.Entities.Alerts.Service;
@@ -11,6 +12,7 @@ using EasyTrade.BrokerService.Helpers.Metrics;
 using EasyTrade.BrokerService.ProblemPatterns.OpenFeature;
 using EasyTrade.BrokerService.ProblemPatterns.OpenFeature.Providers;
 using EasyTrade.BrokerService.Test.Fakes;
+using Microsoft.AspNetCore.Routing;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
@@ -67,6 +69,7 @@ namespace EasyTrade.BrokerService.Test.IntegrationTests
                 services.GetService<PortfolioInsightsFeatureGate>();
             FeatureProvider? featureProvider = services.GetService<FeatureProvider>();
             IHostedService[] hostedServices = root.GetServices<IHostedService>().ToArray();
+            MatcherPolicy[] matcherPolicies = root.GetServices<MatcherPolicy>().ToArray();
 
             stub.SetFlagEnabled(true);
             bool enabledRead = await feature.IsEnabledAsync(CancellationToken.None);
@@ -95,6 +98,9 @@ namespace EasyTrade.BrokerService.Test.IntegrationTests
             // Both periodic jobs run as hosted services.
             Assert.Contains(hostedServices, service => service is LongTradeSchedulerService);
             Assert.Contains(hostedServices, service => service is AlertEvaluationSchedulerService);
+
+            // Routing holds the notifications-literal policy once, beside the framework's own.
+            Assert.Single(matcherPolicies.OfType<AlertController.NotificationsMatcherPolicy>());
 
             // The OpenFeature provider is the one PluginProvider singleton.
             Assert.IsType<PluginProvider>(featureProvider);

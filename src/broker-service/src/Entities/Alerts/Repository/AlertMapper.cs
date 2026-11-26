@@ -202,5 +202,14 @@ namespace EasyTrade.BrokerService.Entities.Alerts.Repository
                 createdAt: alert.CreatedAt
             );
         }
+
+        /// <summary>
+        /// Wraps alerts already mapped by <see cref="ToDto"/> in the <c>{"results": [...]}</c>
+        /// list envelope, as the same instances in the same order, so nothing is mapped twice.
+        /// </summary>
+        public static AlertsResultDTO ToResult(IEnumerable<AlertDTO> alerts)
+        {
+            return new AlertsResultDTO(alerts);
+        }
     }
 }

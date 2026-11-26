@@ -3,6 +3,7 @@ using System.Runtime.ExceptionServices;
 using System.Text;
 using System.Text.Json;
 using EasyTrade.BrokerService.Connectors;
+using EasyTrade.BrokerService.Entities.Alerts.Controllers;
 using EasyTrade.BrokerService.Entities.Alerts.Repository;
 using EasyTrade.BrokerService.Entities.Alerts.Service;
 using EasyTrade.BrokerService.Entities.Balances.Repository;
@@ -20,8 +21,10 @@ using EasyTrade.BrokerService.ProblemPatterns.OpenFeature.Providers;
 using EasyTrade.BrokerService.ProblemPatterns.OpenFeature.Providers.FeatureFlagService;
 using EasyTrade.BrokerService.Test.Fakes;
 using Microsoft.AspNetCore.Builder;
+using Microsoft.AspNetCore.Routing;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.DependencyInjection.Extensions;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using OpenFeature;
@@ -705,6 +708,12 @@ namespace EasyTrade.BrokerService.Test.IntegrationTests
             services.AddTransient<IPortfolioInsightsService, PortfolioInsightsService>();
             services.AddTransient<IAlertService, AlertService>();
             services.AddTransient<IAlertEvaluationService, AlertEvaluationService>();
+            services.TryAddEnumerable(
+                ServiceDescriptor.Singleton<
+                    MatcherPolicy,
+                    AlertController.NotificationsMatcherPolicy
+                >()
+            );
         }
 
         // Program.cs without its middleware, CORS, health checks and console logger, so the

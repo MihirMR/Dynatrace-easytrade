@@ -2,6 +2,7 @@ using System.Globalization;
 using System.Net;
 using System.Text.Json;
 using EasyTrade.BrokerService.Entities.Alerts;
+using EasyTrade.BrokerService.Entities.Alerts.Controllers;
 using EasyTrade.BrokerService.Entities.Balances;
 using EasyTrade.BrokerService.Entities.Balances.Repository;
 using EasyTrade.BrokerService.Entities.Instruments;
@@ -10,6 +11,12 @@ using EasyTrade.BrokerService.ExceptionHandling.Exceptions;
 using EasyTrade.BrokerService.Helpers;
 using EasyTrade.BrokerService.Test.Fakes;
 using Grpc.Core;
+using Microsoft.AspNetCore.Http;
+using Microsoft.AspNetCore.Mvc;
+using Microsoft.AspNetCore.Mvc.ApiExplorer;
+using Microsoft.AspNetCore.Mvc.Controllers;
+using Microsoft.AspNetCore.Routing;
+using Microsoft.AspNetCore.Routing.Matching;
 using Microsoft.Extensions.DependencyInjection;
 
 namespace EasyTrade.BrokerService.Test.IntegrationTests
@@ -18,7 +25,9 @@ namespace EasyTrade.BrokerService.Test.IntegrationTests
     /// The six <c>/v1/alerts</c> endpoints over real HTTP on a composed host: the feature gate,
     /// model binding with the exact threshold token, the CRUD rules, the error mapping and the
     /// <c>{"results": [...]}</c> list shape. Every body is sent as raw JSON text, so threshold
-    /// tokens reach the converter byte for byte.
+    /// tokens reach the converter byte for byte. The response-metadata case reads the same
+    /// host's ApiExplorer instead of sending a request, and the two notifications routing-policy
+    /// cases call the policy with what no request can produce.
     /// </summary>
     [Collection(BrokerHostCollection.Name)]
     public class AlertsApiTests
@@ -42,6 +51,12 @@ namespace EasyTrade.BrokerService.Test.IntegrationTests
             OverPrecisionThreshold,
             MissingAccountIdQuery,
             NonGuidAccountIdQuery,
+            NonBooleanUnacknowledgedQuery,
+            BlankUnacknowledgedQuery,
+            WhitespaceUnacknowledgedQuery,
+            RepeatedNonBooleanUnacknowledgedQuery,
+            RepeatedBlankUnacknowledgedQuery,
+            RepeatedWhitespaceUnacknowledgedQuery,
         }
 
         /// <summary>A create request one rule of <c>POST /v1/alerts</c> rejects with 400.</summary>
@@ -154,6 +169,18 @@ namespace EasyTrade.BrokerService.Test.IntegrationTests
         [InlineData(UnbindableRequest.MissingAccountIdQuery, true)]
         [InlineData(UnbindableRequest.NonGuidAccountIdQuery, false)]
         [InlineData(UnbindableRequest.NonGuidAccountIdQuery, true)]
+        [InlineData(UnbindableRequest.NonBooleanUnacknowledgedQuery, false)]
+        [InlineData(UnbindableRequest.NonBooleanUnacknowledgedQuery, true)]
+        [InlineData(UnbindableRequest.BlankUnacknowledgedQuery, false)]
+        [InlineData(UnbindableRequest.BlankUnacknowledgedQuery, true)]
+        [InlineData(UnbindableRequest.WhitespaceUnacknowledgedQuery, false)]
+        [InlineData(UnbindableRequest.WhitespaceUnacknowledgedQuery, true)]
+        [InlineData(UnbindableRequest.RepeatedNonBooleanUnacknowledgedQuery, false)]
+        [InlineData(UnbindableRequest.RepeatedNonBooleanUnacknowledgedQuery, true)]
+        [InlineData(UnbindableRequest.RepeatedBlankUnacknowledgedQuery, false)]
+        [InlineData(UnbindableRequest.RepeatedBlankUnacknowledgedQuery, true)]
+        [InlineData(UnbindableRequest.RepeatedWhitespaceUnacknowledgedQuery, false)]
+        [InlineData(UnbindableRequest.RepeatedWhitespaceUnacknowledgedQuery, true)]
         public async Task AlertEndpoints_UnbindableRequest_ShouldMatchFlagState(
             UnbindableRequest request,
             bool featureEnabled
@@ -191,7 +218,51 @@ namespace EasyTrade.BrokerService.Test.IntegrationTests
                     $"{AlertsPath}?accountId=not-a-guid",
                     null
                 ),
+                UnbindableRequest.NonBooleanUnacknowledgedQuery => new(
+                    HttpMethod.Get,
+                    NotificationsPath(fixture.AccountId, "maybe"),
+                    null
+                ),
+                // A supplied blank filter must not read as an omitted one.
+                UnbindableRequest.BlankUnacknowledgedQuery => new(
+                    HttpMethod.Get,
+                    NotificationsPath(fixture.AccountId, ""),
+                    null
+                ),
+                UnbindableRequest.WhitespaceUnacknowledgedQuery => new(
+                    HttpMethod.Get,
+                    NotificationsPath(fixture.AccountId, "%20"),
+                    null
+                ),
+                // A valid first value must not hide a later one that is no boolean.
+                UnbindableRequest.RepeatedNonBooleanUnacknowledgedQuery => new(
+                    HttpMethod.Get,
+                    NotificationsPath(fixture.AccountId, "false", "maybe"),
+                    null
+                ),
+                UnbindableRequest.RepeatedBlankUnacknowledgedQuery => new(
+                    HttpMethod.Get,
+                    NotificationsPath(fixture.AccountId, "false", ""),
+                    null
+                ),
+                UnbindableRequest.RepeatedWhitespaceUnacknowledgedQuery => new(
+                    HttpMethod.Get,
+                    NotificationsPath(fixture.AccountId, "false", "%20"),
+                    null
+                ),
                 _ => throw new ArgumentOutOfRangeException(nameof(request), request, null),
+            };
+            // The filter value binding rejects, which the message names whether or not a valid
+            // value precedes it; null for the requests without a filter.
+            string? rejectedFilter = request switch
+            {
+                UnbindableRequest.NonBooleanUnacknowledgedQuery
+                or UnbindableRequest.RepeatedNonBooleanUnacknowledgedQuery => "maybe",
+                UnbindableRequest.BlankUnacknowledgedQuery
+                or UnbindableRequest.RepeatedBlankUnacknowledgedQuery => "",
+                UnbindableRequest.WhitespaceUnacknowledgedQuery
+                or UnbindableRequest.RepeatedWhitespaceUnacknowledgedQuery => " ",
+                _ => null,
             };
 
             // Act
@@ -200,7 +271,7 @@ namespace EasyTrade.BrokerService.Test.IntegrationTests
             // Assert: off, the gate answers before binding; on, binding answers, not a rule.
             if (featureEnabled)
             {
-                await AssertBindingProblemAsync(response);
+                await AssertBindingProblemAsync(response, rejectedFilter);
             }
             else
             {
@@ -217,6 +288,11 @@ namespace EasyTrade.BrokerService.Test.IntegrationTests
         [InlineData("DELETE", "v1/alerts/not-a-guid", true)]
         [InlineData("POST", "v1/alerts/not-a-guid/acknowledge", false)]
         [InlineData("POST", "v1/alerts/not-a-guid/acknowledge", true)]
+        // The notifications literal is no GUID either, so PATCH and DELETE on it match no route.
+        [InlineData("PATCH", "v1/alerts/notifications", false)]
+        [InlineData("PATCH", "v1/alerts/notifications", true)]
+        [InlineData("DELETE", "v1/alerts/notifications", false)]
+        [InlineData("DELETE", "v1/alerts/notifications", true)]
         public async Task AlertEndpoints_NonGuidPath_ShouldReturn404(
             string method,
             string path,
@@ -237,8 +313,103 @@ namespace EasyTrade.BrokerService.Test.IntegrationTests
 
             // Assert: no route matches, so neither the gate nor data access runs.
             await AssertStatusAsync(response, HttpStatusCode.NotFound);
+            Assert.Empty(response.Content.Headers.Allow);
             Assert.Equal(0, host.Flag.CallCount);
             Assert.Equal(0, TotalAlertCalls(host.Alerts));
+        }
+
+        [Theory]
+        [InlineData("PUT", "v1/alerts/5d1e1ab0-0000-4000-8000-000000000001", "DELETE,PATCH")]
+        [InlineData("DELETE", AlertsPath, "GET,POST")]
+        // Only PATCH and DELETE, the id routes' methods, match no route on the literal.
+        [InlineData("POST", "v1/alerts/notifications", "GET")]
+        [InlineData("PUT", "v1/alerts/notifications", "GET")]
+        [InlineData("HEAD", "v1/alerts/notifications", "GET")]
+        [InlineData("OPTIONS", "v1/alerts/notifications", "GET")]
+        public async Task AlertEndpoints_UnacceptedMethodOnRoutedPath_ShouldReturn405(
+            string method,
+            string path,
+            string allowedMethods
+        )
+        {
+            // Arrange: the notifications literal's 404 covers PATCH and DELETE only.
+            await using BrokerTestHost host = await BrokerTestHost.StartComposedAsync();
+            host.Flag.SetEnabled(true);
+
+            // Act
+            using HttpResponseMessage response = await SendAsync(
+                host,
+                new AlertRequest(new HttpMethod(method), path, null)
+            );
+
+            // Assert: routing answers with the methods the path accepts, before the gate.
+            await AssertStatusAsync(response, HttpStatusCode.MethodNotAllowed);
+            Assert.Equal(
+                allowedMethods.Split(','),
+                response.Content.Headers.Allow.Order(StringComparer.Ordinal)
+            );
+            Assert.Equal(0, host.Flag.CallCount);
+            Assert.Equal(0, TotalAlertCalls(host.Alerts));
+        }
+
+        [Theory]
+        [InlineData(false)]
+        [InlineData(true, nameof(AlertController.GetNotifications))]
+        [InlineData(
+            false,
+            nameof(AlertController.GetNotifications),
+            nameof(AlertController.GetAlerts)
+        )]
+        public async Task AppliesToEndpoints_RoutingNode_ShouldClaimOnlyGetNotificationsNode(
+            bool expected,
+            params string[] actionNames
+        )
+        {
+            // Arrange: a node holding the endpoints MVC built for these actions. The routes form
+            // neither an empty node nor one shared with another action, so the policy gets them
+            // directly.
+            await using BrokerTestHost host = await BrokerTestHost.StartComposedAsync();
+            Endpoint[] endpoints =
+            [
+                .. host
+                    .Services.GetRequiredService<EndpointDataSource>()
+                    .Endpoints.Where(endpoint =>
+                        endpoint.Metadata.GetMetadata<ControllerActionDescriptor>() is { } action
+                        && (action.ControllerTypeInfo.AsType() == typeof(AlertController))
+                        && actionNames.Contains(action.MethodInfo.Name)
+                    ),
+            ];
+            Assert.Equal(actionNames.Length, endpoints.Length);
+            AlertController.NotificationsMatcherPolicy policy = new();
+
+            // Act
+            bool applies = policy.AppliesToEndpoints(endpoints);
+
+            // Assert
+            Assert.Equal(expected, applies);
+        }
+
+        [Theory]
+        [InlineData("patch")]
+        [InlineData("Delete")]
+        public void GetDestination_IdRouteMethodInOtherCase_ShouldReturnExit(string method)
+        {
+            // Arrange: HttpClient sends a known method in upper case, so other casings are put
+            // to the notifications jump table directly; the exit is 0, the one edge 1.
+            AlertController.NotificationsMatcherPolicy policy = new();
+            PolicyNodeEdge edge = Assert.Single(policy.GetEdges([]));
+            PolicyJumpTable table = policy.BuildJumpTable(
+                0,
+                [new PolicyJumpTableEdge(edge.State, 1)]
+            );
+            DefaultHttpContext context = new();
+            context.Request.Method = method;
+
+            // Act
+            int destination = table.GetDestination(context);
+
+            // Assert: compared as HttpMethodMatcherPolicy compares, so no 405 for these either.
+            Assert.Equal(0, destination);
         }
 
         [Theory]
@@ -692,12 +863,18 @@ namespace EasyTrade.BrokerService.Test.IntegrationTests
         }
 
         [Theory]
-        [InlineData("true", false)]
-        [InlineData("false", true)]
-        [InlineData(null, true)]
+        [InlineData(false, "true")]
+        [InlineData(true, "false")]
+        [InlineData(true)]
+        // Any case and surrounding whitespace still spell a boolean.
+        [InlineData(false, "TRUE")]
+        [InlineData(true, "%20false%20")]
+        // Repeated boolean values bind the first one.
+        [InlineData(false, "true", "true")]
+        [InlineData(true, "false", "true")]
         public async Task ListNotifications_UnacknowledgedFilter_ShouldApply(
-            string? unacknowledged,
-            bool includesAcknowledged
+            bool includesAcknowledged,
+            params string[] unacknowledged
         )
         {
             // Arrange: A was created before B but triggered after it, so only trigger order
@@ -732,11 +909,7 @@ namespace EasyTrade.BrokerService.Test.IntegrationTests
                 CreatedTime.AddMinutes(2)
             );
             host.Alerts.Seed(unacknowledgedAlert).Seed(acknowledgedAlert).Seed(armedAlert);
-            string path = $"{AlertsPath}/notifications?accountId={fixture.AccountId}";
-            if (unacknowledged is not null)
-            {
-                path += $"&unacknowledged={unacknowledged}";
-            }
+            string path = NotificationsPath(fixture.AccountId, unacknowledged);
             Alert[] expected = includesAcknowledged
                 ? [unacknowledgedAlert, acknowledgedAlert]
                 : [unacknowledgedAlert];
@@ -787,6 +960,51 @@ namespace EasyTrade.BrokerService.Test.IntegrationTests
             Assert.Empty(await response.Content.ReadAsStringAsync());
             Alert expected = triggered ? seeded with { Acknowledged = true } : seeded;
             Assert.Equal(expected, host.Alerts.Get(seeded.Id));
+        }
+
+        [Theory]
+        [InlineData(nameof(AlertController.CreateAlert))]
+        [InlineData(nameof(AlertController.UpdateAlert))]
+        public async Task AlertWriteAction_BadRequestMetadata_ShouldNameRuleAndBindingBodies(
+            string actionName
+        )
+        {
+            // Arrange
+            await using BrokerTestHost host = await BrokerTestHost.StartComposedAsync();
+            IApiDescriptionGroupCollectionProvider explorer =
+                host.Services.GetRequiredService<IApiDescriptionGroupCollectionProvider>();
+
+            // Act
+            ApiDescription action = Assert.Single(
+                explorer.ApiDescriptionGroups.Items.SelectMany(group => group.Items),
+                description =>
+                    description.ActionDescriptor is ControllerActionDescriptor controllerAction
+                    && (controllerAction.ControllerTypeInfo.AsType() == typeof(AlertController))
+                    && (controllerAction.ActionName == actionName)
+            );
+
+            // Assert: ApiExplorer keeps one response type per status code, so the 400 entry
+            // carries the rule body as its type and names the binding problem body as well.
+            ApiResponseType badRequest = Assert.Single(
+                action.SupportedResponseTypes,
+                response => response.StatusCode == (int)HttpStatusCode.BadRequest
+            );
+            Assert.Equal(typeof(ErrorResponse), badRequest.Type);
+            Assert.Contains(
+                nameof(ErrorResponse),
+                badRequest.Description,
+                StringComparison.Ordinal
+            );
+            Assert.Contains(
+                nameof(ValidationProblemDetails),
+                badRequest.Description,
+                StringComparison.Ordinal
+            );
+            Assert.Contains(
+                "application/problem+json",
+                badRequest.Description,
+                StringComparison.Ordinal
+            );
         }
 
         private static AccountFixture SeedAccount(BrokerTestHost host, decimal? heldQuantity)
@@ -927,6 +1145,14 @@ namespace EasyTrade.BrokerService.Test.IntegrationTests
             };
         }
 
+        // The notifications path with one filter parameter per value, in order, each written
+        // verbatim, already URL-encoded; no value leaves the filter out.
+        private static string NotificationsPath(Guid accountId, params string[] unacknowledged)
+        {
+            return $"{AlertsPath}/notifications?accountId={accountId}"
+                + string.Concat(unacknowledged.Select(value => $"&unacknowledged={value}"));
+        }
+
         private static Task<HttpResponseMessage> SendToEndpointAsync(
             BrokerTestHost host,
             AlertEndpoint endpoint,
@@ -1002,7 +1228,12 @@ namespace EasyTrade.BrokerService.Test.IntegrationTests
         }
 
         // The automatic [ApiController] answer to a binding failure, never an ErrorResponse.
-        private static async Task AssertBindingProblemAsync(HttpResponseMessage response)
+        // Given a rejected unacknowledged value, its one error is the framework's invalid-value
+        // message naming that value.
+        private static async Task AssertBindingProblemAsync(
+            HttpResponseMessage response,
+            string? rejectedFilter = null
+        )
         {
             await AssertStatusAsync(response, HttpStatusCode.BadRequest);
             Assert.Equal(
@@ -1011,8 +1242,23 @@ namespace EasyTrade.BrokerService.Test.IntegrationTests
             );
             JsonElement problem = await BrokerTestHost.ReadJsonAsync(response);
             Assert.Equal((int)HttpStatusCode.BadRequest, problem.GetProperty("status").GetInt32());
-            Assert.Equal(JsonValueKind.Object, problem.GetProperty("errors").ValueKind);
+            JsonElement errors = problem.GetProperty("errors");
+            Assert.Equal(JsonValueKind.Object, errors.ValueKind);
             Assert.False(problem.TryGetProperty("statusCode", out _));
+            if (rejectedFilter is not null)
+            {
+                Assert.Equal(
+                    ["unacknowledged"],
+                    errors.EnumerateObject().Select(error => error.Name)
+                );
+                Assert.Equal(
+                    [$"The value '{rejectedFilter}' is not valid."],
+                    errors
+                        .GetProperty("unacknowledged")
+                        .EnumerateArray()
+                        .Select(message => message.GetString())
+                );
+            }
         }
 
         // A 200 list body: an object whose only member is the results array.

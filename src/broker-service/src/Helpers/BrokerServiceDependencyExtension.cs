@@ -1,4 +1,5 @@
-﻿using EasyTrade.BrokerService.Entities.Alerts.Repository;
+﻿using EasyTrade.BrokerService.Entities.Alerts.Controllers;
+using EasyTrade.BrokerService.Entities.Alerts.Repository;
 using EasyTrade.BrokerService.Entities.Alerts.Scheduler;
 using EasyTrade.BrokerService.Entities.Alerts.Service;
 using EasyTrade.BrokerService.Entities.Balances.Repository;
@@ -19,6 +20,7 @@ using EasyTrade.BrokerService.ProblemPatterns.OpenFeature;
 using EasyTrade.BrokerService.ProblemPatterns.OpenFeature.Providers;
 using EasyTrade.BrokerService.ProblemPatterns.OpenFeature.Providers.FeatureFlagService;
 using HostInitActions;
+using Microsoft.Extensions.DependencyInjection.Extensions;
 using OpenFeature;
 
 namespace EasyTrade.BrokerService.Helpers;
@@ -99,6 +101,10 @@ public static class BrokerServiceDependencyExtension
             .AddSingleton<IPortfolioInsightsFeature, PortfolioInsightsFeature>()
             .AddSingleton<PortfolioInsightsMetrics>()
             .AddHostedService<AlertEvaluationSchedulerService>();
+        // PATCH and DELETE on /v1/alerts/notifications answer 404, as for any non-GUID id.
+        services.TryAddEnumerable(
+            ServiceDescriptor.Singleton<MatcherPolicy, AlertController.NotificationsMatcherPolicy>()
+        );
 
         return services;
     }
