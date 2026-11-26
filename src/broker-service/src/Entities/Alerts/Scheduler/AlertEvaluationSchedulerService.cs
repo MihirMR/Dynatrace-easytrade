@@ -1,6 +1,7 @@
 using System.Globalization;
 using System.Text;
 using EasyTrade.BrokerService.Entities.Alerts.Service;
+using EasyTrade.BrokerService.ExceptionHandling;
 using EasyTrade.BrokerService.Helpers;
 
 namespace EasyTrade.BrokerService.Entities.Alerts.Scheduler
@@ -70,7 +71,11 @@ namespace EasyTrade.BrokerService.Entities.Alerts.Scheduler
 
         /// <summary>
         /// Runs one cycle immediately, then one more each time <paramref name="waitForNextTick"/>
-        /// yields <c>true</c>, and returns when it yields <c>false</c>.
+        /// yields <c>true</c>, and returns when it yields <c>false</c>. A cycle's scope opens
+        /// only while <paramref name="cancellationToken"/> is live: the token is read before the
+        /// first cycle and after each tick that yields <c>true</c>, and once it is cancelled the
+        /// loop returns normally without opening another scope, whether or not
+        /// <paramref name="waitForNextTick"/> honours the token.
         /// </summary>
         /// <remarks>
         /// A cycle that throws while <paramref name="cancellationToken"/> is live, whatever the
@@ -92,10 +97,16 @@ namespace EasyTrade.BrokerService.Entities.Alerts.Scheduler
         {
             try
             {
-                do
+                // Read before every scope, so neither a token cancelled before the first cycle
+                // nor a tick that yields true once cancellation has arrived dispatches a cycle.
+                while (!cancellationToken.IsCancellationRequested)
                 {
                     await RunCycleInScopeAsync(cancellationToken);
-                } while (await waitForNextTick(cancellationToken));
+                    if (!await waitForNextTick(cancellationToken))
+                    {
+                        return;
+                    }
+                }
             }
             catch (OperationCanceledException)
             {
@@ -140,7 +151,17 @@ namespace EasyTrade.BrokerService.Entities.Alerts.Scheduler
             // next tick must still run.
             catch (Exception exception) when (!cancellationToken.IsCancellationRequested)
             {
-                logger.LogError(exception, "Error running alert evaluation cycle");
+                // The console logger prints only the rendered message, so the exception is
+                // carried as text, which never includes a db-adapter driver or RPC diagnostic.
+                // The guard skips rendering it while Error is off (CA1873).
+                if (logger.IsEnabled(LogLevel.Error))
+                {
+                    logger.LogError(
+                        exception,
+                        "Error running alert evaluation cycle ({exception})",
+                        BrokerExceptionFilter.DescribeForLog(exception)
+                    );
+                }
             }
         }
 

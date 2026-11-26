@@ -1,16 +1,32 @@
 using System.Net;
 using System.Text.Json;
 using EasyTrade.BrokerService.Entities.Balances;
+using EasyTrade.BrokerService.Entities.Balances.Repository;
 using EasyTrade.BrokerService.Entities.Instruments;
+using EasyTrade.BrokerService.Entities.Instruments.Repository;
 using EasyTrade.BrokerService.Entities.Prices;
 using EasyTrade.BrokerService.Entities.Prices.ServiceConnector;
 using EasyTrade.BrokerService.Entities.Trades;
+using EasyTrade.BrokerService.Entities.Trades.Repository;
+using EasyTrade.BrokerService.ExceptionHandling;
+using EasyTrade.BrokerService.Helpers;
+using EasyTrade.BrokerService.Test.Fakes;
+using Grpc.Core;
+using Microsoft.Extensions.DependencyInjection;
 
 namespace EasyTrade.BrokerService.Test.IntegrationTests
 {
     [Collection(BrokerHostCollection.Name)]
     public class PortfolioInsightsApiTests
     {
+        /// <summary>The existing db-adapter read of the insights path that fails.</summary>
+        public enum LegacyRead
+        {
+            Balance,
+            Holdings,
+            Trades,
+        }
+
         private const string InsightsPath = "v1/portfolio/insights/";
         private const string HistoryPath = "v1/portfolio/history/";
         private const string AlphaName = "Alpha";
@@ -190,6 +206,86 @@ namespace EasyTrade.BrokerService.Test.IntegrationTests
         }
 
         [Theory]
+        [InlineData(LegacyRead.Balance, nameof(IBalanceRepository.GetBalanceOfAccountAsync))]
+        [InlineData(
+            LegacyRead.Holdings,
+            nameof(IInstrumentRepository.GetOwnedInstrumentsOfAccountAsync)
+        )]
+        [InlineData(LegacyRead.Trades, nameof(ITradeRepository.GetAccountTradesAsync))]
+        public async Task GetInsights_LegacyReadFails_ShouldReturn503WithoutLoggingDriverDetail(
+            LegacyRead failingRead,
+            string operation
+        )
+        {
+            // Arrange: the failing read's driver diagnostic names a database login.
+            string marker = $"driver-diagnostic-{Guid.NewGuid():N}";
+            string diagnostic = $"login error: Login failed for user '{marker}' at db:1433";
+            Mock<IBalanceRepository> balances = new();
+            balances
+                .Setup(repository => repository.GetBalanceOfAccountAsync(It.IsAny<Guid>()))
+                .Returns(() => FailLikeDbAdapter<Balance?>(operation, diagnostic));
+            Mock<IInstrumentRepository> instruments = new();
+            instruments
+                .Setup(repository => repository.GetOwnedInstrumentsOfAccountAsync(It.IsAny<Guid>()))
+                .Returns(() => FailLikeDbAdapter<List<OwnedInstrument>>(operation, diagnostic));
+            Mock<ITradeRepository> trades = new();
+            trades
+                .Setup(repository =>
+                    repository.GetAccountTradesAsync(
+                        It.IsAny<Guid>(),
+                        It.IsAny<bool>(),
+                        It.IsAny<bool>()
+                    )
+                )
+                .Returns(() => FailLikeDbAdapter<List<Trade>>(operation, diagnostic));
+            // The reads before the failing one succeed on the host's fakes.
+            await using BrokerTestHost host = await BrokerTestHost.StartComposedAsync(options =>
+                options.ConfigureServices = services =>
+                {
+                    switch (failingRead)
+                    {
+                        case LegacyRead.Balance:
+                            services.AddSingleton(balances.Object);
+                            break;
+                        case LegacyRead.Holdings:
+                            services.AddSingleton(instruments.Object);
+                            break;
+                        case LegacyRead.Trades:
+                            services.AddSingleton(trades.Object);
+                            break;
+                        default:
+                            throw new ArgumentOutOfRangeException(
+                                nameof(failingRead),
+                                failingRead,
+                                null
+                            );
+                    }
+                }
+            );
+            host.Flag.SetEnabled(true);
+            SeededAccount account = SeedAccount(host, (AlphaName, 3m));
+
+            // Act
+            using HttpResponseMessage response = await GetInsightsAsync(host, account.AccountId);
+
+            // Assert: the body and the log line name no driver detail; the line keeps the
+            // failing call and its gRPC status.
+            await BrokerTestHost.AssertErrorResponseAsync(
+                response,
+                HttpStatusCode.ServiceUnavailable
+            );
+            JsonElement body = await BrokerTestHost.ReadJsonAsync(response);
+            Assert.Equal("Database is unavailable", body.GetProperty("message").GetString());
+            LogEntry handled = Assert.Single(host.Logs.ByCategory<BrokerExceptionFilter>());
+            Assert.Equal(
+                "Exception handled with status [503]: (DbException: db-adapter call "
+                    + $"[{operation}] failed with status [Unknown])",
+                handled.Message
+            );
+            AssertNoEntryContains(host.Logs, marker);
+        }
+
+        [Theory]
         [InlineData(true)]
         [InlineData(false)]
         public async Task GetInsights_NonGuidAccount_ShouldReturn404(bool flagEnabled)
@@ -288,6 +384,35 @@ namespace EasyTrade.BrokerService.Test.IntegrationTests
         )
         {
             return host.Client.GetAsync($"{InsightsPath}{accountId}");
+        }
+
+        // Fails as a db-adapter read fails: GrpcHelper wraps the RPC error, whose detail is the
+        // driver's diagnostic, in a DbException naming the repository method.
+        private static Task<T> FailLikeDbAdapter<T>(string operation, string diagnostic)
+        {
+            RpcException driverError = new(new Status(StatusCode.Unknown, diagnostic));
+            return GrpcHelper.ExecuteAsync(() => Task.FromException<T>(driverError), operation);
+        }
+
+        // Neither the rendered message nor any structured field of any entry holds the text.
+        private static void AssertNoEntryContains(RecordingLogSink logs, string text)
+        {
+            Assert.All(
+                logs.Entries,
+                entry =>
+                {
+                    Assert.DoesNotContain(text, entry.Message, StringComparison.Ordinal);
+                    Assert.All(
+                        entry.State,
+                        pair =>
+                            Assert.DoesNotContain(
+                                text,
+                                pair.Value?.ToString() ?? string.Empty,
+                                StringComparison.Ordinal
+                            )
+                    );
+                }
+            );
         }
 
         // Parses the body first, so a wrong status reports the body it came with.

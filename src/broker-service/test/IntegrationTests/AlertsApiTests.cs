@@ -3,9 +3,14 @@ using System.Net;
 using System.Text.Json;
 using EasyTrade.BrokerService.Entities.Alerts;
 using EasyTrade.BrokerService.Entities.Balances;
+using EasyTrade.BrokerService.Entities.Balances.Repository;
 using EasyTrade.BrokerService.Entities.Instruments;
+using EasyTrade.BrokerService.ExceptionHandling;
 using EasyTrade.BrokerService.ExceptionHandling.Exceptions;
+using EasyTrade.BrokerService.Helpers;
 using EasyTrade.BrokerService.Test.Fakes;
+using Grpc.Core;
+using Microsoft.Extensions.DependencyInjection;
 
 namespace EasyTrade.BrokerService.Test.IntegrationTests
 {
@@ -564,6 +569,76 @@ namespace EasyTrade.BrokerService.Test.IntegrationTests
             );
             Assert.DoesNotContain(diagnostic, await response.Content.ReadAsStringAsync());
             Assert.Equal(1, host.Alerts.CallCount(failingMethod));
+        }
+
+        [Fact]
+        public async Task CreateAlert_BalanceReadFails_ShouldReturn503WithoutLoggingDriverDetail()
+        {
+            // Arrange: the existing balance read, the create's account check, fails as
+            // GrpcHelper reports it, with a driver diagnostic that names a database login.
+            string marker = $"driver-diagnostic-{Guid.NewGuid():N}";
+            RpcException driverError = new(
+                new Status(
+                    StatusCode.Unknown,
+                    $"login error: Login failed for user '{marker}' at db:1433"
+                )
+            );
+            Mock<IBalanceRepository> balances = new();
+            balances
+                .Setup(repository => repository.GetBalanceOfAccountAsync(It.IsAny<Guid>()))
+                .Returns(
+                    () =>
+                        GrpcHelper.ExecuteAsync(
+                            () => Task.FromException<Balance?>(driverError),
+                            nameof(IBalanceRepository.GetBalanceOfAccountAsync)
+                        )
+                );
+            await using BrokerTestHost host = await BrokerTestHost.StartComposedAsync(options =>
+                options.ConfigureServices = services => services.AddSingleton(balances.Object)
+            );
+            host.Flag.SetEnabled(true);
+            AccountFixture fixture = SeedAccount(host, HeldQuantity);
+
+            // Act
+            using HttpResponseMessage response = await SendToEndpointAsync(
+                host,
+                AlertEndpoint.Create,
+                fixture.AccountId,
+                fixture.InstrumentId,
+                Guid.NewGuid()
+            );
+
+            // Assert: nothing is stored; the body and the log line name no driver detail, and
+            // the line keeps the failing call and its gRPC status.
+            await BrokerTestHost.AssertErrorResponseAsync(
+                response,
+                HttpStatusCode.ServiceUnavailable
+            );
+            JsonElement body = await BrokerTestHost.ReadJsonAsync(response);
+            Assert.Equal("Database is unavailable", body.GetProperty("message").GetString());
+            Assert.Empty(host.Alerts.All());
+            LogEntry handled = Assert.Single(host.Logs.ByCategory<BrokerExceptionFilter>());
+            Assert.Equal(
+                "Exception handled with status [503]: (DbException: db-adapter call "
+                    + "[GetBalanceOfAccountAsync] failed with status [Unknown])",
+                handled.Message
+            );
+            Assert.All(
+                host.Logs.Entries,
+                entry =>
+                {
+                    Assert.DoesNotContain(marker, entry.Message, StringComparison.Ordinal);
+                    Assert.All(
+                        entry.State,
+                        pair =>
+                            Assert.DoesNotContain(
+                                marker,
+                                pair.Value?.ToString() ?? string.Empty,
+                                StringComparison.Ordinal
+                            )
+                    );
+                }
+            );
         }
 
         [Fact]

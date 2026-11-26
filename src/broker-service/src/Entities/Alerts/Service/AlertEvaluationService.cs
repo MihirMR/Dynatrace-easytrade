@@ -1,8 +1,10 @@
 using System.Diagnostics;
+using System.Globalization;
 using EasyTrade.BrokerService.Entities.Alerts.Repository;
 using EasyTrade.BrokerService.Entities.Portfolio.Service;
 using EasyTrade.BrokerService.Entities.Prices;
 using EasyTrade.BrokerService.Entities.Prices.ServiceConnector;
+using EasyTrade.BrokerService.ExceptionHandling;
 using EasyTrade.BrokerService.Helpers.FeatureFlags;
 using EasyTrade.BrokerService.Helpers.Metrics;
 
@@ -17,8 +19,12 @@ namespace EasyTrade.BrokerService.Entities.Alerts.Service
     /// <see cref="AlertEvaluationOutcome.Completed"/>, both without pricing. Otherwise the latest
     /// prices are fetched once, and a failed or empty fetch ends the cycle
     /// <see cref="AlertEvaluationOutcome.Failed"/> with no alert evaluated. Otherwise every armed
-    /// alert is evaluated, and each crossing is recorded by one conditional trigger write, which
-    /// alone decides whether it notifies.
+    /// alert is evaluated. Only a crossing whose rounded observed value lies in the trigger-value
+    /// domain reaches one conditional trigger write, which alone decides whether the alert
+    /// notifies; any other crossing is a per-alert failure (<c>trigger_value_out_of_range</c>)
+    /// and is never written. A trigger is counted only when that write is observed to return
+    /// <c>triggered = true</c>; a trigger db-adapter committed stays committed through
+    /// cancellation, and one whose reply was not observed stays committed and uncounted.
     /// </summary>
     public class AlertEvaluationService(
         IAlertRepository alertRepository,
@@ -52,6 +58,15 @@ namespace EasyTrade.BrokerService.Entities.Alerts.Service
             "Alert [{alertId}] of account [{accountId}] skipped: reason [{reason}]";
         private const string AlertFailedTemplate =
             "Alert [{alertId}] of account [{accountId}] evaluation failed: reason [{reason}]";
+
+        // The console logger prints only the rendered message, so a failure caused by an
+        // exception carries it as text, rendered by BrokerExceptionFilter.DescribeForLog, which
+        // never includes a db-adapter driver or RPC diagnostic. Failures without an exception
+        // keep the templates above.
+        private const string CycleFailedWithExceptionTemplate =
+            CycleFailedTemplate + " ({exception})";
+        private const string AlertFailedWithExceptionTemplate =
+            AlertFailedTemplate + " ({exception})";
         private const string TriggeredTemplate =
             "Alert [{alertId}] triggered for account [{accountId}] type [{type}] "
             + "direction [{direction}] threshold [{threshold}] value [{triggerValue}] "
@@ -66,11 +81,13 @@ namespace EasyTrade.BrokerService.Entities.Alerts.Service
             "Alert evaluation cycle cancelled: alerts [{alertCount}] "
             + "triggered [{triggeredCount}]";
 
-        // Serializes every log record this class emits. The console provider writes one record
-        // in several separate writes (prefix, message, padding, terminator), so records that
-        // parallel workers emit at once would interleave and split lines. Static, because the
-        // console is process-wide and evaluator instances can run at the same time. Only log
-        // emission is held under it, never evaluation, db-adapter calls or metrics.
+        // Serializes the log records this class emits, and only those: records that other
+        // categories write to the same console do not take it and can still interleave with
+        // them. The console provider writes one record in several separate writes (prefix,
+        // message, padding, terminator), so records that parallel workers emit at once would
+        // otherwise interleave and split lines. Static, because the console is process-wide and
+        // evaluator instances can run at the same time. Only log emission is held under it,
+        // never evaluation, db-adapter calls or metrics.
         private static readonly Lock LogGate = new();
 
         /// <inheritdoc/>
@@ -423,11 +440,36 @@ namespace EasyTrade.BrokerService.Entities.Alerts.Service
                     }
                 }
             }
-            catch (Exception) when (!cancellationToken.IsCancellationRequested)
+            catch (Exception exception) when (!cancellationToken.IsCancellationRequested)
             {
                 // The trigger is committed and counted, so a failing log provider is a
                 // diagnostics fault, not a per-alert evaluation failure: it is not passed on to
-                // the per-alert failure path and adds nothing to the failed counter.
+                // the per-alert failure path and adds nothing to the failed counter. The lost
+                // audit line is reported outside the logger instead.
+                ReportUnloggedTrigger(alert, exception);
+            }
+        }
+
+        // The console logger is the only log provider and is what failed, so the loss is written
+        // to standard error, which the container runtime captures beside standard output, as one
+        // line in one write. It names only the alert, its account and the exception's type: never
+        // the record's other fields, nor the exception's message or stack, which a failing
+        // provider can fill with the record's contents.
+        private static void ReportUnloggedTrigger(Alert alert, Exception exception)
+        {
+            string line = string.Create(
+                CultureInfo.InvariantCulture,
+                $"Alert [{alert.Id}] of account [{alert.AccountId}] triggered but its audit log "
+                    + $"line could not be written: exception [{exception.GetType().FullName}]"
+            );
+            try
+            {
+                Console.Error.WriteLine(line);
+            }
+            catch (Exception)
+            {
+                // Standard error is the last channel: nothing is left to report that this write
+                // failed, and the committed trigger must not become a per-alert failure.
             }
         }
 
@@ -452,15 +494,28 @@ namespace EasyTrade.BrokerService.Entities.Alerts.Service
         {
             if (logger.IsEnabled(LogLevel.Error))
             {
-                lock (LogGate)
+                if (exception is null)
                 {
-                    logger.LogError(
-                        exception,
-                        AlertFailedTemplate,
-                        alert.Id,
-                        alert.AccountId,
-                        reason
-                    );
+                    lock (LogGate)
+                    {
+                        logger.LogError(AlertFailedTemplate, alert.Id, alert.AccountId, reason);
+                    }
+                }
+                else
+                {
+                    // Rendered before the gate is taken, so only the log call is held under it.
+                    string description = BrokerExceptionFilter.DescribeForLog(exception);
+                    lock (LogGate)
+                    {
+                        logger.LogError(
+                            exception,
+                            AlertFailedWithExceptionTemplate,
+                            alert.Id,
+                            alert.AccountId,
+                            reason,
+                            description
+                        );
+                    }
                 }
             }
             metrics.AddFailed(alert.Type);
@@ -469,9 +524,29 @@ namespace EasyTrade.BrokerService.Entities.Alerts.Service
 
         private void LogCycleFailure(string reason, Exception? exception)
         {
-            lock (LogGate)
+            if (exception is null)
             {
-                logger.LogError(exception, CycleFailedTemplate, reason);
+                lock (LogGate)
+                {
+                    logger.LogError(CycleFailedTemplate, reason);
+                }
+                return;
+            }
+
+            // The guard skips rendering the exception while Error is off (CA1873); it is rendered
+            // before the gate is taken, so only the log call is held under it.
+            if (logger.IsEnabled(LogLevel.Error))
+            {
+                string description = BrokerExceptionFilter.DescribeForLog(exception);
+                lock (LogGate)
+                {
+                    logger.LogError(
+                        exception,
+                        CycleFailedWithExceptionTemplate,
+                        reason,
+                        description
+                    );
+                }
             }
         }
 

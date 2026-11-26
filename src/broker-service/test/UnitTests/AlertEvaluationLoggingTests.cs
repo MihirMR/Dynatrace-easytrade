@@ -14,8 +14,9 @@ using Microsoft.Extensions.Logging;
 namespace EasyTrade.BrokerService.Test.UnitTests
 {
     /// <summary>
-    /// How the evaluator's log emission interacts with its trigger accounting and with a console
-    /// provider that writes one record in several separate writes.
+    /// How the evaluator's log emission interacts with its trigger accounting, with a console
+    /// provider that writes one record in several separate writes, and with standard error,
+    /// where a trigger record the provider failed to write is reported.
     /// </summary>
     public class AlertEvaluationLoggingTests
     {
@@ -34,6 +35,9 @@ namespace EasyTrade.BrokerService.Test.UnitTests
 
         // The start of the Debug record a cycle ended by shutdown logs instead of the summary.
         private const string CycleCancelledPrefix = "Alert evaluation cycle cancelled";
+
+        // The message a failing log provider throws with; no diagnostic may carry it.
+        private const string ProviderFailureMessage = "The log provider failed on purpose.";
 
         private static readonly DateTimeOffset PriceTime = FakeAlertRepository.BaseTime;
 
@@ -58,37 +62,111 @@ namespace EasyTrade.BrokerService.Test.UnitTests
             // Arrange
             const int alertCount = 3;
             using EvaluationHarness harness = new();
-            harness.SeedCrossedAlerts(type, alertCount);
+            IReadOnlyList<Alert> seeded = harness.SeedCrossedAlerts(type, alertCount);
             HookedLogger logger = new(entry =>
             {
                 if (entry.HasField(TriggerValueField))
                 {
-                    throw new InvalidOperationException("The log provider failed on purpose.");
+                    throw new InvalidOperationException(ProviderFailureMessage);
                 }
             });
             AlertEvaluationService service = harness.CreateService(logger);
+            using StringWriter standardError = new();
 
             // Act
-            AlertEvaluationResult result = await service
-                .RunCycleAsync(CancellationToken.None)
-                .WaitAsync(WaitBound);
+            AlertEvaluationResult result = await WithStandardErrorAsync(
+                standardError,
+                () => service.RunCycleAsync(CancellationToken.None).WaitAsync(WaitBound)
+            );
 
             // Assert
-            TriggerAccounting expected = new(
-                AlertEvaluationOutcome.Completed,
-                CommittedTriggers: alertCount,
-                ResultTriggered: alertCount,
-                ResultFailed: 0,
-                TriggeredMetric: alertCount,
-                FailedMeasurements: 0
+            string written = standardError.ToString();
+            string exceptionType = typeof(InvalidOperationException).FullName!;
+            TriggerLogFault expected = new(
+                new TriggerAccounting(
+                    AlertEvaluationOutcome.Completed,
+                    CommittedTriggers: alertCount,
+                    ResultTriggered: alertCount,
+                    ResultFailed: 0,
+                    TriggeredMetric: alertCount,
+                    FailedMeasurements: 0
+                ),
+                AlertsWithOneDiagnostic: alertCount,
+                DiagnosticsNamingAccountAndException: alertCount,
+                ProviderMessageWritten: false
             );
-            TriggerAccounting actual = new(
-                result.Outcome,
-                harness.Repository.TriggerCalls.Count(call => call.Result == true),
-                result.Triggered,
-                result.Failed,
-                harness.Capture.Sum(PortfolioInsightsMetrics.TriggeredName, type),
-                harness.Capture.Count(PortfolioInsightsMetrics.EvaluationFailedName)
+            TriggerLogFault actual = new(
+                new TriggerAccounting(
+                    result.Outcome,
+                    harness.Repository.TriggerCalls.Count(call => call.Result == true),
+                    result.Triggered,
+                    result.Failed,
+                    harness.Capture.Sum(PortfolioInsightsMetrics.TriggeredName, type),
+                    harness.Capture.Count(PortfolioInsightsMetrics.EvaluationFailedName)
+                ),
+                seeded.Count(alert => LinesNaming(written, alert).Length == 1),
+                seeded.Sum(alert =>
+                    LinesNaming(written, alert)
+                        .Count(line =>
+                            line.Contains(alert.AccountId.ToString(), StringComparison.Ordinal)
+                            && line.Contains(exceptionType, StringComparison.Ordinal)
+                        )
+                ),
+                written.Contains(ProviderFailureMessage, StringComparison.Ordinal)
+            );
+            Assert.Equal(expected, actual);
+        }
+
+        [Theory]
+        [InlineData(AlertType.TARGET_PRICE)]
+        [InlineData(AlertType.PROFIT_LOSS)]
+        public async Task RunCycle_StandardErrorThrows_ShouldCountCommittedTriggersAndNoFailure(
+            AlertType type
+        )
+        {
+            // Arrange: the trigger log fails, and so does the standard error write that reports
+            // the lost line.
+            const int alertCount = 3;
+            using EvaluationHarness harness = new();
+            IReadOnlyList<Alert> seeded = harness.SeedCrossedAlerts(type, alertCount);
+            HookedLogger logger = new(entry =>
+            {
+                if (entry.HasField(TriggerValueField))
+                {
+                    throw new InvalidOperationException(ProviderFailureMessage);
+                }
+            });
+            AlertEvaluationService service = harness.CreateService(logger);
+            using FailingStandardError standardError = new(Console.Error, seeded);
+
+            // Act
+            AlertEvaluationResult result = await WithStandardErrorAsync(
+                standardError,
+                () => service.RunCycleAsync(CancellationToken.None).WaitAsync(WaitBound)
+            );
+
+            // Assert
+            DiagnosticFault expected = new(
+                new TriggerAccounting(
+                    AlertEvaluationOutcome.Completed,
+                    CommittedTriggers: alertCount,
+                    ResultTriggered: alertCount,
+                    ResultFailed: 0,
+                    TriggeredMetric: alertCount,
+                    FailedMeasurements: 0
+                ),
+                RejectedDiagnostics: alertCount
+            );
+            DiagnosticFault actual = new(
+                new TriggerAccounting(
+                    result.Outcome,
+                    harness.Repository.TriggerCalls.Count(call => call.Result == true),
+                    result.Triggered,
+                    result.Failed,
+                    harness.Capture.Sum(PortfolioInsightsMetrics.TriggeredName, type),
+                    harness.Capture.Count(PortfolioInsightsMetrics.EvaluationFailedName)
+                ),
+                standardError.RejectedLines
             );
             Assert.Equal(expected, actual);
         }
@@ -104,7 +182,7 @@ namespace EasyTrade.BrokerService.Test.UnitTests
             // fails, so the evaluator sees the throw while the cycle's token is cancelled.
             using EvaluationHarness harness = new();
             using CancellationTokenSource shutdown = new();
-            harness.SeedCrossedAlerts(type, 1);
+            Alert seeded = Assert.Single(harness.SeedCrossedAlerts(type, 1));
             ConcurrentQueue<string> messages = new();
             HookedLogger logger = new(entry =>
             {
@@ -112,17 +190,19 @@ namespace EasyTrade.BrokerService.Test.UnitTests
                 if (entry.HasField(TriggerValueField))
                 {
                     shutdown.Cancel();
-                    throw new InvalidOperationException("The log provider failed on purpose.");
+                    throw new InvalidOperationException(ProviderFailureMessage);
                 }
             });
             AlertEvaluationService service = harness.CreateService(logger);
+            using StringWriter standardError = new();
 
             // Act
-            AlertEvaluationResult result = await service
-                .RunCycleAsync(shutdown.Token)
-                .WaitAsync(WaitBound);
+            AlertEvaluationResult result = await WithStandardErrorAsync(
+                standardError,
+                () => service.RunCycleAsync(shutdown.Token).WaitAsync(WaitBound)
+            );
 
-            // Assert
+            // Assert: the throw is cancellation, so no lost-line diagnostic is written either.
             ShutdownAccounting expected = new(
                 new TriggerAccounting(
                     AlertEvaluationOutcome.Cancelled,
@@ -134,7 +214,8 @@ namespace EasyTrade.BrokerService.Test.UnitTests
                 ),
                 SummaryRecords: 0,
                 CancelledRecords: 1,
-                DurationMeasurements: 0
+                DurationMeasurements: 0,
+                DiagnosticLines: 0
             );
             ShutdownAccounting actual = new(
                 new TriggerAccounting(
@@ -151,7 +232,8 @@ namespace EasyTrade.BrokerService.Test.UnitTests
                 messages.Count(message =>
                     message.StartsWith(CycleCancelledPrefix, StringComparison.Ordinal)
                 ),
-                harness.Capture.Count(PortfolioInsightsMetrics.EvaluationDurationName)
+                harness.Capture.Count(PortfolioInsightsMetrics.EvaluationDurationName),
+                LinesNaming(standardError.ToString(), seeded).Length
             );
             Assert.Equal(expected, actual);
         }
@@ -241,6 +323,41 @@ namespace EasyTrade.BrokerService.Test.UnitTests
             Assert.Equal(expected, actual);
         }
 
+        /// <summary>
+        /// Runs <paramref name="run"/> with the process's standard error replaced by
+        /// <paramref name="writer"/>, and restores the original writer however it ends.
+        /// Standard error is process-wide, so every test that replaces it stays in this class,
+        /// whose tests run one at a time, and reads back only the lines naming its own alerts.
+        /// </summary>
+        private static async Task<TResult> WithStandardErrorAsync<TResult>(
+            TextWriter writer,
+            Func<Task<TResult>> run
+        )
+        {
+            TextWriter original = Console.Error;
+            Console.SetError(writer);
+            try
+            {
+                return await run();
+            }
+            finally
+            {
+                Console.SetError(original);
+            }
+        }
+
+        /// <summary>The lines of <paramref name="written"/> that name the alert's id.</summary>
+        private static string[] LinesNaming(string written, Alert alert)
+        {
+            string id = alert.Id.ToString();
+            return
+            [
+                .. written
+                    .Split(['\r', '\n'], StringSplitOptions.RemoveEmptyEntries)
+                    .Where(line => line.Contains(id, StringComparison.Ordinal)),
+            ];
+        }
+
         /// <summary>The trigger accounting a cycle leaves behind.</summary>
         private sealed record TriggerAccounting(
             AlertEvaluationOutcome Outcome,
@@ -252,14 +369,35 @@ namespace EasyTrade.BrokerService.Test.UnitTests
         );
 
         /// <summary>
+        /// The trigger accounting of a cycle whose trigger log failed, with what standard error
+        /// received: how many alerts are named by exactly one line, how many of those lines also
+        /// name the alert's account and the exception's type, and whether the provider's
+        /// exception message was written.
+        /// </summary>
+        private sealed record TriggerLogFault(
+            TriggerAccounting Triggers,
+            int AlertsWithOneDiagnostic,
+            int DiagnosticsNamingAccountAndException,
+            bool ProviderMessageWritten
+        );
+
+        /// <summary>
+        /// The trigger accounting of a cycle whose trigger log and standard error both failed,
+        /// with the number of diagnostic lines standard error rejected.
+        /// </summary>
+        private sealed record DiagnosticFault(TriggerAccounting Triggers, int RejectedDiagnostics);
+
+        /// <summary>
         /// The trigger accounting of a cycle ended by shutdown, with the summary and cancelled
-        /// records it logged and the evaluation durations it recorded.
+        /// records it logged, the evaluation durations it recorded and the standard error lines
+        /// naming its alert.
         /// </summary>
         private sealed record ShutdownAccounting(
             TriggerAccounting Triggers,
             int SummaryRecords,
             int CancelledRecords,
-            int DurationMeasurements
+            int DurationMeasurements,
+            int DiagnosticLines
         );
 
         /// <summary>
@@ -466,6 +604,41 @@ namespace EasyTrade.BrokerService.Test.UnitTests
         }
 
         /// <summary>
+        /// Stands in for standard error and rejects each line that names one of
+        /// <paramref name="alerts"/> with an <see cref="IOException"/>, as a closed stream would,
+        /// counting the rejections. Every other write, which a test of another class running at
+        /// the same time may make, goes on to <paramref name="original"/>.
+        /// </summary>
+        private sealed class FailingStandardError(TextWriter original, IReadOnlyList<Alert> alerts)
+            : TextWriter
+        {
+            private readonly string[] _alertIds = [.. alerts.Select(alert => alert.Id.ToString())];
+            private int _rejectedLines;
+
+            public int RejectedLines => Volatile.Read(ref _rejectedLines);
+
+            public override Encoding Encoding => original.Encoding;
+
+            public override void Write(char value)
+            {
+                original.Write(value);
+            }
+
+            public override void WriteLine(string? value)
+            {
+                if (
+                    value is not null
+                    && _alertIds.Any(id => value.Contains(id, StringComparison.Ordinal))
+                )
+                {
+                    Interlocked.Increment(ref _rejectedLines);
+                    throw new IOException("Standard error failed on purpose.");
+                }
+                original.WriteLine(value);
+            }
+        }
+
+        /// <summary>
         /// Collects the counter and histogram measurements of the meters one
         /// <see cref="IMeterFactory"/> created, so instruments of other tests running at the same
         /// time are never seen.
@@ -589,30 +762,32 @@ namespace EasyTrade.BrokerService.Test.UnitTests
             /// <summary>
             /// Seeds <paramref name="count"/> armed <see cref="AlertDirection.ABOVE"/> alerts of
             /// <paramref name="type"/>, each on its own account and instrument so each is its own
-            /// work item, with a price and a holding that cross every one of them.
+            /// work item, with a price and a holding that cross every one of them, and returns
+            /// the seeded alerts.
             /// </summary>
-            public void SeedCrossedAlerts(AlertType type, int count)
+            public IReadOnlyList<Alert> SeedCrossedAlerts(AlertType type, int count)
             {
+                List<Alert> seeded = [];
                 for (int index = 0; index < count; index++)
                 {
                     Guid accountId = Guid.NewGuid();
                     Guid instrumentId = Guid.NewGuid();
-                    Repository.Seed(
-                        new Alert(
-                            Guid.NewGuid(),
-                            accountId,
-                            instrumentId,
-                            type,
-                            AlertDirection.ABOVE,
-                            Threshold,
-                            Enabled: true,
-                            ArmingRevision: 1,
-                            TriggeredAt: null,
-                            TriggerValue: null,
-                            Acknowledged: false,
-                            CreatedAt: FakeAlertRepository.BaseTime.AddMinutes(index)
-                        )
+                    Alert alert = new(
+                        Guid.NewGuid(),
+                        accountId,
+                        instrumentId,
+                        type,
+                        AlertDirection.ABOVE,
+                        Threshold,
+                        Enabled: true,
+                        ArmingRevision: 1,
+                        TriggeredAt: null,
+                        TriggerValue: null,
+                        Acknowledged: false,
+                        CreatedAt: FakeAlertRepository.BaseTime.AddMinutes(index)
                     );
+                    Repository.Seed(alert);
+                    seeded.Add(alert);
                     _prices.AddPrice(
                         new Price(
                             instrumentId,
@@ -637,6 +812,7 @@ namespace EasyTrade.BrokerService.Test.UnitTests
                         ),
                     ];
                 }
+                return seeded;
             }
 
             public AlertEvaluationService CreateService(ILogger<AlertEvaluationService> logger)

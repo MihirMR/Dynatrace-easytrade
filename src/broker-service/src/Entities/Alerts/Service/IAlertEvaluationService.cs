@@ -11,14 +11,23 @@ namespace EasyTrade.BrokerService.Entities.Alerts.Service
         /// <see cref="AlertEvaluationOutcome.Completed"/>, both without pricing. Otherwise the
         /// latest prices are fetched once, and a failed or empty fetch ends the cycle
         /// <see cref="AlertEvaluationOutcome.Failed"/> with no alert evaluated. Otherwise every
-        /// armed alert is evaluated, and each crossing is recorded by the single conditional
-        /// trigger write, which alone decides whether it notifies.
+        /// armed alert is evaluated. Only a crossing whose rounded observed value lies in the
+        /// trigger-value domain reaches the single conditional trigger write, which alone decides
+        /// whether the alert notifies; any other crossing is a per-alert failure
+        /// (<c>trigger_value_out_of_range</c>) and is never written. A trigger is counted, in
+        /// <see cref="AlertEvaluationResult.Triggered"/> and
+        /// <c>easytrade.broker.alerts.triggered</c>, only when the write is observed to return
+        /// <c>triggered = true</c>; a write db-adapter committed but whose reply cancellation or
+        /// the per-call deadline cut off stays committed and uncounted.
         /// </summary>
         /// <param name="cancellationToken">
         /// Cancels the cycle, normally on host shutdown. It is observed in the flag read and the
         /// db-adapter calls, after each call that takes no token (the price fetch and the
-        /// positions load), and between alerts. Triggers committed before the cancellation stay
-        /// committed and counted; the cancelled cycle records no duration and logs no summary.
+        /// positions load), and between alerts. Triggers db-adapter committed stay committed
+        /// after the cancellation, but each is counted only when its <c>triggered = true</c> reply
+        /// returned first; one whose reply the cancellation cut off is not counted, and its
+        /// arming no longer matches the conditional write, so no second notification follows.
+        /// The cancelled cycle records no duration and logs no summary.
         /// </param>
         /// <returns>
         /// The cycle result, whose outcome is <see cref="AlertEvaluationOutcome.FlagDisabled"/>,

@@ -41,6 +41,7 @@ namespace EasyTrade.BrokerService.Test.UnitTests
             CycleCancellationWhileLiveLoggedAndNextRuns,
             TickCancellationWhileLiveEndsQuietly,
             TickFaultWhileLivePropagates,
+            TickAcceptedAfterCancellationEndsWithoutCycle,
         }
 
         [Theory]
@@ -299,6 +300,7 @@ namespace EasyTrade.BrokerService.Test.UnitTests
         [InlineData(LoopScenario.CycleCancellationWhileLiveLoggedAndNextRuns)]
         [InlineData(LoopScenario.TickCancellationWhileLiveEndsQuietly)]
         [InlineData(LoopScenario.TickFaultWhileLivePropagates)]
+        [InlineData(LoopScenario.TickAcceptedAfterCancellationEndsWithoutCycle)]
         public async Task RunLoop_TickSource_ShouldDriveCycles(LoopScenario scenario)
         {
             // Arrange
@@ -373,6 +375,16 @@ namespace EasyTrade.BrokerService.Test.UnitTests
                     );
                     Assert.Equal(LogLevel.Error, error.Level);
                     Assert.Same(cycleFault, error.Exception);
+                    // The console logger prints only the message, so the message carries the
+                    // exception's type and text.
+                    Assert.Equal(
+                        scenario == LoopScenario.ThrowingCycleLoggedAndNextRuns
+                            ? "Error running alert evaluation cycle (InvalidOperationException: "
+                                + "Cycle 1 failed on purpose.)"
+                            : "Error running alert evaluation cycle (OperationCanceledException: "
+                                + "Cycle 1 timed out on purpose.)",
+                        error.Message
+                    );
                     harness.ReleaseTick();
                     Assert.True(
                         await harness.Probe.WaitForCycleAsync(),
@@ -457,6 +469,17 @@ namespace EasyTrade.BrokerService.Test.UnitTests
                     expectedStatus = TaskStatus.Faulted;
                     break;
 
+                case LoopScenario.TickAcceptedAfterCancellationEndsWithoutCycle:
+                    // The tick requested after the startup cycle cancels the loop's token and
+                    // still yields true, as a tick source that ignores cancellation, or a timer
+                    // tick that lands as shutdown begins, can. The loop must end normally on
+                    // that tick without opening another scope.
+                    harness.CancelThenReleaseTick();
+                    await harness.Loop.WaitAsync(WaitBound);
+                    Assert.True(harness.Loop.IsCompletedSuccessfully);
+                    Assert.Equal(1, harness.ScopesCreated);
+                    break;
+
                 default:
                     throw new ArgumentOutOfRangeException(nameof(scenario), scenario, null);
             }
@@ -475,6 +498,26 @@ namespace EasyTrade.BrokerService.Test.UnitTests
                 tickAfterLastCycle ?? log.EndsWith(" TickRequested", StringComparison.Ordinal);
             Assert.Equal(SerialCycleLog(expectedCycles, trailingTick), log);
             Assert.Equal(expectedErrors, harness.Logger.Sink.ByLevel(LogLevel.Error).Count);
+        }
+
+        [Fact]
+        public async Task RunLoop_TokenCancelledBeforeStart_ShouldReturnWithoutScopeOrCycle()
+        {
+            // Arrange
+            await using LoopHarness harness = new(null, false);
+            await harness.CancelAsync();
+
+            // Act
+            harness.Start();
+            await harness.Loop.WaitAsync(WaitBound);
+
+            // Assert
+            // The loop ends normally before the immediate first cycle: it opens no scope, runs
+            // no cycle and never asks for a tick, so the probe log stays empty.
+            Assert.True(harness.Loop.IsCompletedSuccessfully);
+            Assert.Equal(0, harness.ScopesCreated);
+            Assert.Equal(string.Empty, harness.Probe.Log);
+            Assert.Empty(harness.Logger.Sink.ByLevel(LogLevel.Error));
         }
 
         /// <summary>
@@ -644,13 +687,34 @@ namespace EasyTrade.BrokerService.Test.UnitTests
         }
 
         /// <summary>
+        /// Scope factory that counts every scope opened through it and returns the provider's
+        /// own scope, so each scope resolves and disposes exactly as the provider's does. Safe
+        /// for concurrent callers.
+        /// </summary>
+        private sealed class CountingScopeFactory(IServiceScopeFactory inner) : IServiceScopeFactory
+        {
+            private int _created;
+
+            /// <summary>The number of scopes opened so far.</summary>
+            public int Created => Volatile.Read(ref _created);
+
+            public IServiceScope CreateScope()
+            {
+                Interlocked.Increment(ref _created);
+                return inner.CreateScope();
+            }
+        }
+
+        /// <summary>
         /// Owns the scheduler under test, its service provider and its tick source. Each
-        /// <see cref="ReleaseTick"/>, <see cref="EndSource"/> or <see cref="FailTick"/> completes
-        /// exactly one tick, in the order they are called.
+        /// <see cref="ReleaseTick"/>, <see cref="CancelThenReleaseTick"/>,
+        /// <see cref="EndSource"/> or <see cref="FailTick"/> completes exactly one tick, in the
+        /// order they are called.
         /// </summary>
         private sealed class LoopHarness : IAsyncDisposable
         {
             private readonly ServiceProvider _provider;
+            private readonly CountingScopeFactory _scopes;
             private readonly AlertEvaluationSchedulerService _scheduler;
 
             // Each item is one tick: it returns whether the source goes on, or throws as a
@@ -668,14 +732,20 @@ namespace EasyTrade.BrokerService.Test.UnitTests
                     new ServiceProviderOptions { ValidateOnBuild = true, ValidateScopes = true }
                 );
                 Probe = _provider.GetRequiredService<CycleProbe>();
+                _scopes = new CountingScopeFactory(
+                    _provider.GetRequiredService<IServiceScopeFactory>()
+                );
                 _scheduler = new AlertEvaluationSchedulerService(
-                    _provider.GetRequiredService<IServiceScopeFactory>(),
+                    _scopes,
                     new ConfigurationBuilder().AddInMemoryCollection().Build(),
                     Logger
                 );
             }
 
             public CycleProbe Probe { get; }
+
+            /// <summary>The number of scopes the scheduler has opened so far.</summary>
+            public int ScopesCreated => _scopes.Created;
 
             public RecordingLogger<AlertEvaluationSchedulerService> Logger { get; } = new();
 
@@ -689,6 +759,19 @@ namespace EasyTrade.BrokerService.Test.UnitTests
             public void ReleaseTick()
             {
                 QueueTick(() => true);
+            }
+
+            /// <summary>
+            /// Completes one more tick that cancels the loop's token and then reports the source
+            /// as going on, as a tick source that ignores cancellation does.
+            /// </summary>
+            public void CancelThenReleaseTick()
+            {
+                QueueTick(() =>
+                {
+                    _cts.Cancel();
+                    return true;
+                });
             }
 
             /// <summary>Completes one more tick that reports the source as finished.</summary>

@@ -9,9 +9,11 @@ using EasyTrade.BrokerService.Entities.Prices;
 using EasyTrade.BrokerService.Entities.Prices.ServiceConnector;
 using EasyTrade.BrokerService.Entities.Trades;
 using EasyTrade.BrokerService.ExceptionHandling.Exceptions;
+using EasyTrade.BrokerService.Helpers;
 using EasyTrade.BrokerService.Helpers.FeatureFlags;
 using EasyTrade.BrokerService.Helpers.Metrics;
 using EasyTrade.BrokerService.Test.Fakes;
+using Grpc.Core;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
 // System.Diagnostics.Metrics also declares an Instrument type, so only the types used are imported.
@@ -119,6 +121,15 @@ namespace EasyTrade.BrokerService.Test.UnitTests
         {
             ListThrows,
             PricesThrow,
+            PricesEmpty,
+        }
+
+        public enum FailureLogScenario
+        {
+            TriggerThrowsDbException,
+            TriggerValueOutOfRange,
+            ListThrowsDbException,
+            PricesThrowHttpRequestException,
             PricesEmpty,
         }
 
@@ -707,6 +718,182 @@ namespace EasyTrade.BrokerService.Test.UnitTests
                     harness.Measurements.Count(EvaluationFailedName),
                     harness.FirstLineStartingWith(CycleFailedPrefix)?.GetField("reason")
                 )
+            );
+        }
+
+        [Theory]
+        [InlineData(
+            FailureLogScenario.TriggerThrowsDbException,
+            "reason [exception] (DbException: db-adapter call [TriggerAsync] failed with status "
+                + "[Unavailable])"
+        )]
+        [InlineData(
+            FailureLogScenario.TriggerValueOutOfRange,
+            "reason [trigger_value_out_of_range]"
+        )]
+        [InlineData(
+            FailureLogScenario.ListThrowsDbException,
+            "reason [list_failed] (DbException: db-adapter call [ListAsync] failed with status "
+                + "[Unavailable])"
+        )]
+        [InlineData(
+            FailureLogScenario.PricesThrowHttpRequestException,
+            "reason [prices_failed] (HttpRequestException: Name does not resolve "
+                + "(pricing-service:8080))"
+        )]
+        [InlineData(FailureLogScenario.PricesEmpty, "reason [prices_empty]")]
+        public async Task RunCycle_FailureLogged_ShouldRenderExceptionWithoutDriverDetail(
+            FailureLogScenario scenario,
+            string expectedTail
+        )
+        {
+            // Arrange: one armed alert; a db-adapter failure carries a driver diagnostic that
+            // names a database login, as GrpcHelper reports it.
+            using CycleHarness harness = new();
+            string marker = $"driver-diagnostic-{Guid.NewGuid():N}";
+            Alert alert;
+            Exception? thrown = null;
+            IPriceServiceConnector? prices = null;
+            switch (scenario)
+            {
+                case FailureLogScenario.TriggerThrowsDbException:
+                    harness.AddCandle(harness.InstrumentA, CrossingClose);
+                    alert = harness.SeedTargetPriceAlert(harness.InstrumentA);
+                    thrown = await CaptureDbAdapterFailureAsync("TriggerAsync", marker);
+                    harness.Alerts.ThrowOnNext(FakeAlertRepositoryMethod.Trigger, thrown);
+                    break;
+                case FailureLogScenario.TriggerValueOutOfRange:
+                    harness.AddCandle(harness.InstrumentA, OutOfRangeClose);
+                    alert = harness.SeedTargetPriceAlert(harness.InstrumentA);
+                    break;
+                case FailureLogScenario.ListThrowsDbException:
+                    alert = harness.SeedTargetPriceAlert(harness.InstrumentA);
+                    thrown = await CaptureDbAdapterFailureAsync("ListAsync", marker);
+                    harness.Alerts.ThrowOnNext(FakeAlertRepositoryMethod.List, thrown);
+                    break;
+                case FailureLogScenario.PricesThrowHttpRequestException:
+                    alert = harness.SeedTargetPriceAlert(harness.InstrumentA);
+                    thrown = new HttpRequestException(
+                        "Name does not resolve (pricing-service:8080)"
+                    );
+                    Mock<IPriceServiceConnector> failing = new(MockBehavior.Strict);
+                    failing.Setup(connector => connector.GetLatestPrices()).ThrowsAsync(thrown);
+                    prices = failing.Object;
+                    break;
+                case FailureLogScenario.PricesEmpty:
+                    // No candle is added, as pricing answers a non-200 with an empty list.
+                    alert = harness.SeedTargetPriceAlert(harness.InstrumentA);
+                    break;
+                default:
+                    throw new ArgumentOutOfRangeException(nameof(scenario), scenario, null);
+            }
+            AlertEvaluationService evaluator = harness.BuildEvaluator(prices: prices);
+
+            // Act
+            _ = await harness.RunAsync(evaluator);
+
+            // Assert: the console logger prints only the message, so the message carries the
+            // exception when there is one, never its driver detail; the exception object is
+            // still passed to the logger. A failure without an exception keeps its line.
+            bool perAlert =
+                scenario
+                    is FailureLogScenario.TriggerThrowsDbException
+                        or FailureLogScenario.TriggerValueOutOfRange;
+            string expectedMessage = perAlert
+                ? $"Alert [{alert.Id}] of account [{alert.AccountId}] evaluation failed: "
+                    + expectedTail
+                : $"{CycleFailedPrefix}: {expectedTail}";
+            LogEntry error = Assert.Single(
+                harness.EvaluatorLogs,
+                entry => entry.Level == LogLevel.Error
+            );
+            Assert.Equal(expectedMessage, error.Message);
+            Assert.Same(thrown, error.Exception);
+            Assert.Equal(thrown is not null, error.HasField("exception"));
+            Assert.All(
+                harness.Logs.Entries,
+                entry =>
+                {
+                    Assert.DoesNotContain(marker, entry.Message, StringComparison.Ordinal);
+                    Assert.All(
+                        entry.State,
+                        pair =>
+                            Assert.DoesNotContain(
+                                marker,
+                                pair.Value?.ToString() ?? string.Empty,
+                                StringComparison.Ordinal
+                            )
+                    );
+                }
+            );
+        }
+
+        [Theory]
+        [InlineData(FailureLogScenario.TriggerThrowsDbException)]
+        [InlineData(FailureLogScenario.ListThrowsDbException)]
+        public async Task RunCycle_FailureWithErrorLevelOff_ShouldCountWithoutLogging(
+            FailureLogScenario scenario
+        )
+        {
+            // Arrange: one crossed armed alert, and an evaluator logger with Error off.
+            using CycleHarness harness = new();
+            using ILoggerFactory loggerFactory = LoggerFactory.Create(builder =>
+                builder
+                    .SetMinimumLevel(LogLevel.Critical)
+                    .AddProvider(new RecordingLoggerProvider(harness.Logs))
+            );
+            harness.AddCandle(harness.InstrumentA, CrossingClose);
+            harness.SeedTargetPriceAlert(harness.InstrumentA);
+            (FakeAlertRepositoryMethod failingMethod, string operation) = scenario switch
+            {
+                FailureLogScenario.TriggerThrowsDbException => (
+                    FakeAlertRepositoryMethod.Trigger,
+                    "TriggerAsync"
+                ),
+                FailureLogScenario.ListThrowsDbException => (
+                    FakeAlertRepositoryMethod.List,
+                    "ListAsync"
+                ),
+                _ => throw new ArgumentOutOfRangeException(nameof(scenario), scenario, null),
+            };
+            harness.Alerts.ThrowOnNext(
+                failingMethod,
+                await CaptureDbAdapterFailureAsync(operation, "driver-diagnostic")
+            );
+            AlertEvaluationService evaluator = harness.BuildEvaluator(
+                logger: loggerFactory.CreateLogger<AlertEvaluationService>()
+            );
+
+            // Act
+            AlertEvaluationResult result = await harness.RunAsync(evaluator);
+
+            // Assert: the failure keeps its outcome and counts; with Error off no line is written.
+            Assert.Equal(
+                scenario == FailureLogScenario.TriggerThrowsDbException
+                    ? (AlertEvaluationOutcome.Completed, 1, 1d)
+                    : (AlertEvaluationOutcome.Failed, 0, 0d),
+                (
+                    result.Outcome,
+                    result.Failed,
+                    harness.Measurements.Sum(PortfolioInsightsMetrics.EvaluationFailedName)
+                )
+            );
+            Assert.Empty(harness.EvaluatorLogs);
+        }
+
+        // Fails as a db-adapter call fails: GrpcHelper wraps the RPC error, whose detail is the
+        // driver's diagnostic, in a DbException naming the repository method.
+        private static Task<DbException> CaptureDbAdapterFailureAsync(
+            string operation,
+            string marker
+        )
+        {
+            RpcException driverError = new(
+                new Status(StatusCode.Unavailable, $"login error: Login failed for user '{marker}'")
+            );
+            return Assert.ThrowsAsync<DbException>(
+                () =>
+                    GrpcHelper.ExecuteAsync(() => Task.FromException<bool>(driverError), operation)
             );
         }
 
@@ -1619,13 +1806,15 @@ namespace EasyTrade.BrokerService.Test.UnitTests
 
             /// <summary>
             /// An evaluator over the shared store, metrics and log sink. Pricing defaults to
-            /// <see cref="PriceCalls"/>, and positions to the real
-            /// <see cref="PortfolioInsightsService"/> over the harness fakes and that pricing.
+            /// <see cref="PriceCalls"/>, positions to the real
+            /// <see cref="PortfolioInsightsService"/> over the harness fakes and that pricing,
+            /// and the evaluator's logger to one recording every level into <see cref="Logs"/>.
             /// </summary>
             public AlertEvaluationService BuildEvaluator(
                 bool flagEnabled = true,
                 IPriceServiceConnector? prices = null,
-                IPortfolioInsightsService? insights = null
+                IPortfolioInsightsService? insights = null,
+                ILogger<AlertEvaluationService>? logger = null
             )
             {
                 IPriceServiceConnector pricing = prices ?? PriceCalls;
@@ -1653,7 +1842,7 @@ namespace EasyTrade.BrokerService.Test.UnitTests
                     positions,
                     feature.Object,
                     _metrics,
-                    new RecordingLogger<AlertEvaluationService>(Logs)
+                    logger ?? new RecordingLogger<AlertEvaluationService>(Logs)
                 );
             }
 
