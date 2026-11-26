@@ -53,6 +53,12 @@
  *
  * Exit codes: 0 when every check passed; 1 when a check or the setup failed;
  * 2 on a usage or fixture error.
+ *
+ * The check runs only when node starts this file. Importing it runs nothing
+ * and exposes the helpers the unit tests exercise, which run from
+ * src/loadgen, with the other verification suites, as:
+ *
+ *     node --test "verification/*.test.mjs"
  */
 import { mkdir, readFile, writeFile } from "node:fs/promises"
 import path from "node:path"
@@ -3562,6 +3568,30 @@ async function main() {
     }
     process.exitCode =
         failed || report.checks.some((check) => check.status === "FAIL") ? 1 : 0
+}
+
+export {
+    UsageError,
+    armingKey,
+    attributeToasts,
+    classifyResponse,
+    expectEqual,
+    fixtureAlertOf,
+    formatInPage,
+    idOf,
+    insightsShapeProblem,
+    isTriggered,
+    parseAccount,
+    parseAlert,
+    parseAlerts,
+    parseBaseUrl,
+    parseFlagBody,
+    parseOptions,
+    readFixture,
+    recordCheck,
+    resultsOf,
+    toastCounts,
+    waitOrReport,
 }
 
 // The check runs when this file is the entry point, and not when a unit test

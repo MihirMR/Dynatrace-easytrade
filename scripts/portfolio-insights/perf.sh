@@ -7,7 +7,7 @@
 #
 # Usage: scripts/portfolio-insights/perf.sh --project NAME [--base-url URL] [--compose-file FILE]
 #   --project NAME       Compose project of the running stack (required)
-#   --base-url URL       Reverse-proxy URL of that stack (default: http://localhost)
+#   --base-url URL       Reverse-proxy origin of that stack (default: http://localhost)
 #   --compose-file FILE  Compose file of that project, relative to the current directory
 #                        (default: compose.dev.yaml)
 #   --help               Show this help and exit
@@ -42,6 +42,16 @@ LOG_STEP_SECONDS=5
 # clock at the first request, so a host clock ahead of the Docker engine's loses no insights
 # line; the earlier lines it also reads carry other trace ids and are left out.
 LOG_SKEW_MARGIN_SECONDS=30
+# Every broker-service log read runs under timeout(1), so a Docker call that never answers
+# cannot hold the run. Inside wait_cycle_line it may take the time left to that wait's deadline;
+# a read outside it may take this fixed bound. Either is a hard limit on the whole read, its
+# termination included: TERM comes LOG_PROBE_KILL_SECONDS before the limit and KILL at it.
+LOG_PROBE_TIMEOUT_SECONDS=60
+LOG_PROBE_KILL_SECONDS=5
+# The hard limit of cleanup's compose start of loadgen, termination included as for log reads,
+# so a Docker engine that never answers cannot hold the exit. A start takes seconds on a healthy
+# engine; one cut off is reported as a cleanup problem.
+DOCKER_CALL_TIMEOUT_SECONDS=60
 PRESET_COUNT=25
 HOLDINGS_EXPECTED=15
 ALERTS_PER_ACCOUNT=40
@@ -84,7 +94,7 @@ usage() {
     cat <<'EOF'
 Usage: scripts/portfolio-insights/perf.sh --project NAME [--base-url URL] [--compose-file FILE]
   --project NAME       Compose project of the running stack (required)
-  --base-url URL       Reverse-proxy URL of that stack (default: http://localhost)
+  --base-url URL       Reverse-proxy origin of that stack (default: http://localhost)
   --compose-file FILE  Compose file of that project, relative to the current directory
                        (default: compose.dev.yaml)
   --help               Show this help and exit
@@ -96,6 +106,101 @@ usage_error() {
     echo "$1" >&2
     usage >&2
     exit 2
+}
+
+# The origin helpers list their characters instead of using ranges, so no locale can widen a
+# bracket expression beyond ASCII.
+# scripts/portfolio-insights/harness-test.sh tests these helpers and this script's Docker probes.
+
+# is_port_number TEXT: 1 to 5 decimal digits whose value is from 1 to 65535.
+is_port_number() {
+    local re='^[0123456789]{1,5}$'
+    [[ "$1" =~ $re ]] && ((10#$1 >= 1 && 10#$1 <= 65535))
+}
+
+# is_ipv4_address TEXT: a dotted quad of four decimal octets from 0 to 255, none with a leading
+# zero, which a WHATWG URL parser would read as octal.
+is_ipv4_address() {
+    local octet='(0|[123456789][0123456789]{0,2})' i
+    local re="^${octet}\\.${octet}\\.${octet}\\.${octet}\$"
+    [[ "$1" =~ $re ]] || return 1
+    for i in 1 2 3 4; do
+        ((10#${BASH_REMATCH[i]} <= 255)) || return 1
+    done
+}
+
+# is_dns_name TEXT: labels of 1 to 63 letters, digits and inner hyphens joined by dots, with one
+# optional trailing dot for a rooted name and at most 253 characters without it. The last label
+# is not a number (all digits, or 0x and hex digits), since a WHATWG URL parser reads a host that
+# ends in one as an IPv4 address.
+is_dns_name() {
+    local alnum='0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz'
+    local label="[${alnum}]([${alnum}-]{0,61}[${alnum}])?"
+    local re="^${label}(\\.${label})*\$"
+    local number='^([0123456789]+|0[xX][0123456789ABCDEFabcdef]*)$'
+    local name="${1%.}"
+    ((${#name} <= 253)) && [[ "$name" =~ $re && ! "${name##*.}" =~ $number ]]
+}
+
+# is_ipv6_address TEXT: an unbracketed IPv6 address in RFC 4291 text form. That is one to eight
+# groups of 1 to 4 hex digits, at most one "::" standing for one or more zero groups, and an
+# optional trailing dotted quad that counts as two groups. A zone id is refused.
+is_ipv6_address() {
+    local hex='[0123456789ABCDEFabcdef]{1,4}'
+    local re="^${hex}(:${hex})*\$"
+    local text="$1" head tail quad part colons groups=0
+    if [[ "$text" == *.* ]]; then
+        quad="${text##*:}"
+        is_ipv4_address "$quad" || return 1
+        text="${text%"$quad"}0:0"
+    fi
+    head="$text"
+    tail=""
+    if [[ "$text" == *::* ]]; then
+        head="${text%%::*}"
+        tail="${text#*::}"
+        [[ "$tail" != *::* ]] || return 1
+    fi
+    for part in "$head" "$tail"; do
+        if [[ -n "$part" ]]; then
+            [[ "$part" =~ $re ]] || return 1
+            colons="${part//[!:]/}"
+            groups=$((groups + ${#colons} + 1))
+        fi
+    done
+    if [[ "$text" == *::* ]]; then
+        ((groups < 8))
+    else
+        ((groups == 8))
+    fi
+}
+
+# is_base_origin TEXT: an http:// or https:// origin, that is a host (a DNS name, an IPv4 address
+# or a bracketed IPv6 literal) and an optional port, with at most one trailing slash. It refuses
+# credentials, a path, a query, a fragment, whitespace and control characters, so an accepted
+# origin is safe to print and to build every request URL from. A WHATWG URL parser, as the browser
+# check uses, reads every origin it accepts as an origin.
+is_base_origin() {
+    local authority host port
+    # No origin is longer than 269 characters: https://, a 253-character name and its root dot, a
+    # five-digit port and a slash. Longer text is refused before any pattern runs on it.
+    ((${#1} <= 269)) || return 1
+    case "$1" in
+        http://* | https://*) authority="${1#*://}" ;;
+        *) return 1 ;;
+    esac
+    authority="${authority%/}"
+    if [[ "$authority" == \[* ]]; then
+        [[ "$authority" == *\]* ]] || return 1
+        host="${authority%%\]*}"
+        port="${authority#*\]}"
+        is_ipv6_address "${host#\[}" || return 1
+    else
+        host="${authority%%:*}"
+        port="${authority#"$host"}"
+        is_ipv4_address "$host" || is_dns_name "$host" || return 1
+    fi
+    [[ -z "$port" ]] || { [[ "$port" == :* ]] && is_port_number "${port#:}"; }
 }
 
 BASE_URL="http://localhost"
@@ -119,7 +224,12 @@ while [[ $# -gt 0 ]]; do
             exit 0
             ;;
         *)
-            usage_error "Unknown option: $1"
+            # Only a bare option name is echoed: a stray value or a --name=value argument can be
+            # a URL that holds credentials.
+            if [[ "$1" =~ ^--?[A-Za-z][A-Za-z0-9-]*$ ]]; then
+                usage_error "Unknown option: $1"
+            fi
+            usage_error "Unknown argument (not shown): each option takes its value as the next argument."
             ;;
     esac
 done
@@ -127,8 +237,9 @@ done
 if [[ -z "$PROJECT" ]]; then
     usage_error "Option --project is required."
 fi
-if [[ ! "$BASE_URL" =~ ^https?://[^[:space:]]+$ ]]; then
-    usage_error "Option --base-url needs an http:// or https:// URL, got: $BASE_URL"
+# The refused value is never echoed, since it can hold credentials.
+if ! is_base_origin "$BASE_URL"; then
+    usage_error "Option --base-url needs an http:// or https:// origin: a host and optional port, without credentials, path, query or fragment."
 fi
 BASE_URL="${BASE_URL%/}"
 if [[ ! -f "$COMPOSE_FILE" ]]; then
@@ -136,7 +247,7 @@ if [[ ! -f "$COMPOSE_FILE" ]]; then
 fi
 
 missing_tools=""
-for tool in bash curl jq docker; do
+for tool in bash curl jq docker timeout; do
     if ! command -v "$tool" >/dev/null 2>&1; then
         missing_tools="$missing_tools $tool"
     fi
@@ -176,6 +287,10 @@ LOADGEN_STOPPED=0
 DIALECT=""
 EVAL_INTERVAL=""
 STARTED_AT=""
+# The deadline (on the $SECONDS clock) of the wait_cycle_line running now, empty outside it,
+# and why the last log read failed.
+PROBE_DEADLINE=""
+LOG_PROBE_DETAIL=""
 
 # Report values; "n/a" until measured.
 R_INSIGHTS_ACCOUNT="n/a"
@@ -345,13 +460,20 @@ create_alert() {
 }
 
 post_alert() {
-    local body id revision fields
+    local strings body id revision fields
     if [[ ! "$5" =~ ^-?(0|[1-9][0-9]*)(\.[0-9]+)?$ ]]; then
         CREATE_ERROR="threshold [$5] is not a plain decimal token"
         return 1
     fi
-    body="$(printf '{"accountId":"%s","type":"%s","instrumentId":"%s","direction":"%s","threshold":%s}' \
-        "$1" "$2" "$3" "$4" "$5")"
+    # jq encodes the four strings; the threshold token, checked above, is appended as its own
+    # text, so it never passes through a number type.
+    if ! strings="$(jq -cn --arg accountId "$1" --arg type "$2" --arg instrumentId "$3" \
+        --arg direction "$4" '{$accountId, $type, $instrumentId, $direction}' 2>/dev/null | tr -d '\r')" ||
+        [[ "$strings" != \{*\} ]]; then
+        CREATE_ERROR="the request body could not be encoded"
+        return 1
+    fi
+    body="${strings%?},\"threshold\":$5}"
     http POST "$ALERTS_URL" "$body"
     if [[ "$HTTP_STATUS" == "000" ]]; then
         CREATE_ERROR="$(status_text); the alert may exist without an id this run knows"
@@ -386,6 +508,30 @@ compose() {
     MSYS_NO_PATHCONV=1 docker compose -p "$PROJECT" -f "$COMPOSE_FILE" "$@" </dev/null
 }
 
+# hard_timeout LIMIT PROGRAM [ARGS...]: runs PROGRAM under timeout(1) so that it has ended,
+# killed if need be, LIMIT seconds after it started. TERM comes LOG_PROBE_KILL_SECONDS before
+# LIMIT, so a program that honours it can end cleanly, and KILL at LIMIT; with LIMIT no longer
+# than that grace, KILL alone comes at LIMIT. Exits 124 or 137 when the limit cut PROGRAM off,
+# otherwise with PROGRAM's status. Arguments reach docker unchanged, as in compose().
+hard_timeout() {
+    local limit="$1"
+    shift
+    if [[ $limit -gt $LOG_PROBE_KILL_SECONDS ]]; then
+        MSYS_NO_PATHCONV=1 timeout -k "$LOG_PROBE_KILL_SECONDS" "$((limit - LOG_PROBE_KILL_SECONDS))" "$@"
+    else
+        MSYS_NO_PATHCONV=1 timeout -s KILL "$limit" "$@"
+    fi
+}
+
+# docker_problem WHAT STATUS LIMIT: why the Docker call WHAT, run by hard_timeout with LIMIT,
+# ended with STATUS, telling a call Docker did not answer in time from one that failed.
+docker_problem() {
+    case "$2" in
+        124 | 137) echo "$1 timed out after $3 s (Docker did not answer)" ;;
+        *) echo "$1 failed, exit $2 (see $RUN_DIR/compose.log)" ;;
+    esac
+}
+
 now_rfc3339() {
     date -u +%Y-%m-%dT%H:%M:%SZ
 }
@@ -397,10 +543,43 @@ epoch_to_rfc3339() {
 
 # broker_logs SINCE: broker-service output since SINCE, without colour codes or carriage
 # returns. The custom console logger pads each line and ends it with " | <CallerName>", so
-# callers match substrings only.
+# callers match substrings only. The read has ended, killed if need be, probe_limit seconds
+# after it started (hard_timeout), and is never started once the wait's deadline has passed. On
+# failure LOG_PROBE_DETAIL tells a read Docker did not answer in time from one that failed.
 broker_logs() {
-    compose logs --no-color --no-log-prefix --since "$1" broker-service 2>>"$RUN_DIR/compose.log" \
-        | sed "s/$(printf '\033')\[[0-9;]*m//g" | tr -d '\r'
+    local limit rc=0
+    if ! limit="$(probe_limit)"; then
+        # Only wait_cycle_line sets a deadline, and its last attempt can start just as the
+        # deadline passes. That attempt fails at once and leaves LOG_PROBE_DETAIL to the read
+        # before it, the one that tells why the wait found no line.
+        return 1
+    fi
+    LOG_PROBE_DETAIL=""
+    # compose() cannot run under timeout(1), which needs a program, so its settings are repeated.
+    hard_timeout "$limit" docker compose -p "$PROJECT" -f "$COMPOSE_FILE" \
+        logs --no-color --no-log-prefix --since "$1" broker-service </dev/null 2>>"$RUN_DIR/compose.log" \
+        | sed "s/$(printf '\033')\[[0-9;]*m//g" | tr -d '\r' || rc=$?
+    case "$rc" in
+        0) return 0 ;;
+        124 | 137) LOG_PROBE_DETAIL="broker-service logs probe timed out after $limit s (Docker did not answer)" ;;
+        *) LOG_PROBE_DETAIL="broker-service logs unreadable, exit $rc (see $RUN_DIR/compose.log)" ;;
+    esac
+    return 1
+}
+
+# probe_limit: the seconds a log read may take now, the time left to PROBE_DEADLINE inside
+# wait_cycle_line and LOG_PROBE_TIMEOUT_SECONDS outside it. Fails when the deadline has passed.
+probe_limit() {
+    local left
+    if [[ -z "$PROBE_DEADLINE" ]]; then
+        echo "$LOG_PROBE_TIMEOUT_SECONDS"
+        return 0
+    fi
+    left=$((PROBE_DEADLINE - SECONDS))
+    if [[ $left -le 0 ]]; then
+        return 1
+    fi
+    echo "$left"
 }
 
 # parse_cycle_line LINE: sets C_ALERTS, C_TRIGGERED, C_FAILED, C_SKIPPED, C_OUTCOME and
@@ -430,9 +609,12 @@ cycle_summary_text() {
 # wait_cycle_line AFTER TIMEOUT [ALERTS]: bounded poll, every LOG_STEP_SECONDS for at most
 # TIMEOUT seconds, for the first cycle line of the current window after the AFTER-th one. With
 # ALERTS, lines rendering another alert count are cycles that began during setup and are
-# skipped. Sets CYCLE_INDEX and CYCLE_LINE.
+# skipped. Sets CYCLE_INDEX and CYCLE_LINE. Its log reads see the deadline as PROBE_DEADLINE,
+# local to this call, so it ends with the wait; on expiry LOG_PROBE_DETAIL holds why the last
+# read failed, or nothing when it succeeded.
 wait_cycle_line() {
     local after="$1" deadline=$((SECONDS + $2)) wanted="${3:-}" reported="$1" index line
+    local PROBE_DEADLINE="$deadline"
     while :; do
         if broker_logs "$LOG_SINCE" >"$RUN_DIR/broker.log"; then
             index=0
@@ -543,26 +725,36 @@ running_services() {
     compose ps --status running --services 2>>"$RUN_DIR/compose.log" | tr -d '\r'
 }
 
-# container_env SERVICE NAME: the value of NAME in the service container's environment.
-# Prints nothing when it is unset.
+# container_env SERVICE NAME: the value of NAME (which holds no "=") in the service container's
+# environment, byte for byte: line feeds and carriage returns inside it and at its end included.
+# The first entry named exactly NAME wins. jq hands the value over as base64, because jq on
+# Windows writes text with CRLF line ends. Prints nothing when NAME is unset; fails when the
+# service has no container. Capture it as "$(container_env S N && printf x)" and drop the x, so
+# command substitution keeps any trailing line feed.
 container_env() {
-    local cid
+    local cid encoded value
     cid="$(compose ps -q "$1" 2>>"$RUN_DIR/compose.log" | tr -d '\r' | sed -n '1p')" || return 1
     if [[ -z "$cid" ]]; then
         return 1
     fi
-    MSYS_NO_PATHCONV=1 docker inspect --format '{{range .Config.Env}}{{println .}}{{end}}' "$cid" </dev/null \
-        | tr -d '\r' | sed -n "/^$2=/{s/^$2=//p;q;}"
+    encoded="$(MSYS_NO_PATHCONV=1 docker inspect --format '{{json .Config.Env}}' "$cid" </dev/null \
+        | jq -r --arg name "$2" 'first(.[]? | select(startswith($name + "="))) | ltrimstr($name + "=") | @base64')" \
+        || return 1
+    value="$(printf '%s' "$encoded" | tr -d '\r\n' | base64 -d && printf x)" || return 1
+    printf '%s' "${value%x}"
 }
 
-# resolve_interval RAW: the broker's interval rule. Like int.TryParse with NumberStyles.Integer,
-# surrounding white space and a leading sign are allowed; a whole number from 1 to
-# MAX_INTERVAL_SECONDS is used, anything else (unset included) gives the default.
+# resolve_interval RAW: the broker's interval rule, RAW read as int.TryParse with
+# NumberStyles.Integer and the invariant culture reads it: an optional + or - sign and ASCII
+# digits, with optional white space around them that is only tab, line feed, vertical tab, form
+# feed, carriage return and space. A whole number from 1 to MAX_INTERVAL_SECONDS is used;
+# anything else, unset included, gives the default. Both sets are spelled out because
+# [[:space:]] and [0-9] follow the locale: in a UTF-8 locale [[:space:]] also matches Unicode
+# spaces .NET rejects. The anchors of =~ hold for the whole of RAW, line feeds included.
 resolve_interval() {
-    local raw="$1" digits
-    raw="${raw#"${raw%%[![:space:]]*}"}"
-    raw="${raw%"${raw##*[![:space:]]}"}"
-    if [[ "$raw" =~ ^([+-]?)([0-9]+)$ && "${BASH_REMATCH[1]}" != "-" ]]; then
+    local ws=$' \t\n\v\f\r' re digits
+    re="^[$ws]*([+-]?)([0123456789]+)[$ws]*\$"
+    if [[ "$1" =~ $re && "${BASH_REMATCH[1]}" != "-" ]]; then
         digits="${BASH_REMATCH[2]}"
         digits="${digits#"${digits%%[!0]*}"}"
         if [[ -n "$digits" && ${#digits} -le ${#MAX_INTERVAL_SECONDS} ]] &&
@@ -626,7 +818,7 @@ delete_owned_alerts() {
 }
 
 cleanup_all() {
-    local remaining
+    local remaining rc=0
     CLEANUP_PROBLEMS=""
     LC_ALL=C sort -u "$RUN_DIR/owned" >"$RUN_DIR/owned.sorted"
     LC_ALL=C sort -u "$RUN_DIR/deleted" >"$RUN_DIR/deleted.sorted"
@@ -652,11 +844,15 @@ cleanup_all() {
             add_cleanup_problem "flag $FLAG_ID not restored to enabled=$FLAG_INITIAL: $(status_text)"
         fi
     fi
+    # loadgen starts again last, after the deletions and the flag, and under a hard limit, so a
+    # Docker engine that does not answer delays the exit by that limit at most.
     if [[ $LOADGEN_STOPPED -eq 1 ]]; then
-        if compose start loadgen >>"$RUN_DIR/compose.log" 2>&1; then
+        hard_timeout "$DOCKER_CALL_TIMEOUT_SECONDS" docker compose -p "$PROJECT" -f "$COMPOSE_FILE" \
+            start loadgen </dev/null >>"$RUN_DIR/compose.log" 2>&1 || rc=$?
+        if [[ $rc -eq 0 ]]; then
             info "cleanup: loadgen started again"
         else
-            add_cleanup_problem "loadgen was running at start and could not be started again (see $RUN_DIR/compose.log)"
+            add_cleanup_problem "loadgen was running at start and could not be started again: $(docker_problem "compose start loadgen" "$rc" "$DOCKER_CALL_TIMEOUT_SECONDS")"
         fi
     fi
     CLEANUP_DONE=1
@@ -670,7 +866,7 @@ print_report() {
     printf '  %-24s %s\n' \
         "project" "$PROJECT" \
         "base url" "$BASE_URL" \
-        "db type" "${DIALECT:-n/a}" \
+        "db type" "$(printf '%q' "${DIALECT:-n/a}")" \
         "host" "$(uname -n)" \
         "evaluation interval" "${EVAL_INTERVAL:-n/a}${EVAL_INTERVAL:+ s}" \
         "insights account" "$R_INSIGHTS_ACCOUNT" \
@@ -762,14 +958,18 @@ setup() {
     done
     pass "readiness"
 
-    DIALECT="$(container_env db-adapter DB_TYPE)" || DIALECT=""
+    # The x keeps a trailing line feed of the value; printf %q prints a value with control
+    # characters on one line, as $'...'.
+    DIALECT="$(container_env db-adapter DB_TYPE && printf x)" || DIALECT=""
+    DIALECT="${DIALECT%x}"
     if [[ "$DIALECT" != "mssql" && "$DIALECT" != "postgres" ]]; then
-        abort "runtime facts" "db-adapter DB_TYPE is [$DIALECT], expected mssql or postgres"
+        abort "runtime facts" "db-adapter DB_TYPE is [${DIALECT:+$(printf '%q' "$DIALECT")}], expected mssql or postgres"
     fi
-    raw_interval="$(container_env broker-service ALERT_EVALUATION_INTERVAL_SECONDS)" || raw_interval=""
+    raw_interval="$(container_env broker-service ALERT_EVALUATION_INTERVAL_SECONDS && printf x)" || raw_interval=""
+    raw_interval="${raw_interval%x}"
     EVAL_INTERVAL="$(resolve_interval "$raw_interval")"
     pass "runtime facts"
-    info "db type $DIALECT; evaluation interval ${EVAL_INTERVAL}s (ALERT_EVALUATION_INTERVAL_SECONDS [$raw_interval]); loadgen running at start: $([[ $LOADGEN_WAS_RUNNING -eq 1 ]] && echo yes || echo no)"
+    info "db type $DIALECT; evaluation interval ${EVAL_INTERVAL}s (ALERT_EVALUATION_INTERVAL_SECONDS [${raw_interval:+$(printf '%q' "$raw_interval")}]); loadgen running at start: $([[ $LOADGEN_WAS_RUNNING -eq 1 ]] && echo yes || echo no)"
 
     http GET "$FLAG_URL"
     if [[ "$HTTP_STATUS" != "200" ]]; then
@@ -808,44 +1008,253 @@ setup() {
     pass "flag enabled"
 }
 
-# fetch_presets: the first PRESET_COUNT preset account ids, in the service's order, into
-# $RUN_DIR/presets. Sets PRESETS_STATUS.
-fetch_presets() {
-    : >"$RUN_DIR/presets"
-    http GET "$BASE_URL/user-service/api/accounts/presets?limit=$PRESET_COUNT"
-    PRESETS_STATUS="$(status_text)"
-    if [[ "$HTTP_STATUS" == "200" ]]; then
-        jget '.results[]?.id' "$HTTP_BODY" | tr '[:upper:]' '[:lower:]' | sed '/^$/d' >"$RUN_DIR/presets"
+# ---------------------------------------------------------------------------------------------
+# Inputs. Account and instrument ids come from remote JSON, so each one is checked to be a
+# canonical UUID before it becomes part of a URL, a file name or a request body.
+
+# jq definition, used with --arg re "$UUID_RE": the lower-cased text of a canonical UUID
+# string, otherwise null. The length test keeps out a trailing newline, which jq's "$" accepts.
+JQ_CANONICAL="def canonical: if type == \"string\" and length == 36 and (ascii_downcase | test(\$re)) then ascii_downcase else null end;"
+# jq definition, used with jq -s: the one JSON value a body holds. jq -s reads the whole body,
+# so trailing text fails the read and a second value fails here; neither is read as a body.
+JQ_ONE_VALUE='def one_value: if length == 1 then .[0] else error("not exactly one JSON value") end;'
+
+# id_file_matches FILE COUNT: succeeds when FILE holds exactly COUNT lines and each one is a
+# canonical UUID. Otherwise empties FILE, so none of its lines is used, and sets
+# ID_FILE_COUNTS naming what it held.
+id_file_matches() {
+    local line lines=0 malformed=0
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        lines=$((lines + 1))
+        if [[ ! "$line" =~ $UUID_RE ]]; then
+            malformed=$((malformed + 1))
+        fi
+    done <"$1"
+    if [[ $lines -eq $2 && $malformed -eq 0 ]]; then
+        return 0
+    fi
+    : >"$1"
+    ID_FILE_COUNTS="$lines id lines written, $malformed of them not canonical UUIDs, $2 canonical ids counted"
+    return 1
+}
+
+# read_id_list JSON FILE: writes the canonical ids of a {"results": [{"id": ...}]} body, in
+# order, to FILE and sets IDS_TOTAL, IDS_INVALID (ids that are not canonical UUIDs) and
+# IDS_DUPLICATE. The body must be exactly one JSON value. Fails, leaving FILE empty and
+# IDS_ERROR naming the reason, when it is not, when jq cannot read it, when it has no results
+# array, or when FILE would not hold exactly the canonical ids counted.
+read_id_list() {
+    local lines canonical
+    IDS_ERROR=""
+    : >"$2"
+    # One line "total non-canonical canonical distinct", then the canonical ids in order.
+    if ! lines="$(jq -rs --arg re "$UUID_RE" "$JQ_CANONICAL$JQ_ONE_VALUE"'
+        (one_value | .results | if type == "array" then map((.id? // null) | canonical)
+            else error("no results array") end) as $ids
+        | [$ids[] | select(. != null)] as $ok
+        | "\($ids | length) \([$ids[] | select(. == null)] | length) \($ok | length) \($ok | unique | length)",
+          $ok[]' 2>/dev/null <<<"$1" | tr -d '\r')" ||
+        [[ ! "${lines%%$'\n'*}" =~ ^([0-9]+)\ ([0-9]+)\ ([0-9]+)\ ([0-9]+)$ ]]; then
+        IDS_ERROR="an unreadable ${HTTP_CTYPE:-untyped} body"
+        return 1
+    fi
+    IDS_TOTAL="${BASH_REMATCH[1]}"
+    IDS_INVALID="${BASH_REMATCH[2]}"
+    canonical="${BASH_REMATCH[3]}"
+    IDS_DUPLICATE=$((BASH_REMATCH[3] - BASH_REMATCH[4]))
+    if [[ "$lines" == *$'\n'* ]]; then
+        printf '%s\n' "${lines#*$'\n'}" >"$2"
+    fi
+    if ! id_file_matches "$2" "$canonical"; then
+        IDS_ERROR="results whose written ids do not match their counts: $ID_FILE_COUNTS"
+        return 1
     fi
 }
 
-# insights_profile ACCOUNT: GETs the account's insights. Sets PROFILE_STATUS,
-# PROFILE_ALLOCATIONS and PROFILE_HELD (allocations with quantity > 0), and writes the held
-# instrument ids, sorted, to $RUN_DIR/held-ACCOUNT. Succeeds when the account holds exactly
-# HOLDINGS_EXPECTED instruments.
+# fetch_presets: the first PRESET_COUNT preset account ids, in the service's order, into
+# $RUN_DIR/presets. They must be exactly PRESET_COUNT distinct canonical UUIDs; otherwise
+# PRESETS_ERROR names the counts and $RUN_DIR/presets stays empty, so no id is used.
+fetch_presets() {
+    PRESETS_ERROR=""
+    : >"$RUN_DIR/presets"
+    http GET "$BASE_URL/user-service/api/accounts/presets?limit=$PRESET_COUNT"
+    if [[ "$HTTP_STATUS" != "200" ]]; then
+        PRESETS_ERROR="GET presets gave $(status_text); exactly $PRESET_COUNT distinct canonical account ids are needed"
+        return 0
+    fi
+    if ! read_id_list "$HTTP_BODY" "$RUN_DIR/presets"; then
+        PRESETS_ERROR="GET presets gave status 200 with $IDS_ERROR; exactly $PRESET_COUNT distinct canonical account ids are needed"
+        return 0
+    fi
+    if [[ $IDS_TOTAL -ne $PRESET_COUNT || $IDS_INVALID -ne 0 || $IDS_DUPLICATE -ne 0 ]]; then
+        : >"$RUN_DIR/presets"
+        PRESETS_ERROR="GET presets gave $IDS_TOTAL accounts, $IDS_INVALID without a canonical UUID id and $IDS_DUPLICATE duplicate ids; exactly $PRESET_COUNT distinct canonical account ids are needed"
+    fi
+}
+
+# insights_profile ACCOUNT: GETs the account's insights. Sets PROFILE_STATUS and
+# PROFILE_COUNTS (empty when there are none to name), and writes the distinct held instrument
+# ids, sorted, to $RUN_DIR/held-ACCOUNT. Succeeds when the account has exactly
+# HOLDINGS_EXPECTED allocations and every one is held, each on another instrument. An ACCOUNT
+# that is not a canonical UUID is refused before it reaches a file name or a URL. The body
+# must be exactly one JSON value, and the held file exactly the canonical ids counted;
+# otherwise the file is left empty.
 insights_profile() {
-    local counts
+    local lines allocations positive invalid held distinct
+    PROFILE_COUNTS=""
+    if [[ ! "$1" =~ $UUID_RE ]]; then
+        PROFILE_STATUS="refused: the account id is not a canonical UUID"
+        return 1
+    fi
     : >"$RUN_DIR/held-$1"
-    PROFILE_ALLOCATIONS="?"
-    PROFILE_HELD="?"
     http GET "$INSIGHTS_URL/$1"
     PROFILE_STATUS="$(status_text)"
     if [[ "$HTTP_STATUS" != "200" ]]; then
         return 1
     fi
-    counts="$(jget '(.allocations // []) | "\(length) \([.[] | select(.quantity > 0)] | length)"' "$HTTP_BODY")"
-    if [[ ! "$counts" =~ ^[0-9]+\ [0-9]+$ ]]; then
+    # One line "allocations positive non-canonical held distinct", then the distinct held
+    # instrument ids, sorted. An allocation is held when its quantity is a JSON number above 0
+    # and its instrumentId is a canonical UUID. The type is tested first because jq orders
+    # every string and object above every number.
+    if ! lines="$(jq -rs --arg re "$UUID_RE" "$JQ_CANONICAL$JQ_ONE_VALUE"'
+        (one_value | .allocations | if type == "array" then . else error("no allocations array") end
+            | map(if type == "object"
+                then {positive: ((.quantity | type) == "number" and .quantity > 0), id: (.instrumentId | canonical)}
+                else {positive: false, id: null} end)) as $all
+        | [$all[] | select(.positive and .id != null) | .id] as $held
+        | "\($all | length) \([$all[] | select(.positive)] | length) \([$all[] | select(.id == null)] | length) \($held | length) \($held | unique | length)",
+          ($held | unique[])' 2>/dev/null <<<"$HTTP_BODY" | tr -d '\r')" ||
+        [[ ! "${lines%%$'\n'*}" =~ ^([0-9]+)\ ([0-9]+)\ ([0-9]+)\ ([0-9]+)\ ([0-9]+)$ ]]; then
         PROFILE_STATUS="status 200 with an unreadable ${HTTP_CTYPE:-untyped} body"
         return 1
     fi
-    PROFILE_ALLOCATIONS="${counts% *}"
-    PROFILE_HELD="${counts#* }"
-    jget '(.allocations // [])[] | select(.quantity > 0) | .instrumentId' "$HTTP_BODY" \
-        | tr '[:upper:]' '[:lower:]' | sed '/^$/d' | LC_ALL=C sort -u >"$RUN_DIR/held-$1"
-    if [[ "$PROFILE_ALLOCATIONS" != "$HOLDINGS_EXPECTED" || "$PROFILE_HELD" != "$HOLDINGS_EXPECTED" ]]; then
+    allocations="${BASH_REMATCH[1]}"
+    positive="${BASH_REMATCH[2]}"
+    invalid="${BASH_REMATCH[3]}"
+    held="${BASH_REMATCH[4]}"
+    distinct="${BASH_REMATCH[5]}"
+    PROFILE_COUNTS="$allocations allocations, $positive with a numeric quantity > 0, $invalid without a canonical instrumentId, $held held on $distinct distinct instruments"
+    if [[ "$lines" == *$'\n'* ]]; then
+        printf '%s\n' "${lines#*$'\n'}" | LC_ALL=C sort -u >"$RUN_DIR/held-$1"
+    fi
+    if ! id_file_matches "$RUN_DIR/held-$1" "$distinct"; then
+        PROFILE_STATUS="status 200 with held instruments that do not match their counts: $ID_FILE_COUNTS"
+        return 1
+    fi
+    if [[ $allocations -ne $HOLDINGS_EXPECTED || $held -ne $HOLDINGS_EXPECTED || $distinct -ne $HOLDINGS_EXPECTED ]]; then
         return 1
     fi
     return 0
+}
+
+# select_insights_account: the p95 account, from what preflight_inputs recorded before any
+# timing: the first preset whose insights passed insights_profile, as SELECTED_ACCOUNT. That
+# preset is timed only when its instrument listing matched its holdings too, so the timed
+# account is fully verified. Sets SELECT_ERROR, naming the counts found, when no preset
+# qualifies or the first one that does failed its listing.
+select_insights_account() {
+    local k seen=""
+    SELECTED_ACCOUNT=""
+    SELECT_ERROR=""
+    if [[ -n "$PRESETS_ERROR" ]]; then
+        SELECT_ERROR="$PRESETS_ERROR"
+        return 1
+    fi
+    if [[ -z "${INPUTS_VERIFIED:-}" ]]; then
+        SELECT_ERROR="the preset inputs were not verified before the account was selected"
+        return 1
+    fi
+    for ((k = 0; k < ${#INPUT_IDS[@]}; k++)); do
+        if [[ "${INPUT_HELD[k]}" == "1" ]]; then
+            if [[ -n "${INPUT_LISTING[k]}" ]]; then
+                SELECT_ERROR="the first preset with exactly $HOLDINGS_EXPECTED allocations, each with a numeric quantity > 0 on a distinct canonical instrumentId, [${INPUT_IDS[k]}], is not timed because its instrument listing does not match its holdings: ${INPUT_LISTING[k]}${seen:+; presets before it:$seen}"
+                return 1
+            fi
+            SELECTED_ACCOUNT="${INPUT_IDS[k]}"
+            return 0
+        fi
+        seen="$seen [${INPUT_IDS[k]}] ${INPUT_INSIGHTS[k]};"
+    done
+    SELECT_ERROR="no preset account has exactly $HOLDINGS_EXPECTED allocations, each with a numeric quantity > 0 on a distinct canonical instrumentId:$seen"
+    return 1
+}
+
+# verify_cycle_inputs: every preset holds HOLDINGS_EXPECTED instruments (insights_profile), and
+# its instrument listing returns exactly those: HOLDINGS_EXPECTED distinct canonical ids, the
+# same set as the held one. An id that is not a canonical UUID is refused before any URL or
+# file name is built from it. Records, per preset in order, INPUT_IDS, INPUT_HELD (1 when its
+# insights passed insights_profile), INPUT_INSIGHTS (that insights status and its counts) and
+# INPUT_LISTING (the listing shortfall, empty when the listing matched). Sets INPUTS_ERROR,
+# naming the counts of each account that falls short.
+verify_cycle_inputs() {
+    local id problem shortfalls="" listing unlisted unheld
+    INPUTS_ERROR=""
+    INPUT_IDS=()
+    INPUT_HELD=()
+    INPUT_INSIGHTS=()
+    INPUT_LISTING=()
+    if [[ -n "$PRESETS_ERROR" ]]; then
+        INPUTS_ERROR="$PRESETS_ERROR"
+        return 1
+    fi
+    while IFS= read -r id; do
+        INPUT_IDS+=("$id")
+        if [[ ! "$id" =~ $UUID_RE ]]; then
+            INPUT_HELD+=(0)
+            INPUT_INSIGHTS+=("refused: the account id is not a canonical UUID")
+            INPUT_LISTING+=("not requested")
+            shortfalls="$shortfalls [$id] refused: the account id is not a canonical UUID, so neither its insights nor its instrument listing is requested;"
+            continue
+        fi
+        problem=""
+        if insights_profile "$id"; then
+            INPUT_HELD+=(1)
+        else
+            INPUT_HELD+=(0)
+            problem="insights $PROFILE_STATUS${PROFILE_COUNTS:+, $PROFILE_COUNTS}"
+        fi
+        INPUT_INSIGHTS+=("$PROFILE_STATUS${PROFILE_COUNTS:+, $PROFILE_COUNTS}")
+        listing=""
+        http GET "$BASE_URL/broker-service/v1/instrument?accountId=$id"
+        if [[ "$HTTP_STATUS" != "200" ]]; then
+            listing="$(status_text)"
+        elif ! read_id_list "$HTTP_BODY" "$RUN_DIR/listed"; then
+            listing="status 200 with $IDS_ERROR"
+        else
+            LC_ALL=C sort -u -o "$RUN_DIR/listed" "$RUN_DIR/listed"
+            unlisted=$(($(LC_ALL=C comm -23 "$RUN_DIR/held-$id" "$RUN_DIR/listed" | wc -l)))
+            unheld=$(($(LC_ALL=C comm -13 "$RUN_DIR/held-$id" "$RUN_DIR/listed" | wc -l)))
+            if [[ $IDS_TOTAL -ne $HOLDINGS_EXPECTED || $IDS_INVALID -ne 0 || $IDS_DUPLICATE -ne 0 ||
+                $unlisted -ne 0 || $unheld -ne 0 ]]; then
+                listing="$IDS_TOTAL results, $IDS_INVALID without a canonical UUID id, $IDS_DUPLICATE duplicate ids, $unlisted held instruments not listed, $unheld listed instruments not held"
+            fi
+        fi
+        INPUT_LISTING+=("$listing")
+        if [[ -n "$listing" ]]; then
+            problem="${problem:+$problem, }instrument listing $listing"
+        fi
+        if [[ -n "$problem" ]]; then
+            shortfalls="$shortfalls [$id] $problem;"
+        fi
+    done <"$RUN_DIR/presets"
+    if [[ -n "$shortfalls" ]]; then
+        INPUTS_ERROR="every preset must hold and list the same $HOLDINGS_EXPECTED instruments:$shortfalls"
+        return 1
+    fi
+    return 0
+}
+
+# preflight_inputs: runs verify_cycle_inputs once, after fetch_presets and before anything is
+# timed or created, and prints its "cycle inputs" line. select_insights_account chooses the
+# p95 account from what it recorded, and measure_cycle measures only when INPUTS_VERIFIED is 1.
+preflight_inputs() {
+    INPUTS_VERIFIED=0
+    if verify_cycle_inputs; then
+        INPUTS_VERIFIED=1
+        pass "cycle inputs"
+    else
+        fail "cycle inputs" "$INPUTS_ERROR"
+    fi
 }
 
 
@@ -933,24 +1342,14 @@ insights_trace_durations() {
 }
 
 measure_insights() {
-    local account="" id seen="" since i total out rc nonce failures=0 reasons="" timed p95 p95_ms
+    local account="" since i total out rc nonce failures=0 reasons="" timed p95 p95_ms
     local matched median_ms server_p95_ms
 
-    if [[ ! -s "$RUN_DIR/presets" ]]; then
-        fail "insights p95 account" "GET presets gave $PRESETS_STATUS with no account ids"
+    if ! select_insights_account; then
+        fail "insights p95 account" "$SELECT_ERROR"
         return 0
     fi
-    while IFS= read -r id; do
-        if insights_profile "$id"; then
-            account="$id"
-            break
-        fi
-        seen="$seen [$id] $PROFILE_STATUS, $PROFILE_ALLOCATIONS allocations, $PROFILE_HELD held;"
-    done <"$RUN_DIR/presets"
-    if [[ -z "$account" ]]; then
-        fail "insights p95 account" "no preset account has exactly $HOLDINGS_EXPECTED allocations with quantity > 0:$seen"
-        return 0
-    fi
+    account="$SELECTED_ACCOUNT"
     R_INSIGHTS_ACCOUNT="$account"
     pass "insights p95 account"
 
@@ -1010,7 +1409,7 @@ measure_insights() {
     # the valid timed requests, matched by the trace id each one sent. Warm-ups, failed requests
     # and other callers' requests carry other trace ids and are left out.
     if ! broker_logs "$since" >"$RUN_DIR/insights.log"; then
-        info "insights server share: broker-service logs unreadable (see $RUN_DIR/compose.log)"
+        info "insights server share: $LOG_PROBE_DETAIL"
         return 0
     fi
     if ! insights_trace_durations "$account" "$RUN_DIR/insights.log" "$RUN_DIR/insights-traces" \
@@ -1113,7 +1512,7 @@ select_cycle_sample() {
     open_verified_window || rc=$?
     if [[ $rc -eq 1 ]]; then
         R_CYCLE_VERDICT="FAIL"
-        fail "cycle < 10 s" "broker-service logs unreadable (see $RUN_DIR/compose.log)"
+        fail "cycle < 10 s" "${LOG_PROBE_DETAIL:-broker-service logs unreadable (see $RUN_DIR/compose.log)}"
         return 1
     fi
     if [[ $rc -ne 0 ]]; then
@@ -1131,7 +1530,7 @@ select_cycle_sample() {
     while :; do
         if ! wait_cycle_line "$after" "$timeout" "$ALERTS_EXPECTED"; then
             R_CYCLE_VERDICT="FAIL"
-            fail "cycle < 10 s" "no cycle line rendered alerts [$ALERTS_EXPECTED] within ${timeout}s after $CYCLE_T${reasons:+; rejected: $reasons}"
+            fail "cycle < 10 s" "no cycle line rendered alerts [$ALERTS_EXPECTED] within ${timeout}s after $CYCLE_T${LOG_PROBE_DETAIL:+; last read: $LOG_PROBE_DETAIL}${reasons:+; rejected: $reasons}"
             return 1
         fi
         parse_cycle_line "$CYCLE_LINE"
@@ -1178,7 +1577,7 @@ select_cycle_sample() {
         open_verified_window || rc=$?
         if [[ $rc -eq 1 ]]; then
             R_CYCLE_VERDICT="FAIL"
-            fail "cycle < 10 s" "broker-service logs unreadable (see $RUN_DIR/compose.log)"
+            fail "cycle < 10 s" "${LOG_PROBE_DETAIL:-broker-service logs unreadable (see $RUN_DIR/compose.log)}"
             return 1
         fi
         if [[ $rc -ne 0 ]]; then
@@ -1212,9 +1611,9 @@ record_follow_ups() {
         attempt=$((attempt + 1))
         if ! wait_cycle_line "$after" "$timeout" "$wanted"; then
             if [[ -n "$wanted" ]]; then
-                problem="no cycle line rendered alerts [$wanted] within ${timeout}s after $CYCLE_T"
+                problem="no cycle line rendered alerts [$wanted] within ${timeout}s after $CYCLE_T${LOG_PROBE_DETAIL:+; last read: $LOG_PROBE_DETAIL}"
             else
-                problem="no cycle line within ${timeout}s"
+                problem="no cycle line within ${timeout}s${LOG_PROBE_DETAIL:+; last read: $LOG_PROBE_DETAIL}"
             fi
             problems="${problems:+$problems; }follow-up $attempt: $problem"
             info "follow-up cycle $attempt: $problem"
@@ -1263,7 +1662,7 @@ record_follow_ups() {
         rc=0
         open_verified_window || rc=$?
         if [[ $rc -eq 1 ]]; then
-            problems="$problems; broker-service logs unreadable (see $RUN_DIR/compose.log)"
+            problems="$problems; ${LOG_PROBE_DETAIL:-broker-service logs unreadable (see $RUN_DIR/compose.log)}"
             break
         fi
         if [[ $rc -ne 0 ]]; then
@@ -1286,34 +1685,16 @@ record_follow_ups() {
 }
 
 measure_cycle() {
-    local count id problem listed shortfalls="" armed created=0 k type instrument held
+    local id armed created=0 k type instrument held
     local instruments units limit
 
     # Inputs: all presets hold every instrument, and every instrument is listed with a price.
-    count=$(($(wc -l <"$RUN_DIR/presets")))
-    if [[ $count -lt $PRESET_COUNT ]]; then
-        fail "cycle inputs" "GET presets gave $PRESETS_STATUS with $count accounts, $PRESET_COUNT needed"
+    # preflight_inputs verified them before anything was timed and printed "cycle inputs";
+    # nothing is created on inputs that failed it.
+    if [[ "${INPUTS_VERIFIED:-0}" != "1" ]]; then
+        info "cycle not measured: the cycle inputs check did not pass"
         return 0
     fi
-    while IFS= read -r id; do
-        problem=""
-        if ! insights_profile "$id"; then
-            problem="insights $PROFILE_STATUS, $PROFILE_ALLOCATIONS allocations, $PROFILE_HELD held"
-        fi
-        http GET "$BASE_URL/broker-service/v1/instrument?accountId=$id"
-        listed="$(jget '(.results // []) | length' "$HTTP_BODY")"
-        if [[ "$HTTP_STATUS" != "200" || "$listed" != "$HOLDINGS_EXPECTED" ]]; then
-            problem="${problem:+$problem, }instrument listing $(status_text) with ${listed:-?} results"
-        fi
-        if [[ -n "$problem" ]]; then
-            shortfalls="$shortfalls [$id] $problem;"
-        fi
-    done <"$RUN_DIR/presets"
-    if [[ -n "$shortfalls" ]]; then
-        fail "cycle inputs" "every preset must hold and list $HOLDINGS_EXPECTED instruments:$shortfalls"
-        return 0
-    fi
-    pass "cycle inputs"
 
     if ! read_armed_set; then
         fail "cycle precondition" "$ARMED_ERROR"
@@ -1392,15 +1773,24 @@ on_signal() {
     exit 130
 }
 
-trap on_exit EXIT
-trap on_signal INT TERM
+# Runs the checks in order. The options, the tool checks and the run directory are handled
+# above, when the file is read.
+main() {
+    trap on_exit EXIT
+    trap on_signal INT TERM
 
-STARTED_AT="$(now_rfc3339)"
-info "run dir $RUN_DIR"
-info "started $STARTED_AT: project [$PROJECT], base url $BASE_URL, compose file $COMPOSE_FILE"
-setup
-fetch_presets
-measure_insights
-measure_cycle
-finish
+    STARTED_AT="$(now_rfc3339)"
+    info "run dir $RUN_DIR"
+    info "started $STARTED_AT: project [$PROJECT], base url $BASE_URL, compose file $COMPOSE_FILE"
+    setup
+    fetch_presets
+    preflight_inputs
+    measure_insights
+    measure_cycle
+    finish
+}
 
+# Sourcing the file defines its functions without running it.
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    main
+fi

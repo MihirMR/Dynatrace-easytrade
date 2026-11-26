@@ -4,7 +4,8 @@
 # of two fresh accounts, enabling the flag, the insights figures, the empty account, every
 # documented 400 and 404, alert CRUD for both types, a trigger within two evaluation cycles, no
 # second notification, the browser check in both modes, an untriggered acknowledge, and cleanup.
-# Run it from the repository root, once per dialect, against a project whose stack is up.
+# Run it from the repository root, once per dialect, against a project whose stack is up with
+# the shipped defaults: step 1 stops the run, before any write, unless the flag starts disabled.
 #
 # Usage: scripts/portfolio-insights/e2e.sh --project NAME [--base-url URL]
 #            [--compose-file FILE] [--evidence-dir DIR]
@@ -56,10 +57,21 @@ LOG_LINE_TIMEOUT_SECONDS=30
 # Log windows start this far back so a host clock ahead of the Docker engine's loses no line;
 # lines already present when a window opens are counted as its baseline, never read as new.
 LOG_SKEW_MARGIN_SECONDS=30
+# Every broker-service log read runs under timeout(1), so a Docker call that never answers
+# cannot hold the run. Inside poll it may take the time left to the poll's deadline; a read
+# outside any poll may take this fixed bound. Either is a hard limit on the whole read, its
+# termination included: TERM comes LOG_PROBE_KILL_SECONDS before the limit and KILL at it.
+LOG_PROBE_TIMEOUT_SECONDS=60
+LOG_PROBE_KILL_SECONDS=5
 # Cleanup stops sending DELETEs after this many transport errors in a row.
 MAX_CONSECUTIVE_TRANSPORT_ERRORS=5
 # The threshold domain maximum (10 integer and 8 fractional digits), sent as the exact token.
 MAX_THRESHOLD="9999999999.99999999"
+# The trigger-value domain: at most 20 integer and 8 fractional digits once normalised, so
+# |value| <= MAX_TRIGGER_VALUE, 28 significant digits.
+MAX_TRIGGER_VALUE="99999999999999999999.99999999"
+TRIGGER_INTEGER_DIGITS=20
+TRIGGER_FRACTION_DIGITS=8
 # A close of C units of 1e-8 in this range keeps both C - 1 and C + 1 inside the TARGET_PRICE
 # threshold domain, which is above 0 and at most MAX_THRESHOLD.
 MIN_CLOSE_UNITS=2
@@ -104,6 +116,101 @@ usage_error() {
     exit 2
 }
 
+# The origin helpers list their characters instead of using ranges, so no locale can widen a
+# bracket expression beyond ASCII.
+# scripts/portfolio-insights/harness-test.sh tests these helpers and this script's Docker probes.
+
+# is_port_number TEXT: 1 to 5 decimal digits whose value is from 1 to 65535.
+is_port_number() {
+    local re='^[0123456789]{1,5}$'
+    [[ "$1" =~ $re ]] && ((10#$1 >= 1 && 10#$1 <= 65535))
+}
+
+# is_ipv4_address TEXT: a dotted quad of four decimal octets from 0 to 255, none with a leading
+# zero, which a WHATWG URL parser would read as octal.
+is_ipv4_address() {
+    local octet='(0|[123456789][0123456789]{0,2})' i
+    local re="^${octet}\\.${octet}\\.${octet}\\.${octet}\$"
+    [[ "$1" =~ $re ]] || return 1
+    for i in 1 2 3 4; do
+        ((10#${BASH_REMATCH[i]} <= 255)) || return 1
+    done
+}
+
+# is_dns_name TEXT: labels of 1 to 63 letters, digits and inner hyphens joined by dots, with one
+# optional trailing dot for a rooted name and at most 253 characters without it. The last label
+# is not a number (all digits, or 0x and hex digits), since a WHATWG URL parser reads a host that
+# ends in one as an IPv4 address.
+is_dns_name() {
+    local alnum='0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz'
+    local label="[${alnum}]([${alnum}-]{0,61}[${alnum}])?"
+    local re="^${label}(\\.${label})*\$"
+    local number='^([0123456789]+|0[xX][0123456789ABCDEFabcdef]*)$'
+    local name="${1%.}"
+    ((${#name} <= 253)) && [[ "$name" =~ $re && ! "${name##*.}" =~ $number ]]
+}
+
+# is_ipv6_address TEXT: an unbracketed IPv6 address in RFC 4291 text form. That is one to eight
+# groups of 1 to 4 hex digits, at most one "::" standing for one or more zero groups, and an
+# optional trailing dotted quad that counts as two groups. A zone id is refused.
+is_ipv6_address() {
+    local hex='[0123456789ABCDEFabcdef]{1,4}'
+    local re="^${hex}(:${hex})*\$"
+    local text="$1" head tail quad part colons groups=0
+    if [[ "$text" == *.* ]]; then
+        quad="${text##*:}"
+        is_ipv4_address "$quad" || return 1
+        text="${text%"$quad"}0:0"
+    fi
+    head="$text"
+    tail=""
+    if [[ "$text" == *::* ]]; then
+        head="${text%%::*}"
+        tail="${text#*::}"
+        [[ "$tail" != *::* ]] || return 1
+    fi
+    for part in "$head" "$tail"; do
+        if [[ -n "$part" ]]; then
+            [[ "$part" =~ $re ]] || return 1
+            colons="${part//[!:]/}"
+            groups=$((groups + ${#colons} + 1))
+        fi
+    done
+    if [[ "$text" == *::* ]]; then
+        ((groups < 8))
+    else
+        ((groups == 8))
+    fi
+}
+
+# is_base_origin TEXT: an http:// or https:// origin, that is a host (a DNS name, an IPv4 address
+# or a bracketed IPv6 literal) and an optional port, with at most one trailing slash. It refuses
+# credentials, a path, a query, a fragment, whitespace and control characters, so an accepted
+# origin is safe to print and to build every request URL from. A WHATWG URL parser, as the browser
+# check uses, reads every origin it accepts as an origin.
+is_base_origin() {
+    local authority host port
+    # No origin is longer than 269 characters: https://, a 253-character name and its root dot, a
+    # five-digit port and a slash. Longer text is refused before any pattern runs on it.
+    ((${#1} <= 269)) || return 1
+    case "$1" in
+        http://* | https://*) authority="${1#*://}" ;;
+        *) return 1 ;;
+    esac
+    authority="${authority%/}"
+    if [[ "$authority" == \[* ]]; then
+        [[ "$authority" == *\]* ]] || return 1
+        host="${authority%%\]*}"
+        port="${authority#*\]}"
+        is_ipv6_address "${host#\[}" || return 1
+    else
+        host="${authority%%:*}"
+        port="${authority#"$host"}"
+        is_ipv4_address "$host" || is_dns_name "$host" || return 1
+    fi
+    [[ -z "$port" ]] || { [[ "$port" == :* ]] && is_port_number "${port#:}"; }
+}
+
 BASE_URL="http://localhost"
 COMPOSE_FILE="compose.dev.yaml"
 PROJECT=""
@@ -127,7 +234,12 @@ while [[ $# -gt 0 ]]; do
             exit 0
             ;;
         *)
-            usage_error "Unknown option: $1"
+            # Only a bare option name is echoed: a stray value or a --name=value argument can be
+            # a URL that holds credentials.
+            if [[ "$1" =~ ^--?[A-Za-z][A-Za-z0-9-]*$ ]]; then
+                usage_error "Unknown option: $1"
+            fi
+            usage_error "Unknown argument (not shown): each option takes its value as the next argument."
             ;;
     esac
 done
@@ -136,8 +248,9 @@ if [[ -z "$PROJECT" ]]; then
     usage_error "Option --project is required."
 fi
 # The browser check serves the app from the origin's root, so a path is refused here as well.
-if [[ ! "$BASE_URL" =~ ^https?://[^/?#[:space:]]+/?$ ]]; then
-    usage_error "Option --base-url needs an http:// or https:// origin without a path, got: $BASE_URL"
+# The refused value is never echoed, since it can hold credentials.
+if ! is_base_origin "$BASE_URL"; then
+    usage_error "Option --base-url needs an http:// or https:// origin: a host and optional port, without credentials, path, query or fragment."
 fi
 BASE_URL="${BASE_URL%/}"
 if [[ ! -f "$COMPOSE_FILE" ]]; then
@@ -145,13 +258,21 @@ if [[ ! -f "$COMPOSE_FILE" ]]; then
 fi
 
 missing_tools=""
-for tool in bash curl jq docker node; do
+for tool in bash curl jq docker node timeout; do
     if ! command -v "$tool" >/dev/null 2>&1; then
         missing_tools="$missing_tools $tool"
     fi
 done
 if [[ -n "$missing_tools" ]]; then
     echo "Missing required tools:$missing_tools" >&2
+    exit 2
+fi
+# Trigger values and closes are read as the number literal jq prints for the unmodified value.
+# jq before 1.7 reads every number as a double and prints MAX_TRIGGER_VALUE as 1e+20, so a jq
+# that changes the literal, printed directly, interpolated or through tojson, is refused.
+if [[ "$(jq -c '[.v, "\(.v)", (.v | tojson)]' <<<"{\"v\":$MAX_TRIGGER_VALUE}" 2>/dev/null | tr -d '\r')" != \
+    "[$MAX_TRIGGER_VALUE,\"$MAX_TRIGGER_VALUE\",\"$MAX_TRIGGER_VALUE\"]" ]]; then
+    echo "jq must keep number literals exact (jq 1.7 or later); $(jq --version 2>/dev/null | tr -d '\r') changes $MAX_TRIGGER_VALUE." >&2
     exit 2
 fi
 if ! docker compose version >/dev/null 2>&1 </dev/null; then
@@ -292,6 +413,10 @@ LAST_TRIGGER_INDEX=""
 PAIRS_READY=0
 SKIP_REASON=""
 POLL_DETAIL=""
+# The absolute deadline (epoch seconds) of the poll running now, empty outside a poll, and why
+# the last log read failed.
+PROBE_DEADLINE=""
+LOG_PROBE_DETAIL=""
 
 # ---------------------------------------------------------------------------------------------
 # Reporting
@@ -353,7 +478,7 @@ http() {
     if [[ $rc -ne 0 ]]; then
         HTTP_STATUS="000"
         HTTP_CTYPE=""
-        HTTP_ERROR="$(tr -d '\r' <"$PRIVATE_DIR/curl-error" | grep -v 'Debug-enabled' | head -c 300)"
+        HTTP_ERROR="$(tr -d '\r' <"$PRIVATE_DIR/curl-error" | { grep -v 'Debug-enabled' || true; } | head -c 300)"
     else
         HTTP_STATUS="${out%% *}"
         HTTP_CTYPE="${out#* }"
@@ -497,8 +622,10 @@ expect_forbidden() {
 }
 
 # ---------------------------------------------------------------------------------------------
-# Exact decimals. jq compares and prints numbers as doubles (0.00000001 comes out as 1E-8), so
-# thresholds, closes and trigger values are compared here as bash integers in units of 1e-8.
+# Exact decimals. jq compares numbers as doubles and prints small ones in exponent form
+# (0.00000001 comes out as 1E-8), so thresholds and closes are compared here as bash integers
+# in units of 1e-8. Trigger values reach 20 integer digits, beyond int64 units, so they are
+# compared as digit strings instead.
 
 # dec_to_units TEXT: plain decimal text to units of 1e-8, rounding half away from zero beyond
 # the eighth fractional digit. Fails on anything else or on more than 10 integer digits, which
@@ -600,6 +727,123 @@ units_to_dec() {
     echo "$sign$int.$frac"
 }
 
+# num_split TEXT: a number as jq prints it, exponent form included (-1E-8, 1.5E+3), read
+# exactly at any length. Sets NUM_SIGN ("-" or empty), NUM_DIGITS (the significant digits,
+# without leading or trailing zeros), NUM_POINT (the decimal point's place in NUM_DIGITS: 0 is
+# before the first digit, and it may lie outside them), and NUM_INTEGERS and NUM_FRACTIONS (the
+# digit counts of the normalised value). Zero, -0 included, has an empty sign and no digits.
+# Fails on anything that is not a JSON number.
+num_split() {
+    local int frac exp_sign exp lead
+    if [[ ! "$1" =~ ^(-?)([0-9]+)(\.([0-9]+))?([eE]([+-]?)([0-9]+))?$ ]]; then
+        return 1
+    fi
+    NUM_SIGN="${BASH_REMATCH[1]}"
+    int="${BASH_REMATCH[2]}"
+    frac="${BASH_REMATCH[4]}"
+    exp_sign="${BASH_REMATCH[6]}"
+    exp="${BASH_REMATCH[7]}"
+    NUM_DIGITS="$int$frac"
+    lead="${NUM_DIGITS%%[!0]*}"
+    NUM_DIGITS="${NUM_DIGITS#"$lead"}"
+    NUM_DIGITS="${NUM_DIGITS%"${NUM_DIGITS##*[!0]}"}"
+    NUM_POINT=0
+    NUM_INTEGERS=0
+    NUM_FRACTIONS=0
+    if [[ -z "$NUM_DIGITS" ]]; then
+        NUM_SIGN=""
+        return 0
+    fi
+    exp="${exp#"${exp%%[!0]*}"}"
+    # An exponent of 18 or more digits moves the point past any text, so it is capped at 10^17:
+    # the arithmetic stays inside int64 and the value stays outside every domain.
+    if [[ ${#exp} -gt 17 ]]; then
+        exp=100000000000000000
+    fi
+    NUM_POINT=$((${#int} - ${#lead}))
+    if [[ "$exp_sign" == "-" ]]; then
+        NUM_POINT=$((NUM_POINT - 10#${exp:-0}))
+    else
+        NUM_POINT=$((NUM_POINT + 10#${exp:-0}))
+    fi
+    if [[ $NUM_POINT -gt 0 ]]; then
+        NUM_INTEGERS=$NUM_POINT
+    fi
+    if [[ $((${#NUM_DIGITS} - NUM_POINT)) -gt 0 ]]; then
+        NUM_FRACTIONS=$((${#NUM_DIGITS} - NUM_POINT))
+    fi
+}
+
+# magnitude_cmp DIGITS_A POINT_A DIGITS_B POINT_B: compares two magnitudes as num_split gives
+# them. Prints -1, 0 or 1 as A is below, equal to or above B.
+magnitude_cmp() {
+    local a="$1" b="$3" zeros i x y
+    if [[ -z "$a" || -z "$b" ]]; then
+        if [[ -z "$a" && -z "$b" ]]; then
+            echo 0
+        elif [[ -z "$a" ]]; then
+            echo -1
+        else
+            echo 1
+        fi
+        return 0
+    fi
+    # Both lead with a nonzero digit, so the later decimal point is the larger magnitude.
+    if [[ $2 -ne $4 ]]; then
+        if [[ $2 -lt $4 ]]; then
+            echo -1
+        else
+            echo 1
+        fi
+        return 0
+    fi
+    printf -v zeros '%*s' "$((${#a} > ${#b} ? ${#a} - ${#b} : ${#b} - ${#a}))" ''
+    if [[ ${#a} -lt ${#b} ]]; then
+        a="$a${zeros// /0}"
+    else
+        b="$b${zeros// /0}"
+    fi
+    # Equal-length digit strings, compared 18 digits at a time so each part fits int64.
+    for ((i = 0; i < ${#a}; i += 18)); do
+        x=$((10#${a:i:18}))
+        y=$((10#${b:i:18}))
+        if [[ $x -ne $y ]]; then
+            if [[ $x -lt $y ]]; then
+                echo -1
+            else
+                echo 1
+            fi
+            return 0
+        fi
+    done
+    echo 0
+}
+
+# num_cmp A B: exact comparison of two numbers as jq prints them, at any length. Prints -1, 0
+# or 1 as A is below, equal to or above B. Fails when either is not a number.
+num_cmp() {
+    local a_sign a_digits a_point order
+    num_split "$1" || return 1
+    a_sign="$NUM_SIGN"
+    a_digits="$NUM_DIGITS"
+    a_point="$NUM_POINT"
+    num_split "$2" || return 1
+    # Zero has no sign, so differing signs alone decide: the negative number is the lower.
+    if [[ "$a_sign" != "$NUM_SIGN" ]]; then
+        if [[ "$a_sign" == "-" ]]; then
+            echo -1
+        else
+            echo 1
+        fi
+        return 0
+    fi
+    order="$(magnitude_cmp "$a_digits" "$a_point" "$NUM_DIGITS" "$NUM_POINT")"
+    if [[ "$a_sign" == "-" ]]; then
+        order=$((-order))
+    fi
+    echo "$order"
+}
+
 # ---------------------------------------------------------------------------------------------
 # Identifiers and times
 
@@ -637,10 +881,13 @@ log_since_now() {
 # poll CHECK TIMEOUT STEP COMMAND [ARGS...]: runs COMMAND every STEP seconds until it succeeds
 # or the deadline TIMEOUT seconds from now passes. On expiry it reports FAIL CHECK, with the
 # POLL_DETAIL the last attempt left, and fails. STEP is the only sleep the script makes.
+# COMMAND's log reads see the deadline as PROBE_DEADLINE, local to this call, so it ends with
+# the poll.
 poll() {
     local check="$1" timeout="$2" step="$3" deadline
     shift 3
     deadline=$(($(date -u +%s) + timeout))
+    local PROBE_DEADLINE="$deadline"
     POLL_DETAIL=""
     while :; do
         if "$@"; then
@@ -664,30 +911,55 @@ compose() {
     MSYS_NO_PATHCONV=1 docker compose -p "$PROJECT" -f "$COMPOSE_FILE" "$@" </dev/null
 }
 
+# hard_timeout LIMIT PROGRAM [ARGS...]: runs PROGRAM under timeout(1) so that it has ended,
+# killed if need be, LIMIT seconds after it started. TERM comes LOG_PROBE_KILL_SECONDS before
+# LIMIT, so a program that honours it can end cleanly, and KILL at LIMIT; with LIMIT no longer
+# than that grace, KILL alone comes at LIMIT. Exits 124 or 137 when the limit cut PROGRAM off,
+# otherwise with PROGRAM's status. Arguments reach docker unchanged, as in compose().
+hard_timeout() {
+    local limit="$1"
+    shift
+    if [[ $limit -gt $LOG_PROBE_KILL_SECONDS ]]; then
+        MSYS_NO_PATHCONV=1 timeout -k "$LOG_PROBE_KILL_SECONDS" "$((limit - LOG_PROBE_KILL_SECONDS))" "$@"
+    else
+        MSYS_NO_PATHCONV=1 timeout -s KILL "$limit" "$@"
+    fi
+}
+
 running_services() {
     compose ps --status running --services 2>>"$RUN_DIR/compose.log" | tr -d '\r'
 }
 
-# container_env SERVICE NAME: the value of NAME in the service container's environment.
-# Prints nothing when it is unset.
+# container_env SERVICE NAME: the value of NAME (which holds no "=") in the service container's
+# environment, byte for byte: line feeds and carriage returns inside it and at its end included.
+# The first entry named exactly NAME wins. jq hands the value over as base64, because jq on
+# Windows writes text with CRLF line ends. Prints nothing when NAME is unset; fails when the
+# service has no container. Capture it as "$(container_env S N && printf x)" and drop the x, so
+# command substitution keeps any trailing line feed.
 container_env() {
-    local cid
+    local cid encoded value
     cid="$(compose ps -q "$1" 2>>"$RUN_DIR/compose.log" | tr -d '\r' | sed -n '1p')" || return 1
     if [[ -z "$cid" ]]; then
         return 1
     fi
-    MSYS_NO_PATHCONV=1 docker inspect --format '{{range .Config.Env}}{{println .}}{{end}}' "$cid" </dev/null \
-        | tr -d '\r' | sed -n "/^$2=/{s/^$2=//p;q;}"
+    encoded="$(MSYS_NO_PATHCONV=1 docker inspect --format '{{json .Config.Env}}' "$cid" </dev/null \
+        | jq -r --arg name "$2" 'first(.[]? | select(startswith($name + "="))) | ltrimstr($name + "=") | @base64')" \
+        || return 1
+    value="$(printf '%s' "$encoded" | tr -d '\r\n' | base64 -d && printf x)" || return 1
+    printf '%s' "${value%x}"
 }
 
-# resolve_interval RAW: the broker's interval rule. Like int.TryParse with NumberStyles.Integer,
-# surrounding white space and a leading sign are allowed; a whole number from 1 to
-# MAX_INTERVAL_SECONDS is used, anything else (unset included) gives the default.
+# resolve_interval RAW: the broker's interval rule, RAW read as int.TryParse with
+# NumberStyles.Integer and the invariant culture reads it: an optional + or - sign and ASCII
+# digits, with optional white space around them that is only tab, line feed, vertical tab, form
+# feed, carriage return and space. A whole number from 1 to MAX_INTERVAL_SECONDS is used;
+# anything else, unset included, gives the default. Both sets are spelled out because
+# [[:space:]] and [0-9] follow the locale: in a UTF-8 locale [[:space:]] also matches Unicode
+# spaces .NET rejects. The anchors of =~ hold for the whole of RAW, line feeds included.
 resolve_interval() {
-    local raw="$1" digits
-    raw="${raw#"${raw%%[![:space:]]*}"}"
-    raw="${raw%"${raw##*[![:space:]]}"}"
-    if [[ "$raw" =~ ^([+-]?)([0-9]+)$ && "${BASH_REMATCH[1]}" != "-" ]]; then
+    local ws=$' \t\n\v\f\r' re digits
+    re="^[$ws]*([+-]?)([0123456789]+)[$ws]*\$"
+    if [[ "$1" =~ $re && "${BASH_REMATCH[1]}" != "-" ]]; then
         digits="${BASH_REMATCH[2]}"
         digits="${digits#"${digits%%[!0]*}"}"
         if [[ -n "$digits" && ${#digits} -le ${#MAX_INTERVAL_SECONDS} ]] &&
@@ -701,24 +973,43 @@ resolve_interval() {
 
 # broker_logs SINCE: broker-service output since SINCE, without colour codes or carriage
 # returns. The custom console logger pads each line and ends it with " | <CallerName>", so
-# callers match substrings only.
+# callers match substrings only. The read has ended, killed if need be, probe_limit seconds
+# after it started (hard_timeout), and is never started once the poll's deadline has passed. On
+# failure LOG_PROBE_DETAIL tells a read Docker did not answer in time from one that failed.
 broker_logs() {
-    compose logs --no-color --no-log-prefix --since "$1" broker-service 2>>"$RUN_DIR/compose.log" \
-        | sed "s/$(printf '\033')\[[0-9;]*m//g" | tr -d '\r'
-}
-
-# shellcheck disable=SC2329 # Invoked through poll.
-# log_has_text SINCE TEXT: whether the broker logged a line containing TEXT since SINCE.
-log_has_text() {
-    if ! broker_logs "$1" >"$RUN_DIR/text.log"; then
-        POLL_DETAIL="broker-service logs unreadable (see $RUN_DIR/compose.log)"
+    local limit rc=0
+    if ! limit="$(probe_limit)"; then
+        # Only poll sets a deadline, and its last attempt can start just as the deadline passes.
+        # That attempt fails at once and keeps the POLL_DETAIL of the attempt before it.
+        LOG_PROBE_DETAIL="${POLL_DETAIL:-broker-service logs probe not started: no time left before the poll deadline}"
         return 1
     fi
-    if grep -qF "$2" "$RUN_DIR/text.log"; then
+    LOG_PROBE_DETAIL=""
+    # compose() cannot run under timeout(1), which needs a program, so its settings are repeated.
+    hard_timeout "$limit" docker compose -p "$PROJECT" -f "$COMPOSE_FILE" \
+        logs --no-color --no-log-prefix --since "$1" broker-service </dev/null 2>>"$RUN_DIR/compose.log" \
+        | sed "s/$(printf '\033')\[[0-9;]*m//g" | tr -d '\r' || rc=$?
+    case "$rc" in
+        0) return 0 ;;
+        124 | 137) LOG_PROBE_DETAIL="broker-service logs probe timed out after $limit s (Docker did not answer)" ;;
+        *) LOG_PROBE_DETAIL="broker-service logs unreadable, exit $rc (see $RUN_DIR/compose.log)" ;;
+    esac
+    return 1
+}
+
+# probe_limit: the seconds a log read may take now, the time left to PROBE_DEADLINE inside a
+# poll and LOG_PROBE_TIMEOUT_SECONDS outside one. Fails when the deadline has passed.
+probe_limit() {
+    local left
+    if [[ -z "$PROBE_DEADLINE" ]]; then
+        echo "$LOG_PROBE_TIMEOUT_SECONDS"
         return 0
     fi
-    POLL_DETAIL="no broker-service line contains [$2]"
-    return 1
+    left=$((PROBE_DEADLINE - $(date -u +%s)))
+    if [[ $left -le 0 ]]; then
+        return 1
+    fi
+    echo "$left"
 }
 
 # read_window SINCE: the broker's cycle summary and trigger lines since SINCE, in log order,
@@ -765,7 +1056,7 @@ trigger_position() {
 # trigger_logged ID REVISION: poll command; rereads the step-9 window and finds the trigger.
 trigger_logged() {
     if ! read_window "$LOG9_SINCE"; then
-        POLL_DETAIL="broker-service logs unreadable (see $RUN_DIR/compose.log)"
+        POLL_DETAIL="$LOG_PROBE_DETAIL"
         return 1
     fi
     if trigger_position "$1" "$2"; then
@@ -781,7 +1072,7 @@ trigger_logged() {
 later_cycles_seen() {
     local after
     if ! read_window "$LOG9_SINCE"; then
-        POLL_DETAIL="broker-service logs unreadable (see $RUN_DIR/compose.log)"
+        POLL_DETAIL="$LOG_PROBE_DETAIL"
         return 1
     fi
     after="$(tail -n "+$((LAST_TRIGGER_INDEX + 1))" "$RUN_DIR/window.events" | grep -c '^C$' || true)"
@@ -827,11 +1118,18 @@ remaining_owned() {
     wc -l <"$RUN_DIR/to-delete" | tr -d ' '
 }
 
-# alert_body ACCOUNT TYPE INSTRUMENT DIRECTION THRESHOLD: the create body with THRESHOLD
-# written in as an unquoted token, exactly as given; it never passes through a number type.
+# alert_body ACCOUNT TYPE INSTRUMENT DIRECTION THRESHOLD: the create body. The four strings are
+# JSON-encoded, whatever they hold, so none can change the body's shape. THRESHOLD follows as an
+# unquoted token written in exactly as given: it never passes through a number type, and an
+# invalid one reaches the broker unchanged.
 alert_body() {
-    printf '{"accountId":"%s","type":"%s","instrumentId":"%s","direction":"%s","threshold":%s}' \
-        "$1" "$2" "$3" "$4" "$5"
+    local strings
+    # Git Bash would rewrite a path-like argument, so the strings reach jq unchanged.
+    strings="$(MSYS_NO_PATHCONV=1 jq -cn --arg accountId "$1" --arg type "$2" \
+        --arg instrumentId "$3" --arg direction "$4" \
+        '{accountId: $accountId, type: $type, instrumentId: $instrumentId, direction: $direction}' |
+        tr -d '\r')" || return 1
+    printf '%s,"threshold":%s}' "${strings%\}}" "$5"
 }
 
 # create_alert ACCOUNT TYPE INSTRUMENT DIRECTION THRESHOLD: POST /v1/alerts. On 201 the id is
@@ -873,13 +1171,6 @@ post_alert() {
         return 1
     fi
     own_alert "$CREATED_ID"
-}
-
-# post_expect CHECK STATUS BODY: POST BODY, sent verbatim, to /v1/alerts and expect STATUS.
-post_expect() {
-    http POST "$ALERTS_URL" "$3"
-    own_if_created
-    expect_status "$1" "$2"
 }
 
 # check_forbidden_endpoints STEP ACCOUNT ALERT INSTRUMENT: the seven feature endpoints, each
@@ -1105,8 +1396,18 @@ readiness_once() {
     [[ "$broker" == "status 200" && "$flag" == "status 200" ]]
 }
 
+# startup_flag_default RAW: the flag's startup value for an ENABLE_PORTFOLIO_INSIGHTS of RAW, by
+# feature-flag-service's getEnvBool rule. strconv.ParseBool's true spellings give true; its false
+# spellings, an empty or unset value and anything unparsable give the shipped default, false.
+startup_flag_default() {
+    case "$1" in
+        1 | t | T | TRUE | true | True) echo true ;;
+        *) echo false ;;
+    esac
+}
+
 step1_ready() {
-    local running missing="" service flag_id modifiable enabled raw_interval
+    local running missing="" service flag_id modifiable enabled raw_default startup_default raw_interval
     running="$(running_services)" || running=""
     for service in $REQUIRED_SERVICES; do
         if ! grep -qxF "$service" <<<"$running"; then
@@ -1138,24 +1439,34 @@ step1_ready() {
     fi
     FLAG_INITIAL="$enabled"
     pass "step 1 flag modifiable"
-    info "flag $FLAG_ID initially enabled=$FLAG_INITIAL"
-    if [[ "$FLAG_INITIAL" == "true" ]]; then
-        info "switching $FLAG_ID off for step 2; it is restored on exit"
-        FLAG_TOUCHED=1
-        http PUT "$F" '{"enabled": false}'
-        if [[ "$HTTP_STATUS" != "200" || "$(jget '.enabled' "$HTTP_BODY")" != "false" ]]; then
-            abort "step 1 flag switched off" "PUT {\"enabled\": false} gave $(status_text); body [$(body_snippet)]"
-        fi
-    fi
 
-    DIALECT="$(container_env db-adapter DB_TYPE)" || DIALECT=""
-    if [[ "$DIALECT" != "mssql" && "$DIALECT" != "postgres" ]]; then
-        abort "step 1 runtime facts" "db-adapter DB_TYPE is [$DIALECT], expected mssql or postgres"
+    # The run certifies a stack on the shipped defaults, so nothing writes the flag before both
+    # the flag and feature-flag-service's startup setting show it starts disabled. The value is
+    # read byte for byte, as the service's strconv.ParseBool reads it untrimmed: the x keeps a
+    # trailing line feed, and printf %q prints a value with control characters on one line.
+    if ! raw_default="$(container_env feature-flag-service ENABLE_PORTFOLIO_INSIGHTS && printf x)"; then
+        abort "step 1 flag default disabled" "ENABLE_PORTFOLIO_INSIGHTS could not be read from the feature-flag-service container of project [$PROJECT]; the run needs the shipped default, disabled"
     fi
-    raw_interval="$(container_env broker-service ALERT_EVALUATION_INTERVAL_SECONDS)" || raw_interval=""
+    raw_default="${raw_default%x}"
+    startup_default="$(startup_flag_default "$raw_default")"
+    if [[ "$FLAG_INITIAL" != "false" || "$startup_default" != "false" ]]; then
+        abort "step 1 flag default disabled" "the flag reads enabled [$FLAG_INITIAL] and ENABLE_PORTFOLIO_INSIGHTS [${raw_default:+$(printf '%q' "$raw_default")}] gives startup default enabled [$startup_default]; the run needs the shipped default, disabled, on both"
+    fi
+    pass "step 1 flag default disabled"
+    info "flag $FLAG_ID initially enabled=$FLAG_INITIAL; ENABLE_PORTFOLIO_INSIGHTS [${raw_default:+$(printf '%q' "$raw_default")}]"
+
+    # The x keeps a trailing line feed of the value; printf %q prints a value with control
+    # characters on one line, as $'...'.
+    DIALECT="$(container_env db-adapter DB_TYPE && printf x)" || DIALECT=""
+    DIALECT="${DIALECT%x}"
+    if [[ "$DIALECT" != "mssql" && "$DIALECT" != "postgres" ]]; then
+        abort "step 1 runtime facts" "db-adapter DB_TYPE is [${DIALECT:+$(printf '%q' "$DIALECT")}], expected mssql or postgres"
+    fi
+    raw_interval="$(container_env broker-service ALERT_EVALUATION_INTERVAL_SECONDS && printf x)" || raw_interval=""
+    raw_interval="${raw_interval%x}"
     INTERVAL="$(resolve_interval "$raw_interval")"
     pass "step 1 runtime facts"
-    info "db type $DIALECT; evaluation interval ${INTERVAL}s (ALERT_EVALUATION_INTERVAL_SECONDS [$raw_interval])"
+    info "db type $DIALECT; evaluation interval ${INTERVAL}s (ALERT_EVALUATION_INTERVAL_SECONDS [${raw_interval:+$(printf '%q' "$raw_interval")}])"
 }
 
 # ---------------------------------------------------------------------------------------------
@@ -1223,8 +1534,10 @@ step3_fixture() {
 
     http GET "$B/v1/instrument?accountId=$HOLDER_ID"
     ids="$(jget '[.results[]?.id] | .[0:2] | join(" ")' "$HTTP_BODY" | lower)"
-    if [[ "$HTTP_STATUS" != "200" || ! "$ids" =~ ^[0-9a-f-]{36}\ [0-9a-f-]{36}$ ]]; then
-        abort "step 3 buy instrument 1" "the holder's instrument listing gave $(status_text) without two instruments; body [$(body_snippet)]"
+    # Both ids go into request bodies and run files, so each must be a distinct canonical id.
+    if [[ "$HTTP_STATUS" != "200" || ! "${ids%% *}" =~ $UUID_RE || ! "${ids#* }" =~ $UUID_RE ||
+        "${ids%% *}" == "${ids#* }" ]]; then
+        abort "step 3 buy instrument 1" "the holder's instrument listing gave $(status_text) without two distinct canonical instrument ids"
     fi
     for id in $ids; do
         n=$((n + 1))
@@ -1282,8 +1595,59 @@ step4_enable() {
 # ---------------------------------------------------------------------------------------------
 # Step 5: figures of the holder (doubles with a 1e-6 tolerance are precise enough here)
 
+# "Portfolio insights for account [<id>] holdings [<n>] value [<decimal>] risk [<level>]
+# duration [<n>] ms trace [<trace id>]", as PortfolioInsightsService renders it.
+INSIGHTS_LINE_RE='Portfolio insights for account \[([^]]*)\] holdings \[([^]]*)\] value \[([^]]*)\] risk \[([^]]*)\] duration \[([^]]*)\] ms trace \[([^]]*)\]'
+
+# shellcheck disable=SC2329 # Invoked through poll.
+# insights_line_logged SINCE ACCOUNT HOLDINGS VALUE RISK: poll command; whether the broker logged,
+# since SINCE, the rendered insights event of ACCOUNT with HOLDINGS holdings, a value equal to
+# VALUE, risk RISK, a whole-millisecond duration and a W3C trace id. VALUE is the number as jq
+# prints it (1E-8) and the line renders a C# decimal (1.50), so num_cmp compares the two exactly
+# whatever their form. On a miss, POLL_DETAIL names every field the last line of ACCOUNT got wrong.
+insights_line_logged() {
+    local line holdings value risk duration trace order wrong detail=""
+    if ! broker_logs "$1" >"$RUN_DIR/insights.log"; then
+        POLL_DETAIL="$LOG_PROBE_DETAIL"
+        return 1
+    fi
+    while IFS= read -r line; do
+        if [[ ! "$line" =~ $INSIGHTS_LINE_RE ]]; then
+            detail="the line for account [$2] does not render holdings, value, risk, duration and trace"
+            continue
+        fi
+        holdings="${BASH_REMATCH[2]}"
+        value="${BASH_REMATCH[3]}"
+        risk="${BASH_REMATCH[4]}"
+        duration="${BASH_REMATCH[5]}"
+        trace="${BASH_REMATCH[6]}"
+        wrong=""
+        if [[ "$holdings" != "$3" ]]; then
+            wrong="$wrong; holdings [$holdings], expected [$3]"
+        fi
+        if ! order="$(num_cmp "$value" "$4")" || [[ "$order" != "0" ]]; then
+            wrong="$wrong; value [$value], expected [$4]"
+        fi
+        if [[ "$risk" != "$5" ]]; then
+            wrong="$wrong; risk [$risk], expected [$5]"
+        fi
+        if [[ ! "$duration" =~ ^[0-9]+$ ]]; then
+            wrong="$wrong; duration [$duration], expected whole milliseconds"
+        fi
+        if [[ ! "$trace" =~ ^[0-9a-f]{32}$ || "$trace" =~ ^0+$ ]]; then
+            wrong="$wrong; trace [$trace], expected a W3C trace id of 32 lowercase hex digits, not all zero"
+        fi
+        if [[ -z "$wrong" ]]; then
+            return 0
+        fi
+        detail="the line for account [$2] has${wrong#;}"
+    done < <(grep -iF "Portfolio insights for account [$2]" "$RUN_DIR/insights.log" || true)
+    POLL_DETAIL="${detail:-no broker-service line renders insights for account [$2]} (log window since $1)"
+    return 1
+}
+
 step5_figures() {
-    local j="$HOLDER_INSIGHTS"
+    local j="$HOLDER_INSIGHTS" holdings total risk
     jcheck "step 5 two allocations" \
         'if (.allocations | length) == 2 then "ok" else "\(.allocations | length) allocations, expected 2" end' "$j"
     jcheck "step 5 percents sum to 100" \
@@ -1310,8 +1674,14 @@ step5_figures() {
          | if $expected == null then "largestPosition has no percent"
            elif .riskLevel == $expected then "ok"
            else "riskLevel [\(.riskLevel)], a largest share of \($share) % gives \($expected)" end' "$j"
-    if poll "step 5 insights log line" "$LOG_LINE_TIMEOUT_SECONDS" "$LOG_STEP_SECONDS" \
-        log_has_text "$LOG4_SINCE" "Portfolio insights for account [$HOLDER_ID]"; then
+    # The line must carry this response's own figures, so they are read from it first.
+    holdings="$(jget '.allocations | if type == "array" then length else empty end' "$j")"
+    total="$(jget '.totalValue | if type == "number" then . else empty end' "$j")"
+    risk="$(jget '.riskLevel | select(. == "LOW" or . == "MEDIUM" or . == "HIGH")' "$j")"
+    if [[ -z "$holdings" || -z "$risk" ]] || ! num_split "$total"; then
+        fail "step 5 insights log line" "the response lacks an allocations array, a numeric totalValue or a LOW, MEDIUM or HIGH riskLevel to match the line against"
+    elif poll "step 5 insights log line" "$LOG_LINE_TIMEOUT_SECONDS" "$LOG_STEP_SECONDS" \
+        insights_line_logged "$LOG4_SINCE" "$HOLDER_ID" "$holdings" "$total" "$risk"; then
         pass "step 5 insights log line"
     fi
 }
@@ -1319,84 +1689,247 @@ step5_figures() {
 # ---------------------------------------------------------------------------------------------
 # Step 6: the empty account
 
+# jq definitions for the property checks of steps 6 and 8. want(KEY; OK; EXPECTED) yields nothing
+# when the object has KEY and its value passes OK, otherwise why not: has() keeps an absent
+# property from passing as null. verdict(REASONS) prints "ok" or every reason, as jcheck needs.
+WANT_JQ='def show: tojson | if length > 60 then .[0:60] + "..." else . end;
+    def want($key; ok; $expected):
+        if has($key) | not then "\($key) missing, expected \($expected)"
+        elif .[$key] | ok then empty
+        else "\($key) [\(.[$key] | show)], expected \($expected)" end;
+    def verdict(reasons):
+        if type != "object" then "the body is a JSON \(type), expected an object"
+        else [reasons] | if length == 0 then "ok" else join("; ") end end;
+'
+
 step6_empty() {
     http GET "$INSIGHTS_URL/$EMPTY_ID"
-    expect_json "step 6 empty account insights" 200 \
-        'if .totalValue == 0 and .totalInvested == 0 and .unrealizedPnl == 0
-            and .unrealizedPnlPercent == 0 and .allocations == [] and .largestPosition == null
-            and .riskLevel == null then "ok"
-         else "got \(tojson)" end'
+    expect_json "step 6 empty account insights" 200 "$WANT_JQ"'verdict(
+        (("totalValue", "totalInvested", "unrealizedPnl", "unrealizedPnlPercent") as $key
+            | want($key; type == "number" and . == 0; "the number 0")),
+        want("allocations"; . == []; "[]"),
+        (("largestPosition", "riskLevel") as $key | want($key; . == null; "null")))'
 }
 
 # ---------------------------------------------------------------------------------------------
 # Step 7: every documented 400 and 404
 
+# response_kind: the kind of the last response's body, never the body itself.
+#   error_response  the broker's ErrorResponse {"statusCode": n, "message": "..."}, n the status
+#   problem         the automatic [ApiController] validation response: an object with a numeric
+#                   status equal to the HTTP status and a non-empty errors object
+#   empty, json or text otherwise, and "... with another statusCode" or "... with another status"
+#   when an ErrorResponse or a validation problem names a code other than the HTTP status.
+response_kind() {
+    local kind=""
+    kind="$(jq -r -s --arg status "$HTTP_STATUS" '
+        if length == 0 then "empty"
+        elif length > 1 or (.[0] | type) != "object" then "json"
+        else .[0]
+          | if (.statusCode | type) == "number" and (.message | type) == "string" then
+              (if (.statusCode | tostring) == $status then "error_response"
+               else "error_response with another statusCode" end)
+            elif (.status | type) == "number" and (.errors | type) == "object"
+                and (.errors | length) > 0 then
+              (if (.status | tostring) == $status then "problem"
+               else "problem with another status" end)
+            else "json" end
+        end' <"$PRIVATE_DIR/body" 2>/dev/null | tr -d '\r')" || kind=""
+    echo "${kind:-text}"
+}
+
+# expect_error CHECK STATUS KIND: PASS when the last response has STATUS and a body of KIND:
+#   error_response  a rule violation, through BrokerExceptionFilter, as application/json
+#   problem         a body or query that cannot bind, as application/problem+json
+#   no_route        a non-GUID path segment, which matches no route: neither of the two above
+# The failure reason names the status, the body's kind and the content type, never the body.
+expect_error() {
+    local check="$1" status="$2" want="$3" kind ok=0 expected
+    kind="$(response_kind)"
+    case "$want" in
+        error_response)
+            expected="an ErrorResponse with statusCode $status as application/json"
+            if [[ "$kind" == "error_response" && "$HTTP_CTYPE" == application/json* ]]; then
+                ok=1
+            fi
+            ;;
+        problem)
+            expected="a validation problem with status $status as application/problem+json"
+            if [[ "$kind" == "problem" && "$HTTP_CTYPE" == application/problem+json* ]]; then
+                ok=1
+            fi
+            ;;
+        no_route)
+            expected="no route, so neither an ErrorResponse nor a validation problem"
+            if [[ "$kind" != error_response* && "$kind" != problem* ]]; then
+                ok=1
+            fi
+            ;;
+        *)
+            fail "$check" "unknown expected response kind [$want]"
+            return 0
+            ;;
+    esac
+    if [[ "$HTTP_STATUS" == "$status" && $ok -eq 1 ]]; then
+        pass "$check"
+    else
+        fail "$check" "$(status_text), body kind [$kind], content type [${HTTP_CTYPE:-none}]; expected $status: $expected"
+    fi
+}
+
+# post_error CHECK STATUS KIND BODY: POST BODY, sent verbatim, to /v1/alerts, then expect_error.
+# A 201 is owned at once, and an interrupt during the POST waits for that as in create_alert, so
+# a request the broker wrongly accepts still leaves nothing behind.
+post_error() {
+    IN_CREATE=1
+    http POST "$ALERTS_URL" "$4"
+    own_if_created
+    IN_CREATE=0
+    if [[ -n "$PENDING_EXIT" ]]; then
+        exit "$PENDING_EXIT"
+    fi
+    expect_error "$1" "$2" "$3"
+}
+
+# One request per 400 and 404 case, each asserting its status and the response kind that
+# answers it. Every other input of a request is valid, so only the tested one is wrong; creates
+# start from the holder, its held instrument H1, TARGET_PRICE, ABOVE and threshold 1.
 step7_errors() {
-    local nh unknown patch_status patch_body
+    local nh unknown valid temp reason
     unknown="$(random_guid)"
+    valid="$(alert_body "$HOLDER_ID" TARGET_PRICE "$H1" ABOVE 1)"
 
     http GET "$B/v1/instrument?accountId=$EMPTY_ID"
     nh="$(jget 'first(.results[]? | select(.amount == 0) | .id) // empty' "$HTTP_BODY" | lower)"
 
-    post_expect "step 7 POST type target_price 400" 400 \
+    post_error "step 7 POST type target_price 400" 400 error_response \
         "$(alert_body "$HOLDER_ID" target_price "$H1" ABOVE 1)"
-    post_expect "step 7 POST direction UP 400" 400 \
+    post_error "step 7 POST type missing 400" 400 error_response \
+        "$(printf '{"accountId":"%s","instrumentId":"%s","direction":"ABOVE","threshold":1}' "$HOLDER_ID" "$H1")"
+    post_error "step 7 POST direction UP 400" 400 error_response \
         "$(alert_body "$HOLDER_ID" TARGET_PRICE "$H1" UP 1)"
-    post_expect "step 7 POST quoted threshold \"abc\" 400" 400 \
+    post_error "step 7 POST direction missing 400" 400 error_response \
+        "$(printf '{"accountId":"%s","type":"TARGET_PRICE","instrumentId":"%s","threshold":1}' "$HOLDER_ID" "$H1")"
+    post_error "step 7 POST quoted threshold \"abc\" 400" 400 problem \
         "$(alert_body "$HOLDER_ID" TARGET_PRICE "$H1" ABOVE '"abc"')"
-    post_expect "step 7 POST quoted threshold \"12\" 400" 400 \
+    post_error "step 7 POST quoted threshold \"12\" 400" 400 problem \
         "$(alert_body "$HOLDER_ID" TARGET_PRICE "$H1" ABOVE '"12"')"
-    post_expect "step 7 POST TARGET_PRICE threshold 0 400" 400 \
+    # The exact-token rule: no exponent, at most 10 integer and 8 fractional digits, nothing
+    # rounded into the domain.
+    post_error "step 7 POST threshold exponent 1e5 400" 400 problem \
+        "$(alert_body "$HOLDER_ID" TARGET_PRICE "$H1" ABOVE 1e5)"
+    post_error "step 7 POST threshold 10000000000 400" 400 problem \
+        "$(alert_body "$HOLDER_ID" TARGET_PRICE "$H1" ABOVE 10000000000)"
+    post_error "step 7 POST threshold 0.000000010000000000000000000001 400" 400 problem \
+        "$(alert_body "$HOLDER_ID" TARGET_PRICE "$H1" ABOVE 0.000000010000000000000000000001)"
+    post_error "step 7 POST threshold 0.000000001 400" 400 problem \
+        "$(alert_body "$HOLDER_ID" TARGET_PRICE "$H1" ABOVE 0.000000001)"
+    # The valid body without its closing brace.
+    post_error "step 7 POST malformed JSON 400" 400 problem "${valid%\}}"
+    post_error "step 7 POST TARGET_PRICE threshold 0 400" 400 error_response \
         "$(alert_body "$HOLDER_ID" TARGET_PRICE "$H1" ABOVE 0)"
-    post_expect "step 7 POST TARGET_PRICE threshold -1 400" 400 \
+    post_error "step 7 POST TARGET_PRICE threshold -1 400" 400 error_response \
         "$(alert_body "$HOLDER_ID" TARGET_PRICE "$H1" ABOVE -1)"
-    post_expect "step 7 POST accountId missing 400" 400 \
+    post_error "step 7 POST accountId missing 400" 400 error_response \
         "$(printf '{"type":"TARGET_PRICE","instrumentId":"%s","direction":"ABOVE","threshold":1}' "$H1")"
-    post_expect "step 7 POST threshold missing 400" 400 \
+    post_error "step 7 POST instrumentId missing 400" 400 error_response \
+        "$(printf '{"accountId":"%s","type":"TARGET_PRICE","direction":"ABOVE","threshold":1}' "$HOLDER_ID")"
+    post_error "step 7 POST threshold missing 400" 400 error_response \
         "$(printf '{"accountId":"%s","type":"TARGET_PRICE","instrumentId":"%s","direction":"ABOVE"}' "$HOLDER_ID" "$H1")"
     if [[ "$nh" =~ $UUID_RE ]]; then
-        post_expect "step 7 POST PROFIT_LOSS not held 400" 400 \
+        post_error "step 7 POST PROFIT_LOSS not held 400" 400 error_response \
             "$(alert_body "$EMPTY_ID" PROFIT_LOSS "$nh" ABOVE 1)"
     else
         fail "step 7 POST PROFIT_LOSS not held 400" "the empty account's listing ($(status_text)) shows no instrument with amount 0"
     fi
 
-    post_expect "step 7 POST unknown account 404" 404 \
+    post_error "step 7 POST unknown account 404" 404 error_response \
         "$(alert_body "$unknown" TARGET_PRICE "$H1" ABOVE 1)"
-    post_expect "step 7 POST unknown instrument 404" 404 \
+    post_error "step 7 POST unknown instrument 404" 404 error_response \
         "$(alert_body "$HOLDER_ID" TARGET_PRICE "$unknown" ABOVE 1)"
+    http GET "$INSIGHTS_URL/$unknown"
+    expect_error "step 7 GET insights unknown account 404" 404 error_response
+    http GET "$INSIGHTS_URL/not-a-guid"
+    expect_error "step 7 GET insights non-GUID account 404" 404 no_route
     http GET "$ALERTS_URL?accountId=$unknown"
-    expect_status "step 7 GET alerts unknown account 404" 404
+    expect_error "step 7 GET alerts unknown account 404" 404 error_response
+    http GET "$ALERTS_URL"
+    expect_error "step 7 GET alerts accountId missing 400" 400 problem
+    http GET "$ALERTS_URL?accountId=not-a-guid"
+    expect_error "step 7 GET alerts non-GUID accountId 400" 400 problem
     http GET "$ALERTS_URL/notifications?accountId=$unknown"
-    expect_status "step 7 GET notifications unknown account 404" 404
+    expect_error "step 7 GET notifications unknown account 404" 404 error_response
+    http GET "$ALERTS_URL/notifications"
+    expect_error "step 7 GET notifications accountId missing 400" 400 problem
+    http GET "$ALERTS_URL/notifications?accountId=not-a-guid"
+    expect_error "step 7 GET notifications non-GUID accountId 400" 400 problem
+    http GET "$ALERTS_URL/notifications?accountId=$HOLDER_ID&unacknowledged=maybe"
+    expect_error "step 7 GET notifications unacknowledged maybe 400" 400 problem
     http PATCH "$ALERTS_URL/$unknown" '{"enabled":true}'
-    expect_status "step 7 PATCH unknown alert 404" 404
+    expect_error "step 7 PATCH unknown alert 404" 404 error_response
+    http PATCH "$ALERTS_URL/not-a-guid" '{"enabled":true}'
+    expect_error "step 7 PATCH non-GUID alert 404" 404 no_route
     http DELETE "$ALERTS_URL/$unknown"
-    expect_status "step 7 DELETE unknown alert 404" 404
+    expect_error "step 7 DELETE unknown alert 404" 404 error_response
+    http DELETE "$ALERTS_URL/not-a-guid"
+    expect_error "step 7 DELETE non-GUID alert 404" 404 no_route
     http POST "$ALERTS_URL/$unknown/acknowledge"
-    expect_status "step 7 POST acknowledge unknown alert 404" 404
+    expect_error "step 7 POST acknowledge unknown alert 404" 404 error_response
+    http POST "$ALERTS_URL/not-a-guid/acknowledge"
+    expect_error "step 7 POST acknowledge non-GUID alert 404" 404 no_route
 
+    # A missing and a null enabled need a real alert, since an unknown id answers 404 first.
     if ! create_alert "$HOLDER_ID" TARGET_PRICE "$H1" ABOVE "$MAX_THRESHOLD"; then
-        fail "step 7 PATCH {} 400" "creating the temporary alert: $CREATE_ERROR"
+        reason="creating the temporary alert gave $(status_text), body kind [$(response_kind)]; expected 201 with an id"
+        fail "step 7 PATCH {} 400" "$reason"
+        fail "step 7 PATCH enabled null 400" "$reason"
+        fail "step 7 DELETE temporary alert 204" "not attempted: $reason"
         return 0
     fi
-    http PATCH "$ALERTS_URL/$CREATED_ID" '{}'
-    patch_status="$HTTP_STATUS"
-    patch_body="$(body_snippet)"
-    delete_alert "$CREATED_ID"
-    if [[ "$patch_status" == "400" && "$HTTP_STATUS" == "204" ]]; then
-        pass "step 7 PATCH {} 400"
+    temp="$CREATED_ID"
+    http PATCH "$ALERTS_URL/$temp" '{}'
+    expect_error "step 7 PATCH {} 400" 400 error_response
+    http PATCH "$ALERTS_URL/$temp" '{"enabled":null}'
+    expect_error "step 7 PATCH enabled null 400" 400 error_response
+    delete_alert "$temp"
+    if [[ "$HTTP_STATUS" == "204" ]]; then
+        pass "step 7 DELETE temporary alert 204"
     else
-        fail "step 7 PATCH {} 400" "PATCH {} gave status $patch_status body [$patch_body], expected 400; the temporary alert's DELETE gave $(status_text), expected 204"
+        fail "step 7 DELETE temporary alert 204" "$(status_text) for the temporary alert [$temp], expected 204"
     fi
 }
 
 # ---------------------------------------------------------------------------------------------
 # Step 8: CRUD for both types
 
-CREATED_FILTER='if .enabled == true and .armingRevision == 1 and .triggeredAt == null
-        and .triggerValue == null and .acknowledged == false then "ok"
-    else "enabled [\(.enabled)] armingRevision [\(.armingRevision)] triggeredAt [\(.triggeredAt)] triggerValue [\(.triggerValue)] acknowledged [\(.acknowledged)]" end'
+# alert(ENABLED; REVISION; KEPT): the AlertDTO check. Every property must be present with its
+# type, enabled ENABLED, armingRevision REVISION and the alert not acknowledged. triggeredAt and
+# triggerValue must both be null, as a create or a re-arm answers. With KEPT true, a trigger of
+# the current arming passes as well, since a disable keeps it: an ISO-8601 triggeredAt with a
+# numeric triggerValue, never one without the other.
+ALERT_JQ="$WANT_JQ"'def guid: type == "string"
+        and test("^[0-9a-fA-F]{8}-([0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12}$");
+    def stamp: type == "string" and test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}");
+    def trigger($kept):
+        if $kept and (.triggeredAt != null or .triggerValue != null) then
+            want("triggeredAt"; stamp; "an ISO-8601 string in a kept trigger"),
+            want("triggerValue"; type == "number"; "a number in a kept trigger")
+        else
+            (("triggeredAt", "triggerValue") as $key
+                | want($key; . == null; if $kept then "null or a kept trigger" else "null" end))
+        end;
+    def alert($enabled; $revision; $kept): verdict(
+        (("id", "accountId", "instrumentId") as $key | want($key; guid; "a GUID string")),
+        want("type"; . == "TARGET_PRICE" or . == "PROFIT_LOSS"; "TARGET_PRICE or PROFIT_LOSS"),
+        want("direction"; . == "ABOVE" or . == "BELOW"; "ABOVE or BELOW"),
+        want("threshold"; type == "number"; "a number"),
+        want("enabled"; . == $enabled; $enabled),
+        want("armingRevision"; . == $revision; $revision),
+        trigger($kept),
+        want("acknowledged"; . == false; false),
+        want("createdAt"; stamp; "an ISO-8601 string"));
+'
+CREATED_FILTER="$ALERT_JQ"'alert(true; 1; false)'
 
 # create_checked CHECK TYPE: creates TYPE ABOVE the domain maximum on H1 and checks the 201.
 # Leaves the id in CREATED_ID, empty when the create failed.
@@ -1448,13 +1981,12 @@ step8_crud() {
         else
             type="PROFIT_LOSS"
         fi
+        # A trigger value can exceed the domain-maximum threshold, so the evaluator may trigger
+        # revision 1 before the disable, which keeps that trigger. The re-arm clears it.
         http PATCH "$ALERTS_URL/$id" '{"enabled":false}'
-        expect_json "step 8 $type disable" 200 \
-            'if .enabled == false then "ok" else "enabled [\(.enabled)], expected false" end'
+        expect_json "step 8 $type disable" 200 "$ALERT_JQ"'alert(false; 1; true)'
         http PATCH "$ALERTS_URL/$id" '{"enabled":true}'
-        expect_json "step 8 $type re-arm" 200 \
-            'if .enabled == true and .armingRevision == 2 and .triggeredAt == null then "ok"
-             else "enabled [\(.enabled)] armingRevision [\(.armingRevision)] triggeredAt [\(.triggeredAt)], expected true, 2 and null" end'
+        expect_json "step 8 $type re-arm" 200 "$ALERT_JQ"'alert(true; 2; false)'
         delete_alert "$id"
         expect_status "step 8 $type delete" 204
         http GET "$ALERTS_URL?accountId=$HOLDER_ID"
@@ -1514,23 +2046,65 @@ skip_later_steps() {
     fail "step 12 untriggered acknowledge" "skipped: $SKIP_REASON"
 }
 
+# pick_close_instrument LISTING: the first held instrument of the instrument listing LISTING whose
+# close suits the step-9 pairs. Sets CHOSEN_ID, lower case, and CHOSEN_UNITS, its close in units
+# of 1e-8, from MIN_CLOSE_UNITS to MAX_CLOSE_UNITS; fails, both empty, when none qualifies.
+pick_close_instrument() {
+    local quoted close id units
+    CHOSEN_ID=""
+    CHOSEN_UNITS=""
+    # Only a quantity and a close that are JSON numbers count. Each id arrives JSON-encoded, so
+    # no listed text can forge a line or a field, and only a canonical id is chosen: it goes
+    # into request bodies and run files.
+    while read -r quoted close; do
+        id=""
+        if [[ "$quoted" =~ ^\"(.*)\"$ ]]; then
+            id="${BASH_REMATCH[1]}"
+        fi
+        if [[ "$id" =~ $UUID_RE ]] && units="$(num_to_units "$close")" &&
+            [[ $units -ge $MIN_CLOSE_UNITS && $units -le $MAX_CLOSE_UNITS ]]; then
+            CHOSEN_ID="$id"
+            CHOSEN_UNITS="$units"
+            return 0
+        fi
+    done < <(jget '.results[]?
+        | select((.amount | type) == "number" and .amount >= 1 and (.price.close | type) == "number")
+        | "\(.id | tojson) \(.price.close)"' "$1" | lower)
+    return 1
+}
+
+# trigger_value_verdict DIRECTION THRESHOLD TYPE VALUE: the check of a notification's
+# triggerValue, of JSON type TYPE and VALUE as jq prints it, against its alert's DIRECTION and
+# THRESHOLD. Prints "ok" when it is a number inside the trigger-value domain and on the
+# DIRECTION side of THRESHOLD or equal to it (rounding), otherwise the reason it is not.
+trigger_value_verdict() {
+    local order
+    if [[ "$3" != "number" ]]; then
+        echo "triggerValue has JSON type ${3:-unknown}, expected number"
+    elif ! num_split "$4"; then
+        echo "triggerValue is a JSON number in a form this script cannot read"
+    elif [[ $NUM_INTEGERS -gt $TRIGGER_INTEGER_DIGITS || $NUM_FRACTIONS -gt $TRIGGER_FRACTION_DIGITS ]]; then
+        echo "triggerValue has $NUM_INTEGERS integer and $NUM_FRACTIONS fractional digits, outside the trigger-value domain of at most $TRIGGER_INTEGER_DIGITS and $TRIGGER_FRACTION_DIGITS"
+    elif ! order="$(num_cmp "$4" "$2")"; then
+        echo "threshold [$2] of this run is not a readable decimal"
+    elif [[ ("$1" == "ABOVE" && $order -ge 0) || ("$1" == "BELOW" && $order -le 0) ]]; then
+        echo "ok"
+    else
+        echo "triggerValue $4 is not on the $1 side of threshold $2"
+    fi
+}
+
 step9_trigger() {
-    local id close units chosen="" c="" t9 spec pair type direction threshold errors="" fields
-    local revision triggered_at value value_units threshold_units cycles
+    local id chosen="" c="" t9 spec pair type direction threshold errors="" fields
+    local revision triggered_at value_type value verdict cycles
 
     http GET "$B/v1/instrument?accountId=$HOLDER_ID"
-    if [[ "$HTTP_STATUS" == "200" ]]; then
-        while read -r id close; do
-            if units="$(num_to_units "$close")" &&
-                [[ $units -ge $MIN_CLOSE_UNITS && $units -le $MAX_CLOSE_UNITS ]]; then
-                chosen="$id"
-                c="$units"
-                break
-            fi
-        done < <(jget '.results[]? | select(.amount >= 1) | "\(.id) \(.price.close)"' "$HTTP_BODY" | lower)
+    if [[ "$HTTP_STATUS" == "200" ]] && pick_close_instrument "$HTTP_BODY"; then
+        chosen="$CHOSEN_ID"
+        c="$CHOSEN_UNITS"
     fi
     if [[ -z "$chosen" ]]; then
-        fail "step 9 instrument with a usable close" "no held instrument has a close from 0.00000002 to 9999999999.99999998 (listing $(status_text))"
+        fail "step 9 instrument with a usable close" "no held instrument with a canonical id has a close from 0.00000002 to 9999999999.99999998 (listing $(status_text))"
         skip_later_steps "no held instrument with a usable close"
         return 0
     fi
@@ -1544,7 +2118,7 @@ step9_trigger() {
         BASE9="$(window_cycles)"
     else
         BASE9=0
-        info "broker-service logs unreadable at $t9 (see $RUN_DIR/compose.log)"
+        info "log window baseline at $t9: $LOG_PROBE_DETAIL"
     fi
     info "creating the pair alerts at $t9; $BASE9 cycle lines already in the log window"
     for spec in \
@@ -1583,19 +2157,18 @@ step9_trigger() {
         if ! grep -qxF "$id" "$RUN_DIR/listed"; then
             continue
         fi
-        fields="$(jitem "$id" "$NOTIFICATIONS" '"\(.armingRevision) \(.triggeredAt) \(.triggerValue)"')"
-        read -r revision triggered_at value <<<"$fields"
+        # triggerValue is the literal jq prints for the unmodified number, never arithmetic.
+        fields="$(jitem "$id" "$NOTIFICATIONS" \
+            '"\(.armingRevision) \(.triggeredAt) \(.triggerValue | type) \(.triggerValue | tojson)"')"
+        read -r revision triggered_at value_type value <<<"$fields"
         info "triggered $pair $direction $id revision $revision"
         echo "$id $revision $triggered_at $pair $direction" >>"$RUN_DIR/triggered"
 
-        threshold_units="$(dec_to_units "$threshold")"
-        if ! value_units="$(num_to_units "$value")"; then
-            fail "step 9 $pair $direction trigger value" "triggerValue [$value] is not a readable decimal"
-        elif [[ ("$direction" == "ABOVE" && $value_units -ge $threshold_units) ||
-            ("$direction" == "BELOW" && $value_units -le $threshold_units) ]]; then
+        verdict="$(trigger_value_verdict "$direction" "$threshold" "$value_type" "$value")"
+        if [[ "$verdict" == "ok" ]]; then
             pass "step 9 $pair $direction trigger value"
         else
-            fail "step 9 $pair $direction trigger value" "triggerValue [$value] is not on the $direction side of threshold [$threshold]"
+            fail "step 9 $pair $direction trigger value" "$verdict"
         fi
 
         if poll "step 9 $pair $direction trigger log line" "$LOG_LINE_TIMEOUT_SECONDS" \
@@ -1798,26 +2371,33 @@ step13_cleanup_and_disable() {
 # ---------------------------------------------------------------------------------------------
 # Main
 
-trap cleanup EXIT
-trap on_signal INT TERM
+main() {
+    trap cleanup EXIT
+    trap on_signal INT TERM
 
-info "run dir $RUN_DIR"
-info "started $(now_rfc3339): project [$PROJECT], base url $BASE_URL, compose file $COMPOSE_FILE, evidence dir $EVIDENCE_DIR"
-step1_ready
-step2_flag_off
-step3_fixture
-step4_enable
-step5_figures
-step6_empty
-step7_errors
-step8_crud
-step9_trigger
-step10_no_repeat
-step11_browser
-step12_untriggered_ack
-step13_cleanup_and_disable
-if [[ $failed -gt 0 ]]; then
-    exit 1
+    info "run dir $RUN_DIR"
+    info "started $(now_rfc3339): project [$PROJECT], base url $BASE_URL, compose file $COMPOSE_FILE, evidence dir $EVIDENCE_DIR"
+    step1_ready
+    step2_flag_off
+    step3_fixture
+    step4_enable
+    step5_figures
+    step6_empty
+    step7_errors
+    step8_crud
+    step9_trigger
+    step10_no_repeat
+    step11_browser
+    step12_untriggered_ack
+    step13_cleanup_and_disable
+    if [[ $failed -gt 0 ]]; then
+        exit 1
+    fi
+    exit 0
+}
+
+# Sourcing the file defines its functions without running them. The options, tool checks and
+# run directory above still apply, so a test sources it with valid options and its own TMPDIR.
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    main
 fi
-exit 0
-

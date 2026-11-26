@@ -16,6 +16,25 @@ import {
 } from "../helpers/portfolioInsights"
 import { VisitName } from "./types"
 
+// The message names no part of the URL, since a refused URL can hold a secret.
+const ORIGIN_REQUIRED =
+    "EASYTRADE_URL must be an http or https origin without credentials, path, query or fragment; portfolio insights visit not run"
+
+/**
+ * Throws unless the URL is a bare http or https origin. Its serialised form
+ * must be exactly the origin followed by "/", which refuses credentials, any
+ * path, and any query or fragment, an empty "?" or "#" included. The URL feeds
+ * the page cookie, the logs, the flag read, the page and the cleanup request,
+ * so a value that can carry a secret stops the visit before any of them; the
+ * worker counts the error as a failed visit.
+ */
+function requireCredentialFreeOrigin(url: URL): void {
+    const isHttp = url.protocol === "http:" || url.protocol === "https:"
+    if (!isHttp || url.href !== `${url.origin}/`) {
+        throw new Error(ORIGIN_REQUIRED)
+    }
+}
+
 export class PortfolioInsightsAlertVisit implements IVisit {
     readonly visitName: VisitName
     readonly url: URL
@@ -41,6 +60,9 @@ export class PortfolioInsightsAlertVisit implements IVisit {
     }
 
     async setup(pageActions: IPageActions, logger: Logger): Promise<void> {
+        // The worker calls setup before run, and page setup sets a cookie for
+        // the URL's host, so the URL is checked before anything uses it.
+        requireCredentialFreeOrigin(this.url)
         logger.info(
             `Setting up page for user [${this.user.username}|${this.user.ip4}]`
         )
@@ -50,6 +72,9 @@ export class PortfolioInsightsAlertVisit implements IVisit {
     }
 
     async run(pageActions: IPageActions, logger: Logger): Promise<void> {
+        // Checked again because run does not depend on setup having run.
+        requireCredentialFreeOrigin(this.url)
+
         const enabled = await withVisitLogger(logger, () =>
             isPortfolioInsightsEnabled(this.url, this.fetchFn)
         )
@@ -60,7 +85,7 @@ export class PortfolioInsightsAlertVisit implements IVisit {
             return
         }
 
-        logger.info(`Going to EasyTrade frontend at [${this.url}]`)
+        logger.info(`Going to EasyTrade frontend at [${this.url.origin}]`)
         await pageActions.gotoPage(this.url.toString())
 
         logger.info(`Logging in as user [${this.user.username}]`)

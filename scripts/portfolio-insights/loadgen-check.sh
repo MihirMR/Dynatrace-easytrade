@@ -15,7 +15,7 @@
 # Usage: scripts/portfolio-insights/loadgen-check.sh --project NAME [--base-url URL]
 #            [--compose-file FILE]... [--weight N] [--minutes M] [--out FILE]
 #   --project NAME       Compose project of the running stack (required)
-#   --base-url URL       Reverse-proxy URL of that stack (default: http://localhost)
+#   --base-url URL       Reverse-proxy origin of that stack (default: http://localhost)
 #   --compose-file FILE  Compose file of that project, relative to the current directory
 #                        (default: compose.dev.yaml); repeat it for override files
 #   --weight N           Visit weight of run B and the flag-off phase (default: 1)
@@ -81,6 +81,21 @@ FLAG_OFF_STEP_SECONDS=15
 # Each window follows a recreate of loadgen, whose new container holds no earlier output, so the
 # margin never pulls in a line of another phase.
 LOG_SKEW_MARGIN_SECONDS=30
+# Every loadgen log read runs under timeout(1), so a Docker call that never answers cannot hold
+# the run. Inside a poll or the quiescence wait it may take the time left to that wait's
+# deadline; the closing read of a window may take this fixed bound, sized for a whole run's
+# output, and a progress read the smaller of the two: this bound or the time left in its window.
+# Each is a hard limit on the whole read, its termination included: TERM comes
+# LOG_PROBE_KILL_SECONDS before the limit and KILL at it.
+LOG_PROBE_TIMEOUT_SECONDS=120
+LOG_PROBE_KILL_SECONDS=5
+# The hard limit, termination included as for log reads, of every other Docker call the run B
+# drain and the EXIT cleanup make: pausing, unpausing, stopping and killing loadgen
+# (pause_loadgen, unpause_loadgen, stop_loadgen, kill_loadgen), restoring it (restore_loadgen)
+# and reading container state (running_services, container_env, container_env_entry,
+# loadgen_state), wherever those functions run. Each takes seconds on a healthy engine. A call
+# cut off is reported, and cleanup carries on with its other steps.
+DOCKER_CALL_TIMEOUT_SECONDS=60
 # Cleanup stops sending DELETEs after this many transport errors in a row.
 MAX_CONSECUTIVE_TRANSPORT_ERRORS=5
 ID_CHUNK_SIZE=100
@@ -123,7 +138,7 @@ usage() {
 Usage: scripts/portfolio-insights/loadgen-check.sh --project NAME [--base-url URL]
            [--compose-file FILE]... [--weight N] [--minutes M] [--out FILE]
   --project NAME       Compose project of the running stack (required)
-  --base-url URL       Reverse-proxy URL of that stack (default: http://localhost)
+  --base-url URL       Reverse-proxy origin of that stack (default: http://localhost)
   --compose-file FILE  Compose file of that project, relative to the current directory
                        (default: compose.dev.yaml). Repeat it, as with docker compose -f,
                        when the project was started with override files: loadgen is
@@ -146,6 +161,101 @@ usage_error() {
 # is_count TEXT: a positive integer of at most MAX_COUNT_DIGITS digits.
 is_count() {
     [[ "$1" =~ ^[1-9][0-9]*$ && ${#1} -le $MAX_COUNT_DIGITS ]]
+}
+
+# The origin helpers list their characters instead of using ranges, so no locale can widen a
+# bracket expression beyond ASCII.
+# scripts/portfolio-insights/harness-test.sh tests these helpers and this script's Docker probes.
+
+# is_port_number TEXT: 1 to 5 decimal digits whose value is from 1 to 65535.
+is_port_number() {
+    local re='^[0123456789]{1,5}$'
+    [[ "$1" =~ $re ]] && ((10#$1 >= 1 && 10#$1 <= 65535))
+}
+
+# is_ipv4_address TEXT: a dotted quad of four decimal octets from 0 to 255, none with a leading
+# zero, which a WHATWG URL parser would read as octal.
+is_ipv4_address() {
+    local octet='(0|[123456789][0123456789]{0,2})' i
+    local re="^${octet}\\.${octet}\\.${octet}\\.${octet}\$"
+    [[ "$1" =~ $re ]] || return 1
+    for i in 1 2 3 4; do
+        ((10#${BASH_REMATCH[i]} <= 255)) || return 1
+    done
+}
+
+# is_dns_name TEXT: labels of 1 to 63 letters, digits and inner hyphens joined by dots, with one
+# optional trailing dot for a rooted name and at most 253 characters without it. The last label
+# is not a number (all digits, or 0x and hex digits), since a WHATWG URL parser reads a host that
+# ends in one as an IPv4 address.
+is_dns_name() {
+    local alnum='0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz'
+    local label="[${alnum}]([${alnum}-]{0,61}[${alnum}])?"
+    local re="^${label}(\\.${label})*\$"
+    local number='^([0123456789]+|0[xX][0123456789ABCDEFabcdef]*)$'
+    local name="${1%.}"
+    ((${#name} <= 253)) && [[ "$name" =~ $re && ! "${name##*.}" =~ $number ]]
+}
+
+# is_ipv6_address TEXT: an unbracketed IPv6 address in RFC 4291 text form. That is one to eight
+# groups of 1 to 4 hex digits, at most one "::" standing for one or more zero groups, and an
+# optional trailing dotted quad that counts as two groups. A zone id is refused.
+is_ipv6_address() {
+    local hex='[0123456789ABCDEFabcdef]{1,4}'
+    local re="^${hex}(:${hex})*\$"
+    local text="$1" head tail quad part colons groups=0
+    if [[ "$text" == *.* ]]; then
+        quad="${text##*:}"
+        is_ipv4_address "$quad" || return 1
+        text="${text%"$quad"}0:0"
+    fi
+    head="$text"
+    tail=""
+    if [[ "$text" == *::* ]]; then
+        head="${text%%::*}"
+        tail="${text#*::}"
+        [[ "$tail" != *::* ]] || return 1
+    fi
+    for part in "$head" "$tail"; do
+        if [[ -n "$part" ]]; then
+            [[ "$part" =~ $re ]] || return 1
+            colons="${part//[!:]/}"
+            groups=$((groups + ${#colons} + 1))
+        fi
+    done
+    if [[ "$text" == *::* ]]; then
+        ((groups < 8))
+    else
+        ((groups == 8))
+    fi
+}
+
+# is_base_origin TEXT: an http:// or https:// origin, that is a host (a DNS name, an IPv4 address
+# or a bracketed IPv6 literal) and an optional port, with at most one trailing slash. It refuses
+# credentials, a path, a query, a fragment, whitespace and control characters, so an accepted
+# origin is safe to print and to build every request URL from. A WHATWG URL parser, as the browser
+# check uses, reads every origin it accepts as an origin.
+is_base_origin() {
+    local authority host port
+    # No origin is longer than 269 characters: https://, a 253-character name and its root dot, a
+    # five-digit port and a slash. Longer text is refused before any pattern runs on it.
+    ((${#1} <= 269)) || return 1
+    case "$1" in
+        http://* | https://*) authority="${1#*://}" ;;
+        *) return 1 ;;
+    esac
+    authority="${authority%/}"
+    if [[ "$authority" == \[* ]]; then
+        [[ "$authority" == *\]* ]] || return 1
+        host="${authority%%\]*}"
+        port="${authority#*\]}"
+        is_ipv6_address "${host#\[}" || return 1
+    else
+        host="${authority%%:*}"
+        port="${authority#"$host"}"
+        is_ipv4_address "$host" || is_dns_name "$host" || return 1
+    fi
+    [[ -z "$port" ]] || { [[ "$port" == :* ]] && is_port_number "${port#:}"; }
 }
 
 parse_options() {
@@ -177,7 +287,12 @@ parse_options() {
                 exit 0
                 ;;
             *)
-                usage_error "Unknown option: $1"
+                # Only a bare option name is echoed: a stray value or a --name=value argument can
+                # be a URL that holds credentials.
+                if [[ "$1" =~ ^--?[A-Za-z][A-Za-z0-9-]*$ ]]; then
+                    usage_error "Unknown option: $1"
+                fi
+                usage_error "Unknown argument (not shown): each option takes its value as the next argument."
                 ;;
         esac
     done
@@ -185,8 +300,9 @@ parse_options() {
     if [[ -z "$PROJECT" ]]; then
         usage_error "Option --project is required."
     fi
-    if [[ ! "$BASE_URL" =~ ^https?://[^[:space:]]+$ ]]; then
-        usage_error "Option --base-url needs an http:// or https:// URL, got: $BASE_URL"
+    # The refused value is never echoed, since it can hold credentials.
+    if ! is_base_origin "$BASE_URL"; then
+        usage_error "Option --base-url needs an http:// or https:// origin: a host and optional port, without credentials, path, query or fragment."
     fi
     BASE_URL="${BASE_URL%/}"
     if ! is_count "$WEIGHT"; then
@@ -217,7 +333,7 @@ parse_options() {
 
 check_tools() {
     local tool missing=""
-    for tool in bash curl jq docker; do
+    for tool in bash curl jq docker timeout; do
         if ! command -v "$tool" >/dev/null 2>&1; then
             missing="$missing $tool"
         fi
@@ -339,14 +455,54 @@ compose() {
     MSYS_NO_PATHCONV=1 docker compose -p "$PROJECT" "${COMPOSE_ARGS[@]}" "$@" </dev/null
 }
 
-# recreate_loadgen WEIGHT [START]: recreates loadgen alone with
+# hard_timeout LIMIT PROGRAM [ARGS...]: runs PROGRAM under timeout(1) so that it has ended,
+# killed if need be, LIMIT seconds after it started. TERM comes LOG_PROBE_KILL_SECONDS before
+# LIMIT, so a program that honours it can end cleanly, and KILL at LIMIT; with LIMIT no longer
+# than that grace, KILL alone comes at LIMIT. Exits 124 or 137 when the limit cut PROGRAM off,
+# otherwise with PROGRAM's status. Arguments reach docker unchanged, as in compose().
+hard_timeout() {
+    local limit="$1"
+    shift
+    if [[ $limit -gt $LOG_PROBE_KILL_SECONDS ]]; then
+        MSYS_NO_PATHCONV=1 timeout -k "$LOG_PROBE_KILL_SECONDS" "$((limit - LOG_PROBE_KILL_SECONDS))" "$@"
+    else
+        MSYS_NO_PATHCONV=1 timeout -s KILL "$limit" "$@"
+    fi
+}
+
+# docker_problem WHAT STATUS LIMIT: why the Docker call WHAT, run by hard_timeout with LIMIT,
+# ended with STATUS, telling a call Docker did not answer in time from one that failed.
+docker_problem() {
+    case "$2" in
+        124 | 137) echo "$1 timed out after $3 s (Docker did not answer)" ;;
+        *) echo "$1 failed, exit $2 (see $RUN_DIR/compose.log)" ;;
+    esac
+}
+
+# compose_within LIMIT ARGS...: compose ARGS run by hard_timeout, so the call has ended within
+# LIMIT seconds, with status 124 or 137 when the limit cut it off. compose() cannot run under
+# timeout(1), which needs a program, so its settings are repeated.
+compose_within() {
+    local limit="$1"
+    shift
+    hard_timeout "$limit" docker compose -p "$PROJECT" "${COMPOSE_ARGS[@]}" "$@" </dev/null
+}
+
+# recreate_loadgen WEIGHT [START [LIMIT]]: recreates loadgen alone with
 # PORTFOLIO_INSIGHTS_ALERT_WEIGHT=WEIGHT, started when START is -d (the default) and only created
 # when it is --no-start. The value reaches only this command, where it overrides the shell and
-# .env for Compose's interpolation of the declaration both compose files carry.
+# .env for Compose's interpolation of the declaration both compose files carry. With LIMIT the
+# call has ended within LIMIT seconds (compose_within), with status 124 or 137 when cut off.
+# Without it, as when a window opens and Compose may first have to build or pull the image, the
+# call is not bounded.
 recreate_loadgen() {
-    PORTFOLIO_INSIGHTS_ALERT_WEIGHT="$1" MSYS_NO_PATHCONV=1 \
-        docker compose -p "$PROJECT" "${COMPOSE_ARGS[@]}" up "${2:--d}" --no-deps --force-recreate loadgen \
-        </dev/null >>"$RUN_DIR/compose.log" 2>&1
+    if [[ -n "${3:-}" ]]; then
+        PORTFOLIO_INSIGHTS_ALERT_WEIGHT="$1" compose_within "$3" up "${2:--d}" --no-deps --force-recreate loadgen \
+            >>"$RUN_DIR/compose.log" 2>&1
+    else
+        PORTFOLIO_INSIGHTS_ALERT_WEIGHT="$1" compose up "${2:--d}" --no-deps --force-recreate loadgen \
+            >>"$RUN_DIR/compose.log" 2>&1
+    fi
 }
 
 # restore_loadgen: puts loadgen back as setup recorded it in LOADGEN_AT_START and verifies the
@@ -356,13 +512,16 @@ recreate_loadgen() {
 # --compose-file files, so the weight is the only interpolated value this run overrides. A loadgen
 # stopped at start is recreated without being started rather than started and stopped: a visit
 # run in between could create an alert and be cut off. Without a container at start, the one this
-# run created is removed.
+# run created is removed. Each Docker call has ended within DOCKER_CALL_TIMEOUT_SECONDS
+# (hard_timeout), and RESTORE_ERROR tells a call Docker did not answer in time from one that failed.
 restore_loadgen() {
     local start=-d entry actual rc=0
     RESTORE_ERROR=""
     if [[ "$LOADGEN_AT_START" == "no container" ]]; then
-        if ! compose rm --force --stop loadgen >>"$RUN_DIR/compose.log" 2>&1; then
-            RESTORE_ERROR="removing the loadgen container this run created failed (see $RUN_DIR/compose.log)"
+        compose_within "$DOCKER_CALL_TIMEOUT_SECONDS" rm --force --stop loadgen >>"$RUN_DIR/compose.log" 2>&1 ||
+            rc=$?
+        if [[ $rc -ne 0 ]]; then
+            RESTORE_ERROR="$(docker_problem "removing the loadgen container this run created" "$rc" "$DOCKER_CALL_TIMEOUT_SECONDS")"
             return 1
         fi
     else
@@ -371,25 +530,30 @@ restore_loadgen() {
         fi
         entry="${LOADGEN_AT_START#*, }"
         if [[ "$entry" == PORTFOLIO_INSIGHTS_ALERT_WEIGHT=* ]]; then
-            recreate_loadgen "${entry#PORTFOLIO_INSIGHTS_ALERT_WEIGHT=}" "$start" || rc=$?
+            recreate_loadgen "${entry#PORTFOLIO_INSIGHTS_ALERT_WEIGHT=}" "$start" "$DOCKER_CALL_TIMEOUT_SECONDS" ||
+                rc=$?
         else
             # Unset in a subshell, so only this command runs without it.
             (
                 unset PORTFOLIO_INSIGHTS_ALERT_WEIGHT
-                compose up "$start" --no-deps --force-recreate loadgen >>"$RUN_DIR/compose.log" 2>&1
+                compose_within "$DOCKER_CALL_TIMEOUT_SECONDS" up "$start" --no-deps --force-recreate loadgen \
+                    >>"$RUN_DIR/compose.log" 2>&1
             ) || rc=$?
         fi
         if [[ $rc -ne 0 ]]; then
-            RESTORE_ERROR="recreating loadgen as [$LOADGEN_AT_START] failed (see $RUN_DIR/compose.log)"
+            RESTORE_ERROR="$(docker_problem "recreating loadgen as [$(loadgen_state_text "$LOADGEN_AT_START")]" "$rc" "$DOCKER_CALL_TIMEOUT_SECONDS")"
             return 1
         fi
     fi
-    if ! actual="$(loadgen_state)"; then
-        RESTORE_ERROR="loadgen's state after the restore is unreadable (see $RUN_DIR/compose.log)"
+    # The x keeps a trailing line feed of the weight.
+    actual="$(loadgen_state && printf x)" || rc=$?
+    if [[ $rc -ne 0 ]]; then
+        RESTORE_ERROR="$(docker_problem "reading loadgen's state after the restore" "$rc" "$DOCKER_CALL_TIMEOUT_SECONDS")"
         return 1
     fi
+    actual="${actual%x}"
     if [[ "$actual" != "$LOADGEN_AT_START" ]]; then
-        RESTORE_ERROR="expected [$LOADGEN_AT_START] as at start, got [$actual]"
+        RESTORE_ERROR="expected [$(loadgen_state_text "$LOADGEN_AT_START")] as at start, got [$(loadgen_state_text "$actual")]"
         return 1
     fi
 }
@@ -399,83 +563,118 @@ restore_loadgen() {
 # error in a tight loop: hundreds of thousands of lines, enough to rotate the run's own lines out
 # of compose.yaml's json-file logs. The visits a grace period would let finish are covered by the
 # owned-id rules instead. A paused loadgen is killed: compose stop thaws it to deliver SIGTERM, and
-# it then logs, and acts, once more.
+# it then logs, and acts, once more. The call has ended within DOCKER_CALL_TIMEOUT_SECONDS
+# (hard_timeout), with status 124 or 137 when cut off.
 stop_loadgen() {
     if [[ $LOADGEN_PAUSED -eq 1 ]]; then
         kill_loadgen
     else
-        compose stop --timeout 0 loadgen >>"$RUN_DIR/compose.log" 2>&1
+        compose_within "$DOCKER_CALL_TIMEOUT_SECONDS" stop --timeout 0 loadgen >>"$RUN_DIR/compose.log" 2>&1
     fi
 }
 
 # pause_loadgen: freezes every loadgen process, so loadgen neither logs nor acts until it is
 # unpaused or killed. LOADGEN_PAUSED is set first, so a stop that cuts the pause short kills
-# loadgen rather than thawing it.
+# loadgen rather than thawing it. Bounded as stop_loadgen is.
 pause_loadgen() {
     LOADGEN_PAUSED=1
-    compose pause loadgen >>"$RUN_DIR/compose.log" 2>&1
+    compose_within "$DOCKER_CALL_TIMEOUT_SECONDS" pause loadgen >>"$RUN_DIR/compose.log" 2>&1
 }
 
-# unpause_loadgen: lets a paused loadgen run on.
+# unpause_loadgen: lets a paused loadgen run on. Bounded as stop_loadgen is.
 unpause_loadgen() {
-    compose unpause loadgen >>"$RUN_DIR/compose.log" 2>&1 || return 1
+    compose_within "$DOCKER_CALL_TIMEOUT_SECONDS" unpause loadgen >>"$RUN_DIR/compose.log" 2>&1 || return
     LOADGEN_PAUSED=0
 }
 
 # kill_loadgen: ends loadgen with SIGKILL. A paused loadgen dies without being thawed, so it logs
-# nothing after the freeze. Killing a loadgen that no longer runs succeeds.
+# nothing after the freeze. Killing a loadgen that no longer runs succeeds. Bounded as
+# stop_loadgen is.
 kill_loadgen() {
-    compose kill -s SIGKILL loadgen >>"$RUN_DIR/compose.log" 2>&1 || return 1
+    compose_within "$DOCKER_CALL_TIMEOUT_SECONDS" kill -s SIGKILL loadgen >>"$RUN_DIR/compose.log" 2>&1 || return
     LOADGEN_PAUSED=0
 }
 
+# running_services: the project's running services, one per line. The call has ended within
+# DOCKER_CALL_TIMEOUT_SECONDS (hard_timeout); one cut off fails the function with 124 or 137.
 running_services() {
-    compose ps --status running --services 2>>"$RUN_DIR/compose.log" | tr -d '\r'
+    compose_within "$DOCKER_CALL_TIMEOUT_SECONDS" ps --status running --services 2>>"$RUN_DIR/compose.log" |
+        tr -d '\r'
 }
 
-# container_env SERVICE NAME: the value of NAME in the service container's environment.
-# Prints nothing when it is unset.
+# container_env SERVICE NAME: the value of NAME (which holds no "=") in the service container's
+# environment, byte for byte: line feeds and carriage returns inside it and at its end included.
+# The first entry named exactly NAME wins. jq hands the value over as base64, because jq on
+# Windows writes text with CRLF line ends. Prints nothing when NAME is unset; fails when the
+# service has no container. Capture it as "$(container_env S N && printf x)" and drop the x, so
+# command substitution keeps any trailing line feed. Each Docker call has ended within
+# DOCKER_CALL_TIMEOUT_SECONDS (hard_timeout); one cut off fails the function with 124 or 137.
 container_env() {
-    local cid
-    cid="$(compose ps -a -q "$1" 2>>"$RUN_DIR/compose.log" | tr -d '\r' | sed -n '1p')" || return 1
+    local cid encoded value
+    cid="$(compose_within "$DOCKER_CALL_TIMEOUT_SECONDS" ps -a -q "$1" 2>>"$RUN_DIR/compose.log" |
+        tr -d '\r' | sed -n '1p')" || return
     if [[ -z "$cid" ]]; then
         return 1
     fi
-    MSYS_NO_PATHCONV=1 docker inspect --format '{{range .Config.Env}}{{println .}}{{end}}' "$cid" </dev/null \
-        | tr -d '\r' | sed -n "/^$2=/{s/^$2=//p;q;}"
+    encoded="$(hard_timeout "$DOCKER_CALL_TIMEOUT_SECONDS" docker inspect --format '{{json .Config.Env}}' "$cid" </dev/null \
+        | jq -r --arg name "$2" 'first(.[]? | select(startswith($name + "="))) | ltrimstr($name + "=") | @base64')" \
+        || return
+    value="$(printf '%s' "$encoded" | tr -d '\r\n' | base64 -d && printf x)" || return 1
+    printf '%s' "${value%x}"
 }
 
 # container_env_entry SERVICE NAME: the NAME=VALUE entry of the service container's environment,
-# read from docker inspect's JSON, so NAME set to an empty value still prints NAME=. Prints
-# nothing when NAME is unset; fails when the service has no container or docker inspect fails.
+# byte for byte, read from docker inspect's JSON and handed over as base64 as container_env does,
+# so NAME set to an empty value still prints NAME=. Prints nothing when NAME is unset; fails when
+# the service has no container or a Docker call fails. Capture it as
+# "$(container_env_entry S N && printf x)" and drop the x. Each Docker call has ended within
+# DOCKER_CALL_TIMEOUT_SECONDS (hard_timeout); one cut off fails the function with 124 or 137.
 container_env_entry() {
-    local cid env
-    cid="$(compose ps -a -q "$1" 2>>"$RUN_DIR/compose.log" | tr -d '\r' | sed -n '1p')" || return 1
+    local cid encoded entry
+    cid="$(compose_within "$DOCKER_CALL_TIMEOUT_SECONDS" ps -a -q "$1" 2>>"$RUN_DIR/compose.log" |
+        tr -d '\r' | sed -n '1p')" || return
     if [[ -z "$cid" ]]; then
         return 1
     fi
-    env="$(MSYS_NO_PATHCONV=1 docker inspect --format '{{json .Config.Env}}' "$cid" </dev/null 2>>"$RUN_DIR/compose.log")" ||
-        return 1
-    jq -r --arg prefix "$2=" '(. // []) | map(select(startswith($prefix))) | .[0] // empty' <<<"$env" \
-        2>>"$RUN_DIR/compose.log" | tr -d '\r'
+    encoded="$(hard_timeout "$DOCKER_CALL_TIMEOUT_SECONDS" docker inspect --format '{{json .Config.Env}}' "$cid" \
+        </dev/null 2>>"$RUN_DIR/compose.log" |
+        jq -r --arg prefix "$2=" '(. // []) | map(select(startswith($prefix))) | .[0] // empty | @base64' \
+            2>>"$RUN_DIR/compose.log")" || return
+    entry="$(printf '%s' "$encoded" | tr -d '\r\n' | base64 -d && printf x)" || return 1
+    printf '%s' "${entry%x}"
 }
 
 # loadgen_state: loadgen's container as setup records it and restore_loadgen verifies it, either
 # "no container" or "running" or "stopped" followed by ", PORTFOLIO_INSIGHTS_ALERT_WEIGHT=VALUE"
-# or ", PORTFOLIO_INSIGHTS_ALERT_WEIGHT unset". Fails when Compose or docker inspect fails.
+# or ", PORTFOLIO_INSIGHTS_ALERT_WEIGHT unset", with VALUE byte for byte and no line feed after
+# it. Capture it as "$(loadgen_state && printf x)" and drop the x; print it with
+# loadgen_state_text. Fails when a Compose or docker inspect call fails, with 124 or 137 when
+# DOCKER_CALL_TIMEOUT_SECONDS cut one off.
 loadgen_state() {
     local cid running entry state="stopped"
-    cid="$(compose ps -a -q loadgen 2>>"$RUN_DIR/compose.log" | tr -d '\r' | sed -n '1p')" || return 1
+    cid="$(compose_within "$DOCKER_CALL_TIMEOUT_SECONDS" ps -a -q loadgen 2>>"$RUN_DIR/compose.log" |
+        tr -d '\r' | sed -n '1p')" || return
     if [[ -z "$cid" ]]; then
-        echo "no container"
+        printf '%s' "no container"
         return 0
     fi
-    running="$(running_services)" || return 1
-    entry="$(container_env_entry loadgen PORTFOLIO_INSIGHTS_ALERT_WEIGHT)" || return 1
+    running="$(running_services)" || return
+    entry="$(container_env_entry loadgen PORTFOLIO_INSIGHTS_ALERT_WEIGHT && printf x)" || return
+    entry="${entry%x}"
     if grep -qxF loadgen <<<"$running"; then
         state="running"
     fi
-    echo "$state, ${entry:-PORTFOLIO_INSIGHTS_ALERT_WEIGHT unset}"
+    printf '%s, %s' "$state" "${entry:-PORTFOLIO_INSIGHTS_ALERT_WEIGHT unset}"
+}
+
+# loadgen_state_text STATE: STATE, a loadgen_state result, for a report line: the weight's value
+# as printf %q writes it, so a value with control characters stays on one line, as $'...'.
+loadgen_state_text() {
+    if [[ "$1" != *", PORTFOLIO_INSIGHTS_ALERT_WEIGHT="* ]]; then
+        printf '%s' "$1"
+        return 0
+    fi
+    printf '%s, PORTFOLIO_INSIGHTS_ALERT_WEIGHT=%q' "${1%%, *}" "${1#*, PORTFOLIO_INSIGHTS_ALERT_WEIGHT=}"
 }
 
 now_rfc3339() {
@@ -488,10 +687,43 @@ epoch_to_rfc3339() {
 }
 
 # loadgen_logs SINCE: loadgen output since SINCE, without colour codes or carriage returns,
-# reduced by sanitize_loadgen_log to the lines this script reads.
+# reduced by sanitize_loadgen_log to the lines this script reads. The read has ended, killed if
+# need be, probe_limit seconds after it started (compose_within), and is never started once the
+# wait's deadline has passed. On failure LOG_PROBE_DETAIL tells a read Docker did not answer in
+# time from one that failed.
 loadgen_logs() {
-    compose logs --no-color --no-log-prefix --since "$1" loadgen 2>>"$RUN_DIR/compose.log" \
-        | sed "s/$(printf '\033')\[[0-9;]*m//g" | tr -d '\r' | sanitize_loadgen_log
+    local limit rc=0
+    if ! limit="$(probe_limit)"; then
+        # Only a poll, the run B drain or the progress watch sets a deadline, and its last
+        # attempt can start just as the deadline passes. That attempt fails at once and keeps the
+        # POLL_DETAIL of the attempt before it.
+        LOG_PROBE_DETAIL="${POLL_DETAIL:-loadgen logs probe not started: no time left before the wait deadline}"
+        return 1
+    fi
+    LOG_PROBE_DETAIL=""
+    compose_within "$limit" logs --no-color --no-log-prefix --since "$1" loadgen 2>>"$RUN_DIR/compose.log" \
+        | sed "s/$(printf '\033')\[[0-9;]*m//g" | tr -d '\r' | sanitize_loadgen_log || rc=$?
+    case "$rc" in
+        0) return 0 ;;
+        124 | 137) LOG_PROBE_DETAIL="loadgen logs probe timed out after $limit s (Docker did not answer)" ;;
+        *) LOG_PROBE_DETAIL="loadgen logs unreadable, exit $rc (see $RUN_DIR/compose.log)" ;;
+    esac
+    return 1
+}
+
+# probe_limit: the seconds a log read may take now, the time left to PROBE_DEADLINE inside a
+# bounded wait and LOG_PROBE_TIMEOUT_SECONDS outside one. Fails when the deadline has passed.
+probe_limit() {
+    local left
+    if [[ -z "$PROBE_DEADLINE" ]]; then
+        echo "$LOG_PROBE_TIMEOUT_SECONDS"
+        return 0
+    fi
+    left=$((PROBE_DEADLINE - $(date -u +%s)))
+    if [[ $left -le 0 ]]; then
+        return 1
+    fi
+    echo "$left"
 }
 
 # sanitize_loadgen_log: keeps only the stdin lines this script reads, each rebuilt from validated
@@ -659,11 +891,13 @@ report_outcomes() {
 # poll CHECK TIMEOUT STEP COMMAND [ARGS...]: runs COMMAND every STEP seconds until it succeeds or
 # the deadline TIMEOUT seconds from now passes. On expiry it reports FAIL CHECK, with the
 # POLL_DETAIL the last attempt left, and fails. STEP is the poll's only sleep; every wait in this
-# script is such a fixed step under an explicit deadline.
+# script is such a fixed step under an explicit deadline. COMMAND's log reads see the deadline
+# as PROBE_DEADLINE, local to this call, so it ends with the poll.
 poll() {
     local check="$1" timeout="$2" step="$3" deadline
     shift 3
     deadline=$(($(date -u +%s) + timeout))
+    local PROBE_DEADLINE="$deadline"
     POLL_DETAIL=""
     while :; do
         if "$@"; then
@@ -710,14 +944,14 @@ latest_breakdown() {
 
 # shellcheck disable=SC2329 # Invoked through poll.
 # breakdown_since SINCE FILE: writes to FILE (NAME.json) the breakdown of a cumulative stats line
-# stamped at or after SINCE, and that line to NAME.line.
+# stamped at or after SINCE, and that line to NAME.line. The breakdown goes through a file, not
+# a command substitution, so the probe's LOG_PROBE_DETAIL reaches POLL_DETAIL.
 breakdown_since() {
-    local json
-    if ! json="$(latest_breakdown "$1" "$RUN_DIR/stats.line")"; then
-        POLL_DETAIL="no cumulative stats line stamped at or after $1"
+    if ! latest_breakdown "$1" "$RUN_DIR/stats.line" >"$RUN_DIR/stats.json"; then
+        POLL_DETAIL="${LOG_PROBE_DETAIL:-no cumulative stats line stamped at or after $1}"
         return 1
     fi
-    printf '%s\n' "$json" >"$2"
+    cp "$RUN_DIR/stats.json" "$2"
     cp "$RUN_DIR/stats.line" "${2%.json}.line"
 }
 
@@ -883,7 +1117,13 @@ db_count_chunk() {
     else
         sql="SELECT COUNT(*) FROM \"Alerts\" WHERE \"Id\" IN ($list)"
     fi
-    out="$(db_query "$sql")" || return 1
+    if ! out="$(db_query "$sql")"; then
+        # sqlcmd reports SQL errors on stdout, so a failed query's output joins the error log.
+        if [[ -n "$out" ]]; then
+            printf '%s\n' "$out" >>"$RUN_DIR/db-error.log"
+        fi
+        return 1
+    fi
     if [[ ! "$out" =~ ^[0-9]+$ ]]; then
         echo "unexpected count output [$out]" >>"$RUN_DIR/db-error.log"
         return 1
@@ -961,9 +1201,12 @@ open_window() {
     if ! recreate_loadgen "$weight"; then
         abort "$prefix loadgen weight" "recreating loadgen with weight $weight failed (see $RUN_DIR/compose.log)"
     fi
-    actual="$(container_env loadgen PORTFOLIO_INSIGHTS_ALERT_WEIGHT)" || actual=""
+    # The x keeps a trailing line feed of the value; printf %q prints a value with control
+    # characters on one line, as $'...'.
+    actual="$(container_env loadgen PORTFOLIO_INSIGHTS_ALERT_WEIGHT && printf x)" || actual=""
+    actual="${actual%x}"
     if [[ "$actual" != "$weight" ]]; then
-        abort "$prefix loadgen weight" "the recreated container has PORTFOLIO_INSIGHTS_ALERT_WEIGHT [$actual], expected [$weight]"
+        abort "$prefix loadgen weight" "the recreated container has PORTFOLIO_INSIGHTS_ALERT_WEIGHT [${actual:+$(printf '%q' "$actual")}], expected [$weight]"
     fi
     pass "$prefix loadgen weight: $weight"
 }
@@ -972,17 +1215,23 @@ open_window() {
 # killed it, keeps the phase's whole output in $RUN_DIR/LABEL.log, writes the error-line counts of
 # the stretch its breakdown covers to $RUN_DIR/errors-LABEL, and owns every alert the phase logged
 # as created and never resolved, in that output or an earlier read of it, so cleanup deletes it.
-# Sets CLOSE_ERROR on failure.
+# Sets CLOSE_ERROR on failure; WINDOW_OPEN stays 1 when the stop itself was not confirmed.
 close_window() {
-    local label="$WINDOW_LABEL" covered=""
+    local label="$WINDOW_LABEL" covered="" rc=0 stop_call="compose stop loadgen"
     CLOSE_ERROR=""
-    if [[ "${1:-0}" != "1" ]] && ! stop_loadgen; then
-        CLOSE_ERROR="stopping loadgen failed (see $RUN_DIR/compose.log)"
-        return 1
+    if [[ "${1:-0}" != "1" ]]; then
+        if [[ $LOADGEN_PAUSED -eq 1 ]]; then
+            stop_call="compose kill loadgen"
+        fi
+        stop_loadgen || rc=$?
+        if [[ $rc -ne 0 ]]; then
+            CLOSE_ERROR="$(docker_problem "$stop_call" "$rc" "$DOCKER_CALL_TIMEOUT_SECONDS")"
+            return 1
+        fi
     fi
     WINDOW_OPEN=0
     if ! loadgen_logs "$WINDOW_SINCE" >"$RUN_DIR/$label.log"; then
-        CLOSE_ERROR="loadgen logs since $WINDOW_SINCE unreadable (see $RUN_DIR/compose.log)"
+        CLOSE_ERROR="reading the window since $WINDOW_SINCE: $LOG_PROBE_DETAIL"
         return 1
     fi
     # Error lines up to the breakdown's stats line, so the table's error column and its totals
@@ -1021,7 +1270,7 @@ report_new_owned() {
 window_started() {
     local line
     if ! read_window "$RUN_DIR/start.log"; then
-        POLL_DETAIL="loadgen logs unreadable (see $RUN_DIR/compose.log)"
+        POLL_DETAIL="$LOG_PROBE_DETAIL"
         return 1
     fi
     line="$(grep -F "$RUNNING_MARKER" "$RUN_DIR/start.log" | head -n 1)" || true
@@ -1034,17 +1283,30 @@ window_started() {
 
 # watch_progress LABEL DEADLINE: until DEADLINE (epoch seconds), every PROGRESS_STEP_SECONDS,
 # prints the latest cumulative breakdown's total per visit name and the error lines per name.
+# The window ends at DEADLINE, and the breakdown poll and close_window read its final state right
+# after, each under its own bound. So every progress read ends by DEADLINE: it may take
+# LOG_PROBE_TIMEOUT_SECONDS, or the time left before DEADLINE when that is shorter. A read due
+# with no time left, as the last one usually is, is skipped with an INFO line and no failure.
 watch_progress() {
-    local label="$1" deadline="$2" remaining elapsed json totals errors
+    local label="$1" deadline="$2" remaining now elapsed json totals errors
+    # A read's cap is PROBE_DEADLINE, local to this call so it ends with the watch. POLL_DETAIL is
+    # local and empty, so a read that finds no time left says so rather than echo a poll's detail.
+    local PROBE_DEADLINE="" POLL_DETAIL=""
     while :; do
         remaining=$((deadline - $(date -u +%s)))
         if [[ $remaining -le 0 ]]; then
             return 0
         fi
         sleep $((remaining < PROGRESS_STEP_SECONDS ? remaining : PROGRESS_STEP_SECONDS))
-        elapsed=$((($(date -u +%s) - WINDOW_START_EPOCH) / 60))
+        now="$(date -u +%s)"
+        elapsed=$(((now - WINDOW_START_EPOCH) / 60))
+        if [[ $now -ge $deadline ]]; then
+            info "run $label progress $elapsed/$MINUTES min: read skipped at the window end; the breakdown and the window's closing read follow"
+            return 0
+        fi
+        PROBE_DEADLINE=$((now + LOG_PROBE_TIMEOUT_SECONDS < deadline ? now + LOG_PROBE_TIMEOUT_SECONDS : deadline))
         if ! read_window "$RUN_DIR/progress.log"; then
-            info "run $label progress $elapsed/$MINUTES min: loadgen logs unreadable (see $RUN_DIR/compose.log)"
+            info "run $label progress $elapsed/$MINUTES min: $LOG_PROBE_DETAIL"
             continue
         fi
         totals="no stats line yet"
@@ -1133,7 +1395,7 @@ readiness_once() {
 }
 
 setup() {
-    local defined required running missing="" service flag_id modifiable enabled
+    local defined required running missing="" service flag_id modifiable enabled state_rc=0
     if ! defined="$(compose config --services 2>>"$RUN_DIR/compose.log" | tr -d '\r')"; then
         abort "readiness" "docker compose config failed for project [$PROJECT] (see $RUN_DIR/compose.log)"
     fi
@@ -1156,10 +1418,13 @@ setup() {
     if [[ -n "$missing" ]]; then
         abort "readiness" "services not running in project [$PROJECT]:$missing"
     fi
-    # loadgen as the run found it, before anything recreates it, for cleanup to restore.
-    if ! LOADGEN_AT_START="$(loadgen_state)"; then
-        abort "readiness" "loadgen's container state is unreadable (see $RUN_DIR/compose.log)"
+    # loadgen as the run found it, before anything recreates it, for cleanup to restore. The x
+    # keeps a trailing line feed of the weight.
+    LOADGEN_AT_START="$(loadgen_state && printf x)" || state_rc=$?
+    if [[ $state_rc -ne 0 ]]; then
+        abort "readiness" "$(docker_problem "reading loadgen's container state" "$state_rc" "$DOCKER_CALL_TIMEOUT_SECONDS")"
     fi
+    LOADGEN_AT_START="${LOADGEN_AT_START%x}"
     if [[ "$LOADGEN_AT_START" == running,* ]]; then
         LOADGEN_WAS_RUNNING=1
     fi
@@ -1168,12 +1433,15 @@ setup() {
     fi
     pass "readiness"
 
-    DIALECT="$(container_env db-adapter DB_TYPE)" || DIALECT=""
+    # The x keeps a trailing line feed of the value; printf %q prints a value with control
+    # characters on one line, as $'...'.
+    DIALECT="$(container_env db-adapter DB_TYPE && printf x)" || DIALECT=""
+    DIALECT="${DIALECT%x}"
     if [[ "$DIALECT" != "mssql" && "$DIALECT" != "postgres" ]]; then
-        abort "runtime facts" "db-adapter DB_TYPE is [$DIALECT], expected mssql or postgres"
+        abort "runtime facts" "db-adapter DB_TYPE is [${DIALECT:+$(printf '%q' "$DIALECT")}], expected mssql or postgres"
     fi
     pass "runtime facts"
-    info "db type $DIALECT; loadgen at start: $LOADGEN_AT_START"
+    info "db type $DIALECT; loadgen at start: $(loadgen_state_text "$LOADGEN_AT_START")"
 
     http GET "$FLAG_URL"
     if [[ "$HTTP_STATUS" != "200" ]]; then
@@ -1295,13 +1563,18 @@ quiescent() {
 
 # frozen_log: reads the output of the paused loadgen into $RUN_DIR/frozen.log, again every
 # QUIESCE_FLUSH_STEP_SECONDS until two reads in a row match. Fails, with POLL_DETAIL, on an
-# unreadable log or when no two reads match within QUIESCE_FLUSH_TIMEOUT_SECONDS.
+# unreadable log or when no two reads match within QUIESCE_FLUSH_TIMEOUT_SECONDS. Its reads see
+# that deadline, or the drain's when it comes first, as PROBE_DEADLINE, local to this call.
 frozen_log() {
     local deadline reads=0
     deadline=$(($(date -u +%s) + QUIESCE_FLUSH_TIMEOUT_SECONDS))
+    local PROBE_DEADLINE="${PROBE_DEADLINE:-$deadline}"
+    if [[ $deadline -lt $PROBE_DEADLINE ]]; then
+        PROBE_DEADLINE="$deadline"
+    fi
     while :; do
         if ! read_window "$RUN_DIR/frozen.next"; then
-            POLL_DETAIL="loadgen logs unreadable while paused (see $RUN_DIR/compose.log)"
+            POLL_DETAIL="reading the paused loadgen's output: $LOG_PROBE_DETAIL"
             return 1
         fi
         if [[ $reads -gt 0 ]] && cmp -s "$RUN_DIR/frozen.log" "$RUN_DIR/frozen.next"; then
@@ -1324,30 +1597,41 @@ frozen_log() {
 # that holds too, it kills the paused loadgen, and that is Q; otherwise it unpauses loadgen and
 # polls on. Returns 0 at Q and 1 when the deadline passes or Compose fails, with DRAIN_DETAIL
 # describing the outcome; loadgen may then still run or be paused, for close_window to stop.
+# Each pause, unpause and kill has ended within DOCKER_CALL_TIMEOUT_SECONDS, and DRAIN_DETAIL
+# tells one Docker did not answer in time from one that failed.
 drain_loadgen() {
-    local deadline
+    local deadline rc
     DRAIN_DETAIL=""
     deadline=$(($(date -u +%s) + QUIESCE_TIMEOUT_SECONDS))
+    # The log reads of the drain see this deadline, local to this call, so the closing read of
+    # close_or_abort takes the fixed bound.
+    local PROBE_DEADLINE="$deadline"
     while :; do
         POLL_DETAIL=""
+        rc=0
         if ! read_window "$RUN_DIR/quiesce.log"; then
-            DRAIN_DETAIL="loadgen logs unreadable (see $RUN_DIR/compose.log)"
+            DRAIN_DETAIL="$LOG_PROBE_DETAIL"
         elif ! quiescent "$RUN_DIR/quiesce.log"; then
             DRAIN_DETAIL="$POLL_DETAIL"
-        elif ! pause_loadgen; then
-            DRAIN_DETAIL="pausing loadgen failed (see $RUN_DIR/compose.log)"
-            return 1
-        elif frozen_log && quiescent "$RUN_DIR/frozen.log"; then
-            if ! kill_loadgen; then
-                DRAIN_DETAIL="killing the paused loadgen failed (see $RUN_DIR/compose.log)"
+        else
+            pause_loadgen || rc=$?
+            if [[ $rc -ne 0 ]]; then
+                DRAIN_DETAIL="$(docker_problem "pausing loadgen" "$rc" "$DOCKER_CALL_TIMEOUT_SECONDS")"
                 return 1
             fi
-            DRAIN_DETAIL="Q at $(now_rfc3339) with $(($(created_ids "$RUN_DIR/frozen.log" | wc -l))) created alerts, all resolved, and no create in flight; loadgen killed while paused"
-            return 0
-        else
+            if frozen_log && quiescent "$RUN_DIR/frozen.log"; then
+                kill_loadgen || rc=$?
+                if [[ $rc -ne 0 ]]; then
+                    DRAIN_DETAIL="$(docker_problem "killing the paused loadgen" "$rc" "$DOCKER_CALL_TIMEOUT_SECONDS")"
+                    return 1
+                fi
+                DRAIN_DETAIL="Q at $(now_rfc3339) with $(($(created_ids "$RUN_DIR/frozen.log" | wc -l))) created alerts, all resolved, and no create in flight; loadgen killed while paused"
+                return 0
+            fi
             DRAIN_DETAIL="paused: $POLL_DETAIL"
-            if ! unpause_loadgen; then
-                DRAIN_DETAIL="$DRAIN_DETAIL; unpausing loadgen failed (see $RUN_DIR/compose.log)"
+            unpause_loadgen || rc=$?
+            if [[ $rc -ne 0 ]]; then
+                DRAIN_DETAIL="$DRAIN_DETAIL; $(docker_problem "unpausing loadgen" "$rc" "$DOCKER_CALL_TIMEOUT_SECONDS")"
                 return 1
             fi
         fi
@@ -1613,14 +1897,25 @@ cleanup() {
     local rc=$? remaining problems=""
     trap - EXIT
     set +e
+    # An exit inside a poll, the quiescence wait or the progress watch leaves that wait's deadline
+    # in scope here, so the closing log read below would inherit it; cleanup reads with the fixed
+    # bound instead. Every Docker call below has a hard limit, so none can hold the exit.
+    PROBE_DEADLINE=""
     if [[ $WINDOW_OPEN -eq 1 ]]; then
         # A run ended mid-phase: loadgen stops first, so no visit runs while the flag is switched
         # for deletion, and whatever the phase created and did not resolve is owned. A loadgen
         # the run B drain left paused is killed without being thawed.
+        # When the stop is not confirmed, because Docker did not answer within its limit or the
+        # call failed, cleanup still deletes the owned alerts and restores the flag. Skipping them
+        # would leave those alerts and a changed flag behind for certain; a loadgen that is still
+        # running risks less, since each of its visits deletes its own alert and logs the id of
+        # one it cannot. The cleanup check then fails, naming loadgen as not confirmed stopped.
         if close_window; then
             report_new_owned "cleanup"
+        elif [[ $WINDOW_OPEN -eq 1 ]]; then
+            problems="loadgen not confirmed stopped: $CLOSE_ERROR"
         else
-            problems="loadgen not stopped: $CLOSE_ERROR"
+            problems="loadgen stopped, but its window was not read: $CLOSE_ERROR"
         fi
     fi
     if [[ $LOADGEN_TOUCHED -eq 1 && $TABLE_WRITTEN -eq 0 ]]; then
@@ -1651,7 +1946,7 @@ cleanup() {
     fi
     if [[ $LOADGEN_TOUCHED -eq 1 ]]; then
         if restore_loadgen; then
-            info "cleanup: loadgen restored as at start: $LOADGEN_AT_START"
+            info "cleanup: loadgen restored as at start: $(loadgen_state_text "$LOADGEN_AT_START")"
         else
             problems="${problems:+$problems; }loadgen not restored: $RESTORE_ERROR"
         fi
@@ -1702,6 +1997,10 @@ main() {
     WINDOW_SINCE=""
     LOADGEN_PAUSED=0
     TABLE_WRITTEN=0
+    # The absolute deadline (epoch seconds) of the bounded wait running now, empty outside one,
+    # and why the last log read failed.
+    PROBE_DEADLINE=""
+    LOG_PROBE_DETAIL=""
     STARTED_AT="$(now_rfc3339)"
 
     trap cleanup EXIT
@@ -1719,4 +2018,3 @@ main() {
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
     main "$@"
 fi
-

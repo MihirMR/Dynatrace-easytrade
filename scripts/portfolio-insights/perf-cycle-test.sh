@@ -9,8 +9,9 @@
 #     nothing was re-armed it reads on in the same window; a failing step fails with its reason;
 #   - record_follow_ups fills a slot only with a clean follow-up whose owned set is unchanged,
 #     continues the same way after an unclean one, and fails `cycle follow-ups` on any shortfall;
-#   - measure_cycle counts no time row as an armed alert, and records the follow-ups after a
-#     failing `cycle < 10 s` verdict as well.
+#   - measure_cycle measures nothing unless the cycle inputs check of preflight_inputs passed,
+#     counts no time row as an armed alert, and records the follow-ups after a failing
+#     `cycle < 10 s` verdict as well.
 # The functions and constants under test are read from perf.sh in this directory without
 # running its main body. Only the pieces that reach the stack (HTTP, Docker logs, the database)
 # or the clock are replaced by scripted fakes, defined after loading; the sleep fake advances
@@ -32,7 +33,7 @@ PERF_SH="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/perf.sh"
 LOADED_CONSTANTS="PRESET_COUNT HOLDINGS_EXPECTED ALERTS_PER_ACCOUNT TARGET_PRICE_PER_ACCOUNT
 ALERTS_EXPECTED MAX_THRESHOLD CYCLE_LIMIT_MS LOG_STEP_SECONDS MAX_REJECTED_SAMPLES
 FOLLOW_UP_CYCLES CYCLE_WAIT_MARGIN_SECONDS CYCLE_MARKER CYCLE_RE ARMED_TIME_RE"
-LOADED_FUNCTIONS="pass fail info jget status_text dec_to_units armed_sql read_armed_set
+LOADED_FUNCTIONS="pass fail info dec_to_units armed_sql read_armed_set
 parse_cycle_line cycle_is_clean cycle_summary_text wait_cycle_line open_verified_window
 select_cycle_sample record_follow_ups measure_cycle"
 # The scripted clock reads FIXED_T at 0 s.
@@ -43,6 +44,8 @@ DEFAULT_TIME_ROW="at,2026-01-01t00:00:00.000000"
 # output, each line ending in a space.
 OUTAGE_ERROR="armed-set query failed: scripted outage  "
 REARM_FAILURE="PATCH alert [00000001-0000-4000-8000-000000000000] gave status 503"
+# measure_cycle's only line when the cycle inputs check did not pass.
+NOT_MEASURED_LINE="INFO cycle not measured: the cycle inputs check did not pass"
 
 usage() {
     cat <<'EOF'
@@ -266,23 +269,6 @@ rearm_missing() {
     info "re-armed $REARMED owned alerts missing from the armed set"
 }
 
-# Every preset holds HOLDINGS_EXPECTED instruments, written where measure_cycle reads them.
-insights_profile() {
-    awk -v n="$HOLDINGS_EXPECTED" \
-        'BEGIN { for (i = 1; i <= n; i++) printf "%08x-0000-4000-9000-000000000000\n", i }' \
-        >"$RUN_DIR/held-$1"
-}
-
-# The only request measure_cycle sends here is the per-account instrument listing, answered
-# with HOLDINGS_EXPECTED instruments.
-# shellcheck disable=SC2034 # measure_cycle, loaded through eval, reads these.
-http() {
-    HTTP_STATUS="200"
-    HTTP_CTYPE="application/json"
-    HTTP_ERROR=""
-    HTTP_BODY="$(jq -cn --argjson n "$HOLDINGS_EXPECTED" '{results: [range($n) | {id: .}]}')"
-}
-
 # Each created alert joins the expected owned set at revision 1, as a 201 records it.
 create_alert() {
     created_alerts=$((created_alerts + 1))
@@ -292,7 +278,8 @@ create_alert() {
 # start_test NAME: fresh fake state and run directory for test NAME. The owned set holds
 # ALERTS_EXPECTED alerts at revision 1, the database holds no armed alert, the scripted log is
 # empty, the clock reads FIXED_T, every re-arm re-arms one alert, the dialect is PostgreSQL and
-# the interval is 60 s, so a first line is awaited for 150 s and a follow-up for 90 s.
+# the interval is 60 s, so a first line is awaited for 150 s and a follow-up for 90 s. The
+# cycle inputs are unverified (INPUTS_VERIFIED 0) until measure_presets records them.
 # shellcheck disable=SC2034 # The perf.sh functions loaded through eval read these.
 start_test() {
     current_test="$1"
@@ -323,8 +310,7 @@ start_test() {
     passed=0
     failed=0
     EVAL_INTERVAL=60
-    BASE_URL="http://localhost"
-    PRESETS_STATUS="status 200"
+    INPUTS_VERIFIED=0
     R_CYCLE_VERDICT="not measured"
     R_CYCLE_REJECTIONS="0"
     R_FOLLOW_UPS="n/a"
@@ -470,13 +456,23 @@ armed_set_suffix() {
     fi
 }
 
-# measure_presets: the PRESET_COUNT preset accounts measure_cycle reads, and an empty owned set
-# that its workload fills.
+# measure_presets: what a passed preflight_inputs leaves for measure_cycle, and an empty owned
+# set that its workload fills. The PRESET_COUNT preset accounts are in $RUN_DIR/presets; each
+# one's HOLDINGS_EXPECTED distinct canonical instrument ids are in $RUN_DIR/held-ID, sorted, as
+# insights_profile writes them; and INPUTS_VERIFIED is 1.
+# shellcheck disable=SC2034 # measure_cycle, loaded through eval, reads INPUTS_VERIFIED.
 measure_presets() {
+    local id
     : >"$RUN_DIR/expected"
     awk -v n="$PRESET_COUNT" \
         'BEGIN { for (i = 1; i <= n; i++) printf "%08x-0000-4000-a000-000000000000\n", i }' \
         >"$RUN_DIR/presets"
+    while IFS= read -r id; do
+        awk -v n="$HOLDINGS_EXPECTED" \
+            'BEGIN { for (i = 1; i <= n; i++) printf "%08x-0000-4000-9000-000000000000\n", i }' \
+            >"$RUN_DIR/held-$id"
+    done <"$RUN_DIR/presets"
+    INPUTS_VERIFIED=1
 }
 
 # read_armed_set, through perf.sh's own armed_sql
@@ -776,6 +772,35 @@ for step in armedQuery rearm logs ownedSet ownedSetNothingRearmed; do
 done
 
 # measure_cycle
+
+# One case per INPUTS_VERIFIED short of 1: 0, as a failed preflight_inputs leaves it, and unset,
+# as before any preflight. The presets and their held instruments are in place, so the marker
+# alone stops measure_cycle: it prints only the not-measured line, sends no armed-set query and
+# creates no alert.
+while IFS='|' read -r name verified; do
+    start_test "$name"
+    measure_presets
+    if [[ "$verified" == "unset" ]]; then
+        unset INPUTS_VERIFIED
+    else
+        # shellcheck disable=SC2034 # measure_cycle, loaded through eval, reads INPUTS_VERIFIED.
+        INPUTS_VERIFIED="$verified"
+    fi
+    run_measure
+    if [[ "$(cat "$RUN_DIR/out")" == "$NOT_MEASURED_LINE" && ! -e "$RUN_DIR/db-sql" &&
+        $created_alerts -eq 0 && ! -s "$RUN_DIR/expected" ]]; then
+        test_pass
+    else
+        queried="no armed-set query"
+        if [[ -e "$RUN_DIR/db-sql" ]]; then
+            queried="an armed-set query"
+        fi
+        test_fail "$queried and $created_alerts alerts created, output: $(one_line "$RUN_DIR/out"); expected only '$NOT_MEASURED_LINE', no armed-set query and no alert"
+    fi
+done <<'EOF'
+measureCycle_inputsCheckFailed_printsNotMeasuredOnly|0
+measureCycle_inputsNeverChecked_printsNotMeasuredOnly|unset
+EOF
 
 # One case per armed-set answer at the precondition: the time row is never an armed alert.
 while IFS='|' read -r name rows expected; do

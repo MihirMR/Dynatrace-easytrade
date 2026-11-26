@@ -3,7 +3,7 @@ import { afterEach, beforeEach, describe, it, mock, test } from "node:test"
 import { IHandleWrapper } from "@demoability/loadgen-core/lib/handles"
 import { IPageActions } from "@demoability/loadgen-core/lib/pageActions"
 import { ISelector } from "@demoability/loadgen-core/lib/selectors"
-import type { ElementHandle } from "puppeteer"
+import type { ElementHandle, Page } from "puppeteer"
 import { Logger, createLogger, format, transports } from "winston"
 import { Config } from "../config"
 import { getRegularProviderFunction } from "../provider/regularVisits"
@@ -43,6 +43,11 @@ function unexpected(action: string): never {
  */
 function key(selector: ISelector): string {
     return selector.toString()
+}
+
+/** The page methods pageSetup calls, which the fake page actions record. */
+type SetupPage = Pick<Page, "setExtraHTTPHeaders" | "setCookie"> & {
+    setUserAgent(userAgent: string): Promise<void>
 }
 
 class FakeOptionHandle implements IHandleWrapper {
@@ -190,8 +195,23 @@ class RecordingPageActions implements IPageActions {
         this.calls.push("longDelay")
     }
 
-    async setupPage(): Promise<void> {
-        return unexpected("setupPage")
+    async setupPage(setup: (page: Page) => Promise<void>): Promise<void> {
+        this.calls.push("setupPage")
+        const page: SetupPage = {
+            setUserAgent: async (userAgent) => {
+                this.calls.push(`setUserAgent ${userAgent}`)
+            },
+            setExtraHTTPHeaders: async (headers) => {
+                this.calls.push(
+                    `setExtraHTTPHeaders ${JSON.stringify(headers)}`
+                )
+            },
+            setCookie: async (...cookies) => {
+                this.calls.push(`setCookie ${JSON.stringify(cookies)}`)
+            },
+        }
+        // pageSetup calls no other page method, so this page serves it.
+        await setup(page as Page)
     }
 
     async getHandle(selector: ISelector): Promise<IHandleWrapper> {
@@ -263,7 +283,10 @@ function recordingLogger(): {
 }
 
 /** Answers the flag read with the given state and fails any other request. */
-function flagFetch(enabled: boolean): {
+function flagFetch(
+    enabled: boolean,
+    flagRequest: string = FLAG_REQUEST
+): {
     fetchFn: typeof fetch
     requests: string[]
 } {
@@ -272,7 +295,7 @@ function flagFetch(enabled: boolean): {
         const url = input instanceof Request ? input.url : String(input)
         const method = init?.method ?? "GET"
         requests.push(`${method} ${url}`)
-        if (`${method} ${url}` !== FLAG_REQUEST) {
+        if (`${method} ${url}` !== flagRequest) {
             throw new Error(`Unexpected request [${method} ${url}]`)
         }
         return new Response(
@@ -362,7 +385,7 @@ test("run_flagOn_runsLoginLifecycleLogoutInOrder", async () => {
             ],
             requests: [FLAG_REQUEST],
             messages: [
-                "info: Going to EasyTrade frontend at [http://easytrade.test/]",
+                "info: Going to EasyTrade frontend at [http://easytrade.test]",
                 "info: Logging in as user [test_visitor]",
                 "info: Opening portfolio insights page",
                 `info: Created alert [${OWN_ID}] threshold [${MARKER}]`,
@@ -373,6 +396,159 @@ test("run_flagOn_runsLoginLifecycleLogoutInOrder", async () => {
         }
     )
 })
+
+// Each row puts a secret where a misconfigured EASYTRADE_URL could carry one,
+// or breaks the origin shape the visit relies on.
+const URL_SECRET = "s3cret-token-value"
+const NOT_ORIGIN_URLS = [
+    ["userAndPassword", `http://visitor:${URL_SECRET}@easytrade.test/`],
+    ["usernameOnly", `http://${URL_SECRET}@easytrade.test/`],
+    ["query", `http://easytrade.test/?token=${URL_SECRET}`],
+    ["fragment", `http://easytrade.test/#${URL_SECRET}`],
+    ["emptyQuery", "http://easytrade.test/?"],
+    ["emptyFragment", "http://easytrade.test/#"],
+    ["path", "http://easytrade.test/app"],
+    ["nonHttpScheme", "ftp://easytrade.test/"],
+] as const
+
+/**
+ * Calls one visit step with a URL it must refuse. Returns what it threw,
+ * the page actions and requests it made, what it logged, and each of those
+ * texts that shows the secret or any part of the URL.
+ */
+async function refuse(
+    rawUrl: string,
+    step: (
+        visit: PortfolioInsightsAlertVisit,
+        page: IPageActions,
+        logger: Logger
+    ) => Promise<void>
+): Promise<Record<string, unknown>> {
+    const page = new RecordingPageActions()
+    const { fetchFn, requests } = flagFetch(true)
+    const { logger, messages } = recordingLogger()
+    const url = new URL(rawUrl)
+    const visit = new PortfolioInsightsAlertVisit(
+        "portfolio_insights_alert",
+        url,
+        USER,
+        { fetchFn }
+    )
+
+    const outcome: unknown = await step(visit, page, logger).then(
+        () => "resolved",
+        (error: unknown) => error
+    )
+
+    const thrown = outcome instanceof Error ? outcome.message : outcome
+    const exposed = [...messages, String(thrown)].filter(
+        (text) =>
+            text.includes(URL_SECRET) ||
+            text.includes(rawUrl) ||
+            text.includes(url.href) ||
+            text.includes("easytrade.test")
+    )
+    return { thrown, pageCalls: page.calls, requests, messages, exposed }
+}
+
+const REFUSED = {
+    thrown: "EASYTRADE_URL must be an http or https origin without credentials, path, query or fragment; portfolio insights visit not run",
+    pageCalls: [],
+    requests: [],
+    messages: [],
+    exposed: [],
+}
+
+for (const [scenario, rawUrl] of NOT_ORIGIN_URLS) {
+    test(`run_urlNotCredentialFreeOrigin_throwsBeforeAnyRequest (${scenario})`, async () => {
+        const refused = await refuse(rawUrl, (visit, page, logger) =>
+            visit.run(page, logger)
+        )
+
+        assert.deepEqual(refused, REFUSED)
+    })
+
+    // The worker calls setup before run, so setup refuses the URL before the
+    // page cookie takes its host and before setup logs anything.
+    test(`setup_urlNotCredentialFreeOrigin_throwsBeforePageSetup (${scenario})`, async () => {
+        const refused = await refuse(rawUrl, (visit, page, logger) =>
+            visit.setup(page, logger)
+        )
+
+        assert.deepEqual(refused, REFUSED)
+    })
+}
+
+// The EASYTRADE_URL values Compose and the Helm chart ship (the chart's with
+// a port) are origins: setup sets the page cookie for their host, and run logs
+// them exactly as configured and keeps them in every request.
+const SHIPPED_ORIGINS = [
+    ["compose", "http://reverse-proxy", "reverse-proxy"],
+    [
+        "helmWithPort",
+        "http://easytrade-reverse-proxy:8080",
+        "easytrade-reverse-proxy",
+    ],
+] as const
+
+for (const [scenario, origin, host] of SHIPPED_ORIGINS) {
+    test(`setup_shippedOrigin_setsUpPageWithCookieForHost (${scenario})`, async () => {
+        const page = new RecordingPageActions()
+        const { logger, messages } = recordingLogger()
+        const visit = new PortfolioInsightsAlertVisit(
+            "portfolio_insights_alert",
+            new URL(origin),
+            USER
+        )
+
+        await visit.setup(page, logger)
+
+        assert.deepEqual(
+            { pageCalls: page.calls, messages },
+            {
+                pageCalls: [
+                    "setupPage",
+                    "setUserAgent loadgen-test",
+                    'setExtraHTTPHeaders {"x-forwarded-for":"192.0.2.10"}',
+                    `setCookie [{"name":"rxVisitor","value":"test-visitor-id","domain":"${host}","path":"/"}]`,
+                ],
+                messages: [
+                    "info: Setting up page for user [test_visitor|192.0.2.10]",
+                ],
+            }
+        )
+    })
+
+    test(`run_shippedOrigin_logsOriginAndOpensIt (${scenario})`, async () => {
+        const page = new RecordingPageActions()
+        const flagRequest = `GET ${origin}/feature-flag-service/v1/flags/portfolio-insights-enabled`
+        const { fetchFn, requests } = flagFetch(true, flagRequest)
+        const { logger, messages } = recordingLogger()
+        const visit = new PortfolioInsightsAlertVisit(
+            "portfolio_insights_alert",
+            new URL(origin),
+            USER,
+            { fetchFn, random: () => 0.5 }
+        )
+
+        await visit.run(page, logger)
+
+        assert.deepEqual(
+            {
+                requests,
+                firstMessage: messages[0],
+                gotoCalls: page.calls.filter((call) =>
+                    call.startsWith("gotoPage")
+                ),
+            },
+            {
+                requests: [flagRequest],
+                firstMessage: `info: Going to EasyTrade frontend at [${origin}]`,
+                gotoCalls: [`gotoPage ${origin}/`],
+            }
+        )
+    })
+}
 
 const NAV_KEY = key(selectors.navigation_portfolioInsightsPage)
 const SUBMIT_KEY = key(selectors.portfolioInsightsPage_alertSubmit)
@@ -471,7 +647,7 @@ function enabledFetch(deleteStatus?: number): {
 }
 
 const OPENING = [
-    "info: Going to EasyTrade frontend at [http://easytrade.test/]",
+    "info: Going to EasyTrade frontend at [http://easytrade.test]",
     "info: Logging in as user [test_visitor]",
     "info: Opening portfolio insights page",
 ]

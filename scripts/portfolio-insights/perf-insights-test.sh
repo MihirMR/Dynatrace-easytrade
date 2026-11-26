@@ -7,10 +7,12 @@
 #   - insights_trace and insights_trace_nonce: every request gets its own W3C traceparent;
 #   - insights_trace_durations: the server share reads only the measured account's log lines
 #     whose trace id belongs to a valid timed request;
-#   - measure_insights end to end, with curl, broker_logs and insights_profile replaced by fakes:
+#   - measure_insights end to end, with curl and broker_logs replaced by fakes and the account
+#     chosen by perf.sh's own select_insights_account from the record preflight_inputs leaves:
 #     any failed request or stray timing record fails the check without a p95, a p95 of 500 ms
-#     or more fails it, and a clean run passes on the 190th timing with a trace-matched server
-#     share, which stays unreported when no log line matches.
+#     or more fails it, a clean run passes on the 190th timing with a trace-matched server
+#     share, which stays unreported when no log line matches, and a record that leaves no
+#     qualifying account fails `insights p95 account` before any request.
 # The functions and constants come from perf.sh itself, without running its main body: each
 # column-0 definition and assignment the tests need is extracted and evaluated, so the code in
 # this tree is the code tested. No docker and no running stack are needed.
@@ -31,6 +33,10 @@ PERF_SH="$SCRIPT_DIR/perf.sh"
 ACCOUNT="5c2e1f0a-3b4d-4e6f-8a9b-0c1d2e3f4a5b"
 OTHER_ACCOUNT="9d8c7b6a-5f4e-4d3c-8b2a-1f0e9d8c7b6a"
 NONCE="0123456789abcdef"
+# The insights status and counts verify_cycle_inputs records for a preset with 15 held
+# instruments, and for one whose single zero quantity leaves 14 held.
+QUALIFYING_INSIGHTS="status 200, 15 allocations, 15 with a numeric quantity > 0, 0 without a canonical instrumentId, 15 held on 15 distinct instruments"
+UNHELD_INSIGHTS="status 200, 15 allocations, 14 with a numeric quantity > 0, 0 without a canonical instrumentId, 14 held on 14 distinct instruments"
 W3C_TRACEPARENT_RE='^00-[0-9a-f]{32}-[0-9a-f]{16}-01$'
 
 usage() {
@@ -71,7 +77,9 @@ INSIGHTS_TRACEPARENT=""
 # Steer the fakes below: request numbers that fail (space-padded list), the exit status and
 # -w output they give, the time_total every timed request reports instead of its own, the
 # request at which curl adds a stray line to the timing records, which insights log lines
-# broker_logs prints, and whether awk fails inside measure_insights.
+# broker_logs prints, and whether awk fails inside measure_insights; and the preflight record
+# of the measured account: INPUTS_VERIFIED (empty leaves it unset), INPUT_HELD and
+# INPUT_INSIGHTS. By default it is the record of a passed preflight.
 FAKE_FAIL_INDEXES=""
 FAKE_FAIL_RC=0
 FAKE_FAIL_OUT=""
@@ -79,6 +87,9 @@ FAKE_TIMED_SECONDS=""
 FAKE_STRAY_RECORD_AT=0
 FAKE_LOG_MODE="timed"
 FAKE_AWK_FAILS=0
+FAKE_INPUTS_VERIFIED=1
+FAKE_INPUT_HELD=1
+FAKE_INPUT_INSIGHTS="$QUALIFYING_INSIGHTS"
 
 pass() {
     passed=$((passed + 1))
@@ -232,31 +243,32 @@ broker_logs() {
         "$ACCOUNT"
 }
 
-# Fake insights_profile: the measured account qualifies with 15 held instruments.
-# shellcheck disable=SC2317,SC2329,SC2034 # Called by measure_insights, which reads the PROFILE_* values.
-insights_profile() {
-    PROFILE_STATUS="status 200"
-    PROFILE_ALLOCATIONS=15
-    PROFILE_HELD=15
-    [[ "$1" == "$ACCOUNT" ]]
-}
-
 # run_measure_insights NAME: runs measure_insights in a subshell, with set -e in force and
 # perf.sh's reporting replaced by CHECK lines, and writes its output, its exit status and the
 # report values to $work/NAME.out. The run directory and the recorded traceparents start empty.
+# The preflight record holds the measured account alone, as the FAKE_INPUT* values set it,
+# with the presets read and its instrument listing matched.
 run_measure_insights() {
     local out="$work/$1.out" status
     rm -rf "$work/run"
     mkdir "$work/run"
     : >"$work/sent"
-    printf '%s\n' "$ACCOUNT" >"$work/run/presets"
     set +e
-    # shellcheck disable=SC2317,SC2329,SC2034 # The functions and RUN_DIR serve measure_insights.
+    # shellcheck disable=SC2317,SC2329,SC2034 # The functions and values serve measure_insights.
     (
         set -e
         RUN_DIR="$work/run"
         INSIGHTS_URL="http://perf-insights-test.invalid/broker-service/v1/portfolio/insights"
-        PRESETS_STATUS="status 200"
+        PRESETS_ERROR=""
+        if [[ -n "$FAKE_INPUTS_VERIFIED" ]]; then
+            INPUTS_VERIFIED="$FAKE_INPUTS_VERIFIED"
+        else
+            unset INPUTS_VERIFIED
+        fi
+        INPUT_IDS=("$ACCOUNT")
+        INPUT_HELD=("$FAKE_INPUT_HELD")
+        INPUT_INSIGHTS=("$FAKE_INPUT_INSIGHTS")
+        INPUT_LISTING=("")
         pass() { echo "CHECK PASS $1"; }
         fail() { echo "CHECK FAIL $1: $2"; }
         info() { echo "CHECK INFO $*"; }
@@ -298,7 +310,7 @@ for name in HOLDINGS_EXPECTED HTTP_TIMEOUT_SECONDS LOG_SKEW_MARGIN_SECONDS WARMU
 done
 for name in dec_to_units units_to_dec seconds_to_ms nearest_rank epoch_to_rfc3339 \
     insights_trace_nonce insights_trace classify_insights_request insights_p95 \
-    insights_trace_durations measure_insights; do
+    insights_trace_durations select_insights_account measure_insights; do
     load_function "$name"
 done
 check="perfScript_load_definesTestedNames"
@@ -579,6 +591,34 @@ expect_line "$work/at-limit.out" "CHECK FAIL insights p95 < 500 ms: p95 500 ms i
 expect_equal "$(report_value "$work/at-limit.out" R_INSIGHTS_P95)" "500 ms" "R_INSIGHTS_P95"
 expect_equal "$(report_value "$work/at-limit.out" R_INSIGHTS_VERDICT)" "FAIL" "R_INSIGHTS_VERDICT"
 conclude "$check"
+
+# measure_insights when the preflight record leaves no qualifying account: name | the measured
+# account's INPUTS_VERIFIED (empty leaves it unset) | INPUT_HELD | INPUT_INSIGHTS | the
+# SELECT_ERROR of select_insights_account. The account check fails with it before any request,
+# and every report value stays at its default.
+while IFS='|' read -r check verified held insights select_error; do
+    FAKE_INPUTS_VERIFIED="$verified"
+    FAKE_INPUT_HELD="$held"
+    FAKE_INPUT_INSIGHTS="$insights"
+    run_measure_insights unqualified
+    unqualified="$work/unqualified.out"
+    expect_line "$unqualified" "EXIT=0"
+    expect_line "$unqualified" "CHECK FAIL insights p95 account: $select_error"
+    expect_no_text "$unqualified" "CHECK PASS"
+    expect_no_text "$unqualified" "CHECK INFO"
+    expect_equal "$(wc -l <"$work/sent" | tr -d ' ')" 0 "requests sent"
+    expect_equal "$(report_value "$unqualified" R_INSIGHTS_ACCOUNT)" "n/a" "R_INSIGHTS_ACCOUNT"
+    expect_equal "$(report_value "$unqualified" R_INSIGHTS_P95)" "n/a" "R_INSIGHTS_P95"
+    expect_equal "$(report_value "$unqualified" R_INSIGHTS_VERDICT)" "not measured" "R_INSIGHTS_VERDICT"
+    expect_equal "$(report_value "$unqualified" R_SERVER_SHARE)" "n/a" "R_SERVER_SHARE"
+    conclude "$check"
+done <<EOF
+measureInsights_noPresetHeld_failsAccountCheckWithoutRequest|0|0|$UNHELD_INSIGHTS|no preset account has exactly 15 allocations, each with a numeric quantity > 0 on a distinct canonical instrumentId: [$ACCOUNT] $UNHELD_INSIGHTS;
+measureInsights_inputsNeverVerified_failsAccountCheckWithoutRequest||1|$QUALIFYING_INSIGHTS|the preset inputs were not verified before the account was selected
+EOF
+FAKE_INPUTS_VERIFIED=1
+FAKE_INPUT_HELD=1
+FAKE_INPUT_INSIGHTS="$QUALIFYING_INSIGHTS"
 
 summarize
 if [[ "$failed" -ne 0 ]]; then

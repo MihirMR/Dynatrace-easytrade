@@ -118,6 +118,8 @@ t_fresh_run_dir() {
     WINDOW_SINCE=""
     LOADGEN_PAUSED=0
     TABLE_WRITTEN=0
+    PROBE_DEADLINE=""
+    LOG_PROBE_DETAIL=""
     STARTED_AT="2026-01-01T00:00:00Z"
 }
 
@@ -165,10 +167,12 @@ t_drain_resolved() {
 # the audit, in the calling test's subshell only.
 #   - date -u +%s and now_rfc3339 read the fake clock in $RUN_DIR/clock; sleep advances it.
 #   - compose appends its arguments to $RUN_DIR/compose.calls and fails for a subcommand listed
-#     in $RUN_DIR/compose.fail.
+#     in $RUN_DIR/compose.fail. compose_within, the bounded form the stop, pause, unpause and
+#     kill use, runs compose without the time limit, which harness-test.sh covers.
 #   - loadgen_logs prints $RUN_DIR/logs.N on its Nth read, the highest N there is from then on,
 #     and $RUN_DIR/logs.final, when it exists, once Compose has stopped or killed loadgen. A
-#     fixture holding the line !unreadable makes the read fail.
+#     fixture holding the line !unreadable makes the read fail with the LOG_PROBE_DETAIL the
+#     real read sets for a log Docker could not give.
 #   - db_query appends its SQL to $RUN_DIR/db.sql and prints the count in $RUN_DIR/db.count.
 t_drain_stubs() {
     echo "$T_DRAIN_CLOCK_START" >"$RUN_DIR/clock"
@@ -193,6 +197,10 @@ t_drain_stubs() {
         echo "$*" >>"$RUN_DIR/compose.calls"
         ! grep -qxF -- "$1" "$RUN_DIR/compose.fail"
     }
+    compose_within() {
+        shift
+        compose "$@"
+    }
     loadgen_logs() {
         local n file
         n=$(($(cat "$RUN_DIR/logs.n") + 1))
@@ -204,7 +212,9 @@ t_drain_stubs() {
         if [[ -f "$RUN_DIR/logs.final" ]] && grep -qE '^(stop|kill) ' "$RUN_DIR/compose.calls"; then
             file="$RUN_DIR/logs.final"
         fi
+        LOG_PROBE_DETAIL=""
         if grep -qxF '!unreadable' "$file"; then
+            LOG_PROBE_DETAIL="loadgen logs unreadable, exit 1 (see $RUN_DIR/compose.log)"
             return 1
         fi
         cat "$file"
@@ -434,10 +444,10 @@ t_drain_failure() {
 }
 
 test_drain_loadgen_failurePaths_failWithDetail() {
-    t_drain_failure logs 0 "not quiescent within 180s: loadgen logs unreadable (see @RUN_DIR@/compose.log)"
-    t_drain_failure pause 1 "pausing loadgen failed (see @RUN_DIR@/compose.log)"
-    t_drain_failure kill 1 "killing the paused loadgen failed (see @RUN_DIR@/compose.log)"
-    t_drain_failure unpause 1 "paused: 1 visits between opening the page and their create outcome; unpausing loadgen failed (see @RUN_DIR@/compose.log)"
+    t_drain_failure logs 0 "not quiescent within 180s: loadgen logs unreadable, exit 1 (see @RUN_DIR@/compose.log)"
+    t_drain_failure pause 1 "pausing loadgen failed, exit 1 (see @RUN_DIR@/compose.log)"
+    t_drain_failure kill 1 "killing the paused loadgen failed, exit 1 (see @RUN_DIR@/compose.log)"
+    t_drain_failure unpause 1 "paused: 1 visits between opening the page and their create outcome; unpausing loadgen failed, exit 1 (see @RUN_DIR@/compose.log)"
 }
 
 # t_frozen_failure CASE DETAIL: frozen_log in a fresh run directory fails with DETAIL, in which
@@ -468,7 +478,7 @@ t_frozen_failure() {
 
 test_frozen_log_outputUnsettledOrUnreadable_fails() {
     t_frozen_failure unsettled "paused loadgen's output still changing after 10s"
-    t_frozen_failure unreadable "loadgen logs unreadable while paused (see @RUN_DIR@/compose.log)"
+    t_frozen_failure unreadable "reading the paused loadgen's output: loadgen logs unreadable, exit 1 (see @RUN_DIR@/compose.log)"
 }
 
 # t_stop_case PAUSED CALLS: stop_loadgen with LOADGEN_PAUSED at PAUSED runs exactly CALLS and
@@ -547,7 +557,9 @@ test_watch_progress_progressRead_recordsObservedIds() {
     t_drain_window
     WINDOW_START_EPOCH="$T_DRAIN_CLOCK_START"
     t_drain_resolved "$T_DRAIN_RUN_1" "$T_DRAIN_ALERT_1" api >"$RUN_DIR/logs.1"
-    watch_progress B $((T_DRAIN_CLOCK_START + PROGRESS_STEP_SECONDS))
+    # Two steps: the read due at the window's end is skipped, so the first step's read is the
+    # one observed.
+    watch_progress B $((T_DRAIN_CLOCK_START + 2 * PROGRESS_STEP_SECONDS))
     t_eq "watch_progress records the created ids of its read" \
         "$T_DRAIN_ALERT_1" "$(observed_ids created | join_lines)"
     t_eq "watch_progress records the resolutions of its read" \
@@ -681,16 +693,23 @@ T_LOG_LAST_5M="${T_LOG_STAMP}[stats:runner][INFO]: In the last [5m] loadgen has 
 T_LOG_LAST_1H="${T_LOG_STAMP}[stats:runner][INFO]: In the last [1h] loadgen has generated [0] visits with fail rate [0.00] and a rate of [0.00/m], detailed breakdown [{}]"
 
 # t_loadgen_output LINE...: stubs compose so that "compose logs" prints the LINEs as raw loadgen
-# output, each wrapped in colour codes and ended with a carriage return.
+# output, each wrapped in colour codes and ended with a carriage return. loadgen_logs reads
+# through compose_within, which runs that stub here without the time limit.
 t_loadgen_output() {
     local line
     for line in "$@"; do
         printf '\033[32m%s\033[39m\r\n' "$line"
     done >"$RUN_DIR/loadgen.raw"
+    # shellcheck disable=SC2329 # Invoked by loadgen_logs through compose_within.
     compose() {
         if [[ "$1" == "logs" ]]; then
             cat "$RUN_DIR/loadgen.raw"
         fi
+    }
+    # shellcheck disable=SC2329 # Invoked by loadgen_logs.
+    compose_within() {
+        shift
+        compose "$@"
     }
 }
 
@@ -850,18 +869,24 @@ T_NO_WEIGHT='["EASYTRADE_URL=http://reverse-proxy"]'
 # running for -d, whose weight is Compose's ${PORTFOLIO_INSIGHTS_ALERT_WEIGHT:-0}, or absent when
 # DECLARED is 0, as with compose files lacking the declaration. The files t-fail, t-inspect-fail
 # and t-exits in $RUN_DIR make up and rm fail, loadgen's inspect fail, and a started container exit.
+# hard_timeout, which bounds those calls, runs the stub here without the time limit, which
+# harness-test.sh covers.
 t_loadgen_fixture() {
     echo "$1" >"$RUN_DIR/t-cid"
     echo "$2" >"$RUN_DIR/t-running"
     echo "$3" >"$RUN_DIR/t-env"
     echo "${4:-1}" >"$RUN_DIR/t-declared"
     : >"$RUN_DIR/docker-calls"
+    hard_timeout() {
+        shift
+        "$@"
+    }
     docker() {
         local weight="${PORTFOLIO_INSIGHTS_ALERT_WEIGHT-(unset)}" cid
         cid="$(cat "$RUN_DIR/t-cid")"
         if [[ "$1" == "inspect" ]]; then
             if [[ "${*: -1}" == "db-adapter-1" ]]; then
-                echo "DB_TYPE=postgres"
+                echo '["DB_TYPE=postgres"]'
             elif [[ -n "$cid" && "${*: -1}" == "$cid" && "$3" == "{{json .Config.Env}}" &&
                 ! -f "$RUN_DIR/t-inspect-fail" ]]; then
                 cat "$RUN_DIR/t-env"
@@ -937,7 +962,8 @@ t_stub_flag_service() {
 
 # t_capture_start: records loadgen at start as setup does.
 t_capture_start() {
-    LOADGEN_AT_START="$(loadgen_state)"
+    LOADGEN_AT_START="$(loadgen_state && printf x)"
+    LOADGEN_AT_START="${LOADGEN_AT_START%x}"
     if [[ "$LOADGEN_AT_START" == running,* ]]; then
         LOADGEN_WAS_RUNNING=1
     fi
@@ -952,14 +978,20 @@ t_cleanup() {
 }
 
 test_container_env_entry_environmentShapes_printsEntryOrFails() {
-    local i actual
-    local cids=(lg-1 lg-1 lg-1 lg-1 lg-1 "" lg-1 lg-1)
+    local i actual cr=$'\r' lf=$'\n'
+    local -a expected
+    # The last two values hold a carriage return and a line feed, which the entry keeps. Their
+    # expected entries take them from variables in a plain assignment: Git Bash drops a carriage
+    # return from an array assigned by local, and from $'\r' in any array assignment.
+    local cids=(lg-1 lg-1 lg-1 lg-1 lg-1 "" lg-1 lg-1 lg-1 lg-1)
     local envs=("$T_WEIGHT_2" '["PORTFOLIO_INSIGHTS_ALERT_WEIGHT="]'
         '["PORTFOLIO_INSIGHTS_ALERT_WEIGHT_MAX=9","PORTFOLIO_INSIGHTS_ALERT_WEIGHT=3"]'
-        "$T_NO_WEIGHT" 'null' '[]' "$T_WEIGHT_2" 'not json')
-    local inspect_fails=(0 0 0 0 0 0 1 0)
-    local expected=("PORTFOLIO_INSIGHTS_ALERT_WEIGHT=2" "PORTFOLIO_INSIGHTS_ALERT_WEIGHT="
-        "PORTFOLIO_INSIGHTS_ALERT_WEIGHT=3" "" "" "fails" "fails" "fails")
+        "$T_NO_WEIGHT" 'null' '[]' "$T_WEIGHT_2" 'not json'
+        '["PORTFOLIO_INSIGHTS_ALERT_WEIGHT=2\r"]' '["PORTFOLIO_INSIGHTS_ALERT_WEIGHT=2\n0"]')
+    local inspect_fails=(0 0 0 0 0 0 1 0 0 0)
+    expected=("PORTFOLIO_INSIGHTS_ALERT_WEIGHT=2" "PORTFOLIO_INSIGHTS_ALERT_WEIGHT="
+        "PORTFOLIO_INSIGHTS_ALERT_WEIGHT=3" "" "" "fails" "fails" "fails"
+        "PORTFOLIO_INSIGHTS_ALERT_WEIGHT=2$cr" "PORTFOLIO_INSIGHTS_ALERT_WEIGHT=2${lf}0")
     for i in "${!cids[@]}"; do
         rm -f "$RUN_DIR/t-inspect-fail"
         t_loadgen_fixture "${cids[$i]}" 1 "${envs[$i]}"
@@ -997,7 +1029,7 @@ test_setup_loadgenUninspectable_failsReadiness() {
     t_stub_flag_service
     (setup) >/dev/null 2>&1 || true
     t_report_has "setup fails readiness when loadgen cannot be inspected" \
-        "FAIL readiness: loadgen's container state is unreadable (see $RUN_DIR/compose.log)"
+        "FAIL readiness: reading loadgen's container state failed, exit 1 (see $RUN_DIR/compose.log)"
 }
 
 test_restore_loadgen_runningWithWeight2_recreatesStartedWithWeight2() {
@@ -1063,6 +1095,21 @@ test_cleanup_loadgenRestored_reportsStateAsAtStartAndPasses() {
     t_report_has "cleanup passes after the restore" "PASS cleanup"
 }
 
+test_cleanup_weightWithControlCharacters_restoresItByteExactAndPrintsItQuoted() {
+    local after
+    unset PORTFOLIO_INSIGHTS_ALERT_WEIGHT
+    t_loadgen_fixture lg-1 1 '["EASYTRADE_URL=http://reverse-proxy","PORTFOLIO_INSIGHTS_ALERT_WEIGHT=2\r\n"]'
+    t_capture_start
+    recreate_loadgen 1
+    t_cleanup
+    after="$(loadgen_state && printf x)"
+    t_eq "cleanup restores a weight ending in a carriage return and a line feed byte for byte" \
+        "running, PORTFOLIO_INSIGHTS_ALERT_WEIGHT=2"$'\r\n'"x" "$after"
+    t_report_has "cleanup prints that weight quoted, on one line" \
+        "INFO cleanup: loadgen restored as at start: running, PORTFOLIO_INSIGHTS_ALERT_WEIGHT=\$'2\\r\\n'"
+    t_report_has "cleanup passes after that restore" "PASS cleanup"
+}
+
 test_cleanup_restoredStateDiffers_failsNamingExpectedAndActual() {
     local i
     # The weight unset at start against compose files declaring it, and a container that exits.
@@ -1091,10 +1138,10 @@ test_cleanup_dockerCommandFails_failsCleanup() {
     local envs=("$T_WEIGHT_2" "$T_NO_WEIGHT" '[]' "$T_WEIGHT_2")
     local declared=(1 0 1 1)
     local switches=(t-fail t-fail t-fail t-inspect-fail)
-    local expected=("recreating loadgen as [running, PORTFOLIO_INSIGHTS_ALERT_WEIGHT=2] failed"
-        "recreating loadgen as [running, PORTFOLIO_INSIGHTS_ALERT_WEIGHT unset] failed"
-        "removing the loadgen container this run created failed"
-        "loadgen's state after the restore is unreadable")
+    local expected=("recreating loadgen as [running, PORTFOLIO_INSIGHTS_ALERT_WEIGHT=2] failed, exit 1"
+        "recreating loadgen as [running, PORTFOLIO_INSIGHTS_ALERT_WEIGHT unset] failed, exit 1"
+        "removing the loadgen container this run created failed, exit 1"
+        "reading loadgen's state after the restore failed, exit 1")
     for i in "${!cids[@]}"; do
         t_fresh_run_dir
         t_loadgen_fixture "${cids[$i]}" 1 "${envs[$i]}" "${declared[$i]}"
