@@ -7,7 +7,11 @@ using EasyTrade.BrokerService.Entities.Instruments;
 using EasyTrade.BrokerService.Entities.Instruments.Repository;
 using EasyTrade.BrokerService.Entities.Prices;
 using EasyTrade.BrokerService.Test.Fakes;
+using Google.Protobuf.WellKnownTypes;
 using Microsoft.Extensions.DependencyInjection;
+// Aliased so db-adapter's wire types read as AlertGrpc.<Type>; the generated namespace also
+// declares an AlertService type.
+using AlertGrpc = EasyTrade.DbAdapter.Alert.Grpc;
 
 namespace EasyTrade.BrokerService.Test.IntegrationTests
 {
@@ -17,7 +21,9 @@ namespace EasyTrade.BrokerService.Test.IntegrationTests
     /// at a <see cref="StubHttpServer"/> that records every request's headers. The broker runs
     /// its shipped registrations with the real repositories, so db-adapter calls reach the
     /// stub's HTTP/2 listener, which answers each with <c>grpc-status</c> 12; the broker's
-    /// responses are therefore errors, and only the recorded headers are asserted.
+    /// responses are therefore errors, and only the recorded headers are asserted. The one
+    /// exception is the armed evaluation cycle, whose <c>ListAlerts</c> the stub answers with
+    /// two armed alerts so that the cycle goes on to fetch prices and evaluate them.
     /// </summary>
     /// <remarks>
     /// No <c>ActivityListener</c> and no tracing package is involved: ASP.NET Core hosting starts
@@ -27,7 +33,9 @@ namespace EasyTrade.BrokerService.Test.IntegrationTests
     [Collection(BrokerHostCollection.Name)]
     public class TraceContextTests
     {
-        /// <summary>The outbound calls a broker request is expected to cause.</summary>
+        /// <summary>
+        /// The outbound calls a broker request or an evaluation cycle is expected to cause.
+        /// </summary>
         [Flags]
         public enum OutboundLeg
         {
@@ -53,6 +61,7 @@ namespace EasyTrade.BrokerService.Test.IntegrationTests
 
         private const string AccountIdText = "3f2b8c1e-5a47-4d9b-8e21-6c0d4f7a9b13";
         private const string AlertIdText = "8d4e2f6a-1b3c-4e5f-9a7b-0c2d4e6f8a1b";
+        private const string ProfitLossAlertIdText = "5c1e7a3b-9d2f-4b6e-8a0c-3f5d7b9e1a2c";
         private const string InstrumentIdText = "c0000000-0000-4000-8000-000000000001";
 
         private const string InsightsPath = "v1/portfolio/insights/" + AccountIdText;
@@ -73,8 +82,19 @@ namespace EasyTrade.BrokerService.Test.IntegrationTests
 
         private const string EnableBody = "{\"enabled\":true}";
 
+        // db-adapter methods as the wire names them, /package.Service/Method, so a renamed or
+        // re-routed call fails the row that requires it.
+        private const string ListAlertsRpc = "/easytrade.dbadapter.alert.AlertService/ListAlerts";
+        private const string TriggerAlertRpc =
+            "/easytrade.dbadapter.alert.AlertService/TriggerAlert";
+        private const string OwnedInstrumentsRpc =
+            "/easytrade.dbadapter.instrument.InstrumentService/GetOwnedInstruments";
+        private const string AccountTradesRpc =
+            "/easytrade.dbadapter.trade.TradeService/GetAccountTrades";
+
         private static readonly Guid AccountId = Guid.Parse(AccountIdText);
         private static readonly Guid InstrumentId = Guid.Parse(InstrumentIdText);
+        private static readonly DateTimeOffset CreatedOn = new(2025, 1, 1, 0, 0, 0, TimeSpan.Zero);
 
         // Bounds the wait for both schedulers' startup runs; no test sleeps.
         private static readonly TimeSpan StartupTimeout = TimeSpan.FromSeconds(10);
@@ -108,7 +128,11 @@ namespace EasyTrade.BrokerService.Test.IntegrationTests
             await using StubHttpServer stub = await StubHttpServer.StartAsync(
                 enableGrpcListener: true
             );
-            await using BrokerTestHost host = await StartHostAsync(stub, seedHolding);
+            await using BrokerTestHost host = await StartHostAsync(
+                stub,
+                seedHolding,
+                listReply: null
+            );
 
             HttpStatusCode status;
             using (
@@ -141,27 +165,75 @@ namespace EasyTrade.BrokerService.Test.IntegrationTests
         }
 
         /// <summary>
-        /// An evaluation cycle outside any request has no ambient <c>Activity</c>, so neither its
-        /// flag read nor its db-adapter call carries a <c>traceparent</c>.
+        /// An evaluation cycle outside any request has no ambient <c>Activity</c>, so none of its
+        /// flag, price and db-adapter requests carries a <c>traceparent</c>. Both rows run every
+        /// repository real, over the stub's gRPC listener. In the <c>list-fails</c> row the flag
+        /// read succeeds and <c>ListAlerts</c> reaches the gRPC stub, whose status 12 fails the
+        /// cycle before pricing, so <see cref="AlertEvaluationOutcome.Failed"/> proves the
+        /// db-adapter leg ran. In the <c>armed</c> row (<paramref name="listArmedAlerts"/>) the
+        /// stub answers <c>ListAlerts</c>, and only it, with an armed target-price alert that its
+        /// close of 101 crosses and an armed P/L alert on the same instrument, so the real price
+        /// connector fetches the latest prices from the stub. Every other call still answers
+        /// status 12: the target-price alert's <c>TriggerAlert</c> and the P/L alert's positions
+        /// load, <c>GetOwnedInstruments</c> with <c>GetAccountTrades</c>, each fail their alert
+        /// alone, so the cycle ends <see cref="AlertEvaluationOutcome.Completed"/> with both
+        /// alerts failed and none triggered, which proves the price fetch returned prices.
+        /// <paramref name="requiredRpcPaths"/> names the db-adapter methods a row must reach.
         /// </summary>
-        [Fact]
-        public async Task RunCycle_OutsideRequest_ShouldSendNoTraceparent()
+        [Theory]
+        [InlineData("list-fails", false, AlertEvaluationOutcome.Failed, FlagAndDbAdapter)]
+        [InlineData(
+            "armed",
+            true,
+            AlertEvaluationOutcome.Completed,
+            AllLegs,
+            ListAlertsRpc,
+            TriggerAlertRpc,
+            OwnedInstrumentsRpc,
+            AccountTradesRpc
+        )]
+        public async Task RunCycle_OutsideRequest_ShouldSendNoTraceparent(
+            string name,
+            bool listArmedAlerts,
+            AlertEvaluationOutcome expectedOutcome,
+            OutboundLeg expectedLegs,
+            params string[] requiredRpcPaths
+        )
         {
             await using StubHttpServer stub = await StubHttpServer.StartAsync(
                 enableGrpcListener: true
             );
-            await using BrokerTestHost host = await StartHostAsync(stub, false);
+            AlertGrpc.AlertsResponse? listReply = listArmedAlerts ? ArmedAlertsReply() : null;
+            await using BrokerTestHost host = await StartHostAsync(
+                stub,
+                seedHolding: false,
+                listReply
+            );
 
             Assert.Null(Activity.Current);
             AlertEvaluationResult result = await host.RunCycleAsync();
 
             IReadOnlyList<StubRecordedRequest> recorded = stub.Requests;
-            string context = $"Outcome {result.Outcome}. Recorded: {Describe(recorded)}";
-            // The flag read succeeded and ListAlerts reached the gRPC stub, whose status 12 fails
-            // the cycle; Failed therefore proves the db-adapter leg ran.
-            Assert.True(result.Outcome == AlertEvaluationOutcome.Failed, context);
-            Assert.True(recorded.Any(IsFlagRequest), $"No flag request. {context}");
-            Assert.True(recorded.Any(IsDbAdapterRequest), $"No db-adapter request. {context}");
+            string context = $"[{name}] {result}. Recorded: {Describe(recorded)}";
+            Assert.True(result.Outcome == expectedOutcome, context);
+            // Each listed alert fails alone, as its trigger write or positions load answers
+            // status 12; a failed list lists none.
+            int listed = listReply?.Alerts.Count ?? 0;
+            Assert.True(
+                (result.AlertCount, result.Triggered, result.Failed, result.Skipped)
+                    == (listed, 0, listed, 0),
+                context
+            );
+            AssertLeg(recorded, expectedLegs, OutboundLeg.Flag, IsFlagRequest, context);
+            AssertLeg(recorded, expectedLegs, OutboundLeg.DbAdapter, IsDbAdapterRequest, context);
+            AssertLeg(recorded, expectedLegs, OutboundLeg.Price, IsPriceRequest, context);
+            foreach (string rpcPath in requiredRpcPaths)
+            {
+                Assert.True(
+                    recorded.Any(request => IsRpcRequest(request, rpcPath)),
+                    $"No {rpcPath} call was recorded. {context}"
+                );
+            }
             foreach (StubRecordedRequest request in recorded)
             {
                 Assert.False(
@@ -175,10 +247,14 @@ namespace EasyTrade.BrokerService.Test.IntegrationTests
         // Production registrations with the real repositories on the stub's gRPC listener. The
         // flag answers false until both schedulers have finished their startup runs, so the
         // alert cycle takes its skip path; it is then switched on so requests pass the gate, and
-        // the recordings are cleared so a test sees only the requests it caused.
+        // the recordings are cleared so a test sees only the requests it caused. seedHolding
+        // replaces the balance and instrument repositories with seeded fakes. listReply, when
+        // given, becomes the stub's answer to ListAlerts alone once the startup runs are over;
+        // the alert repository stays real, and every other gRPC call keeps status 12.
         private static async Task<BrokerTestHost> StartHostAsync(
             StubHttpServer stub,
-            bool seedHolding
+            bool seedHolding,
+            AlertGrpc.AlertsResponse? listReply
         )
         {
             stub.SetFlagEnabled(false);
@@ -218,6 +294,12 @@ namespace EasyTrade.BrokerService.Test.IntegrationTests
                     );
                     host.Instruments.AddOwned(new OwnedInstrument(AccountId, InstrumentId, 10m));
                 }
+                if (listReply is not null)
+                {
+                    // The startup cycle read the flag as false and listed nothing; set only now,
+                    // the reply can serve no call but the test's own cycle.
+                    stub.SetGrpcReply(ListAlertsRpc, listReply);
+                }
                 stub.SetFlagEnabled(true);
                 stub.ClearRecordings();
                 return host;
@@ -227,6 +309,46 @@ namespace EasyTrade.BrokerService.Test.IntegrationTests
                 await host.DisposeAsync();
                 throw;
             }
+        }
+
+        // The evaluator's armed list as db-adapter would answer it: a target-price alert ABOVE
+        // 100, which the stub's close of 101 crosses, and a P/L alert of the same account on the
+        // same instrument.
+        private static AlertGrpc.AlertsResponse ArmedAlertsReply()
+        {
+            return new AlertGrpc.AlertsResponse
+            {
+                Alerts =
+                {
+                    ArmedAlertMessage(AlertIdText, "TARGET_PRICE", "100"),
+                    ArmedAlertMessage(ProfitLossAlertIdText, "PROFIT_LOSS", "5"),
+                },
+            };
+        }
+
+        // The wire form of an enabled alert at its first arming that has not triggered: exact
+        // enum names, a normalised threshold, triggered_at unset with an empty trigger_value,
+        // and created_at set, as the real mapper requires.
+        private static AlertGrpc.AlertMessage ArmedAlertMessage(
+            string id,
+            string type,
+            string threshold
+        )
+        {
+            return new AlertGrpc.AlertMessage
+            {
+                Id = id,
+                AccountId = AccountIdText,
+                Type = type,
+                InstrumentId = InstrumentIdText,
+                Direction = "ABOVE",
+                Threshold = threshold,
+                Enabled = true,
+                ArmingRevision = 1,
+                TriggerValue = "",
+                Acknowledged = false,
+                CreatedAt = Timestamp.FromDateTimeOffset(CreatedOn),
+            };
         }
 
         private static void AssertLeg(
@@ -260,6 +382,12 @@ namespace EasyTrade.BrokerService.Test.IntegrationTests
                 StubHttpServer.GrpcListenerName,
                 StringComparison.Ordinal
             );
+        }
+
+        private static bool IsRpcRequest(StubRecordedRequest request, string rpcPath)
+        {
+            return IsDbAdapterRequest(request)
+                && string.Equals(request.Path, rpcPath, StringComparison.Ordinal);
         }
 
         private static bool IsHttpPath(StubRecordedRequest request, string path)

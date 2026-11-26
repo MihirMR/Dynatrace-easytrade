@@ -1,3 +1,4 @@
+using System.Buffers.Binary;
 using System.Collections.Concurrent;
 using System.Net;
 using System.Net.Sockets;
@@ -7,6 +8,7 @@ using EasyTrade.BrokerService.Entities.Prices;
 using EasyTrade.BrokerService.Entities.Prices.DTO;
 using EasyTrade.BrokerService.Helpers;
 using EasyTrade.BrokerService.ProblemPatterns.OpenFeature.Providers.FeatureFlagService;
+using Google.Protobuf;
 using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.Http;
@@ -91,8 +93,11 @@ namespace EasyTrade.BrokerService.Test.Fakes
     /// defaults, so problem-pattern behaviour stays at its defaults (Guardrails directive 1).
     /// The gRPC listener has no mode and serves HTTP/2 only: it records every HTTP/2 request,
     /// whatever its path or method, and answers HTTP 200 with a trailers-only <c>grpc-status</c>
-    /// 12 (Unimplemented), which Grpc.Net.Client raises as RpcException(Unimplemented). Kestrel
-    /// answers an HTTP/1.1 request on it with 400 before the stub sees it, so it is not recorded.
+    /// 12 (Unimplemented), which Grpc.Net.Client raises as RpcException(Unimplemented). The one
+    /// exception is opt-in: a method path given a reply through <see cref="SetGrpcReply"/> has
+    /// its request message read to the end, then is answered with that one message and
+    /// <c>grpc-status</c> 0 in the trailers, until <see cref="ResetAsync"/>. Kestrel answers an
+    /// HTTP/1.1 request on the listener with 400 before the stub sees it, so it is not recorded.
     /// </remarks>
     public sealed class StubHttpServer : IAsyncDisposable
     {
@@ -107,7 +112,12 @@ namespace EasyTrade.BrokerService.Test.Fakes
 
         private const string HttpScheme = "http://";
         private const string GrpcContentType = "application/grpc";
+        private const string GrpcStatusHeader = "grpc-status";
+        private const string GrpcStatusOk = "0";
         private const string GrpcStatusUnimplemented = "12";
+
+        // gRPC length-prefixed framing: a 1-byte compression flag, then a 4-byte big-endian length.
+        private const int GrpcMessagePrefixLength = 5;
 
         private static readonly TimeSpan ShutdownTimeout = TimeSpan.FromSeconds(5);
         private static readonly JsonSerializerOptions WebJson = new(JsonSerializerDefaults.Web);
@@ -127,6 +137,9 @@ namespace EasyTrade.BrokerService.Test.Fakes
         private readonly Dictionary<string, int> _abortCounts = new(StringComparer.Ordinal);
         private readonly List<RequestWaiter> _requestWaiters = [];
         private readonly List<TaskCompletionSource> _abortWaiters = [];
+
+        // Framed reply per gRPC method path, under _gate; a path without one answers status 12.
+        private readonly Dictionary<string, byte[]> _grpcReplies = new(StringComparer.Ordinal);
         private readonly RouteListener _flagListener = new(StubRoute.Flag, FlagPath);
         private readonly RouteListener _latestPricesListener = new(
             StubRoute.LatestPrices,
@@ -346,6 +359,46 @@ namespace EasyTrade.BrokerService.Test.Fakes
             }
         }
 
+        /// <summary>
+        /// Answers every later gRPC call to <paramref name="methodPath"/>, the request path
+        /// <c>/package.Service/Method</c>, for example
+        /// <c>/easytrade.dbadapter.alert.AlertService/ListAlerts</c>, with
+        /// <paramref name="message"/> and <c>grpc-status</c> 0 instead of status 12. The message
+        /// is serialized when this is called, so later changes to it do not change the reply; a
+        /// later call for the same path replaces it. Every other path keeps status 12, and
+        /// <see cref="ResetAsync"/> removes every configured reply.
+        /// </summary>
+        /// <exception cref="ArgumentException">
+        /// <paramref name="methodPath"/> is empty or does not start with <c>/</c>, so no call
+        /// could match it.
+        /// </exception>
+        /// <exception cref="InvalidOperationException">
+        /// The stub was started without its gRPC listener.
+        /// </exception>
+        public void SetGrpcReply(string methodPath, IMessage message)
+        {
+            ArgumentException.ThrowIfNullOrEmpty(methodPath);
+            ArgumentNullException.ThrowIfNull(message);
+            if (!methodPath.StartsWith('/'))
+            {
+                throw new ArgumentException(
+                    $"The gRPC method path [{methodPath}] does not start with '/'.",
+                    nameof(methodPath)
+                );
+            }
+            if (_grpcApp is null)
+            {
+                throw new InvalidOperationException(
+                    "The stub was started without its gRPC listener."
+                );
+            }
+            byte[] frame = FrameGrpcMessage(message.ToByteArray());
+            lock (_gate)
+            {
+                _grpcReplies[methodPath] = frame;
+            }
+        }
+
         /// <summary>Recorded requests whose path equals <paramref name="path"/>.</summary>
         public int Count(string path)
         {
@@ -383,9 +436,10 @@ namespace EasyTrade.BrokerService.Test.Fakes
         /// <summary>
         /// Listens again on the port of every refused route, puts every route back to
         /// <see cref="StubMode.Respond"/> with 200, the flag to false and the prices to empty,
-        /// and clears the recordings as <see cref="ClearRecordings"/> does. A held request stays
-        /// held, because leaving Hold keeps its listener open, and its client's later abort is
-        /// discarded.
+        /// removes every reply <see cref="SetGrpcReply"/> configured, so every gRPC call answers
+        /// status 12 again, and clears the recordings as <see cref="ClearRecordings"/> does. A
+        /// held request stays held, because leaving Hold keeps its listener open, and its
+        /// client's later abort is discarded.
         /// </summary>
         /// <exception cref="InvalidOperationException">
         /// A refused route's port could not be listened on again; its listener stays closed.
@@ -408,6 +462,7 @@ namespace EasyTrade.BrokerService.Test.Fakes
                     _latestPricesRoute = DefaultRoute;
                     _flagEnabled = false;
                     _latestPrices = [];
+                    _grpcReplies.Clear();
                     ClearRecordingsLocked();
                 }
             }
@@ -626,6 +681,15 @@ namespace EasyTrade.BrokerService.Test.Fakes
             };
         }
 
+        private static byte[] FrameGrpcMessage(byte[] payload)
+        {
+            byte[] frame = new byte[GrpcMessagePrefixLength + payload.Length];
+            // frame[0] stays 0: the message is not compressed.
+            BinaryPrimitives.WriteUInt32BigEndian(frame.AsSpan(1, 4), (uint)payload.Length);
+            payload.CopyTo(frame, GrpcMessagePrefixLength);
+            return frame;
+        }
+
         private async Task HandleRouteAsync(
             HttpContext context,
             RouteListener listener,
@@ -642,16 +706,30 @@ namespace EasyTrade.BrokerService.Test.Fakes
             context.Response.StatusCode = StatusCodes.Status404NotFound;
         }
 
-        private Task HandleGrpcAsync(HttpContext context)
+        private async Task HandleGrpcAsync(HttpContext context)
         {
-            Record(GrpcListenerName, context);
-            // Trailers-only reply: Grpc.Net.Client reads grpc-status from the response headers and
-            // raises RpcException(Unimplemented), which the broker wraps in DbException.
+            (StubRecordedRequest request, _) = Record(GrpcListenerName, context);
+            byte[]? frame;
+            lock (_gate)
+            {
+                frame = _grpcReplies.GetValueOrDefault(request.Path);
+            }
             context.Response.StatusCode = StatusCodes.Status200OK;
             context.Response.ContentType = GrpcContentType;
-            context.Response.Headers["grpc-status"] = GrpcStatusUnimplemented;
-            context.Response.Headers["grpc-message"] = "stub";
-            return Task.CompletedTask;
+            if (frame is null)
+            {
+                // Trailers-only reply: Grpc.Net.Client reads grpc-status from the response headers
+                // and raises RpcException(Unimplemented), which the broker wraps in DbException.
+                context.Response.Headers[GrpcStatusHeader] = GrpcStatusUnimplemented;
+                context.Response.Headers["grpc-message"] = "stub";
+                return;
+            }
+            // A unary call's success: the request message is read to its end, then one message
+            // goes out and the status follows it in the trailers, which every HTTP/2 response
+            // supports and Grpc.Net.Client reads once the message is read.
+            await context.Request.Body.CopyToAsync(Stream.Null, context.RequestAborted);
+            await context.Response.Body.WriteAsync(frame, context.RequestAborted);
+            context.Response.AppendTrailer(GrpcStatusHeader, GrpcStatusOk);
         }
 
         private async Task ServeAsync(

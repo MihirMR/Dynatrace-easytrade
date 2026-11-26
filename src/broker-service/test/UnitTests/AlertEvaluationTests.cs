@@ -43,6 +43,18 @@ namespace EasyTrade.BrokerService.Test.UnitTests
         private const string ReasonException = "exception";
         private const string ReasonOutOfRange = "trigger_value_out_of_range";
 
+        // The published metric contract, stated here rather than read from
+        // PortfolioInsightsMetrics, so a renamed meter, instrument, tag or outcome fails these
+        // tests: a lookup by a renamed instrument finds no measurement.
+        private const string MeterName = "EasyTrade.BrokerService";
+        private const string EvaluationDurationName = "easytrade.broker.alerts.evaluation.duration";
+        private const string TriggeredName = "easytrade.broker.alerts.triggered";
+        private const string EvaluationFailedName = "easytrade.broker.alerts.evaluation.failed";
+        private const string CycleOutcomeTag = "cycle.outcome";
+        private const string AlertTypeTag = "alert.type";
+        private const string OutcomeCompleted = "completed";
+        private const string OutcomeFailed = "failed";
+
         // A TARGET_PRICE alert compares the selected close with this threshold; CrossingClose is
         // one step above it, so an ABOVE alert on it is crossed.
         private const decimal PriceThreshold = 10m;
@@ -256,7 +268,8 @@ namespace EasyTrade.BrokerService.Test.UnitTests
         {
             // Arrange: listing 1 (cycle A) and listing 2 (cycle B) both hold the revision-1
             // snapshot before either triggers; B then waits until the test has re-armed the
-            // alert. Listing 3, the fresh cycle's, passes straight through.
+            // alert. Listing 3, the fresh cycle's, and listing 4, the notifications read, pass
+            // straight through.
             using CycleHarness harness = new();
             harness.AddCandle(harness.InstrumentA, CrossingClose);
             Alert alert = harness.SeedTargetPriceAlert(harness.InstrumentA);
@@ -297,7 +310,20 @@ namespace EasyTrade.BrokerService.Test.UnitTests
             AlertEvaluationResult resultB = await cycleB.WaitAsync(WaitBound);
             AlertEvaluationResult resultC = await harness.RunAsync(freshEvaluator);
 
-            // Assert
+            // The final notification set, read as the notifications endpoint reads it: the
+            // account's alerts whose current arming has triggered, acknowledged or not.
+            IReadOnlyList<Alert> notifications = await harness
+                .Alerts.ListAsync(
+                    alert.AccountId,
+                    armedOnly: false,
+                    triggeredOnly: true,
+                    unacknowledgedOnly: false
+                )
+                .WaitAsync(WaitBound);
+            Alert? notification = notifications.FirstOrDefault();
+
+            // Assert: one notification, this alert's second arming triggered by the fresh cycle,
+            // and none left by the stale revision-1 write.
             Assert.Equal(
                 new StaleEffects(
                     FirstTriggered: 1,
@@ -305,7 +331,12 @@ namespace EasyTrade.BrokerService.Test.UnitTests
                     RearmedTriggerCleared: true,
                     StaleTriggered: 0,
                     FreshTriggered: 1,
-                    TriggerWrites: "rev 1 True, rev 1 False, rev 2 True"
+                    TriggerWrites: "rev 1 True, rev 1 False, rev 2 True",
+                    NotificationCount: 1,
+                    NotificationAlertId: alert.Id,
+                    NotificationRevision: 2,
+                    NotificationTriggered: true,
+                    NotificationTriggerValue: CrossingClose
                 ),
                 new StaleEffects(
                     resultA.Triggered,
@@ -313,7 +344,12 @@ namespace EasyTrade.BrokerService.Test.UnitTests
                     rearmed is { TriggeredAt: null, TriggerValue: null },
                     resultB.Triggered,
                     resultC.Triggered,
-                    DescribeWrites(harness.Alerts.TriggerCalls)
+                    DescribeWrites(harness.Alerts.TriggerCalls),
+                    notifications.Count,
+                    notification?.Id,
+                    notification?.ArmingRevision,
+                    notification?.TriggeredAt is not null,
+                    notification?.TriggerValue
                 )
             );
         }
@@ -354,8 +390,9 @@ namespace EasyTrade.BrokerService.Test.UnitTests
             // Act
             AlertEvaluationResult result = await harness.RunAsync(evaluator);
 
-            // Assert
-            string completedOnly = PortfolioInsightsMetrics.EvaluationDurationName;
+            // Assert: a cycle past its flag check records its own duration, in seconds.
+            string completedOnly = EvaluationDurationName;
+            double cycleSeconds = result.Duration.TotalSeconds;
             SelectionEffects expected = scenario switch
             {
                 SelectionScenario.FlagOff => new SelectionEffects(
@@ -368,7 +405,8 @@ namespace EasyTrade.BrokerService.Test.UnitTests
                     PriceFetches: 0,
                     TriggerWrites: 0,
                     RowUnchanged: true,
-                    MeasuredInstruments: string.Empty
+                    MeasuredInstruments: string.Empty,
+                    DurationSeconds: 0
                 ),
                 SelectionScenario.NoArmedAlert or SelectionScenario.DisabledAlert =>
                     new SelectionEffects(
@@ -381,7 +419,8 @@ namespace EasyTrade.BrokerService.Test.UnitTests
                         PriceFetches: 0,
                         TriggerWrites: 0,
                         RowUnchanged: true,
-                        MeasuredInstruments: completedOnly
+                        MeasuredInstruments: completedOnly,
+                        DurationSeconds: cycleSeconds
                     ),
                 SelectionScenario.TargetPriceWithoutHolding => new SelectionEffects(
                     AlertEvaluationOutcome.Completed,
@@ -393,9 +432,8 @@ namespace EasyTrade.BrokerService.Test.UnitTests
                     PriceFetches: 1,
                     TriggerWrites: 1,
                     RowUnchanged: false,
-                    MeasuredInstruments: Join(
-                        [completedOnly, PortfolioInsightsMetrics.TriggeredName]
-                    )
+                    MeasuredInstruments: Join([completedOnly, TriggeredName]),
+                    DurationSeconds: cycleSeconds
                 ),
                 _ => throw new ArgumentOutOfRangeException(nameof(scenario), scenario, null),
             };
@@ -412,7 +450,8 @@ namespace EasyTrade.BrokerService.Test.UnitTests
                     harness.PriceCalls.LatestPriceFetches,
                     harness.Alerts.TriggerCalls.Count,
                     harness.Alerts.Get(seeded.Id) == seeded,
-                    harness.Measurements.MeasuredInstruments()
+                    harness.Measurements.MeasuredInstruments(),
+                    harness.Measurements.Sum(EvaluationDurationName)
                 )
             );
         }
@@ -469,7 +508,7 @@ namespace EasyTrade.BrokerService.Test.UnitTests
                     result.Skipped,
                     result.Failed,
                     result.Triggered,
-                    harness.Measurements.Count(PortfolioInsightsMetrics.EvaluationFailedName),
+                    harness.Measurements.Count(EvaluationFailedName),
                     warnings.Length,
                     warnings.FirstOrDefault()?.GetField("alertId"),
                     warnings.FirstOrDefault()?.GetField("reason")
@@ -543,7 +582,8 @@ namespace EasyTrade.BrokerService.Test.UnitTests
             // Act
             AlertEvaluationResult result = await harness.RunAsync(evaluator);
 
-            // Assert: the failed counter adds one per failed alert, tagged with its type.
+            // Assert: the failed counter on the published meter adds one per failed alert,
+            // tagged with its type.
             FailureEffects expected = scenario switch
             {
                 AlertFailureScenario.TriggerThrows => new FailureEffects(
@@ -551,8 +591,9 @@ namespace EasyTrade.BrokerService.Test.UnitTests
                     Triggered: 1,
                     Failed: 1,
                     FailedMetricSum: 1,
-                    FailedMetricTypes: nameof(AlertType.TARGET_PRICE),
+                    FailedMetricTypes: "TARGET_PRICE",
                     FailedMetricUnits: AlertUnit,
+                    FailedMetricMeters: MeterName,
                     FailureReasons: ReasonException
                 ),
                 AlertFailureScenario.PositionsThrow => new FailureEffects(
@@ -560,10 +601,9 @@ namespace EasyTrade.BrokerService.Test.UnitTests
                     Triggered: 1,
                     Failed: 2,
                     FailedMetricSum: 2,
-                    FailedMetricTypes: Join(
-                        [nameof(AlertType.PROFIT_LOSS), nameof(AlertType.PROFIT_LOSS)]
-                    ),
+                    FailedMetricTypes: Join(["PROFIT_LOSS", "PROFIT_LOSS"]),
                     FailedMetricUnits: AlertUnit,
+                    FailedMetricMeters: MeterName,
                     FailureReasons: Join([ReasonException, ReasonException])
                 ),
                 AlertFailureScenario.TriggerValueOutOfRange => new FailureEffects(
@@ -571,25 +611,23 @@ namespace EasyTrade.BrokerService.Test.UnitTests
                     Triggered: 1,
                     Failed: 1,
                     FailedMetricSum: 1,
-                    FailedMetricTypes: nameof(AlertType.TARGET_PRICE),
+                    FailedMetricTypes: "TARGET_PRICE",
                     FailedMetricUnits: AlertUnit,
+                    FailedMetricMeters: MeterName,
                     FailureReasons: ReasonOutOfRange
                 ),
                 _ => throw new ArgumentOutOfRangeException(nameof(scenario), scenario, null),
             };
-            string failedName = PortfolioInsightsMetrics.EvaluationFailedName;
             Assert.Equal(
                 expected,
                 new FailureEffects(
                     result.Outcome,
                     result.Triggered,
                     result.Failed,
-                    harness.Measurements.Sum(failedName),
-                    harness.Measurements.TagValues(
-                        failedName,
-                        PortfolioInsightsMetrics.AlertTypeTag
-                    ),
-                    harness.Measurements.Units(failedName),
+                    harness.Measurements.Sum(EvaluationFailedName),
+                    harness.Measurements.TagValues(EvaluationFailedName, AlertTypeTag),
+                    harness.Measurements.Units(EvaluationFailedName),
+                    harness.Measurements.Meters(EvaluationFailedName),
                     harness.AlertFailureReasons()
                 )
             );
@@ -636,8 +674,8 @@ namespace EasyTrade.BrokerService.Test.UnitTests
             // Act
             AlertEvaluationResult result = await harness.RunAsync(evaluator);
 
-            // Assert
-            string durationName = PortfolioInsightsMetrics.EvaluationDurationName;
+            // Assert: the failed cycle's duration is recorded on the published meter, in seconds,
+            // as the same duration the result returns and the summary line logs.
             Assert.Equal(
                 new CycleFailureEffects(
                     AlertEvaluationOutcome.Failed,
@@ -646,8 +684,11 @@ namespace EasyTrade.BrokerService.Test.UnitTests
                     Failed: 0,
                     TriggerWrites: 0,
                     DurationMeasurements: 1,
-                    DurationOutcomes: PortfolioInsightsMetrics.OutcomeFailed,
+                    DurationOutcomes: OutcomeFailed,
                     DurationUnits: SecondsUnit,
+                    DurationMeters: MeterName,
+                    DurationSeconds: result.Duration.TotalSeconds,
+                    SummaryDurationMatches: true,
                     FailedMeasurements: 0,
                     CycleFailureReason: expectedReason
                 ),
@@ -657,13 +698,13 @@ namespace EasyTrade.BrokerService.Test.UnitTests
                     result.Triggered,
                     result.Failed,
                     harness.Alerts.TriggerCalls.Count,
-                    harness.Measurements.Count(durationName),
-                    harness.Measurements.TagValues(
-                        durationName,
-                        PortfolioInsightsMetrics.CycleOutcomeTag
-                    ),
-                    harness.Measurements.Units(durationName),
-                    harness.Measurements.Count(PortfolioInsightsMetrics.EvaluationFailedName),
+                    harness.Measurements.Count(EvaluationDurationName),
+                    harness.Measurements.TagValues(EvaluationDurationName, CycleOutcomeTag),
+                    harness.Measurements.Units(EvaluationDurationName),
+                    harness.Measurements.Meters(EvaluationDurationName),
+                    harness.Measurements.Sum(EvaluationDurationName),
+                    harness.SummaryDurationMatches(result.Duration),
+                    harness.Measurements.Count(EvaluationFailedName),
                     harness.FirstLineStartingWith(CycleFailedPrefix)?.GetField("reason")
                 )
             );
@@ -730,10 +771,10 @@ namespace EasyTrade.BrokerService.Test.UnitTests
                     result.Outcome,
                     committed >= 1,
                     result.Triggered == committed,
-                    harness.Measurements.Sum(PortfolioInsightsMetrics.TriggeredName) == committed,
+                    harness.Measurements.Sum(TriggeredName) == committed,
                     result.Failed,
-                    harness.Measurements.Count(PortfolioInsightsMetrics.EvaluationFailedName),
-                    harness.Measurements.Count(PortfolioInsightsMetrics.EvaluationDurationName),
+                    harness.Measurements.Count(EvaluationFailedName),
+                    harness.Measurements.Count(EvaluationDurationName),
                     harness.LinesStartingWith(CycleFinishedPrefix),
                     harness.LinesStartingWith(CycleFailedPrefix)
                 )
@@ -776,9 +817,8 @@ namespace EasyTrade.BrokerService.Test.UnitTests
             // Act
             AlertEvaluationResult result = await harness.RunAsync(evaluator);
 
-            // Assert
-            string triggeredName = PortfolioInsightsMetrics.TriggeredName;
-            string durationName = PortfolioInsightsMetrics.EvaluationDurationName;
+            // Assert: both instruments record on the published meter, and the cycle's duration is
+            // the one the result returns and the summary line logs, in seconds.
             IReadOnlyList<AlertTriggerCall> writes = harness.Alerts.TriggerCalls;
             Assert.Equal(
                 new TriggeredEffects(
@@ -789,27 +829,29 @@ namespace EasyTrade.BrokerService.Test.UnitTests
                     TriggeredSum: 1,
                     TriggeredTypes: expectedTypeTag,
                     TriggeredUnits: AlertUnit,
+                    TriggeredMeters: MeterName,
                     DurationMeasurements: 1,
-                    DurationOutcomes: PortfolioInsightsMetrics.OutcomeCompleted,
-                    DurationUnits: SecondsUnit
+                    DurationOutcomes: OutcomeCompleted,
+                    DurationUnits: SecondsUnit,
+                    DurationMeters: MeterName,
+                    DurationSeconds: result.Duration.TotalSeconds,
+                    SummaryDurationMatches: true
                 ),
                 new TriggeredEffects(
                     result.Outcome,
                     writes.Count,
                     writes.FirstOrDefault(),
-                    harness.Measurements.Count(triggeredName),
-                    harness.Measurements.Sum(triggeredName),
-                    harness.Measurements.TagValues(
-                        triggeredName,
-                        PortfolioInsightsMetrics.AlertTypeTag
-                    ),
-                    harness.Measurements.Units(triggeredName),
-                    harness.Measurements.Count(durationName),
-                    harness.Measurements.TagValues(
-                        durationName,
-                        PortfolioInsightsMetrics.CycleOutcomeTag
-                    ),
-                    harness.Measurements.Units(durationName)
+                    harness.Measurements.Count(TriggeredName),
+                    harness.Measurements.Sum(TriggeredName),
+                    harness.Measurements.TagValues(TriggeredName, AlertTypeTag),
+                    harness.Measurements.Units(TriggeredName),
+                    harness.Measurements.Meters(TriggeredName),
+                    harness.Measurements.Count(EvaluationDurationName),
+                    harness.Measurements.TagValues(EvaluationDurationName, CycleOutcomeTag),
+                    harness.Measurements.Units(EvaluationDurationName),
+                    harness.Measurements.Meters(EvaluationDurationName),
+                    harness.Measurements.Sum(EvaluationDurationName),
+                    harness.SummaryDurationMatches(result.Duration)
                 )
             );
         }
@@ -851,7 +893,7 @@ namespace EasyTrade.BrokerService.Test.UnitTests
                     SummaryLines: 1,
                     Summary: new SummaryFields(
                         LogLevel.Information,
-                        Outcome: PortfolioInsightsMetrics.OutcomeCompleted,
+                        Outcome: OutcomeCompleted,
                         AlertCount: 6,
                         TriggeredCount: 3,
                         FailedCount: 2,
@@ -988,7 +1030,12 @@ namespace EasyTrade.BrokerService.Test.UnitTests
             bool RearmedTriggerCleared,
             int StaleTriggered,
             int FreshTriggered,
-            string TriggerWrites
+            string TriggerWrites,
+            int NotificationCount,
+            Guid? NotificationAlertId,
+            int? NotificationRevision,
+            bool NotificationTriggered,
+            decimal? NotificationTriggerValue
         );
 
         private sealed record SelectionEffects(
@@ -1001,7 +1048,8 @@ namespace EasyTrade.BrokerService.Test.UnitTests
             int PriceFetches,
             int TriggerWrites,
             bool RowUnchanged,
-            string MeasuredInstruments
+            string MeasuredInstruments,
+            double DurationSeconds
         );
 
         private sealed record SkipEffects(
@@ -1022,6 +1070,7 @@ namespace EasyTrade.BrokerService.Test.UnitTests
             double FailedMetricSum,
             string FailedMetricTypes,
             string FailedMetricUnits,
+            string FailedMetricMeters,
             string FailureReasons
         );
 
@@ -1034,6 +1083,9 @@ namespace EasyTrade.BrokerService.Test.UnitTests
             int DurationMeasurements,
             string DurationOutcomes,
             string DurationUnits,
+            string DurationMeters,
+            double DurationSeconds,
+            bool SummaryDurationMatches,
             int FailedMeasurements,
             object? CycleFailureReason
         );
@@ -1058,9 +1110,13 @@ namespace EasyTrade.BrokerService.Test.UnitTests
             double TriggeredSum,
             string TriggeredTypes,
             string TriggeredUnits,
+            string TriggeredMeters,
             int DurationMeasurements,
             string DurationOutcomes,
-            string DurationUnits
+            string DurationUnits,
+            string DurationMeters,
+            double DurationSeconds,
+            bool SummaryDurationMatches
         );
 
         private sealed record LoggedFields(
@@ -1695,6 +1751,17 @@ namespace EasyTrade.BrokerService.Test.UnitTests
             }
 
             /// <summary>
+            /// Whether the summary line logs <paramref name="duration"/> in whole milliseconds:
+            /// its durationMs is a long less than one millisecond away from it.
+            /// </summary>
+            public bool SummaryDurationMatches(TimeSpan duration)
+            {
+                return FirstLineStartingWith(CycleFinishedPrefix)?.GetField("durationMs")
+                        is long durationMs
+                    && Math.Abs(durationMs - duration.TotalMilliseconds) < 1;
+            }
+
+            /// <summary>
             /// The reason of every per-alert failure line, sorted. Only those lines carry an
             /// alert id; the cycle failure line does not.
             /// </summary>
@@ -1716,8 +1783,9 @@ namespace EasyTrade.BrokerService.Test.UnitTests
 
         /// <summary>
         /// Captures every measurement of the instruments one meter factory created, with its
-        /// instrument name, unit and tags, so tests running in parallel never see each other's
-        /// measurements. Parallel workers record at once, so every access takes the lock.
+        /// meter name, instrument name, unit and tags, so tests running in parallel never see
+        /// each other's measurements. Parallel workers record at once, so every access takes the
+        /// lock.
         /// </summary>
         private sealed class MetricCapture : IDisposable
         {
@@ -1736,11 +1804,11 @@ namespace EasyTrade.BrokerService.Test.UnitTests
                 };
                 _listener.SetMeasurementEventCallback<long>(
                     (instrument, value, tags, _) =>
-                        Record(instrument.Name, instrument.Unit, value, tags)
+                        Record(instrument.Meter.Name, instrument.Name, instrument.Unit, value, tags)
                 );
                 _listener.SetMeasurementEventCallback<double>(
                     (instrument, value, tags, _) =>
-                        Record(instrument.Name, instrument.Unit, value, tags)
+                        Record(instrument.Meter.Name, instrument.Name, instrument.Unit, value, tags)
                 );
                 _listener.Start();
             }
@@ -1770,6 +1838,12 @@ namespace EasyTrade.BrokerService.Test.UnitTests
                 return Join(Of(instrumentName).Select(measurement => measurement.Unit).Distinct());
             }
 
+            /// <summary>The distinct meter names the instrument's measurements carried.</summary>
+            public string Meters(string instrumentName)
+            {
+                return Join(Of(instrumentName).Select(measurement => measurement.Meter).Distinct());
+            }
+
             /// <summary>The distinct names of every instrument that recorded anything.</summary>
             public string MeasuredInstruments()
             {
@@ -1796,6 +1870,7 @@ namespace EasyTrade.BrokerService.Test.UnitTests
             }
 
             private void Record(
+                string meter,
                 string name,
                 string? unit,
                 double value,
@@ -1809,11 +1884,12 @@ namespace EasyTrade.BrokerService.Test.UnitTests
                 }
                 lock (_lock)
                 {
-                    _measurements.Add(new CapturedMeasurement(name, unit, value, copied));
+                    _measurements.Add(new CapturedMeasurement(meter, name, unit, value, copied));
                 }
             }
 
             private sealed record CapturedMeasurement(
+                string Meter,
                 string Name,
                 string? Unit,
                 double Value,

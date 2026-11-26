@@ -29,6 +29,18 @@ namespace EasyTrade.BrokerService.Test.UnitTests
         private const string MidName = "Mid instrument";
         private const string HighName = "High instrument";
 
+        // The calculation metric as the contract names it, stated here rather than read from
+        // PortfolioInsightsMetrics, so a renamed meter, instrument or unit fails the metric test.
+        private const string MeterName = "EasyTrade.BrokerService";
+        private const string CalculationDurationName =
+            "easytrade.broker.portfolio.calculation.duration";
+        private const string SecondsUnit = "s";
+
+        // The success statuses exactly as long-trade settlement persists them, kept apart from
+        // the calculator's own constants so a drift there fails instead of passing.
+        private const string SettledLongBuyStatus = "Long buy transaction finished!";
+        private const string SettledLongSellStatus = "Long sell transaction finished!";
+
         private static readonly Guid AccountId = new("a0000000-0000-4000-8000-000000000001");
 
         // Their canonical lowercase strings sort ordinally in declaration order.
@@ -312,37 +324,37 @@ namespace EasyTrade.BrokerService.Test.UnitTests
         [InlineData("buy", true, true, "Instant Buy done.", true)]
         [InlineData("sell", true, true, "Instant Sell done.", true)]
         // Settlement sets TransactionHappened in memory only, so settled long rows read it false.
-        [InlineData(
-            "longbuy",
-            true,
-            false,
-            PortfolioInsightsCalculator.LongBuyFinishedStatus,
-            true
-        )]
-        [InlineData("longbuy", true, true, PortfolioInsightsCalculator.LongBuyFinishedStatus, true)]
-        [InlineData(
-            "longsell",
-            true,
-            false,
-            PortfolioInsightsCalculator.LongSellFinishedStatus,
-            true
-        )]
+        [InlineData("longbuy", true, false, SettledLongBuyStatus, true)]
+        [InlineData("longbuy", true, true, SettledLongBuyStatus, true)]
+        [InlineData("longsell", true, false, SettledLongSellStatus, true)]
+        [InlineData("longsell", true, true, SettledLongSellStatus, true)]
         [InlineData("buy", true, false, "Instant Buy done.", false)]
         [InlineData("sell", true, false, "Instant Sell done.", false)]
+        // Long rows below are ignored whatever TransactionHappened says: open, including an open
+        // row that already carries the success status, then expired, failed, a status differing
+        // only in case and the other direction's success status.
         [InlineData("longbuy", false, false, "LongBuy registered.", false)]
-        [InlineData("longsell", false, false, "LongSell registered.", false)]
-        [InlineData(
-            "longbuy",
-            false,
-            true,
-            PortfolioInsightsCalculator.LongBuyFinishedStatus,
-            false
-        )]
+        [InlineData("longbuy", false, true, "LongBuy registered.", false)]
+        [InlineData("longbuy", false, false, SettledLongBuyStatus, false)]
+        [InlineData("longbuy", false, true, SettledLongBuyStatus, false)]
         [InlineData("longbuy", true, false, "Time is up: trade failed", false)]
         [InlineData("longbuy", true, true, "Time is up: trade failed", false)]
         [InlineData("longbuy", true, false, "Not enough money to buy stocks! Trade failed!", false)]
-        [InlineData("longsell", true, false, "Not enough stocks to sell! Trade failed!", false)]
+        [InlineData("longbuy", true, true, "Not enough money to buy stocks! Trade failed!", false)]
         [InlineData("longbuy", true, false, "long buy transaction finished!", false)]
+        [InlineData("longbuy", true, true, "long buy transaction finished!", false)]
+        [InlineData("longbuy", true, false, SettledLongSellStatus, false)]
+        [InlineData("longsell", false, false, "LongSell registered.", false)]
+        [InlineData("longsell", false, true, "LongSell registered.", false)]
+        [InlineData("longsell", false, false, SettledLongSellStatus, false)]
+        [InlineData("longsell", false, true, SettledLongSellStatus, false)]
+        [InlineData("longsell", true, false, "Time is up: trade failed", false)]
+        [InlineData("longsell", true, true, "Time is up: trade failed", false)]
+        [InlineData("longsell", true, false, "Not enough stocks to sell! Trade failed!", false)]
+        [InlineData("longsell", true, true, "Not enough stocks to sell! Trade failed!", false)]
+        [InlineData("longsell", true, false, "long sell transaction finished!", false)]
+        [InlineData("longsell", true, true, "long sell transaction finished!", false)]
+        [InlineData("longsell", true, false, SettledLongBuyStatus, false)]
         [InlineData("hold", true, true, "Instant Hold done.", false)]
         public void IsExecuted_PersistedTradeShapes_ShouldMatchRule(
             string direction,
@@ -557,11 +569,24 @@ namespace EasyTrade.BrokerService.Test.UnitTests
             // Act
             _ = await service.GetInsightsAsync(AccountId);
 
-            // Assert
+            // Assert: one untagged measurement on the published meter, in seconds, and the same
+            // duration the insights line logs in whole milliseconds.
             RecordedMeasurement measurement = Assert.Single(capture.Measurements);
+            LogEntry? computed = _logger!.Entries.FirstOrDefault(logged =>
+                logged.GetField("{OriginalFormat}") is string format
+                && format.StartsWith(InsightsLogPrefix, StringComparison.Ordinal)
+            );
             Assert.Equal(
-                (PortfolioInsightsMetrics.CalculationDurationName, "s", 0, true),
-                (measurement.Name, measurement.Unit, measurement.Tags.Length, measurement.Value > 0)
+                (MeterName, CalculationDurationName, SecondsUnit, 0, true, true),
+                (
+                    measurement.Meter,
+                    measurement.Name,
+                    measurement.Unit,
+                    measurement.Tags.Length,
+                    measurement.Value > 0,
+                    computed?.GetField("durationMs") is long durationMs
+                        && Math.Abs(durationMs - (measurement.Value * 1000)) < 1
+                )
             );
         }
 
@@ -1470,6 +1495,7 @@ namespace EasyTrade.BrokerService.Test.UnitTests
         );
 
         private sealed record RecordedMeasurement(
+            string Meter,
             string Name,
             string? Unit,
             double Value,
@@ -1520,11 +1546,11 @@ namespace EasyTrade.BrokerService.Test.UnitTests
                 };
                 _listener.SetMeasurementEventCallback<double>(
                     (instrument, value, tags, _) =>
-                        Add(instrument.Name, instrument.Unit, value, tags)
+                        Add(instrument.Meter.Name, instrument.Name, instrument.Unit, value, tags)
                 );
                 _listener.SetMeasurementEventCallback<long>(
                     (instrument, value, tags, _) =>
-                        Add(instrument.Name, instrument.Unit, value, tags)
+                        Add(instrument.Meter.Name, instrument.Name, instrument.Unit, value, tags)
                 );
                 _listener.Start();
             }
@@ -1546,13 +1572,14 @@ namespace EasyTrade.BrokerService.Test.UnitTests
             }
 
             private void Add(
+                string meter,
                 string name,
                 string? unit,
                 double value,
                 ReadOnlySpan<KeyValuePair<string, object?>> tags
             )
             {
-                RecordedMeasurement measurement = new(name, unit, value, tags.ToArray());
+                RecordedMeasurement measurement = new(meter, name, unit, value, tags.ToArray());
                 lock (_gate)
                 {
                     _measurements.Add(measurement);

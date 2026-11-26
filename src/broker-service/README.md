@@ -40,9 +40,7 @@ A simulated demo feature, **not financial advice**: portfolio figures plus price
 profit/loss alerts, computed from the existing holdings, trades and generated prices. It is
 gated end to end by the feature flag `portfolio-insights-enabled`, which is off by default.
 
-Demo walkthrough, the three variables (`ENABLE_PORTFOLIO_INSIGHTS`,
-`ALERT_EVALUATION_INTERVAL_SECONDS`, `PORTFOLIO_INSIGHTS_ALERT_WEIGHT`) and the database
-recreate note: see [Portfolio insights (demo feature)](../../README.md#portfolio-insights-demo-feature).
+Demo walkthrough, the three variables (`ENABLE_PORTFOLIO_INSIGHTS`, `ALERT_EVALUATION_INTERVAL_SECONDS`, `PORTFOLIO_INSIGHTS_ALERT_WEIGHT`) and the database recreate note: see [Portfolio insights (demo feature)](../../README.md#portfolio-insights-demo-feature).
 Runnable requests are in [`broker-service.http`](broker-service.http).
 
 ### Feature flag
@@ -230,9 +228,10 @@ through the existing HTTP and gRPC clients; evaluator calls carry none.
 
 Alerts are stored in the new `Alerts` table through db-adapter's `AlertService` (see
 [`ADAPTER_SERVICES.md`](../proto/ADAPTER_SERVICES.md)). Init scripts do not add the table to
-an existing database; see the recreate note in
-[the root README](../../README.md#portfolio-insights-demo-feature) and
-[`src/db/README.md`](../db/README.md).
+an existing database.
+
+Database recreate note: see [Portfolio insights (demo feature)](../../README.md#portfolio-insights-demo-feature).
+Script layout and the per-dialect recreate procedure: [`src/db/README.md`](../db/README.md).
 
 ### Limits
 
@@ -240,14 +239,74 @@ Both targets are measured by
 [`scripts/portfolio-insights/perf.sh`](../../scripts/portfolio-insights/perf.sh) on both
 database dialects, with loadgen stopped:
 
-| Limit | Target | Measured (database, host) |
-| --- | --- | --- |
-| Insights p95, account with 15 holdings | Under 500 ms | not yet recorded; run `perf.sh` |
-| One evaluation cycle, 1,000 armed alerts | Under 10 s | not yet recorded; run `perf.sh` |
+| Limit | Target | Measured, MSSQL | Measured, PostgreSQL |
+| --- | --- | --- | --- |
+| Insights p95, account with 15 holdings | Under 500 ms | 28.083 ms, PASS; server side median 12 ms, p95 18 ms | 39.342 ms, PASS; server side median 8 ms, p95 25 ms |
+| One evaluation cycle, 1,000 armed alerts | Under 10 s | 50 ms, PASS; next two cycles 60 ms, 40 ms | 45 ms, PASS; next two cycles 57 ms, 64 ms |
 
-A missed limit is recorded here with its measured value and cause. The targets assume the
-shipped topology: `background-service` stays a singleton, and `feature-flag-service` runs as
-one instance.
+The targets assume the shipped topology: `background-service` stays a singleton, and
+`feature-flag-service` runs as one instance.
+
+Measured on 2026-11-26 by `perf.sh`, 13 checks passed per dialect, on a Compose dev project
+of `compose.dev.yaml` with the whole stack on one Docker host, loadgen stopped, the flag on
+and `ALERT_EVALUATION_INTERVAL_SECONDS` at 60. No cycle sample was rejected.
+
+- Insights: the first of the 25 `PRESET` accounts
+  (`GET /user-service/api/accounts/presets?limit=25`) with exactly 15 positive holdings.
+  After 10 warm-ups, 200 sequential `GET /broker-service/v1/portfolio/insights/{accountId}`
+  go through the reverse proxy, each timed by `curl -w '%{time_total}'`; the p95 is the 190th
+  sorted time. The server side is the `duration [n] ms` of the broker's insights log line
+  for the same 200 requests.
+- Cycle: 40 alerts on each of the 25 `PRESET` accounts, 20 `TARGET_PRICE` and 20
+  `PROFIT_LOSS`, all `ABOVE 9999999999.99999999`, so 1,000 are armed at revision 1. Before
+  any sample is read, a database query of the armed set confirms it equals the 1,000 owned
+  ids, all at revision 1. The sample is the first cycle line after that check that renders
+  `alerts [1000]`; a line with another count is a cycle that began during setup and is
+  skipped. The sample must read
+  `alerts [1000] triggered [0] failed [0] skipped [0] outcome [completed]`, and the
+  armed-set query, repeated after that line, must still return exactly the owned set. A
+  sample with a trigger, skip, failure, another outcome or a changed set is rejected: the
+  owned alerts missing from the armed set are re-armed, the set is verified again and the
+  next cycle is read. Three rejected samples fail the check as `no clean sample`. The value
+  is the accepted sample's `duration [n] ms`; the next two clean cycles are recorded too.
+
+To re-measure, run this from the repository root against the running Compose dev stack, one
+dialect and one project at a time, never alongside `e2e.sh` or `loadgen-check.sh`:
+
+```bash
+bash scripts/portfolio-insights/perf.sh --project <name> --base-url <url> --compose-file compose.dev.yaml
+```
+
+The script enables the flag and stops loadgen itself, and restores both on exit. It prints
+one PASS or FAIL line per check and a `REPORT` block with both values, the database type and
+the host, and exits 0 only when every check passes.
+
+**If a limit is missed:**
+
+1. Audit the measured path against the design. A cycle makes one latest-prices call, and one
+   positions load (holdings and trades) per account with `PROFIT_LOSS` alerts, at most 8 at a
+   time. An insights request checks the balance and loads holdings, then loads instrument
+   names, trades and latest prices together, the prices in one pricing-service call. Unit
+   tests in `AlertEvaluationTests` and `PortfolioInsightsTests` pin these counts; run them
+   from `src/broker-service`:
+
+   ```bash
+   dotnet test BrokerService.sln --filter "FullyQualifiedName~RunCycle_ManyProfitLossAccounts_ShouldLoadEachOnceAtMostEightAtATime|FullyQualifiedName~GetInsights_Scenario_ShouldMatchContract|FullyQualifiedName~GetHoldingPositions_SuppliedPrices_ShouldReadOnlyHoldingsAndTradesOnce"
+   ```
+
+   On the stack, pricing-service logs each request as `Request finished` with
+   `GET /v1/prices/latest`. With the flag on, alerts armed and no other traffic, expect one
+   per evaluation cycle and one a minute from the existing long-trade scheduler, so two a
+   minute at the 60 s interval. Read them with
+   `docker compose -p <project> logs --since <T> pricing-service`, where `<T>` is a UTC time
+   such as `2026-11-26T00:40:00Z`.
+2. A deviation is a defect. Fix it, then re-measure with the same verified workload by
+   rerunning `perf.sh` unchanged: it re-runs the input checks (25 presets with 15 positive
+   holdings and listed instruments, no armed alert) and the owned-set check before measuring,
+   and repeats the owned-set check after each cycle sample.
+3. The concurrency bound of 8 is not changed, and no caching or schema work is added.
+4. If the limit is still missed, record the measured value from the `REPORT` block, its
+   database type and its cause in this section, and in the run report, as a known limit.
 
 ## Problem patterns
 
