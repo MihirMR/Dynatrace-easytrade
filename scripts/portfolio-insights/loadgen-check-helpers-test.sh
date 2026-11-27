@@ -2,18 +2,21 @@
 # Unit tests of the helpers in scripts/portfolio-insights/loadgen-check.sh that its own suite,
 # scripts/portfolio-insights/loadgen-check-test.sh, and scripts/portfolio-insights/harness-test.sh
 # leave uncovered, run without a stack:
-#   - option parsing, the count rule of --weight and --minutes, and the tool check;
+#   - option parsing, the count rule of --weight and --minutes, and the tool check with its
+#     bounded compose plugin probe;
 #   - the HTTP wrapper, the bounded poll and loadgen's output read through Compose;
 #   - the stats-line parser, the visit-family rules applied to its breakdown, the family, failRate
 #     and run A/B comparison checks built on them, and the per-minute progress lines;
-#   - setup's stack checks, the flag switch, the weighted loadgen recreate, the wait for the
-#     first visit and run A;
+#   - setup's stack checks, its target check of a base URL another stack serves, and the loadgen
+#     image it pins, the flag switch, the weighted, bounded
+#     loadgen recreate that neither builds nor pulls and its image check, the wait for the first
+#     visit and run A;
 #   - the per-project run lock: taking it, refusing a run another run's lock stops, naming that
 #     run from a regular owner file read within its time limit, and releasing it;
 #   - the created, resolved and unresolved ids of loadgen's output, the ids it owns for cleanup,
 #     and the count of visits between opening the page and their create outcome;
-#   - the read-only Alerts count: SQL and client per dialect, refusal of non-canonical ids,
-#     chunking, aggregation across chunks and client failures;
+#   - the read-only Alerts count: SQL, client and client time limits per dialect, refusal of
+#     non-canonical ids, chunking, aggregation across chunks, client failures and timeouts;
 #   - run B's outcomes check, the per-family table, the end of the run and the cleanup run on
 #     exit: owned alerts deleted, a DELETE retried after a transport error, owned and deleted
 #     lists that cannot be read or written, the flag restored, and the exit status;
@@ -26,7 +29,8 @@
 # the bounded Docker calls and the cleanup of a window still open.
 # The script is sourced, which defines its functions without running it. docker, curl, date and
 # sleep are then replaced by bash functions that record each call and answer from files the case
-# writes: loadgen's output, a fake Alerts table, HTTP responses and a fake clock. timeout is
+# writes: loadgen's output, a reverse-proxy log, a fake Alerts table, HTTP responses and a fake
+# clock; od gives the target check fixed random bytes. timeout is
 # replaced too, so the Docker calls the script bounds with timeout(1) reach the docker stub.
 # The lock_refusal cases alone source the script in a fresh bash run under the real timeout(1),
 # since the time limit of the owner read is what they test.
@@ -112,6 +116,14 @@ START_STEP_SECONDS=5
 QUIESCE_TIMEOUT_SECONDS=5
 QUIESCE_STEP_SECONDS=5
 
+# Synthetic image ids, as docker image inspect and docker inspect print them: the loadgen image
+# setup resolves, which every stub container runs, and another build.
+T_IMAGE_ID="sha256:0123456789ab0123456789ab0123456789ab0123456789ab0123456789ab0123"
+printf -v T_OTHER_IMAGE_ID 'sha256:%064d' 2
+# The start of a compose call bounded by DOCKER_CALL_TIMEOUT_SECONDS, as the timeout stub records
+# it: hard_timeout's TERM LOG_PROBE_KILL_SECONDS before the limit, then docker compose for the
+# project and its compose file.
+T_BOUNDED_COMPOSE="-k 5 55 docker compose -p et-test -f compose.dev.yaml"
 # Synthetic canonical alert ids.
 ID1="00000001-0000-4000-8000-000000000001"
 ID2="00000002-0000-4000-8000-000000000002"
@@ -243,8 +255,14 @@ t_new_case() {
     : >"$STUB_DIR/http.responses"
     : >"$STUB_DIR/http.calls"
     : >"$STUB_DIR/docker.calls"
+    : >"$STUB_DIR/timeout.calls"
     : >"$STUB_DIR/queries"
     : >"$STUB_DIR/sleeps"
+    : >"$STUB_DIR/proxy.log"
+    : >"$STUB_DIR/other-proxy.log"
+    # The log of the stack that serves the base URL, where the stub curl adds the access line of
+    # each target-check probe: the named project's own reverse-proxy log, or another stack's.
+    STUB_SERVED_LOG="$STUB_DIR/proxy.log"
     PROJECT="et-test"
     COMPOSE_FILES=("compose.dev.yaml")
     COMPOSE_ARGS=(-f compose.dev.yaml)
@@ -268,6 +286,8 @@ t_new_case() {
     LOADGEN_STARTED_AT=""
     LOADGEN_PAUSED=0
     RESTORE_ERROR=""
+    LOADGEN_IMAGE="et-test-loadgen"
+    LOADGEN_IMAGE_ID="$T_IMAGE_ID"
     LOADGEN_ID_AT_START=""
     LOADGEN_TWIN=""
     TWIN_ERROR=""
@@ -299,7 +319,15 @@ t_new_case() {
     STUB_PORT_STATUS=0
     STUB_UP_STATUS=0
     STUB_LOADGEN_WEIGHT=""
+    STUB_UP_IMAGE_ID="$T_IMAGE_ID"
     STUB_VERSION_STATUS=0
+    STUB_CONFIG_STATUS=0
+    STUB_CONFIG_JSON_STATUS=0
+    STUB_IMAGE_STATUS=0
+    STUB_ENV_STATUS=0
+    STUB_ENV_SERVICE=""
+    STUB_CONTAINER_IMAGE_STATUS=0
+    STUB_EXEC_STATUS=0
     STARTED_DETAIL=""
     FAKE_NOW=1767225600
     # The run lock under this case's directory, never the shared /tmp the script's LOCK_ROOT names.
@@ -333,35 +361,45 @@ t_print_file() {
     fi
 }
 
-# The image every stub container runs, which its image reference names, and the config hash the
-# stub's Compose gives loadgen and labels every container with: both invented, so every loadgen
-# container is restorable (loadgen-check-test.sh covers the refusals).
-T_STUB_IMAGE="sha256:0123456789ab0123456789ab0123456789ab0123456789ab0123456789ab0123"
+# The config hash the stub's Compose gives loadgen and labels every container with, invented. Every
+# stub container runs T_IMAGE_ID, which its image reference names wherever STUB_DIR/images maps
+# that reference to it, as t_ready_stack does, so every loadgen container is restorable
+# (loadgen-check-test.sh covers the refusals).
 T_STUB_HASH="fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"
 
 # docker: records each call in STUB_DIR/docker.calls, its MSYS_NO_PATHCONV value and then one
 # argument per line, ended by "--". docker inspect --format '{{json .Config.Env}}' cid-SERVICE
-# prints the entries of STUB_DIR/env.SERVICE as the JSON array container_env and
-# container_env_entry read, and --format '{{json .}}' the container as loadgen_identity reads it:
-# T_STUB_IMAGE, created from et-test-SERVICE, labelled with T_STUB_HASH; any other format fails.
-# docker image inspect prints T_STUB_IMAGE. The compose subcommand after the -p and -f options
-# plays as follows: config --hash SERVICE prints SERVICE and T_STUB_HASH, config
-# --no-interpolate the declaration of loadgen's weight, and any other config STUB_DIR/services;
-# ps ... --services prints STUB_DIR/running and exits STUB_PS_STATUS, and ps ... SERVICE prints
-# cid-SERVICE when STUB_DIR/env.SERVICE exists; port SERVICE PORT prints STUB_DIR/port.SERVICE,
-# the published HOST:PORT, or, when STUB_PORT_STATUS is not 0, prints Compose's error and exits
-# with it; logs prints STUB_DIR/loadgen.log and exits STUB_LOGS_STATUS; up records the
-# PORTFOLIO_INSIGHTS_ALERT_WEIGHT it gets in STUB_DIR/up.env and exits STUB_UP_STATUS, giving
-# loadgen that weight, or STUB_LOADGEN_WEIGHT when set, on success; stop, and the kill that ends
-# a paused loadgen, exit STUB_STOP_STATUS; pause and unpause succeed; version exits
-# STUB_VERSION_STATUS; exec runs the db client stub on its last argument; anything else succeeds
-# without output. The twin the restorability check creates, up ... --scale loadgen=2, records its
-# weight in STUB_DIR/twin.env and becomes container cid-loadgen-twin, answered as loadgen's own
-# container is and listed after it by ps ... loadgen, until docker rm --force --volumes
-# cid-loadgen-twin removes it.
+# exits STUB_ENV_STATUS when it is not 0, for every SERVICE or, when STUB_ENV_SERVICE is set, for
+# that one only, and otherwise prints the entries of STUB_DIR/env.SERVICE as the JSON array
+# container_env and container_env_entry read; docker inspect --format '{{.Image}}' cid-SERVICE
+# exits STUB_CONTAINER_IMAGE_STATUS when it is not 0, and otherwise prints the image id in
+# STUB_DIR/image.SERVICE, failing without that file; --format '{{json .}}' prints the container as
+# loadgen_identity reads it: T_IMAGE_ID, created from et-test-SERVICE, labelled with T_STUB_HASH;
+# any other format fails. docker image inspect --format '{{.Id}}' NAME exits STUB_IMAGE_STATUS when
+# it is not 0, and otherwise prints the id STUB_DIR/images, lines "NAME ID", gives NAME, failing as
+# Docker does for an image it does not hold. The compose subcommand after the -p and -f options
+# plays as follows: config --hash SERVICE prints SERVICE and T_STUB_HASH, config --no-interpolate
+# the declaration of loadgen's weight, config --format json exits STUB_CONFIG_JSON_STATUS when it
+# is not 0 and otherwise prints STUB_DIR/config.json, and any other config exits
+# STUB_CONFIG_STATUS when it is not 0 and otherwise prints STUB_DIR/services; ps ... --services
+# exits STUB_PS_STATUS when it is not 0 and otherwise prints STUB_DIR/running, and ps ... SERVICE
+# prints cid-SERVICE when STUB_DIR/env.SERVICE exists; port SERVICE PORT prints
+# STUB_DIR/port.SERVICE, the published HOST:PORT, or, when STUB_PORT_STATUS is not 0, prints
+# Compose's error and exits with it; logs of reverse-proxy prints STUB_DIR/proxy.log, the
+# project's reverse-proxy log, and any other logs prints STUB_DIR/loadgen.log and exits
+# STUB_LOGS_STATUS; up records the PORTFOLIO_INSIGHTS_ALERT_WEIGHT it gets in STUB_DIR/up.env and
+# exits STUB_UP_STATUS, giving loadgen that weight, or STUB_LOADGEN_WEIGHT when set, and the image
+# STUB_UP_IMAGE_ID, none when it is empty, on success; stop, and the kill that ends a paused
+# loadgen, exit STUB_STOP_STATUS; pause and unpause succeed; version exits STUB_VERSION_STATUS;
+# exec exits STUB_EXEC_STATUS when it is not 0, as a call the time limit cut off, and otherwise
+# runs the db client stub on its last argument; anything else succeeds without output. The twin
+# the restorability check creates, up ... --scale loadgen=2, records its weight in
+# STUB_DIR/twin.env and becomes container cid-loadgen-twin, answered as loadgen's own container is
+# and listed after it by ps ... loadgen, until docker rm --force --volumes cid-loadgen-twin
+# removes it.
 docker() {
     local -a args=("$@")
-    local i=1 last="${*: -1}" service
+    local i=1 last="${*: -1}" name id service
     {
         printf 'MSYS_NO_PATHCONV=%s\n' "${MSYS_NO_PATHCONV:-}"
         printf '%s\n' "$@"
@@ -373,19 +411,28 @@ docker() {
         fi
         return 0
     fi
-    if [[ "${args[0]:-} ${args[1]:-}" == "image inspect" ]]; then
-        echo "$T_STUB_IMAGE"
-        return 0
-    fi
     if [[ "${args[0]:-}" == "inspect" ]]; then
         service="${last#cid-}"
         service="${service%-twin}"
         case "${args[2]:-}" in
             "{{json .Config.Env}}")
+                if [[ $STUB_ENV_STATUS -ne 0 && (-z "$STUB_ENV_SERVICE" || "$last" == "cid-$STUB_ENV_SERVICE") ]]; then
+                    return "$STUB_ENV_STATUS"
+                fi
                 t_print_file "$STUB_DIR/env.$service" | jq -c -R -s 'split("\n") | map(select(length > 0))'
                 ;;
+            "{{.Image}}")
+                if [[ $STUB_CONTAINER_IMAGE_STATUS -ne 0 ]]; then
+                    return "$STUB_CONTAINER_IMAGE_STATUS"
+                fi
+                if [[ ! -f "$STUB_DIR/image.${last#cid-}" ]]; then
+                    echo "Error: No such object: $last" >&2
+                    return 1
+                fi
+                t_print_file "$STUB_DIR/image.${last#cid-}"
+                ;;
             "{{json .}}")
-                jq -c -n --arg image "$T_STUB_IMAGE" --arg ref "et-test-$service" --arg hash "$T_STUB_HASH" \
+                jq -c -n --arg image "$T_IMAGE_ID" --arg ref "et-test-$service" --arg hash "$T_STUB_HASH" \
                     '{Image: $image, Config: {Image: $ref, Labels: {"com.docker.compose.config-hash": $hash}},
                         State: {StartedAt: "2026-01-01T00:00:00.5Z"}}'
                 ;;
@@ -396,6 +443,23 @@ docker() {
         esac
         return 0
     fi
+    if [[ "${args[0]:-}" == "image" ]]; then
+        if [[ "${args[1]:-} ${args[2]:-} ${args[3]:-}" != "inspect --format {{.Id}}" ]]; then
+            echo "stub docker: unexpected image call [$*]" >&2
+            return 1
+        fi
+        if [[ $STUB_IMAGE_STATUS -ne 0 ]]; then
+            return "$STUB_IMAGE_STATUS"
+        fi
+        while read -r name id; do
+            if [[ "$name" == "$last" ]]; then
+                echo "$id"
+                return 0
+            fi
+        done < <(t_print_file "$STUB_DIR/images")
+        echo "Error response from daemon: No such image: $last" >&2
+        return 1
+    fi
     while [[ $i -lt ${#args[@]} && ("${args[i]}" == "-p" || "${args[i]}" == "-f") ]]; do
         i=$((i + 2))
     done
@@ -405,11 +469,25 @@ docker() {
             case "${args[i + 1]:-}" in
                 --hash) echo "$last $T_STUB_HASH" ;;
                 --no-interpolate) echo '{"services":{"loadgen":{"environment":{"PORTFOLIO_INSIGHTS_ALERT_WEIGHT":"${PORTFOLIO_INSIGHTS_ALERT_WEIGHT:-0}"}}}}' ;;
-                *) t_print_file "$STUB_DIR/services" ;;
+                --format)
+                    if [[ $STUB_CONFIG_JSON_STATUS -ne 0 ]]; then
+                        return "$STUB_CONFIG_JSON_STATUS"
+                    fi
+                    t_print_file "$STUB_DIR/config.json"
+                    ;;
+                *)
+                    if [[ $STUB_CONFIG_STATUS -ne 0 ]]; then
+                        return "$STUB_CONFIG_STATUS"
+                    fi
+                    t_print_file "$STUB_DIR/services"
+                    ;;
             esac
             ;;
         ps)
             if [[ "$last" == "--services" ]]; then
+                if [[ $STUB_PS_STATUS -ne 0 ]]; then
+                    return "$STUB_PS_STATUS"
+                fi
                 t_print_file "$STUB_DIR/running"
                 return "$STUB_PS_STATUS"
             elif [[ -f "$STUB_DIR/env.$last" ]]; then
@@ -427,6 +505,10 @@ docker() {
             t_print_file "$STUB_DIR/port.${args[i + 1]:-}"
             ;;
         logs)
+            if [[ "$last" == reverse-proxy ]]; then
+                t_print_file "$STUB_DIR/proxy.log"
+                return 0
+            fi
             t_print_file "$STUB_DIR/loadgen.log"
             return "$STUB_LOGS_STATUS"
             ;;
@@ -442,23 +524,35 @@ docker() {
             fi
             printf 'PATH=/usr/local/bin\nPORTFOLIO_INSIGHTS_ALERT_WEIGHT=%s\n' \
                 "${STUB_LOADGEN_WEIGHT:-${PORTFOLIO_INSIGHTS_ALERT_WEIGHT:-0}}" >"$STUB_DIR/env.loadgen"
+            if [[ -n "$STUB_UP_IMAGE_ID" ]]; then
+                echo "$STUB_UP_IMAGE_ID" >"$STUB_DIR/image.loadgen"
+            else
+                rm -f "$STUB_DIR/image.loadgen"
+            fi
             ;;
         stop | kill) return "$STUB_STOP_STATUS" ;;
         pause | unpause) return 0 ;;
         version) return "$STUB_VERSION_STATUS" ;;
-        exec) t_db_client "$last" ;;
+        exec)
+            if [[ $STUB_EXEC_STATUS -ne 0 ]]; then
+                return "$STUB_EXEC_STATUS"
+            fi
+            t_db_client "$last"
+            ;;
         *) return 0 ;;
     esac
 }
 
 # timeout: stands in for timeout(1), which hard_timeout runs for every bounded Docker call and
-# which would start the docker binary instead of the stub. It takes the two forms hard_timeout
-# uses, -k GRACE LIMIT and -s KILL LIMIT, and runs the command at once without a time limit, so
-# the stub docker answers it with the MSYS_NO_PATHCONV value hard_timeout set. Any other form
-# fails with 125, timeout(1)'s status for its own failure. harness-test.sh runs hard_timeout
-# under the real timeout(1).
+# which would start the docker binary instead of the stub. It records each call, its arguments
+# joined by spaces, in STUB_DIR/timeout.calls, so a case can see that a Docker call was bounded
+# and by what. It takes the two forms hard_timeout uses, -k GRACE LIMIT and -s KILL LIMIT, and
+# runs the command at once without a time limit, so the stub docker answers it with the
+# MSYS_NO_PATHCONV value hard_timeout set. Any other form fails with 125, timeout(1)'s status for
+# its own failure. harness-test.sh runs hard_timeout under the real timeout(1).
 timeout() {
     local call="$*"
+    printf '%s\n' "$call" >>"$STUB_DIR/timeout.calls"
     if [[ "${1:-}" == "-k" && "${2:-}" =~ ^[0-9]+$ ]] || [[ "${1:-}" == "-s" && "${2:-}" == "KILL" ]]; then
         shift 2
     fi
@@ -518,9 +612,11 @@ t_db_client() {
 # value of its request body. Status 000, or no matching line, is a transport error. A request
 # STUB_DIR/http.transient lists as METHOD URL is a transport error first, once per such line
 # (t_respond_transient). Each request is recorded in STUB_DIR/http.calls as METHOD URL [BODY],
-# and its --max-time in STUB_DIR/http.max-times.
+# and its --max-time in STUB_DIR/http.max-times. A target-check probe, a readyz URL with a
+# pi-target query, gets the answer of its URL without the query and adds its access line, with
+# that status, to STUB_SERVED_LOG, as nginx logs it.
 curl() {
-    local method="GET" out="" url="" body="" status="" reply="" r_method r_url r_status r_body
+    local method="GET" out="" url="" body="" status="" reply="" r_method r_url r_status r_body lookup
     local state=false flag_re='"enabled": (true|false)'
     while [[ $# -gt 0 ]]; do
         case "$1" in
@@ -557,8 +653,12 @@ curl() {
         echo "$T_CURL_REFUSED" >&2
         return 7
     fi
+    lookup="$url"
+    if [[ "$url" == *"?pi-target="* ]]; then
+        lookup="${url%%\?*}"
+    fi
     while IFS=$'\t' read -r r_method r_url r_status r_body; do
-        if [[ "$r_method" == "$method" && "$r_url" == "$url" ]]; then
+        if [[ "$r_method" == "$method" && "$r_url" == "$lookup" ]]; then
             status="$r_status"
             reply="$r_body"
             break
@@ -570,6 +670,10 @@ curl() {
     fi
     if [[ "$reply" == "@request" ]]; then
         reply="$body"
+    fi
+    if [[ "$lookup" != "$url" ]]; then
+        printf '172.23.0.1 - [01/Jan/2026:00:00:00 +0000] "GET %s HTTP/1.1" %s 2 "-" "curl/8.21.0"\n' \
+            "${url#"$BASE_URL"}" "$status" >>"$STUB_SERVED_LOG"
     fi
     if [[ "$reply" == "@flag" ]]; then
         if [[ "$method" == "PUT" && "$body" =~ $flag_re ]]; then
@@ -596,10 +700,25 @@ date() {
     fi
 }
 
-# sleep: advances the fake clock by its argument instead of waiting, and records the step.
+# sleep: advances the fake clock, and the shell's SECONDS that the target check reads, by its
+# argument instead of waiting, and records the step.
 sleep() {
     printf '%s\n' "$1" >>"$STUB_DIR/sleeps"
     FAKE_NOW=$((FAKE_NOW + $1))
+    SECONDS=$((SECONDS + $1))
+}
+
+# od: the 16 random bytes of the target check, fixed so that its probe URLs are known; any other
+# use of od runs the real one.
+T_NONCE="0f1e2d3c4b5a69788796a5b4c3d2e1f0"
+# The target check's two probes, as the stub curl records them, on t_new_case's base URL.
+T_PROBES="GET http://stub.invalid/broker-service/readyz?pi-target=$T_NONCE GET http://stub.invalid/feature-flag-service/readyz?pi-target=$T_NONCE"
+od() {
+    if [[ "$*" == "-An -N16 -tx1 /dev/urandom" ]]; then
+        echo " 0f 1e 2d 3c 4b 5a 69 78 87 96 a5 b4 c3 d2 e1 f0"
+        return 0
+    fi
+    command od "$@"
 }
 
 # t_respond METHOD URL STATUS [BODY]: the stub curl's answer to METHOD URL.
@@ -785,11 +904,16 @@ t_check_tools_without_path() {
 }
 
 # t_ready_stack: the stub answers of a ready PostgreSQL stack whose services, loadgen included,
-# all run, with the flag modifiable and off. Answers a row adds before calling it take precedence.
+# all run, with the flag modifiable and off. Its loadgen service only declares a build, as in
+# compose.dev.yaml, and that build's image is held locally under Compose's default name. Answers
+# a row adds before calling it take precedence.
 t_ready_stack() {
     printf '%s\n' broker-service db db-adapter feature-flag-service frontend loadgen offer-service \
         reverse-proxy >"$STUB_DIR/services"
     cp "$STUB_DIR/services" "$STUB_DIR/running"
+    printf '%s\n' '{"name":"et-test","services":{"loadgen":{"build":{"context":"src/loadgen"}}}}' \
+        >"$STUB_DIR/config.json"
+    printf '%s\n' "et-test-loadgen $T_IMAGE_ID" >"$STUB_DIR/images"
     printf '%s\n' "PATH=/usr/local/bin" "DB_TYPE=postgres" >"$STUB_DIR/env.db-adapter"
     printf '%s\n' "PATH=/usr/local/bin" "PORTFOLIO_INSIGHTS_ALERT_WEIGHT=0" >"$STUB_DIR/env.loadgen"
     t_respond GET "$BASE_URL/broker-service/readyz" 200 'ok'
@@ -809,6 +933,16 @@ t_flag_body() {
 t_setup_facts() {
     setup
     printf 'DIALECT=%s FLAG_INITIAL=%s\n' "$DIALECT" "$FLAG_INITIAL"
+}
+
+# t_setup_then_run_a: setup, then the pinned image it resolved, then run A, as main runs them, so
+# a case sees whether setup ended the run before run A changed anything.
+t_setup_then_run_a() {
+    LOADGEN_IMAGE=""
+    LOADGEN_IMAGE_ID=""
+    setup
+    printf 'LOADGEN_IMAGE=%s LOADGEN_IMAGE_ID=%s\n' "$LOADGEN_IMAGE" "$LOADGEN_IMAGE_ID"
+    run_a
 }
 
 # t_set_flag_touch ARGS...: set_flag ARGS, printing FLAG_TOUCHED on the way out, whether set_flag
@@ -946,6 +1080,20 @@ STUB_VERSION_STATUS=1
 t_run_sub check_tools
 t_expect "compose plugin missing" "$T_STATUS|$(<"$T_CASE_DIR/err")" \
     "2|The docker compose plugin is required (docker compose version failed)."
+t_expect "compose plugin probe bounded" "$(<"$STUB_DIR/timeout.calls")" \
+    "-k 5 55 docker compose version
+-k 5 55 docker compose version"
+t_conclude "$check"
+
+check="checkTools_composeVersionTimesOut_exitsTwoNamingTheTimeout"
+# 124 is timeout(1)'s status for a call ended by TERM, 137 for one it had to KILL.
+for t_status in 124 137; do
+    t_new_case
+    STUB_VERSION_STATUS="$t_status"
+    t_run_sub check_tools
+    t_expect "status $t_status" "$T_STATUS|$(<"$T_CASE_DIR/err")" \
+        "2|The docker compose plugin is required: docker compose version timed out after 60 s (Docker did not answer)."
+done
 t_conclude "$check"
 
 # ---------------------------------------------------------------------------------------------
@@ -1762,6 +1910,9 @@ t_conclude "$check"
 # Database (read only)
 
 check="dbQuery_dialects_runsDialectClientInDbContainer"
+# Each client gets a 15 s login and a 30 s query timeout of its own, and the exec the 60 s call
+# limit: TERM at 55 s, KILL at 60 s. sqlcmd, which does not exit after its query timeout, is
+# killed in the container at 50 s, and that kill is reported as its failure, status 1.
 t_new_case
 DIALECT="mssql"
 STUB_DB_OUTPUT="7"
@@ -1778,10 +1929,11 @@ exec
 db
 sh
 -c
-/opt/mssql-tools/bin/sqlcmd -S localhost -U sa -P "$SA_PASSWORD" -d TradeManagement -b -h -1 -W -Q "$1"
+timeout -s KILL 50 /opt/mssql-tools/bin/sqlcmd -S localhost -U sa -P "$SA_PASSWORD" -d TradeManagement -l 15 -t 30 -b -h -1 -W -Q "$1"; rc=$?; if [ "$rc" -eq 137 ]; then echo "sqlcmd had not exited 50 s after it started" >&2; rc=1; fi; exit "$rc"
 sh
 SET NOCOUNT ON; SELECT 1
 --'
+t_expect_match "mssql exec bounded" "$STUB_DIR/timeout.calls" "^$T_BOUNDED_COMPOSE exec -T db sh -c "
 t_new_case
 STUB_DB_OUTPUT="7"
 t_expect "postgres output" "$(db_query "SELECT 1")" 7
@@ -1800,13 +1952,31 @@ ON_ERROR_STOP=1
 -U
 postgres
 -d
-TradeManagement
+dbname=TradeManagement connect_timeout=15 options='"'"'-c statement_timeout=30000'"'"'
 -At
 -F
 ,
 -c
 SELECT 1
 --'
+t_expect_match "postgres exec bounded" "$STUB_DIR/timeout.calls" "^$T_BOUNDED_COMPOSE exec -T db psql "
+t_conclude "$check"
+
+check="dbCountIds_queryTimesOut_failsNamingTheTimeoutNotASqlError"
+for dialect in mssql postgres; do
+    for t_status in 124 137; do
+        t_new_case
+        DIALECT="$dialect"
+        STUB_EXEC_STATUS="$t_status"
+        printf '%s\n' "$ID1" >"$T_CASE_DIR/ids"
+        set +e
+        db_count_ids "$T_CASE_DIR/ids"
+        status=$?
+        set -e
+        t_expect "$dialect status $t_status" "$status|$DB_ERROR|$(t_count "$STUB_DIR/queries")" \
+            "1|count query timed out after 60 s (Docker did not answer)|0"
+    done
+done
 t_conclude "$check"
 
 check="dbQuery_clientFails_exitsNonZeroWithClientError"
@@ -1956,6 +2126,7 @@ t_ready_stack
 t_run_sub t_setup_facts
 t_expect "ready stack" "$T_STATUS" 0
 t_expect_no_match "ready stack: no failure" "$T_CASE_DIR/out" '^FAIL '
+t_expect_line "ready stack: target project" "$T_CASE_DIR/out" "PASS target project"
 t_expect_line "ready stack: facts" "$T_CASE_DIR/out" "DIALECT=postgres FLAG_INITIAL=false"
 t_expect "ready stack: loadgen's twin created with its weight at start, then removed" \
     "$(t_print_file "$STUB_DIR/twin.env")|$(t_lock_presence "$STUB_DIR/twin.loadgen")|$(t_print_file "$STUB_DIR/up.env")" \
@@ -2005,6 +2176,167 @@ for row in 'not the flag;{error: "feature_disabled"};id is not a string;feature_
 done
 t_conclude "$check"
 
+check="setup_composeConfigFailsOrTimesOut_failsReadinessBeforeAnyRequest"
+# STATUS|DETAIL: config --services exits STATUS; @RUN_DIR@ stands for the case's run directory.
+for row in "124|timed out after 60 s (Docker did not answer)" "137|timed out after 60 s (Docker did not answer)" \
+    "1|failed, exit 1 (see @RUN_DIR@/compose.log)"; do
+    t_new_case
+    t_ready_stack
+    STUB_CONFIG_STATUS="${row%%|*}"
+    t_detail="${row#*|}"
+    t_run_sub t_setup_facts
+    t_expect "status ${row%%|*}: exit status" "$T_STATUS" 1
+    t_expect_line "status ${row%%|*}: verdict" "$T_CASE_DIR/out" \
+        "FAIL readiness: docker compose config for project [et-test] ${t_detail//@RUN_DIR@/$RUN_DIR}"
+    t_expect "status ${row%%|*}: no request" "$(t_count "$STUB_DIR/http.calls")" 0
+    t_expect "status ${row%%|*}: config bounded" "$(<"$STUB_DIR/timeout.calls")" "$T_BOUNDED_COMPOSE config --services"
+done
+t_conclude "$check"
+
+check="setup_runningServicesReadFailsOrTimesOut_failsReadinessBeforeAnyRequest"
+# STATUS|DETAIL: ps --services exits STATUS, 124 and 137 standing for a call its limit cut off;
+# @RUN_DIR@ stands for the case's run directory. The failed read is never taken for a list of no
+# running services.
+for row in "124|timed out after 60 s (Docker did not answer)" "137|timed out after 60 s (Docker did not answer)" \
+    "3|failed, exit 3 (see @RUN_DIR@/compose.log)"; do
+    t_new_case
+    t_ready_stack
+    STUB_PS_STATUS="${row%%|*}"
+    t_detail="${row#*|}"
+    t_run_sub t_setup_facts
+    t_expect "status ${row%%|*}: exit status" "$T_STATUS" 1
+    t_expect_line "status ${row%%|*}: verdict" "$T_CASE_DIR/out" \
+        "FAIL readiness: listing the running services of project [et-test] ${t_detail//@RUN_DIR@/$RUN_DIR}"
+    t_expect_no_match "status ${row%%|*}: no missing services" "$T_CASE_DIR/out" 'services not running'
+    t_expect "status ${row%%|*}: no request" "$(t_count "$STUB_DIR/http.calls")" 0
+    t_expect_line "status ${row%%|*}: ps bounded" "$STUB_DIR/timeout.calls" "$T_BOUNDED_COMPOSE ps --status running --services"
+done
+t_conclude "$check"
+
+check="setup_dbTypeReadFailsOrTimesOut_failsRuntimeFactsBeforeAnyFlagPut"
+# STATUS|DETAIL: docker inspect of the db-adapter container exits STATUS, 124 and 137 standing for
+# a call its limit cut off; @RUN_DIR@ stands for the case's run directory. Readiness has passed,
+# and the run ends before the flag is read, run A PUTs it or loadgen is recreated. The failed read
+# is never taken for an unset DB_TYPE.
+for row in "124|timed out after 60 s (Docker did not answer)" "137|timed out after 60 s (Docker did not answer)" \
+    "3|failed, exit 3 (see @RUN_DIR@/compose.log)"; do
+    t_new_case
+    t_ready_stack
+    STUB_ENV_STATUS="${row%%|*}"
+    STUB_ENV_SERVICE="db-adapter"
+    t_detail="${row#*|}"
+    t_run_sub t_setup_then_run_a
+    t_expect "status ${row%%|*}: exit status" "$T_STATUS" 1
+    t_expect_line "status ${row%%|*}: readiness" "$T_CASE_DIR/out" "PASS readiness"
+    t_expect_line "status ${row%%|*}: verdict" "$T_CASE_DIR/out" \
+        "FAIL runtime facts: reading DB_TYPE from the db-adapter container of project [et-test] ${t_detail//@RUN_DIR@/$RUN_DIR}"
+    t_expect_no_match "status ${row%%|*}: no DB_TYPE value judged" "$T_CASE_DIR/out" 'DB_TYPE is \['
+    t_expect_no_match "status ${row%%|*}: setup ended the run" "$T_CASE_DIR/out" '^LOADGEN_IMAGE='
+    t_expect "status ${row%%|*}: only the readiness and target-check requests" "$(t_lines "$STUB_DIR/http.calls")" \
+        "GET $BASE_URL/broker-service/readyz GET $BASE_URL/feature-flag-service/readyz $T_PROBES"
+    # up.env records every up but the twin the restorability check creates and removes.
+    t_expect "status ${row%%|*}: no recreate" "$(t_print_file "$STUB_DIR/up.env")" ""
+    t_expect_line "status ${row%%|*}: inspect bounded" "$STUB_DIR/timeout.calls" \
+        "-k 5 55 docker inspect --format {{json .Config.Env}} cid-db-adapter"
+done
+t_conclude "$check"
+
+# t_setup_then_run_a_on_fake_clock: t_setup_then_run_a with SECONDS, the target check's clock,
+# advanced by the sleep stub alone, so its deadline passes after a fixed number of reads.
+t_setup_then_run_a_on_fake_clock() {
+    unset SECONDS
+    SECONDS=0
+    t_setup_then_run_a
+}
+
+check="setup_baseUrlServedByOtherStack_failsTargetProjectBeforeAnyFlagReadOrRecreate"
+# Two otherwise valid stacks: the base URL is served by another stack, whose reverse proxy logs
+# the probes, while the named project's log never shows them. Over the 30 s deadline the log is
+# read every 2 s, 15 times; then the run ends with readiness passed, before the runtime facts, the
+# loadgen image, the flag read, run A's flag PUT and any recreate of loadgen.
+t_new_case
+t_ready_stack
+STUB_SERVED_LOG="$STUB_DIR/other-proxy.log"
+t_run_sub t_setup_then_run_a_on_fake_clock
+t_expect "exit status" "$T_STATUS" 1
+t_expect_line "readiness" "$T_CASE_DIR/out" "PASS readiness"
+t_expect_line "verdict" "$T_CASE_DIR/out" \
+    "FAIL target project: base url $BASE_URL is not served by the reverse-proxy of project [et-test]: its log shows no request carrying this run's probe within 30 s; give the --base-url and --project of one stack"
+t_expect_no_match "no runtime facts" "$T_CASE_DIR/out" 'runtime facts'
+t_expect_no_match "setup ended the run" "$T_CASE_DIR/out" '^LOADGEN_IMAGE='
+t_expect "only the readiness and target-check requests" "$(t_lines "$STUB_DIR/http.calls")" \
+    "GET $BASE_URL/broker-service/readyz GET $BASE_URL/feature-flag-service/readyz $T_PROBES"
+t_expect "reverse-proxy log reads" "$(grep -cxF reverse-proxy "$STUB_DIR/docker.calls")" 15
+t_expect "sleeps" "$(t_lines "$STUB_DIR/sleeps")" "2 2 2 2 2 2 2 2 2 2 2 2 2 2"
+t_expect_no_match "no image resolved" "$STUB_DIR/timeout.calls" 'config --format json'
+# up.env records every up but the twin the restorability check creates and removes.
+t_expect "no recreate" "$(t_print_file "$STUB_DIR/up.env")" ""
+t_conclude "$check"
+
+check="setup_loadgenImage_pinsImageKeyOrComposeDefaultName"
+# ROW|CONFIG|IMAGE: the resolved compose files CONFIG, whose loadgen image is IMAGE.
+for row in "image key|{\"name\":\"et-test\",\"services\":{\"loadgen\":{\"image\":\"registry.invalid/easytrade/loadgen:latest\"}}}|registry.invalid/easytrade/loadgen:latest" \
+    "build only|{\"name\":\"et-test\",\"services\":{\"loadgen\":{\"build\":{\"context\":\"src/loadgen\"}}}}|et-test-loadgen"; do
+    IFS='|' read -r t_label t_config t_image <<<"$row"
+    t_new_case
+    t_ready_stack
+    printf '%s\n' "$t_config" >"$STUB_DIR/config.json"
+    # Added to the image t_ready_stack's loadgen container was created from, which the
+    # restorability check reads first.
+    printf '%s\n' "$t_image $T_IMAGE_ID" >>"$STUB_DIR/images"
+    LOADGEN_IMAGE=""
+    LOADGEN_IMAGE_ID=""
+    t_run_sub t_setup_facts
+    t_expect "$t_label: exit status" "$T_STATUS" 0
+    t_expect_line "$t_label: verdict" "$T_CASE_DIR/out" "PASS loadgen image"
+    t_expect_line "$t_label: image and id" "$T_CASE_DIR/out" \
+        "INFO loadgen image $t_image, id $T_IMAGE_ID: every window recreates loadgen from it, without building or pulling"
+    t_expect_line "$t_label: config bounded" "$STUB_DIR/timeout.calls" "$T_BOUNDED_COMPOSE config --format json"
+    t_expect_line "$t_label: image read bounded" "$STUB_DIR/timeout.calls" "-k 5 55 docker image inspect --format {{.Id}} $t_image"
+done
+t_conclude "$check"
+
+check="setup_loadgenImageUnavailable_failsBeforeAnyFlagPutOrRecreate"
+# ROW|DETAIL: the stub answers of ROW make setup fail "loadgen image" with DETAIL, in which
+# @RUN_DIR@ stands for the case's run directory. Run A would PUT the flag first, and the stub
+# curl records that request whether or not it answers it.
+for row in "image not built|docker image inspect of [et-test-loadgen] failed, exit 1 (see @RUN_DIR@/compose.log); build or pull that image before the run: every recreate of loadgen uses the local image, never building or pulling it" \
+    "image read timed out|docker image inspect of [et-test-loadgen] timed out after 60 s (Docker did not answer)" \
+    "config timed out|docker compose config --format json for project [et-test] timed out after 60 s (Docker did not answer)" \
+    "no image name|docker compose config for project [et-test] names no image for loadgen" \
+    "id not a digest|docker image inspect gave id [et-test-loadgen] for image [et-test-loadgen], expected sha256: and 64 hex digits"; do
+    t_label="${row%%|*}"
+    t_detail="${row#*|}"
+    t_new_case
+    t_ready_stack
+    # A loadgen container at start makes the restorability check read that same image first
+    # (loadgen-check-test.sh covers its refusals), so the image rows start without one.
+    case "$t_label" in
+        "image not built")
+            : >"$STUB_DIR/images"
+            rm -f "$STUB_DIR/env.loadgen"
+            ;;
+        "image read timed out")
+            STUB_IMAGE_STATUS=124
+            rm -f "$STUB_DIR/env.loadgen"
+            ;;
+        "config timed out") STUB_CONFIG_JSON_STATUS=137 ;;
+        "no image name") printf '%s\n' '{"services":{"loadgen":{}}}' >"$STUB_DIR/config.json" ;;
+        "id not a digest")
+            printf '%s\n' "et-test-loadgen et-test-loadgen" >"$STUB_DIR/images"
+            rm -f "$STUB_DIR/env.loadgen"
+            ;;
+    esac
+    t_run_sub t_setup_then_run_a
+    t_expect "$t_label: exit status" "$T_STATUS" 1
+    t_expect_line "$t_label: verdict" "$T_CASE_DIR/out" "FAIL loadgen image: ${t_detail//@RUN_DIR@/$RUN_DIR}"
+    t_expect_no_match "$t_label: setup ended the run" "$T_CASE_DIR/out" '^LOADGEN_IMAGE='
+    t_expect_no_match "$t_label: no flag PUT" "$STUB_DIR/http.calls" '^PUT '
+    # up.env records every up but the twin the restorability check creates and removes.
+    t_expect "$t_label: no recreate" "$(t_print_file "$STUB_DIR/up.env")" ""
+done
+t_conclude "$check"
+
 check="setFlag_responses_passesOnReadBackOrEndsRunWithFlagTouched"
 t_new_case
 t_respond PUT "$FLAG_URL" 200 '@flag'
@@ -2040,8 +2372,12 @@ check="openWindow_recreatedWeights_passesOnlyTheRequestedWeight"
 t_new_case
 t_run_sub t_open_window_state "run B" B 3
 t_expect "weight applied" "$T_STATUS|$(<"$T_CASE_DIR/out")|$(<"$STUB_DIR/up.env")" "0|PASS run B loadgen weight: 3
+PASS run B loadgen image: $T_IMAGE_ID
 WINDOW_OPEN=1 LOADGEN_TOUCHED=1 shell weight unset|PORTFOLIO_INSIGHTS_ALERT_WEIGHT=3"
-t_expect_line "loadgen recreated alone" "$STUB_DIR/docker.calls" "--no-deps"
+t_expect_line "loadgen recreated alone, bounded, without building or pulling" "$STUB_DIR/timeout.calls" \
+    "$T_BOUNDED_COMPOSE up -d --no-deps --force-recreate --no-build --pull never loadgen"
+t_expect_line "recreated container's image read bounded" "$STUB_DIR/timeout.calls" \
+    "-k 5 55 docker inspect --format {{.Image}} cid-loadgen"
 t_new_case
 STUB_LOADGEN_WEIGHT=1
 t_run_sub t_open_window_state "run B" B 3
@@ -2052,8 +2388,35 @@ t_new_case
 STUB_UP_STATUS=1
 t_run_sub t_open_window_state "run B" B 3
 t_expect "recreate failed" "$T_STATUS|$(<"$T_CASE_DIR/out")" \
-    "1|FAIL run B loadgen weight: recreating loadgen with weight 3 failed (see $RUN_DIR/compose.log)
+    "1|FAIL run B loadgen weight: recreating loadgen with weight 3 failed, exit 1 (see $RUN_DIR/compose.log)
 WINDOW_OPEN=1 LOADGEN_TOUCHED=1 shell weight unset"
+t_conclude "$check"
+
+check="openWindow_callCutOffOrOtherImage_endsRunNamingTheCause"
+# ROW|CHECK|DETAIL: the stub answers of ROW end open_window with FAIL "run B loadgen CHECK" and
+# DETAIL, in which @RUN_DIR@ stands for the case's run directory. The window stays open and
+# loadgen touched, so cleanup stops and restores it.
+for row in "recreate timed out|weight|recreating loadgen with weight 3 timed out after 60 s (Docker did not answer)" \
+    "weight read timed out|weight|reading the recreated loadgen's PORTFOLIO_INSIGHTS_ALERT_WEIGHT timed out after 60 s (Docker did not answer)" \
+    "image read timed out|image|reading the recreated loadgen's image timed out after 60 s (Docker did not answer)" \
+    "image unreadable|image|reading the recreated loadgen's image failed, exit 1 (see @RUN_DIR@/compose.log)" \
+    "another image|image|the recreated container runs image [$T_OTHER_IMAGE_ID], expected [$T_IMAGE_ID] of et-test-loadgen as setup resolved it"; do
+    IFS='|' read -r t_label t_check t_detail <<<"$row"
+    t_new_case
+    case "$t_label" in
+        "recreate timed out") STUB_UP_STATUS=124 ;;
+        "weight read timed out") STUB_ENV_STATUS=137 ;;
+        "image read timed out") STUB_CONTAINER_IMAGE_STATUS=124 ;;
+        "image unreadable") STUB_UP_IMAGE_ID="" ;;
+        "another image") STUB_UP_IMAGE_ID="$T_OTHER_IMAGE_ID" ;;
+    esac
+    t_run_sub t_open_window_state "run B" B 3
+    t_expect "$t_label: exit status" "$T_STATUS" 1
+    t_expect_line "$t_label: verdict" "$T_CASE_DIR/out" "FAIL run B loadgen $t_check: ${t_detail//@RUN_DIR@/$RUN_DIR}"
+    t_expect_line "$t_label: window left for cleanup" "$T_CASE_DIR/out" \
+        "WINDOW_OPEN=1 LOADGEN_TOUCHED=1 shell weight unset"
+    t_expect_no_match "$t_label: no image pass" "$T_CASE_DIR/out" '^PASS run B loadgen image'
+done
 t_conclude "$check"
 
 check="windowStarted_loadgenLogs_succeedsOnFirstRunningVisit"

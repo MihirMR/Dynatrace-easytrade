@@ -1,8 +1,18 @@
 #!/usr/bin/env bash
 # Tests, offline, the shell helpers and bounded Docker calls of the three Portfolio Insights
 # harness scripts, e2e.sh, perf.sh and loadgen-check.sh:
-#   - the origin helpers and hard_timeout are byte-identical in all three, and container_env and
-#     resolve_interval in e2e.sh and perf.sh;
+#   - the origin helpers, hard_timeout and docker_problem are byte-identical in all three,
+#     compose_within, compose, running_services, container_env and resolve_interval in e2e.sh
+#     and perf.sh, and check_tools, with its compose plugin probe, in perf.sh and
+#     loadgen-check.sh, whose two plugin messages e2e.sh's own top-level plugin check prints;
+#   - verify_target_project and its two bounds are byte-identical in all three, and the check
+#     passes only when the named project's reverse-proxy log shows both probes with status 200;
+#     it ends the run before any further step when the probes appear with another nonce, in
+#     another stack's log or only as error-log warnings, when a probe does not answer 200, when
+#     a log read fails or its own bound cuts it off, also after Docker answered an earlier read,
+#     when the deadline cuts off a read before Docker answered any (as Docker not answering) or
+#     after it answered one (as a probe not served), when no time is left for a read, and when
+#     no random bytes make a nonce;
 #   - is_base_origin, in each copy and in the C and a UTF-8 locale, accepts http(s) origins and
 #     refuses credentials, paths, queries, fragments, other schemes, white space, control
 #     characters and malformed hosts and ports;
@@ -15,6 +25,13 @@
 #     loadgen-check.sh's progress watch and run B drain end by their bounds when Docker never
 #     answers, and loadgen-check.sh's cleanup still deletes the owned alerts and restores the
 #     flag then, whether loadgen was running or paused;
+#   - the compose plugin check of e2e.sh, its top-level block, and of perf.sh, its check_tools,
+#     exits 2 by its limit, saying Docker did not answer, and their running_services,
+#     container_env and perf.sh's armed-set query fail with the call's own status, 137 by the
+#     call limit when Docker never answers, never as an empty answer;
+#   - loadgen-check.sh's restorability check of a running loadgen fails by the call limit, before
+#     any change and with no twin left, when docker compose config --hash or the create of the
+#     twin it compares loadgen with never answers;
 #   - perf.sh's cycle-line wait discards a read that ends after its deadline, qualifying line
 #     and all, when Docker answered in time but the output filter ran late;
 #   - loadgen-check.sh's cleanup report reaches the run's own stdout and stderr when an INT or an
@@ -31,7 +48,7 @@
 #   --help  Show this help and exit
 #
 # Needs bash 5 or later, jq and the coreutils the scripts use (timeout, base64, od, sed,
-# mktemp). Takes under two minutes.
+# mktemp). Takes about three minutes.
 #
 # Prints one PASS or FAIL line per check and a final SUMMARY line. Exits 0 when every check
 # passes, 1 when any check fails, and 2 on a usage error or a missing tool. The run's temporary
@@ -178,16 +195,16 @@ cat >"$TEST_DIR/bin/docker" <<'EOF'
 #!/usr/bin/env bash
 # Fake docker for harness-test.sh. It appends each call's arguments to FAKE_DOCKER_RECORD and
 # never reaches a Docker engine. The verb is the first of logs, stop, up, pause, unpause, kill,
-# rm, ps, inspect and config among the arguments. FAKE_DOCKER_MODE_<verb>, else FAKE_DOCKER_MODE,
-# sets what the call does:
-#   answer            (default) logs prints the file FAKE_DOCKER_LINES; stop, up, pause,
-#                     unpause, kill and rm succeed; ps --services prints FAKE_DOCKER_RUNNING, the
-#                     running services, and any other ps FAKE_DOCKER_CID when it is set; inspect
-#                     renders the environment of container FAKE_DOCKER_CID, the NUL-separated
-#                     entries of the file FAKE_DOCKER_ENV, or with {{json .}} that container,
-#                     which runs FAKE_DOCKER_IMAGE and carries the config hash
-#                     FAKE_DOCKER_CONFIG_HASH; image inspect prints FAKE_DOCKER_IMAGE; config
-#                     --hash SERVICE prints SERVICE and FAKE_DOCKER_CONFIG_HASH;
+# rm, ps, inspect, version, exec and config among the arguments. FAKE_DOCKER_MODE_<verb>, else
+# FAKE_DOCKER_MODE, sets what the call does:
+#   answer            (default) logs and exec print the file FAKE_DOCKER_LINES; stop, up, pause,
+#                     unpause, kill, rm and version succeed; ps --services prints
+#                     FAKE_DOCKER_RUNNING, the running services, and any other ps FAKE_DOCKER_CID
+#                     when it is set; inspect renders the environment of container
+#                     FAKE_DOCKER_CID, the NUL-separated entries of the file FAKE_DOCKER_ENV, or
+#                     with {{json .}} that container, which runs FAKE_DOCKER_IMAGE and carries the
+#                     config hash FAKE_DOCKER_CONFIG_HASH; image inspect prints FAKE_DOCKER_IMAGE;
+#                     config --hash SERVICE prints SERVICE and FAKE_DOCKER_CONFIG_HASH;
 #   fail              exits 3 at once with an error on stderr;
 #   hang              waits, ending on TERM;
 #   hang-ignore-term  waits with TERM ignored, ending only on KILL;
@@ -204,7 +221,7 @@ config_hash="${FAKE_DOCKER_CONFIG_HASH:-2222222222222222222222222222222222222222
 verb=""
 for arg in "$@"; do
     case "$arg" in
-        logs | stop | up | pause | unpause | kill | rm | ps | inspect | config)
+        logs | stop | up | pause | unpause | kill | rm | ps | inspect | version | exec | config)
             verb="$arg"
             break
             ;;
@@ -244,12 +261,12 @@ case "$mode" in
         ;;
 esac
 case "$verb" in
-    logs)
+    logs | exec)
         if [[ -n "${FAKE_DOCKER_LINES:-}" ]]; then
             cat "$FAKE_DOCKER_LINES"
         fi
         ;;
-    stop | up | pause | unpause | kill | rm) ;;
+    stop | up | pause | unpause | kill | rm | version) ;;
     ps)
         if [[ " $* " == *" --services "* ]]; then
             if [[ -n "${FAKE_DOCKER_RUNNING:-}" ]]; then
@@ -555,12 +572,14 @@ load_script() {
 # Each must be found exactly once. loadgen-check.sh also does all of that in main, and the cases
 # source it whole.
 
-SHARED_CONSTANTS="LOG_PROBE_TIMEOUT_SECONDS LOG_PROBE_KILL_SECONDS DEFAULT_INTERVAL_SECONDS MAX_INTERVAL_SECONDS"
-E2E_CONSTANTS="$SHARED_CONSTANTS INSIGHTS_LINE_RE"
-E2E_FUNCTIONS="$ORIGIN_HELPERS compose hard_timeout container_env resolve_interval probe_limit broker_logs insights_line_logged poll fail"
-PERF_CONSTANTS="$SHARED_CONSTANTS LOG_STEP_SECONDS CYCLE_MARKER CYCLE_RE"
-PERF_FUNCTIONS="$ORIGIN_HELPERS compose hard_timeout container_env resolve_interval probe_limit broker_logs read_window parse_cycle_line cycle_summary_text info wait_cycle_line"
-LOADGEN_CHECK_FUNCTIONS="$ORIGIN_HELPERS hard_timeout container_env loadgen_logs probe_limit watch_progress cleanup install_cleanup"
+# The target check's own bounds, assigned alike in all three scripts.
+TARGET_CONSTANTS="TARGET_TIMEOUT_SECONDS TARGET_STEP_SECONDS"
+SHARED_CONSTANTS="LOG_PROBE_TIMEOUT_SECONDS LOG_PROBE_KILL_SECONDS DOCKER_CALL_TIMEOUT_SECONDS DEFAULT_INTERVAL_SECONDS MAX_INTERVAL_SECONDS $TARGET_CONSTANTS"
+E2E_CONSTANTS="$SHARED_CONSTANTS INSIGHTS_LINE_RE LOG_SKEW_MARGIN_SECONDS"
+E2E_FUNCTIONS="$ORIGIN_HELPERS compose compose_within hard_timeout docker_problem running_services container_env resolve_interval probe_limit broker_logs insights_line_logged poll fail pass info abort status_text epoch_to_rfc3339 verify_target_project"
+PERF_CONSTANTS="$SHARED_CONSTANTS LOG_STEP_SECONDS CYCLE_MARKER CYCLE_RE DB_LOGIN_TIMEOUT_SECONDS DB_QUERY_TIMEOUT_SECONDS ARMED_TIME_RE"
+PERF_FUNCTIONS="$ORIGIN_HELPERS compose compose_within hard_timeout docker_problem running_services container_env resolve_interval probe_limit broker_logs read_window parse_cycle_line cycle_summary_text info wait_cycle_line db_query armed_sql read_armed_set verify_target_project check_tools"
+LOADGEN_CHECK_FUNCTIONS="$ORIGIN_HELPERS hard_timeout docker_problem container_env loadgen_logs probe_limit watch_progress cleanup install_cleanup verify_target_project check_tools"
 # The guard line of loadgen-check.sh that keeps sourcing it from starting a run.
 # shellcheck disable=SC2016 # Matched as text, never expanded.
 LOADGEN_CHECK_GUARD='if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then'
@@ -587,7 +606,7 @@ conclude_or_abort "extractDefinitions_e2eScript_eachFoundOnce"
 : >"$TEST_DIR/lib-perf.sh"
 check_definitions perf "$PERF_CONSTANTS" "$PERF_FUNCTIONS" "$TEST_DIR/lib-perf.sh"
 conclude_or_abort "extractDefinitions_perfScript_eachFoundOnce"
-check_definitions loadgen-check "" "$LOADGEN_CHECK_FUNCTIONS"
+check_definitions loadgen-check "$TARGET_CONSTANTS" "$LOADGEN_CHECK_FUNCTIONS"
 if ! grep -qxF -- "$LOADGEN_CHECK_GUARD" "$SCRIPT_DIR/loadgen-check.sh"; then
     reasons+=("its source guard line [$LOADGEN_CHECK_GUARD] is missing, so sourcing it would start a run")
 fi
@@ -596,7 +615,7 @@ conclude_or_abort "extractDefinitions_loadgenCheckScript_eachFoundOnce"
 # ---------------------------------------------------------------------------------------------
 # 1. Helper parity: the copies stay byte-identical, so a fix in one script reaches all of them.
 
-read -ra parity_names <<<"$ORIGIN_HELPERS hard_timeout"
+read -ra parity_names <<<"$ORIGIN_HELPERS hard_timeout docker_problem verify_target_project"
 for name in "${parity_names[@]}"; do
     reference="$(extract_function "$SCRIPT_DIR/e2e.sh" "$name")"
     for script in perf loadgen-check; do
@@ -606,12 +625,54 @@ for name in "${parity_names[@]}"; do
     done
     conclude "$(camel "$name")_threeScriptCopies_byteIdentical"
 done
-for name in resolve_interval container_env; do
+# The target check's bounds: each script assigns them on one identical line.
+read -ra parity_names <<<"$TARGET_CONSTANTS"
+for name in "${parity_names[@]}"; do
+    reference="$(grep "^$name=" "$SCRIPT_DIR/e2e.sh" || true)"
+    for script in perf loadgen-check; do
+        if [[ "$(grep "^$name=" "$SCRIPT_DIR/$script.sh" || true)" != "$reference" ]]; then
+            reasons+=("the $script.sh assignment differs from the e2e.sh one [$reference]")
+        fi
+    done
+    conclude "$(camel "${name,,}")_threeScriptAssignments_byteIdentical"
+done
+for name in resolve_interval compose_within compose running_services container_env; do
     if [[ "$(extract_function "$SCRIPT_DIR/perf.sh" "$name")" != "$(extract_function "$SCRIPT_DIR/e2e.sh" "$name")" ]]; then
         reasons+=("the perf.sh copy differs from the e2e.sh copy")
     fi
     conclude "$(camel "$name")_e2eAndPerfCopies_byteIdentical"
 done
+
+# perf.sh and loadgen-check.sh check their tools, the compose plugin probe included, in one
+# check_tools, byte-identical in both.
+if [[ "$(extract_function "$SCRIPT_DIR/perf.sh" check_tools)" != "$(extract_function "$SCRIPT_DIR/loadgen-check.sh" check_tools)" ]]; then
+    reasons+=("the perf.sh copy differs from the loadgen-check.sh copy")
+fi
+conclude "checkTools_perfAndLoadgenCheckCopies_byteIdentical"
+
+# extract_plugin_check FILE: the compose plugin check of FILE, a block at the top level that runs
+# before any function is defined, from its "plugin_status=0" line to the first line after it
+# that is only "esac". e2e.sh has the one such block; the plugin check cases source it from
+# plugin-e2e.sh.
+extract_plugin_check() {
+    sed -n '/^plugin_status=0$/,/^esac$/p' "$1"
+}
+# plugin_messages TEXT: the compose plugin messages TEXT echoes to stderr, one per line, without
+# indentation.
+plugin_messages() {
+    sed -n 's/^[[:space:]]*\(echo "The docker compose plugin is required.*" >&2\)$/\1/p' <<<"$1"
+}
+count="$(grep -c '^plugin_status=0$' "$SCRIPT_DIR/e2e.sh" || true)"
+extract_plugin_check "$SCRIPT_DIR/e2e.sh" >"$TEST_DIR/plugin-e2e.sh"
+if [[ "$count" != 1 || "$(tail -n 1 "$TEST_DIR/plugin-e2e.sh")" != "esac" ]]; then
+    reasons+=("e2e.sh has ${count:-0} plugin_status=0 lines, expected 1 that starts a block ending in esac")
+fi
+# Its timeout and failure messages are the two of check_tools' plugin probe, in that order.
+if [[ "$(plugin_messages "$(<"$TEST_DIR/plugin-e2e.sh")")" != \
+    "$(plugin_messages "$(extract_function "$SCRIPT_DIR/perf.sh" check_tools)")" ]]; then
+    reasons+=("the e2e.sh block's messages differ from those of perf.sh's check_tools")
+fi
+conclude "composePluginCheck_e2eBlockAndCheckTools_sameMessages"
 
 # A UTF-8 locale for the locale cases: one in which a two-byte character has length 1.
 UTF8_LOCALE=""
@@ -1287,6 +1348,158 @@ expect_within_baseline_ms 2000
 expect_docker_calls inspect 1
 conclude "containerEnv_loadgenCheckInspectNeverAnswers_failsWith137ByCallLimit"
 
+# The compose plugin check of e2e.sh, its own top-level block, and of perf.sh, its check_tools,
+# with its limit lowered to 3 s and its grace to 1 s: TERM at 2 s and KILL at 3 s.
+PLUGIN_TIMEOUT_LINE="The docker compose plugin is required: docker compose version timed out after 3 s (Docker did not answer)."
+PLUGIN_FAILED_LINE="The docker compose plugin is required (docker compose version failed)."
+# scenario|result|fake docker mode|status|stderr line, empty for none|bound in ms
+PLUGIN_CHECK_ROWS=(
+    "VersionNeverAnswers|exitsTwoWithTimeoutByLimit|hang-ignore-term|2|$PLUGIN_TIMEOUT_LINE|4000"
+    "VersionHonoursTerm|exitsTwoWithTimeoutByLimit|hang|2|$PLUGIN_TIMEOUT_LINE|3000"
+    "VersionFails|exitsTwoNamingTheFailure|fail|2|$PLUGIN_FAILED_LINE|2000"
+    "VersionAnswers|goesOnWithoutMessage|answer|0||2000"
+)
+
+# case_plugin_check SCRIPT MODE: SCRIPT's compose plugin check, the fake docker in MODE: e2e.sh's
+# block sourced, or perf.sh's check_tools called, whose tool lookups find the fake docker and the
+# host's bash, curl, jq and timeout; prints a line when the check lets the script go on.
+# shellcheck disable=SC2034 # The limits are read by the sourced block and by check_tools.
+case_plugin_check() {
+    export FAKE_DOCKER_MODE="$2"
+    if [[ "$1" == perf ]]; then
+        load_script perf
+    fi
+    LOG_PROBE_KILL_SECONDS=1
+    DOCKER_CALL_TIMEOUT_SECONDS=3
+    mark_start
+    if [[ "$1" == perf ]]; then
+        check_tools
+    else
+        # shellcheck source=/dev/null
+        source "$TEST_DIR/plugin-$1.sh"
+    fi
+    echo "plugin check passed"
+}
+for script in e2e perf; do
+    for row in "${PLUGIN_CHECK_ROWS[@]}"; do
+        IFS='|' read -r scenario result mode status line bound <<<"$row"
+        run_case "plugin-$script-$scenario" case_plugin_check "$script" "$mode"
+        expect_status "$status"
+        expect_within_ms "$bound"
+        expect_docker_calls version 1
+        if [[ -n "$line" ]]; then
+            expect_stderr_line "$line"
+        else
+            expect_line "plugin check passed"
+        fi
+        conclude "composePluginCheck_$(camel "$script")Copy${scenario}_${result}"
+    done
+done
+
+# running_services of e2e.sh and perf.sh under a 2 s call limit, the fake ps in MODE. A failed or
+# cut-off call fails with its status; it is never an answer that lists no service.
+# scenario|result|fake docker mode|status|services printed|bound in ms
+RUNNING_SERVICES_ROWS=(
+    "PsNeverAnswers|failsWith137ByCallLimit|hang-ignore-term|137||3000"
+    "PsFails|failsWithItsStatus|fail|3||2000"
+    "PsAnswers|printsRunningServices|answer|0|broker-service|2000"
+)
+
+# case_running_services SCRIPT MODE: prints running_services' status and the services it printed.
+# shellcheck disable=SC2034 # DOCKER_CALL_TIMEOUT_SECONDS is read by running_services.
+case_running_services() {
+    load_script "$1"
+    export FAKE_DOCKER_MODE_ps="$2" FAKE_DOCKER_RUNNING=broker-service
+    DOCKER_CALL_TIMEOUT_SECONDS=2
+    local running status=0
+    mark_start
+    running="$(running_services)" || status=$?
+    printf 'status %s\nservices [%s]\n' "$status" "$running"
+}
+for script in e2e perf; do
+    for row in "${RUNNING_SERVICES_ROWS[@]}"; do
+        IFS='|' read -r scenario result mode status services bound <<<"$row"
+        run_case "running-services-$script-$scenario" case_running_services "$script" "$mode"
+        expect_status 0
+        expect_line "status $status"
+        expect_line "services [$services]"
+        expect_within_ms "$bound"
+        expect_docker_calls ps 1
+        conclude "runningServices_$(camel "$script")Copy${scenario}_${result}"
+    done
+done
+
+# container_env of e2e.sh and perf.sh under a 2 s call limit, one of its two Docker calls in
+# MODE. A failed or cut-off call fails with its status and prints nothing, so it never passes
+# for an unset variable.
+# scenario|result|verb|fake docker mode|status|inspect calls|bound in ms
+CONTAINER_ENV_CALL_ROWS=(
+    "PsNeverAnswers|failsWith137ByCallLimit|ps|hang-ignore-term|137|0|3000"
+    "InspectNeverAnswers|failsWith137ByCallLimit|inspect|hang-ignore-term|137|1|3000"
+    "PsFails|failsWithItsStatus|ps|fail|3|0|2000"
+    "InspectFails|failsWithItsStatus|inspect|fail|3|1|2000"
+)
+
+# case_container_env_call SCRIPT VERB MODE: prints container_env's status and what it printed.
+# shellcheck disable=SC2034 # DOCKER_CALL_TIMEOUT_SECONDS is read by container_env.
+case_container_env_call() {
+    load_script "$1"
+    export FAKE_DOCKER_CID="$FAKE_CID" FAKE_DOCKER_ENV="$TEST_DIR/env/plainValue_printsItExactly"
+    export "FAKE_DOCKER_MODE_$2=$3"
+    DOCKER_CALL_TIMEOUT_SECONDS=2
+    local value status=0
+    mark_start
+    value="$(container_env broker-service "$V" && printf x)" || status=$?
+    printf 'status %s\nvalue [%s]\n' "$status" "${value%x}"
+}
+for script in e2e perf; do
+    for row in "${CONTAINER_ENV_CALL_ROWS[@]}"; do
+        IFS='|' read -r scenario result verb mode status inspects bound <<<"$row"
+        run_case "container-env-call-$script-$scenario" case_container_env_call "$script" "$verb" "$mode"
+        expect_status 0
+        expect_line "status $status"
+        expect_line "value []"
+        expect_within_ms "$bound"
+        expect_docker_calls ps 1
+        expect_docker_calls inspect "$inspects"
+        conclude "containerEnv_$(camel "$script")Copy${scenario}_${result}"
+    done
+done
+
+# perf.sh's armed-set query, through db_query, under a 2 s call limit with the fake exec in MODE:
+# an exec Docker never answers fails as a timeout, one that fails as a query failure with its
+# error.
+# scenario|result|dialect|fake docker mode|ARMED_ERROR line, an ERE|bound in ms
+READ_ARMED_SET_ROWS=(
+    "mssqlExecNeverAnswers|failsAsTimeoutByCallLimit|mssql|hang-ignore-term|^error armed-set query timed out after 2 s \(Docker did not answer\)$|3000"
+    "postgresExecNeverAnswers|failsAsTimeoutByCallLimit|postgres|hang-ignore-term|^error armed-set query timed out after 2 s \(Docker did not answer\)$|3000"
+    "postgresExecFails|failsAsQueryFailureWithItsError|postgres|fail|^error armed-set query failed: fake docker: Cannot connect to the Docker daemon |2000"
+)
+
+# case_read_armed_set DIALECT MODE: prints read_armed_set's status and ARMED_ERROR.
+# shellcheck disable=SC2034 # The variables are read by read_armed_set and db_query.
+case_read_armed_set() {
+    load_script perf
+    export FAKE_DOCKER_MODE_exec="$2"
+    DOCKER_CALL_TIMEOUT_SECONDS=2
+    DIALECT="$1"
+    ARMED_ERROR=""
+    local status=0
+    mark_start
+    read_armed_set || status=$?
+    printf 'status %s\nerror %s\n' "$status" "$ARMED_ERROR"
+}
+for row in "${READ_ARMED_SET_ROWS[@]}"; do
+    IFS='|' read -r scenario result dialect mode pattern bound <<<"$row"
+    run_case "read-armed-set-$scenario" case_read_armed_set "$dialect" "$mode"
+    expect_status 0
+    expect_line "status 1"
+    expect_line_re "$pattern"
+    expect_within_ms "$bound"
+    expect_docker_calls exec 1
+    conclude "readArmedSet_${scenario}_${result}"
+done
+
 # loadgen-check.sh: setup's restorability check of a running loadgen, with docker compose config
 # --hash never answering. The call has ended by DOCKER_CALL_TIMEOUT_SECONDS, and the run ends
 # with the check failed before any change.
@@ -1508,7 +1721,7 @@ conclude "cleanup_pausedLoadgenKillAndUpNeverAnswer_deletesAlertsAndRestoresFlag
 
 # case_drain_pause MODE: loadgen-check.sh's run B drain over a quiescent window, one create
 # deleted by its visit, with loadgen's pause, the drain's first Docker call after its log read,
-# in fake docker MODE.
+# in fake docker MODE; prints the drain's status, DRAIN_DETAIL and LOADGEN_PAUSED.
 # shellcheck disable=SC2034 # The variables are the run state drain_loadgen reads.
 case_drain_pause() {
     load_script loadgen-check
@@ -1528,6 +1741,16 @@ case_drain_pause() {
     printf 'detail %s\n' "$DRAIN_DETAIL"
     printf 'paused %s\n' "$LOADGEN_PAUSED"
 }
+
+# The pause answering: the drain reaches Q and kills the paused loadgen.
+run_case drain-pause-answers case_drain_pause answer
+expect_status 0
+expect_line "status 0"
+expect_line_re '^detail Q at [0-9TZ:-]+ with 1 created alerts, all resolved, and no create in flight; loadgen killed while paused$'
+expect_line "paused 0"
+expect_docker_calls pause 1
+expect_docker_calls kill 1
+conclude "drainLoadgen_pauseAnswers_reachesQAndKillsPausedLoadgen"
 
 # The pause failing at once: the drain fails, naming the exit status, and leaves LOADGEN_PAUSED
 # at 1, so the stop that follows kills. Up to the pause's answer the drain does what it does
@@ -1805,6 +2028,310 @@ if [[ -s "$CASE_DIR/http.calls" ]]; then
     reasons+=("on_exit ran and sent [$(one_line "$CASE_DIR/http.calls")]")
 fi
 conclude "installTraps_stdoutClosed_endsWithExit2BeforeAnyTrap"
+
+# ---------------------------------------------------------------------------------------------
+# 8. verify_target_project: the base URL must be served by the named project's reverse proxy. The
+# cases run the e2e.sh copy, which the parity check above holds equal to the other two. A stub
+# http answers each probe and writes the line nginx logs for it to a reverse-proxy log: the
+# named project's, which the fake docker's logs verb prints, or another stack's.
+
+TARGET_BASE_URL="http://harness-test.invalid"
+TARGET_MISMATCH="FAIL target project: base url $TARGET_BASE_URL is not served by the reverse-proxy of project [harness-test]: its log shows no request carrying this run's probe within 30 s; give the --base-url and --project of one stack"
+TARGET_LOGS_CALL_RE='^compose -p harness-test -f fake-compose\.yaml logs --no-color --no-log-prefix --since [0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z reverse-proxy$'
+
+# target_log_line FORM URL: the line nginx logs for a GET of URL, CRLF-terminated as a Windows
+# docker CLI may print it: its access line with status 200, or one of the warnings its error log
+# adds about the same request.
+target_log_line() {
+    local request="GET ${2#"$TARGET_BASE_URL"} HTTP/1.1"
+    case "$1" in
+        access)
+            printf '172.23.0.1 - [26/Nov/2026:21:30:41 +0000] "%s" 200 12 "-" "curl/8.21.0" [!dt dt.trace_id=unknown,dt.span_id=unknown,dt.trace_sampled=unknown]\r\n' "$request"
+            ;;
+        warn)
+            printf '2026/11/26 21:30:41 [warn] 49#49: *43228 using uninitialized "dt_trace_id" variable, client: 172.23.0.1, server: , request: "%s", host: "localhost"\r\n' "$request"
+            ;;
+    esac
+}
+
+# target_setup MODE: the e2e.sh copy loaded, with a stub http that answers each probe with
+# TARGET_STATUS (200 by default; TARGET_FAIL_PATH names the one probe that gets TARGET_FAIL_STATUS
+# instead) and logs it per MODE: present (its access line, in the named project's log),
+# otherNonce (an access line of the same path carrying another nonce), otherStack (its access
+# line, in another stack's log) or warnOnly (only an error-log warning naming the request). A
+# sleep stub advances the clock instead of waiting; in each case the named project's log is
+# FAKE_DOCKER_LINES.
+# shellcheck disable=SC2034 # BASE_URL is read by verify_target_project.
+target_setup() {
+    load_script e2e
+    BASE_URL="$TARGET_BASE_URL"
+    TARGET_MODE="$1"
+    export FAKE_DOCKER_LINES="$CASE_DIR/proxy.log"
+    : >"$FAKE_DOCKER_LINES"
+    : >"$CASE_DIR/other-proxy.log"
+    : >"$CASE_DIR/http.calls"
+    : >"$CASE_DIR/sleeps"
+    http() {
+        printf '%s %s\n' "$1" "$2" >>"$CASE_DIR/http.calls"
+        HTTP_STATUS=200
+        HTTP_CTYPE="text/plain"
+        HTTP_BODY="Healthy"
+        HTTP_ERROR=""
+        if [[ -n "${TARGET_FAIL_PATH:-}" && "$2" == "$BASE_URL/$TARGET_FAIL_PATH?"* ]]; then
+            HTTP_STATUS="$TARGET_FAIL_STATUS"
+            HTTP_BODY=""
+            if [[ "$HTTP_STATUS" == "000" ]]; then
+                HTTP_ERROR="curl: (7) Failed to connect to harness-test.invalid port 80"
+            fi
+            return 0
+        fi
+        case "$TARGET_MODE" in
+            present) target_log_line access "$2" >>"$FAKE_DOCKER_LINES" ;;
+            otherNonce) target_log_line access "${2%=*}=0123456789abcdef0123456789abcdef" >>"$FAKE_DOCKER_LINES" ;;
+            otherStack) target_log_line access "$2" >>"$CASE_DIR/other-proxy.log" ;;
+            warnOnly) target_log_line warn "$2" >>"$FAKE_DOCKER_LINES" ;;
+        esac
+    }
+    sleep() {
+        printf '%s\n' "$1" >>"$CASE_DIR/sleeps"
+        SECONDS=$((SECONDS + $1))
+    }
+}
+
+# target_went_on: the check returned and the run would have gone on to its next step.
+target_went_on() {
+    verify_target_project "target project"
+    echo "went on"
+}
+
+# expect_ended_run: the check ended the run, so no step after it ran.
+expect_ended_run() {
+    if grep -qxF "went on" "$CASE_DIR/out"; then
+        reasons+=("the run went on after the check")
+    fi
+}
+
+# expect_not_served_absent: a check that ended as a Docker problem never also sends the operator
+# to the --base-url and --project as a probe not served.
+expect_not_served_absent() {
+    if grep -qF "is not served by the reverse-proxy" "$CASE_DIR/out"; then
+        reasons+=("a Docker problem was reported as a probe not served: [$(one_line "$CASE_DIR/out")]")
+    fi
+}
+
+# case_target_lines MODE: the check over the log lines MODE gives, on a clock only the sleep stub
+# advances, so the deadline of 30 s allows one read every 2 s: 15 reads and 14 sleeps.
+case_target_lines() {
+    target_setup "$1"
+    unset SECONDS
+    SECONDS=0
+    target_went_on
+}
+
+run_case target-present case_target_lines present
+expect_status 0
+expect_line "PASS target project"
+expect_line "INFO base url $TARGET_BASE_URL is served by the reverse-proxy of project [harness-test]"
+expect_line "went on"
+expect_docker_calls logs 1
+if ! grep -qE "$TARGET_LOGS_CALL_RE" "$CASE_DIR/docker.calls"; then
+    reasons+=("no reverse-proxy log read since a fixed time: [$(one_line "$CASE_DIR/docker.calls")]")
+fi
+probe_re="^GET $TARGET_BASE_URL/broker-service/readyz\?pi-target=([0-9a-f]{32})${LF}GET $TARGET_BASE_URL/feature-flag-service/readyz\?pi-target=([0-9a-f]{32})$"
+if [[ ! "$(<"$CASE_DIR/http.calls")" =~ $probe_re || "${BASH_REMATCH[1]}" != "${BASH_REMATCH[2]}" ]]; then
+    reasons+=("requests [$(one_line "$CASE_DIR/http.calls")], expected one GET of each readyz with the same 32-hex-digit nonce")
+fi
+conclude "verifyTargetProject_probeLinesInProjectLog_passes"
+
+# scenario|result|MODE: the named project's log holds no access line of this run's probes.
+TARGET_LINES_ROWS=(
+    "otherNonceOnly|failsAtDeadlineEndingRun|otherNonce"
+    "probeServedByOtherStack|failsAtDeadlineEndingRun|otherStack"
+    "errorLogLineOnly|failsAtDeadlineEndingRun|warnOnly"
+)
+want_sleeps="$(printf '2\n%.0s' {1..14})"
+for row in "${TARGET_LINES_ROWS[@]}"; do
+    IFS='|' read -r scenario result mode <<<"$row"
+    run_case "target-$scenario" case_target_lines "$mode"
+    expect_status 1
+    expect_line "$TARGET_MISMATCH"
+    expect_ended_run
+    expect_docker_calls logs 15
+    if [[ "$(<"$CASE_DIR/sleeps")" != "$want_sleeps" ]]; then
+        reasons+=("sleeps [$(one_line "$CASE_DIR/sleeps")], expected 14 of 2 s")
+    fi
+    conclude "verifyTargetProject_${scenario}_${result}"
+done
+
+# case_target_probe PATH STATUS: the probe of PATH answers STATUS, 000 a transport error.
+# shellcheck disable=SC2034 # The variables are read by the http stub.
+case_target_probe() {
+    target_setup present
+    TARGET_FAIL_PATH="$1"
+    TARGET_FAIL_STATUS="$2"
+    target_went_on
+}
+
+# scenario|PATH|STATUS|requests sent|reason
+TARGET_PROBE_ROWS=(
+    "brokerProbeAnswers503|broker-service/readyz|503|1|status 503"
+    "flagProbeTransportError|feature-flag-service/readyz|000|2|transport error (curl: (7) Failed to connect to harness-test.invalid port 80)"
+)
+for row in "${TARGET_PROBE_ROWS[@]}"; do
+    IFS='|' read -r scenario path status requests reason <<<"$row"
+    run_case "target-$scenario" case_target_probe "$path" "$status"
+    expect_status 1
+    expect_line "FAIL target project: the probe GET /$path gave $reason, expected status 200"
+    expect_ended_run
+    expect_docker_calls logs 0
+    if [[ "$(grep -c '' "$CASE_DIR/http.calls")" -ne "$requests" ]]; then
+        reasons+=("requests [$(one_line "$CASE_DIR/http.calls")], expected $requests")
+    fi
+    conclude "verifyTargetProject_${scenario}_failsBeforeReadingLog"
+done
+
+# case_target_logs MODE TARGET_TIMEOUT PROBE_TIMEOUT: the log read in fake docker MODE, on the
+# real clock, with the check's deadline and the read's own bound set per row.
+# shellcheck disable=SC2034 # The bounds are read by verify_target_project.
+case_target_logs() {
+    target_setup present
+    export FAKE_DOCKER_MODE="$1"
+    TARGET_TIMEOUT_SECONDS="$2"
+    LOG_PROBE_TIMEOUT_SECONDS="$3"
+    mark_start
+    target_went_on
+}
+
+# The reason, an ERE, of a log read that ends the check as a Docker problem.
+TARGET_READ_RE='reading the reverse-proxy log of project \[harness-test\]'
+
+# scenario|result|fake docker mode|deadline|read bound|reason, an ERE|bound in ms. Each row's
+# read is the check's first, so Docker has answered none. Near the deadline the read gets the
+# time left, and its cut-off, whether KILL ends it (137) or TERM does (124), is Docker not
+# answering within the check's deadline, never a probe not served; so is a read its own bound
+# cuts off, and a read that fails is a Docker problem with its status. The time left is read on
+# whole-second clocks, so the near-deadline limit may be one second short.
+TARGET_LOGS_ROWS=(
+    "logsNeverAnswerNearDeadline|failsAsDockerNotAnsweringWhenNoReadAnswered|hang-ignore-term|3|60|$TARGET_READ_RE timed out after [23] s \(Docker did not answer\)|4000"
+    "logsEndOnTermNearDeadline|failsAsDockerNotAnsweringWhenNoReadAnswered|hang|8|60|$TARGET_READ_RE timed out after [78] s \(Docker did not answer\)|4000"
+    "logsNeverAnswer|failsWhenReadBoundCutsReadOff|hang-ignore-term|30|2|$TARGET_READ_RE timed out after 2 s \(Docker did not answer\)|3000"
+    "logsFail|failsWithExitStatus|fail|30|60|$TARGET_READ_RE failed, exit 3 \(see @CASE_DIR@/compose\.log\)|2000"
+)
+for row in "${TARGET_LOGS_ROWS[@]}"; do
+    IFS='|' read -r scenario result mode deadline bound reason ms <<<"$row"
+    run_case "target-$scenario" case_target_logs "$mode" "$deadline" "$bound"
+    expect_status 1
+    expect_line_re "^FAIL target project: ${reason//@CASE_DIR@/$CASE_DIR}$"
+    expect_not_served_absent
+    expect_ended_run
+    expect_within_ms "$ms"
+    expect_docker_calls logs 1
+    conclude "verifyTargetProject_${scenario}_${result}"
+done
+
+# After Docker answered a read without the probe lines, a later read that its own bound cuts off
+# or that fails is still a Docker problem, never the deadline passing. On a clock only the sleep
+# stub advances, the deadline of 30 s leaves the second read its own bound of 2 s; the stub
+# switches the fake docker to MODE after the first read.
+# shellcheck disable=SC2034 # The bounds are read by verify_target_project.
+case_target_later_read() {
+    target_setup otherStack
+    TARGET_LATER_MODE="$1"
+    LOG_PROBE_TIMEOUT_SECONDS=2
+    sleep() {
+        printf '%s\n' "$1" >>"$CASE_DIR/sleeps"
+        SECONDS=$((SECONDS + $1))
+        export FAKE_DOCKER_MODE="$TARGET_LATER_MODE"
+    }
+    unset SECONDS
+    SECONDS=0
+    mark_start
+    target_went_on
+}
+
+# scenario|result|fake docker mode of the second read|reason, an ERE|bound in ms
+TARGET_LATER_ROWS=(
+    "laterReadNeverAnswers|failsWhenReadBoundCutsReadOff|hang-ignore-term|$TARGET_READ_RE timed out after 2 s \(Docker did not answer\)|3000"
+    "laterReadFails|failsWithExitStatus|fail|$TARGET_READ_RE failed, exit 3 \(see @CASE_DIR@/compose\.log\)|2000"
+)
+for row in "${TARGET_LATER_ROWS[@]}"; do
+    IFS='|' read -r scenario result mode reason ms <<<"$row"
+    run_case "target-$scenario" case_target_later_read "$mode"
+    expect_status 1
+    expect_line_re "^FAIL target project: ${reason//@CASE_DIR@/$CASE_DIR}$"
+    expect_not_served_absent
+    expect_ended_run
+    expect_within_ms "$ms"
+    expect_docker_calls logs 2
+    if [[ "$(<"$CASE_DIR/sleeps")" != "2" ]]; then
+        reasons+=("sleeps [$(one_line "$CASE_DIR/sleeps")], expected one of 2 s")
+    fi
+    conclude "verifyTargetProject_${scenario}_${result}"
+done
+
+# The failure a slow live host showed: Docker answers each read with a log that lacks the probe
+# lines, then never answers the read that starts with 1 s left, which the deadline cuts off. On a
+# clock only the sleep stub advances, a deadline of 29 s gives reads at 0, 2, ... 28 s, the last
+# with 1 s left; the stub stops Docker answering once that read is next.
+# shellcheck disable=SC2034 # TARGET_TIMEOUT_SECONDS is read by verify_target_project.
+case_target_last_read_cut() {
+    target_setup otherStack
+    TARGET_TIMEOUT_SECONDS=29
+    sleep() {
+        printf '%s\n' "$1" >>"$CASE_DIR/sleeps"
+        SECONDS=$((SECONDS + $1))
+        if [[ $((TARGET_TIMEOUT_SECONDS - SECONDS)) -le 1 ]]; then
+            export FAKE_DOCKER_MODE=hang-ignore-term
+        fi
+    }
+    unset SECONDS
+    SECONDS=0
+    target_went_on
+}
+run_case target-last-read-cut case_target_last_read_cut
+expect_status 1
+expect_line "${TARGET_MISMATCH/within 30 s;/within 29 s, and the last log read was cut off at the deadline;}"
+if grep -qF "Docker did not answer" "$CASE_DIR/out"; then
+    reasons+=("the deadline's cut-off was blamed on Docker: [$(one_line "$CASE_DIR/out")]")
+fi
+expect_ended_run
+expect_docker_calls logs 15
+if [[ "$(<"$CASE_DIR/sleeps")" != "$want_sleeps" ]]; then
+    reasons+=("sleeps [$(one_line "$CASE_DIR/sleeps")], expected 14 of 2 s")
+fi
+conclude "verifyTargetProject_lastReadCutOffAtDeadline_failsAsNotServed"
+
+# A deadline already passed: no read starts, and the check fails as on a log without the lines.
+# shellcheck disable=SC2034 # TARGET_TIMEOUT_SECONDS is read by verify_target_project.
+case_target_no_time() {
+    target_setup present
+    TARGET_TIMEOUT_SECONDS=0
+    target_went_on
+}
+run_case target-no-time case_target_no_time
+expect_status 1
+expect_line "${TARGET_MISMATCH/within 30 s/within 0 s}"
+expect_ended_run
+expect_docker_calls logs 0
+conclude "verifyTargetProject_deadlinePassedBeforeRead_failsWithoutLogRead"
+
+# No random bytes for the nonce: the check fails closed before any request or Docker call.
+case_target_no_nonce() {
+    target_setup present
+    od() {
+        return 1
+    }
+    target_went_on
+}
+run_case target-no-nonce case_target_no_nonce
+expect_status 1
+expect_line "FAIL target project: no probe generated: /dev/urandom did not supply 16 random bytes"
+expect_ended_run
+expect_docker_calls logs 0
+if [[ -s "$CASE_DIR/http.calls" ]]; then
+    reasons+=("requests were sent: [$(one_line "$CASE_DIR/http.calls")]")
+fi
+conclude "verifyTargetProject_noRandomBytes_failsClosedBeforeAnyRequest"
 
 summarize
 if [[ "$failed" -ne 0 ]]; then

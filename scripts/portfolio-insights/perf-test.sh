@@ -10,26 +10,32 @@
 #     network is reached. docker and curl program files ahead of the real ones on PATH fail any
 #     case whose calls go around the functions. The armed-set query runs against real SQL Server
 #     and PostgreSQL databases in scripts/portfolio-insights/harness-sql-test.sh; the stub cases
-#     cover perf.sh's own handling of it: the exact query text per dialect, refusal before any
-#     query, the id,revision rows and the one time row it reads back through the container
-#     client's output, an answer without exactly one readable time row, and the propagation of
-#     the client's exit status;
-#   - sleep advances SECONDS instead of waiting, and date prints one fixed time.
-# Covered: the command line, direct execution running main, sourcing that runs nothing, exact
-# decimals, the nearest-rank percentile, cycle-line parsing, sample eligibility, bounded log
-# polling and the held window read it parses first, the armed-set query on both dialects
-# including client failures and unexpected answers, the owned-set comparison, re-arming after a
-# rejected sample, alert creation outcomes and the write-ahead record of each create, unknown
-# creates and their reconciliation, the in-flight create of a killed run, http's write-out
-# record and the POST's shield against INT and TERM, the typed flag and alert replies, the run
-# lock container on the project's Docker engine (its creation, stale reclaim by id, refusal and
-# release), setup's readiness wait against its deadline, the time limit of every request, which
-# no exported variable changes, and every cleanup and exit path, the bounded start of loadgen
+#     cover perf.sh's own handling of it: the exact query text and client invocation, login and
+#     query timeouts included, per dialect, refusal before any query, the id,revision rows and
+#     the one time row it reads back through the container client's output, an answer without
+#     exactly one readable time row, the propagation of the client's exit status, and a call the
+#     limit cut off;
+#   - sleep advances SECONDS instead of waiting, date prints one fixed time, and od gives the
+#     target check fixed random bytes.
+# Covered: the command line, direct execution running main, sourcing that runs nothing, the tool
+# check with a tool missing or its compose plugin probe failing, exact decimals, the nearest-rank
+# percentile, cycle-line parsing, sample eligibility, bounded log polling and the held window
+# read it parses first, the armed-set query on both dialects including client failures, cut-off
+# calls and unexpected answers, the owned-set comparison, re-arming after a rejected sample,
+# alert creation outcomes and the write-ahead record of each create, unknown creates and their
+# reconciliation, the in-flight create of a killed run, http's write-out record and the POST's
+# shield against INT and TERM, the typed flag and alert replies, the run lock container on the
+# project's Docker engine (its creation, stale reclaim by id, refusal and release), setup's
+# readiness wait against its deadline, setup's Docker reads and stop of loadgen failing or cut
+# off before any change, setup's target check stopping a base URL another stack serves before
+# any change or any earlier run's alert is taken on, the time limit of every request, which no
+# exported variable changes, and every cleanup and exit path, the bounded start of loadgen
 # included. Covered elsewhere: the recording of a created alert by perf-inputs-test.sh; each
 # time-row format read into ARMED_AT and the sample and follow-up selection built on the armed
-# set by perf-cycle-test.sh; the insights p95 measurement by perf-insights-test.sh; hard_timeout
-# and broker_logs themselves by harness-test.sh; a log read that ends after its wait's deadline
-# by harness-test.sh and perf-cycle-test.sh.
+# set by perf-cycle-test.sh; the insights p95 measurement by perf-insights-test.sh;
+# hard_timeout, broker_logs, running_services, container_env, the compose plugin check and the
+# armed-set query against Docker calls that never answer by harness-test.sh; a log read that
+# ends after its wait's deadline by harness-test.sh and perf-cycle-test.sh.
 #
 # Usage: scripts/portfolio-insights/perf-test.sh
 #   --help  Show this help and exit
@@ -109,6 +115,10 @@ STUB_CURL_MODE=""
 STUB_SELF_SIGNALS=""
 STUB_TIMEOUT_ON=""
 STUB_RUNNING=""
+STUB_PS_RC=0
+STUB_STOP_RC=0
+STUB_INSPECT_FAIL=""
+STUB_INSPECT_RC=1
 STUB_DB_IMAGE=""
 STUB_IMAGE_LABELS=""
 STUB_CREATE_RC=0
@@ -117,6 +127,10 @@ STUB_RESPAWN=""
 STUB_ENV_SIGNAL_PID=""
 STUB_DB_CID=""
 STUB_CREATE_PRINTS=""
+# The log of the stack that serves the base URL, where curl adds the access line of each
+# target-check probe it answers: proxy.log, the named project's own reverse-proxy log, or
+# other-proxy.log, another stack's.
+STUB_SERVED_LOG="$STUB/proxy.log"
 
 # A ready stack: every service perf.sh requires, loadgen not among them.
 STUB_READY_SERVICES="broker-service db db-adapter feature-flag-service pricing-service reverse-proxy user-service"
@@ -132,11 +146,12 @@ RESPAWN_ID="beef$(printf '%060d' 2)"
 reset_stubs() {
     local file
     for file in docker.calls logs.calls requests responses sleeps exec.args timeouts in-flight.seen \
-        max-times; do
+        max-times proxy.log other-proxy.log; do
         : >"$STUB/$file"
     done
     rm -f "$STUB"/lock.* "$STUB"/env.*
     echo 0 >"$STUB/lock.count"
+    STUB_SERVED_LOG="$STUB/proxy.log"
     STUB_EXEC_OUT=""
     STUB_EXEC_ERR=""
     STUB_EXEC_RC=0
@@ -149,6 +164,10 @@ reset_stubs() {
     STUB_SELF_SIGNALS=""
     STUB_TIMEOUT_ON=""
     STUB_RUNNING="$STUB_READY_SERVICES"
+    STUB_PS_RC=0
+    STUB_STOP_RC=0
+    STUB_INSPECT_FAIL=""
+    STUB_INSPECT_RC=1
     STUB_DB_IMAGE="$DB_IMAGE"
     STUB_IMAGE_LABELS="$DB_IMAGE_LABELS"
     STUB_CREATE_RC=0
@@ -180,12 +199,13 @@ export PATH="$TEST_TMP/bin:$PATH"
 # inspect, image inspect, create and rm are answered by stub_inspect, stub_image_inspect,
 # stub_create and stub_rm. Any other call must be `compose -p P -f F <command> ...`: exec writes
 # the MSYS_NO_PATHCONV value it ran with and its arguments, one per line, to exec.args and
-# answers STUB_EXEC_OUT, STUB_EXEC_ERR and STUB_EXEC_RC; the Nth logs call prints logs.N,
-# capped at STUB_LOG_POLLS, and exits STUB_LOGS_RC; start and stop exit STUB_START_RC;
+# answers STUB_EXEC_OUT, STUB_EXEC_ERR and STUB_EXEC_RC; logs of reverse-proxy print proxy.log,
+# the project's reverse-proxy log; the Nth other logs call prints logs.N, capped at
+# STUB_LOG_POLLS, and exits STUB_LOGS_RC; start exits STUB_START_RC and stop STUB_STOP_RC;
 # `ps --status running --services` lists the words of STUB_RUNNING, the running services, one
-# per line, none when it is empty, and `ps -q [--status running] SERVICE` prints SERVICE's
-# container id (stub_cid), unless that is empty, when SERVICE is among them. Any other ps is
-# an unexpected compose command.
+# per line, none when it is empty, and exits STUB_PS_RC, printing none when that is not 0; and
+# `ps -q [--status running] SERVICE` prints SERVICE's container id (stub_cid), unless that is
+# empty, when SERVICE is among them. Any other ps is an unexpected compose command.
 docker() {
     local calls=() n line service
     if [[ "$*" == "compose version" ]]; then
@@ -227,6 +247,12 @@ docker() {
             return "$STUB_EXEC_RC"
             ;;
         logs)
+            if [[ "${!#}" == reverse-proxy ]]; then
+                while IFS= read -r line; do
+                    printf '%s\n' "$line"
+                done <"$STUB/proxy.log"
+                return 0
+            fi
             echo "$*" >>"$STUB/logs.calls"
             mapfile -t calls <"$STUB/logs.calls"
             n=${#calls[@]}
@@ -240,11 +266,12 @@ docker() {
             fi
             return "$STUB_LOGS_RC"
             ;;
-        start | stop)
-            return "$STUB_START_RC"
-            ;;
         ps)
             if [[ "${*:7}" == "--status running --services" ]]; then
+                if [[ $STUB_PS_RC -ne 0 ]]; then
+                    echo "docker stub: services query failed" >&2
+                    return "$STUB_PS_RC"
+                fi
                 for service in $STUB_RUNNING; do
                     echo "$service"
                 done
@@ -261,6 +288,12 @@ docker() {
                 return 97
             fi
             return 0
+            ;;
+        start)
+            return "$STUB_START_RC"
+            ;;
+        stop)
+            return "$STUB_STOP_RC"
             ;;
         *)
             echo "docker stub: unexpected compose command: $*" >&2
@@ -290,8 +323,10 @@ stub_print() {
 
 # stub_inspect inspect [--type container] --format FORMAT TARGET: with {{.Image}}, the db
 # container's image STUB_DB_IMAGE; with {{json .Config.Env}}, a container's environment, the
-# file env.TARGET, else []; with {{json .}}, the lock container's JSON, lock.json, when TARGET is
-# its name. Anything else is an unknown object. While the db-adapter environment is read,
+# file env.TARGET, else [], except that the read of the container of the service
+# STUB_INSPECT_FAIL names fails with STUB_INSPECT_RC, 124 or 137 standing for a call its limit
+# cut off; with {{json .}}, the lock container's JSON, lock.json, when TARGET is its name.
+# Anything else is an unknown object. While the db-adapter environment is read,
 # STUB_ENV_SIGNAL_PID, when set, gets SIGTERM.
 stub_inspect() {
     local format="" previous="" arg target="${!#}"
@@ -307,6 +342,13 @@ stub_inspect() {
         return 0
     fi
     if [[ "$format" == '{{json .Config.Env}}' ]]; then
+        if [[ -n "$STUB_INSPECT_FAIL" ]]; then
+            stub_cid "$STUB_INSPECT_FAIL"
+            if [[ "$target" == "$REPLY" ]]; then
+                echo "docker stub: inspect of $target failed" >&2
+                return "$STUB_INSPECT_RC"
+            fi
+        fi
         stub_cid db-adapter
         if [[ -n "$STUB_ENV_SIGNAL_PID" && "$target" == "$REPLY" ]]; then
             kill -TERM "$STUB_ENV_SIGNAL_PID"
@@ -416,13 +458,14 @@ stub_rm() {
     fi
 }
 
-# timeout: stands in for timeout(1), under which perf.sh's hard_timeout runs the broker log
-# reads and cleanup's start of loadgen. The program timeout(1) would exec is the program file on
-# PATH, never the docker function; this one appends its options and limit ("-k GRACE LIMIT" or
-# "-s SIGNAL LIMIT") as one line to timeouts and runs the rest of its arguments in this shell,
-# so the docker stub answers. It exits with that status, or with STUB_TIMEOUT_RC when that is
-# set: the limit cut the call off, as timeout(1) reports it with 124 after TERM and 137 after
-# KILL. With STUB_TIMEOUT_ON set, only a call that has that word among its arguments is cut off.
+# timeout: stands in for timeout(1), under which perf.sh's hard_timeout runs every Docker call,
+# the compose plugin check of check_tools and the run lock's calls included. The program
+# timeout(1) would exec is the program file on PATH, never the docker function; this one appends
+# its options and limit ("-k GRACE LIMIT" or "-s SIGNAL LIMIT") as one line to timeouts and runs
+# the rest of its arguments in this shell, so the docker stub answers. It exits with that
+# status, or with STUB_TIMEOUT_RC when that is set: the limit cut the call off, as timeout(1)
+# reports it with 124 after TERM and 137 after KILL. With STUB_TIMEOUT_ON set, only a call that
+# has that word among its arguments is cut off.
 timeout() {
     local limits=() rc=0
     while [[ "$1" == -* ]]; do
@@ -444,15 +487,16 @@ timeout() {
 # -w '%{http_code} %{exitcode} %{content_type}' prints, "STATUS 0 application/json". RC 1 to 127
 # prints PAYLOAD as curl's error and the record "STATUS RC " of a failed transfer, and fails with
 # RC. RC 128 and above is a curl killed by a signal, which prints nothing. A request without a
-# queued answer fails as a transport error. STUB_CURL_MODE "interrupted" prints the record of a
-# finished transfer but ends with 130, as the command substitution does under Git Bash when an
-# interrupt arrives while curl runs; "no-exitcode" leaves the record's exit field empty, as a
-# curl older than 7.75 writes it; "no-record" prints no record and ends with 0. With
-# STUB_SIGNAL_PID set, that process gets SIGTERM while the request is in flight. Before it
-# answers, curl's own shell gets each signal STUB_SELF_SIGNALS names, in order, as a signal to
-# the process group delivers it. A POST also appends the lines $RUN_DIR/in-flight-create holds
-# while it is in flight to in-flight.seen. Each request's --max-time value goes, one per line,
-# to max-times.
+# queued answer fails as a transport error. A target-check probe it answers with RC 0 adds its
+# access line, with STATUS, to STUB_SERVED_LOG, as nginx logs it. STUB_CURL_MODE "interrupted"
+# prints the record of a finished transfer but ends with 130, as the command substitution does
+# under Git Bash when an interrupt arrives while curl runs; "no-exitcode" leaves the record's
+# exit field empty, as a curl older than 7.75 writes it; "no-record" prints no record and ends
+# with 0. With STUB_SIGNAL_PID set, that process gets SIGTERM while the request is in flight.
+# Before it answers, curl's own shell gets each signal STUB_SELF_SIGNALS names, in order, as a
+# signal to the process group delivers it. A POST also appends the lines
+# $RUN_DIR/in-flight-create holds while it is in flight to in-flight.seen. Each request's
+# --max-time value goes, one per line, to max-times.
 curl() {
     local method="GET" body_file="" data="" url="" sent=() answers=() response rc status payload exit_field signal
     local max_time=""
@@ -519,6 +563,10 @@ curl() {
         return "$rc"
     fi
     printf '%s' "$payload" >"$body_file"
+    if [[ "$url" == *"?pi-target="* ]]; then
+        printf '172.23.0.1 - [01/Jan/2026:00:00:00 +0000] "GET %s HTTP/1.1" %s 7 "-" "curl/8.21.0"\n' \
+            "${url#http://localhost}" "$status" >>"$STUB_SERVED_LOG"
+    fi
     case "$STUB_CURL_MODE" in
         no-record)
             return 0
@@ -576,6 +624,17 @@ sleep() {
     SECONDS=$((SECONDS + $1))
 }
 
+# od: the 16 random bytes of the target check, fixed so that its probe URLs are known; any other
+# use of od runs the real one.
+PROBE_NONCE="0f1e2d3c4b5a69788796a5b4c3d2e1f0"
+od() {
+    if [[ "$*" == "-An -N16 -tx1 /dev/urandom" ]]; then
+        echo " 0f 1e 2d 3c 4b 5a 69 78 87 96 a5 b4 c3 d2 e1 f0"
+        return 0
+    fi
+    command od "$@"
+}
+
 # date: one fixed synthetic time, as epoch seconds for +%s and as RFC 3339 otherwise.
 date() {
     case " $* " in
@@ -627,6 +686,7 @@ fresh_state() {
     LOADGEN_WAS_RUNNING=0
     LOADGEN_STOPPED=0
     DIALECT=""
+    EVAL_INTERVAL=""
     ARMED_ERROR=""
     OWNED_ERROR=""
     REARM_ERROR=""
@@ -765,9 +825,10 @@ executed_case() {
         STUB_RUNNING=""
         export STUB_EXEC_OUT STUB_EXEC_ERR STUB_EXEC_RC STUB_LOGS_RC STUB_LOG_POLLS \
             STUB_START_RC STUB_SIGNAL_PID STUB_TIMEOUT_RC STUB_CURL_MODE STUB_SELF_SIGNALS \
-            STUB_TIMEOUT_ON STUB_RUNNING STUB_DB_IMAGE STUB_CREATE_RC STUB_RM_RC STUB_RESPAWN \
+            STUB_TIMEOUT_ON STUB_RUNNING STUB_PS_RC STUB_STOP_RC STUB_INSPECT_FAIL STUB_INSPECT_RC \
+            STUB_SERVED_LOG STUB_DB_IMAGE STUB_CREATE_RC STUB_RM_RC STUB_RESPAWN \
             STUB_ENV_SIGNAL_PID STUB_DB_CID STUB_CREATE_PRINTS LOCK_CONTAINER RESPAWN_ID
-        export -f docker curl timeout stub_cid stub_print stub_inspect stub_image_inspect stub_lock \
+        export -f docker curl timeout od stub_cid stub_print stub_inspect stub_image_inspect stub_lock \
             stub_create stub_rm
         "$BASH" "$PERF_SH" --project unit-test --compose-file compose.dev.yaml
     ) >"$RUN_DIR/child.out" 2>"$RUN_DIR/child.err" </dev/null || status=$?
@@ -1229,17 +1290,25 @@ armed_sql_case() {
         "$OUTCOME"
 }
 
+# Each client gets a 15 s login and a 30 s query timeout of its own, and the exec the 60 s call
+# limit: TERM at 55 s, KILL at 60 s. sqlcmd, which does not exit after its query timeout, is
+# killed in the container at 50 s, and that kill is reported as its failure, status 1.
 db_query_case() {
     DIALECT=mssql
     db_query "SELECT 1" >"$TEST_OUT" || true
-    # shellcheck disable=SC2016 # $SA_PASSWORD and $1 are expanded by the container's shell.
+    # shellcheck disable=SC2016 # $SA_PASSWORD, $1 and $rc are expanded by the container's shell.
     expect_file "mssql" "$STUB/exec.args" MSYS_NO_PATHCONV=1 "${COMPOSE_ARGS[@]}" exec -T db sh -c \
-        '/opt/mssql-tools/bin/sqlcmd -S localhost -U sa -P "$SA_PASSWORD" -d TradeManagement -b -h -1 -W -Q "$1"' \
+        'timeout -s KILL 50 /opt/mssql-tools/bin/sqlcmd -S localhost -U sa -P "$SA_PASSWORD" -d TradeManagement -l 15 -t 30 -b -h -1 -W -Q "$1"; rc=$?; if [ "$rc" -eq 137 ]; then echo "sqlcmd had not exited 50 s after it started" >&2; rc=1; fi; exit "$rc"' \
         sh "SET NOCOUNT ON; SELECT 1"
+    expect_file "mssql limit" "$STUB/timeouts" "-k 5 55"
+    : >"$STUB/timeouts"
     DIALECT=postgres
     db_query "SELECT 1" >"$TEST_OUT" || true
     expect_file "postgres" "$STUB/exec.args" MSYS_NO_PATHCONV=1 "${COMPOSE_ARGS[@]}" exec -T db psql \
-        -v ON_ERROR_STOP=1 -U postgres -d TradeManagement -At -F , -c "SELECT 1"
+        -v ON_ERROR_STOP=1 -U postgres \
+        -d "dbname=TradeManagement connect_timeout=15 options='-c statement_timeout=30000'" \
+        -At -F , -c "SELECT 1"
+    expect_file "postgres limit" "$STUB/timeouts" "-k 5 55"
 }
 
 # The time row each client prints for the armed-set query, before db_query lower-cases it:
@@ -1350,6 +1419,29 @@ read_armed_failure_case() {
     client_failure_row "psql connection failure" postgres 2 "" \
         'psql: error: connection to server on socket "/var/run/postgresql/.s.PGSQL.5432" failed'
     client_failure_row "db container not running" mssql 1 "" 'service "db" is not running'
+    # The clients' own login and query timeouts are client errors, told apart from a cut-off call.
+    client_failure_row "sqlcmd query timeout" mssql 1 "" \
+        "Sqlcmd: Error: Microsoft ODBC Driver 17 for SQL Server : Query timeout expired."
+    client_failure_row "psql statement timeout" postgres 1 "" \
+        "ERROR:  canceling statement due to statement timeout"
+}
+
+# A query whose call the limit cut off, 124 after TERM or 137 after KILL, fails as one Docker did
+# not answer, never as a client error, even after a complete-looking answer.
+read_armed_cut_off_case() {
+    local dialect rc
+    for rc in 124 137; do
+        for dialect in mssql postgres; do
+            time_row "$dialect"
+            client_answer "$dialect" "$REPLY"
+            STUB_TIMEOUT_RC="$rc"
+            armed_failure_row "$dialect cut off with $rc" "$dialect" 0 "$REPLY" "" \
+                "armed-set query timed out after 60 s (Docker did not answer)"
+            expect "$dialect cut off with $rc: ARMED_ERROR" \
+                "armed-set query timed out after 60 s (Docker did not answer)" "$ARMED_ERROR"
+            STUB_TIMEOUT_RC=""
+        done
+    done
 }
 
 # A client that exits 0 without exactly one readable time row has not answered the armed-set
@@ -3962,8 +4054,12 @@ container_env_is() {
 }
 
 # queue_ready_stack: queues the answers of a ready stack to setup's requests: both readyz
-# checks, the flag read as off and modifiable, and the PUT that switches it on.
+# checks, the target check's two probes, which the project's own reverse proxy logs unless
+# STUB_SERVED_LOG names another stack's, the flag read as off and modifiable, and the PUT that
+# switches it on.
 queue_ready_stack() {
+    respond 0 200 '{"status":"ready"}'
+    respond 0 200 '{"status":"ready"}'
     respond 0 200 '{"status":"ready"}'
     respond 0 200 '{"status":"ready"}'
     respond 0 200 "$FLAG_OFF"
@@ -3997,7 +4093,7 @@ setup_lock_first_case() {
         "order=$REPLY was_running=$LOADGEN_WAS_RUNNING stopped=$LOADGEN_STOPPED"
     exit_lines "$TEST_OUT"
     expect "verdicts" \
-        "PASS run lock|PASS readiness|PASS runtime facts|PASS flag modifiable|PASS loadgen isolation|PASS flag enabled|" \
+        "PASS run lock|PASS readiness|PASS target project|PASS runtime facts|PASS flag modifiable|PASS loadgen isolation|PASS flag enabled|" \
         "$REPLY"
 }
 
@@ -4058,7 +4154,7 @@ setup_readiness_case() {
     STUB_TIMEOUT_RC=124
     STUB_TIMEOUT_ON="--services"
     setup_readiness_row "db down, services sample cut off" \
-        "FAIL readiness: compose ps timed out after 60 s (Docker did not answer)|$summary" "S" ""
+        "FAIL readiness: listing the running services of project [unit-test] timed out after 60 s (Docker did not answer)|$summary" "S" ""
 
     fresh_state
     STUB_DB_CID=""
@@ -4105,8 +4201,8 @@ setup_dialect_row() {
 # while DB_TYPE is read, or one whose DB_TYPE is anything else, which fails "runtime facts"
 # naming the value as read, shows no db type in its REPORT.
 setup_dialect_case() {
-    local status=0 verdicts facts="PASS run lock|PASS readiness|FAIL runtime facts: db-adapter DB_TYPE is"
-    local tail="expected mssql or postgres|PASS cleanup|SUMMARY 3 passed, 1 failed|"
+    local status=0 verdicts facts="PASS run lock|PASS readiness|PASS target project|FAIL runtime facts: db-adapter DB_TYPE is"
+    local tail="expected mssql or postgres|PASS cleanup|SUMMARY 4 passed, 1 failed|"
     container_env_is db-adapter '["DB_TYPE=mssql"]'
     queue_ready_stack
     setup >"$TEST_OUT"
@@ -4125,12 +4221,223 @@ setup_dialect_case() {
     verdicts="$REPLY"
     report_value "db type"
     expect "interrupted while DB_TYPE is read" \
-        "status=130 PASS run lock|PASS readiness|FAIL run: ended early with status 130|PASS cleanup|SUMMARY 3 passed, 1 failed| db type=[n/a]" \
+        "status=130 PASS run lock|PASS readiness|PASS target project|FAIL run: ended early with status 130|PASS cleanup|SUMMARY 4 passed, 1 failed| db type=[n/a]" \
         "status=$status $verdicts db type=[$REPLY]"
 
     setup_dialect_row "another dialect" '["DB_TYPE=sqlite"]' "$facts [sqlite], $tail"
     setup_dialect_row "postgres and a line feed" '["DB_TYPE=postgres\n"]' "$facts [\$'postgres\\n'], $tail"
     setup_dialect_row "unset" '["OTHER=postgres"]' "$facts [], $tail"
+}
+
+# ---------------------------------------------------------------------------------------------
+# Setup: a Docker call that fails or is cut off stops the run before any change
+
+SERVICES_CALL="$COMPOSE_PREFIX ps --status running --services"
+STOP_CALL="$COMPOSE_PREFIX stop loadgen"
+START_CALL="$COMPOSE_PREFIX start loadgen"
+READY_REQUESTS="GET http://localhost/broker-service/readyz|GET http://localhost/feature-flag-service/readyz"
+# The target check's two probes and its read of the project's reverse-proxy log, since the
+# fixed time the date stub prints.
+PROBE_REQUESTS="GET http://localhost/broker-service/readyz?pi-target=$PROBE_NONCE|GET http://localhost/feature-flag-service/readyz?pi-target=$PROBE_NONCE"
+PROXY_LOGS_CALL="$COMPOSE_PREFIX logs --no-color --no-log-prefix --since 2026-01-01T00:00:00Z reverse-proxy"
+FLAG_READ_REQUEST="GET $FLAG_ENDPOINT"
+FLAG_ON_REQUEST="PUT $FLAG_ENDPOINT {\"enabled\": true}"
+TIMED_OUT="timed out after 60 s (Docker did not answer)"
+# The run lock's release on the way out: the removal, by its id, of the lock container setup made.
+RELEASE_CALL="rm -v $FIRST_LOCK_ID"
+
+# lock_calls: sets REPLY to the four Docker calls of setup's run lock on a free name, joined by
+# |: the running db container's id, its image, that image's labels, and the create of the lock.
+lock_calls() {
+    REPLY="$COMPOSE_PREFIX ps -q --status running db|inspect --type container --format {{.Image}} db0000000001|image inspect --format {{json .Config.Labels}} $DB_IMAGE|create --name $LOCK_CONTAINER --label com.docker.compose.project= --label com.docker.compose.service= --label com.docker.compose.version= --label pi-perf.lock.pid=$$ --label pi-perf.lock.host=$THIS_HOST --label pi-perf.lock.started=2026-01-01T00:00:00Z --label pi-perf.lock.run-dir=$RUN_DIR $DB_IMAGE"
+}
+
+# env_calls SERVICE: sets REPLY to the two Docker calls container_env makes for SERVICE, joined
+# by |: the running container's id, then its environment.
+env_calls() {
+    stub_cid "$1"
+    REPLY="$COMPOSE_PREFIX ps -q $1|inspect --format {{json .Config.Env}} $REPLY"
+}
+
+# file_lines FILE: sets REPLY to FILE's lines joined by |, empty for an empty FILE.
+file_lines() {
+    local all=()
+    mapfile -t all <"$1"
+    REPLY=""
+    if [[ ${#all[@]} -gt 0 ]]; then
+        printf -v REPLY '%s|' "${all[@]}"
+        REPLY="${REPLY%|}"
+    fi
+}
+
+# setup_stack RUNNING: a fresh state on a stack running the services RUNNING, whose db-adapter
+# runs with DB_TYPE postgres and whose broker-service runs with an interval of 60 s, and which
+# answers setup's requests as a ready stack does (queue_ready_stack).
+setup_stack() {
+    fresh_state
+    STUB_RUNNING="$1"
+    container_env_is db-adapter '["PATH=/usr/bin","DB_TYPE=postgres"]'
+    container_env_is broker-service '["PATH=/usr/bin","ALERT_EVALUATION_INTERVAL_SECONDS=60"]'
+    queue_ready_stack
+}
+
+# setup_row ROW LINES REQUESTS CALLS: runs setup in a subshell, as main does, and expects LINES,
+# "status=N" and its PASS, FAIL and SUMMARY lines as exit_lines writes them, and exactly the REST
+# REQUESTS and the Docker CALLS, each list joined by |.
+setup_row() {
+    local status=0
+    (setup) >"$TEST_OUT" 2>&1 || status=$?
+    exit_lines "$TEST_OUT"
+    expect "$1: status and lines" "$2" "status=$status $REPLY"
+    file_lines "$STUB/requests"
+    expect "$1: requests" "$3" "$REPLY"
+    file_lines "$STUB/docker.calls"
+    expect "$1: docker calls" "$4" "$REPLY"
+}
+
+# expect_output_line ROW LINE: the last setup_row's output holds LINE.
+expect_output_line() {
+    if ! grep -qxF -- "$2" "$TEST_OUT"; then
+        case_reasons+=("$1: no output line [$2]")
+    fi
+}
+
+# The services query, after the run lock is taken, fails or is cut off, by the call's own status
+# (STUB_PS_RC) or by timeout's 124 or 137 for that call alone (STUB_TIMEOUT_RC, STUB_TIMEOUT_ON):
+# readiness fails naming the call, with no request sent, and the lock is released on the way out.
+setup_services_query_case() {
+    local of="of project [unit-test]" row calls
+    for row in "137 -" "124 -" "- 3"; do
+        setup_stack "$REQUIRED_SERVICES loadgen"
+        lock_calls
+        calls="$REPLY|$SERVICES_CALL|$RELEASE_CALL"
+        if [[ "${row% *}" != "-" ]]; then
+            STUB_TIMEOUT_RC="${row% *}"
+            STUB_TIMEOUT_ON="--services"
+            setup_row "cut off with ${row% *}" \
+                "status=1 PASS run lock|FAIL readiness: listing the running services $of $TIMED_OUT|PASS cleanup|SUMMARY 2 passed, 1 failed|" \
+                "" "$calls"
+        else
+            STUB_PS_RC="${row#* }"
+            setup_row "failing with ${row#* }" \
+                "status=1 PASS run lock|FAIL readiness: listing the running services $of failed, exit ${row#* } (see RUN/compose.log)|PASS cleanup|SUMMARY 2 passed, 1 failed|" \
+                "" "$calls"
+        fi
+    done
+}
+
+# runtime_facts_row ROW SERVICE NAME RC TEXT: the read of NAME from SERVICE fails with RC (124
+# and 137 standing for a cut-off call). Runtime facts fail with TEXT after readiness passed; the
+# flag is never read and loadgen, running at start, never stopped; no interval is assumed.
+runtime_facts_row() {
+    local calls
+    setup_stack "$REQUIRED_SERVICES loadgen"
+    STUB_INSPECT_FAIL="$2"
+    STUB_INSPECT_RC="$4"
+    lock_calls
+    calls="$REPLY|$SERVICES_CALL|$PROXY_LOGS_CALL"
+    env_calls db-adapter
+    calls="$calls|$REPLY"
+    if [[ "$2" == broker-service ]]; then
+        env_calls broker-service
+        calls="$calls|$REPLY"
+    fi
+    setup_row "$1" \
+        "status=1 PASS run lock|PASS readiness|PASS target project|FAIL runtime facts: reading $3 from the $2 container of project [unit-test] $5|PASS cleanup|SUMMARY 4 passed, 1 failed|" \
+        "$READY_REQUESTS|$PROBE_REQUESTS" "$calls|$RELEASE_CALL"
+    expect_output_line "$1" "  evaluation interval      n/a"
+}
+
+setup_dialect_read_case() {
+    runtime_facts_row "DB_TYPE read cut off" db-adapter DB_TYPE 137 "$TIMED_OUT"
+    runtime_facts_row "DB_TYPE read failing" db-adapter DB_TYPE 1 "failed, exit 1 (see RUN/compose.log)"
+}
+
+setup_interval_read_case() {
+    runtime_facts_row "interval read cut off by TERM" broker-service ALERT_EVALUATION_INTERVAL_SECONDS \
+        124 "$TIMED_OUT"
+    runtime_facts_row "interval read cut off by KILL" broker-service ALERT_EVALUATION_INTERVAL_SECONDS \
+        137 "$TIMED_OUT"
+    runtime_facts_row "interval read failing" broker-service ALERT_EVALUATION_INTERVAL_SECONDS \
+        1 "failed, exit 1 (see RUN/compose.log)"
+}
+
+# An interval read successfully, unset or invalid, gets the broker's default of 60 s, and setup
+# goes on to read and enable the flag.
+setup_interval_default_case() {
+    local value calls
+    for value in "" abc; do
+        setup_stack "$REQUIRED_SERVICES"
+        if [[ -n "$value" ]]; then
+            container_env_is broker-service "[\"PATH=/usr/bin\",\"ALERT_EVALUATION_INTERVAL_SECONDS=$value\"]"
+        else
+            container_env_is broker-service '["PATH=/usr/bin"]'
+        fi
+        lock_calls
+        calls="$REPLY|$SERVICES_CALL|$PROXY_LOGS_CALL"
+        env_calls db-adapter
+        calls="$calls|$REPLY"
+        env_calls broker-service
+        calls="$calls|$REPLY"
+        setup_row "interval [$value]" \
+            "status=0 PASS run lock|PASS readiness|PASS target project|PASS runtime facts|PASS flag modifiable|PASS loadgen isolation|PASS flag enabled|" \
+            "$READY_REQUESTS|$PROBE_REQUESTS|$FLAG_READ_REQUEST|$FLAG_ON_REQUEST" "$calls"
+        expect_output_line "interval [$value]" \
+            "INFO db type postgres; evaluation interval 60s (ALERT_EVALUATION_INTERVAL_SECONDS [$value]); loadgen running at start: no"
+    done
+}
+
+# The stop of loadgen fails or is cut off: loadgen isolation fails naming it, the flag is never
+# switched on, and cleanup still starts loadgen again.
+setup_loadgen_stop_case() {
+    local rc calls text
+    for rc in 137 124 1; do
+        setup_stack "$REQUIRED_SERVICES loadgen"
+        STUB_STOP_RC="$rc"
+        lock_calls
+        calls="$REPLY|$SERVICES_CALL|$PROXY_LOGS_CALL"
+        env_calls db-adapter
+        calls="$calls|$REPLY"
+        env_calls broker-service
+        calls="$calls|$REPLY|$STOP_CALL|$START_CALL|$RELEASE_CALL"
+        text="$TIMED_OUT"
+        if [[ $rc -eq 1 ]]; then
+            text="failed, exit 1 (see RUN/compose.log)"
+        fi
+        setup_row "stop ending with $rc" \
+            "status=1 PASS run lock|PASS readiness|PASS target project|PASS runtime facts|PASS flag modifiable|FAIL loadgen isolation: compose stop loadgen $text|PASS cleanup|SUMMARY 6 passed, 1 failed|" \
+            "$READY_REQUESTS|$PROBE_REQUESTS|$FLAG_READ_REQUEST" "$calls"
+        expect_output_line "stop ending with $rc" "INFO cleanup: loadgen started again"
+    done
+}
+
+# Two otherwise valid stacks: the base URL is served by another stack, whose reverse proxy logs
+# the probes, while the named project's log never shows them. Over the 30 s deadline the log is
+# read every 2 s, 15 times, then the target check fails and ends the run: the flag is never read
+# or switched on, and loadgen, running at start, is never stopped, so cleanup has nothing to
+# start again. The alert an earlier run on the project left undeleted is not taken on, so no
+# DELETE for it goes through that base URL, and that run's record stays for a run whose base URL
+# the project serves.
+setup_target_mismatch_case() {
+    local calls i earlier record
+    setup_stack "$REQUIRED_SERVICES loadgen"
+    STUB_SERVED_LOG="$STUB/other-proxy.log"
+    alert_id 7
+    earlier="$REPLY"
+    earlier_run m1 "http://localhost" "$COMPOSE_PATH" "$earlier" ""
+    record="$REPLY"
+    lock_calls
+    calls="$REPLY|$SERVICES_CALL"
+    for ((i = 0; i < 15; i++)); do
+        calls="$calls|$PROXY_LOGS_CALL"
+    done
+    setup_row "base url of another stack" \
+        "status=1 PASS run lock|PASS readiness|FAIL target project: base url http://localhost is not served by the reverse-proxy of project [unit-test]: its log shows no request carrying this run's probe within 30 s; give the --base-url and --project of one stack|PASS cleanup|SUMMARY 3 passed, 1 failed|" \
+        "$READY_REQUESTS|$PROBE_REQUESTS" "$calls|$RELEASE_CALL"
+    file_lines "$STUB/sleeps"
+    expect "base url of another stack: sleeps" "2|2|2|2|2|2|2|2|2|2|2|2|2|2" "$REPLY"
+    expect "base url of another stack: earlier run" "owned=[] earlier record=kept" \
+        "owned=[$(<"$RUN_DIR/owned")] earlier record=$([[ -f "$record" ]] && echo kept || echo gone)"
 }
 
 # ---------------------------------------------------------------------------------------------
@@ -4168,9 +4475,10 @@ resolve_interval_case() {
 # http_within itself, which readyz and http both call, is wrapped to move the clock on.
 # EXPECTED is "LINE|max-times L...|sleeps S...|requests N|elapsed E": the readiness check line,
 # each request's --max-time, each sleep, the request count and SECONDS when the subshell exits.
-# The run lock before the wait goes through docker alone, so it adds no request. setup ends
-# through abort at the runtime facts check at the latest, since the stub's db-adapter container
-# has no DB_TYPE in its environment.
+# The run lock before the wait goes through docker alone, so it adds no request. setup ends at
+# the target check that follows a passed readiness at the latest: the subshell replaces it with
+# an exit, so only readiness's own requests are counted here, and the target check's own cases
+# are the setup_* cases above.
 readiness_row() {
     local row="$1" times=() statuses=() status limits=() steps=() line readiness="" requests
     fresh_state
@@ -4190,6 +4498,10 @@ readiness_row() {
             perf_http_within "$@"
             SECONDS=$((SECONDS + ${times[request]:-0}))
             request=$((request + 1))
+        }
+        # shellcheck disable=SC2329 # Called by setup once readiness has passed.
+        verify_target_project() {
+            exit 0
         }
         setup
     ) >"$TEST_OUT" 2>&1 || true
@@ -4234,8 +4546,8 @@ HEALTHY='{"status":"Healthy"}'
 # cleanup_all's flag restore keep HTTP_TIMEOUT_SECONDS, and each readyz probe takes the lesser
 # of that and the time left to its deadline: 40 and 7 seconds. Executed: perf.sh as its own
 # process, with HTTP_TIMEOUT_SECONDS also exported as 0 and every required service running,
-# takes the run lock and probes both readyz with its own 15 seconds; setup then ends at the
-# runtime facts check, since the stub's db-adapter container has no DB_TYPE in its environment.
+# takes the run lock and probes both readyz with its own 15 seconds, and so does the target
+# check's first probe, which no answer is queued for, so setup ends there.
 limit_variables_case() {
     local name id status=0 out=() line readiness=""
     alert_id 1
@@ -4280,9 +4592,10 @@ limit_variables_case() {
         STUB_RUNNING="$REQUIRED_SERVICES"
         export STUB_EXEC_OUT STUB_EXEC_ERR STUB_EXEC_RC STUB_LOGS_RC STUB_LOG_POLLS \
             STUB_START_RC STUB_SIGNAL_PID STUB_TIMEOUT_RC STUB_CURL_MODE STUB_SELF_SIGNALS \
-            STUB_TIMEOUT_ON STUB_RUNNING STUB_DB_IMAGE STUB_CREATE_RC STUB_RM_RC STUB_RESPAWN \
+            STUB_TIMEOUT_ON STUB_RUNNING STUB_PS_RC STUB_STOP_RC STUB_INSPECT_FAIL STUB_INSPECT_RC \
+            STUB_SERVED_LOG STUB_DB_IMAGE STUB_CREATE_RC STUB_RM_RC STUB_RESPAWN \
             STUB_ENV_SIGNAL_PID STUB_DB_CID STUB_CREATE_PRINTS LOCK_CONTAINER RESPAWN_ID
-        export -f docker curl timeout stub_cid stub_print stub_inspect stub_image_inspect stub_lock \
+        export -f docker curl timeout od stub_cid stub_print stub_inspect stub_image_inspect stub_lock \
             stub_create stub_rm
         # The image's labels are JSON, so they reach perf.sh's environment as one quoted word.
         STUB_IMAGE_LABELS="$STUB_IMAGE_LABELS" \
@@ -4297,8 +4610,9 @@ limit_variables_case() {
     done
     expect "executed: readiness" "PASS readiness" "$readiness"
     expect_file "executed: requests" "$STUB/requests" "GET http://localhost/broker-service/readyz" \
-        "GET http://localhost/feature-flag-service/readyz"
-    expect_file "executed: limits" "$STUB/max-times" 15 15
+        "GET http://localhost/feature-flag-service/readyz" \
+        "GET http://localhost/broker-service/readyz?pi-target=$PROBE_NONCE"
+    expect_file "executed: limits" "$STUB/max-times" 15 15 15
 }
 
 # refused_limit_row LIMIT: http_within with LIMIT, after an earlier answer, sends nothing and
@@ -4357,6 +4671,7 @@ run_case "dbQuery_dialect_sendsContainerClientInvocation" db_query_case
 run_case "readArmedSet_emptyResult_writesEmptySet" read_armed_empty_case
 run_case "readArmedSet_populatedRows_writesSortedLowerCaseSet" read_armed_populated_case
 run_case "readArmedSet_clientFails_returnsOneWithErrorAndNoSet" read_armed_failure_case
+run_case "readArmedSet_callCutOff_returnsOneWithTimeoutAndNoSet" read_armed_cut_off_case
 run_case "readArmedSet_unexpectedClientOutput_returnsOneWithoutSet" read_armed_unexpected_case
 run_case "readArmedSet_unknownDialect_returnsOneWithoutQuery" read_armed_unknown_dialect_case
 run_case "armedSetDifference_expectedAndArmed_countsUnmatchedRows" armed_set_difference_case
@@ -4424,6 +4739,12 @@ run_case "setup_loadgenRunning_samplesServicesOnlyAfterTakingLock" setup_lock_fi
 run_case "setup_lockHeldByLiveRun_abortsBeforeSamplingOrChanging" setup_lock_refused_case
 run_case "setup_requiredServiceDown_failsReadinessNamingServicesWithoutLeavingLock" setup_readiness_case
 run_case "setup_dbTypeInterruptedOrNotADialect_reportsNoDbType" setup_dialect_case
+run_case "setup_servicesQueryFailsOrIsCutOff_failsReadinessWithoutRequest" setup_services_query_case
+run_case "setup_dialectReadFailsOrIsCutOff_failsRuntimeFactsBeforeFlagRead" setup_dialect_read_case
+run_case "setup_intervalReadFailsOrIsCutOff_failsRuntimeFactsWithoutDefault" setup_interval_read_case
+run_case "setup_intervalReadUnsetOrInvalid_appliesDefaultAndEnablesFlag" setup_interval_default_case
+run_case "setup_loadgenStopFailsOrIsCutOff_failsIsolationAndCleanupStartsLoadgen" setup_loadgen_stop_case
+run_case "setup_baseUrlServedByOtherStack_failsTargetProjectBeforeFlagReadOrLoadgenStop" setup_target_mismatch_case
 run_case "resolveInterval_rawSetting_appliesBrokerRule" resolve_interval_case
 run_case "setup_readyzAnswerTimes_passesOnlyBothAnswersWithinDeadline" readiness_case
 run_case "httpWithin_limitVariablesExported_sendsFixedLimitAndReadyzTimeLeft" limit_variables_case

@@ -4,16 +4,23 @@
 #   - read_armed_set of perf.sh, with armed_sql and db_query: a fresh database gives an empty set,
 #     armed rows give exactly their sorted lower-case id,revision lines while disabled and
 #     triggered rows are left out, and a failing client is a failed read, never a set;
+#   - db_query of perf.sh with its client timeouts lowered: a query that outlasts them fails as
+#     the client's own timeout, well before the call limit, and leaves no client running in the
+#     container;
 #   - db_count_ids of loadgen-check.sh, with db_count_chunk and db_query: no ids count 0 without a
 #     query, listed ids count exactly the rows present, a list longer than one chunk sums every
-#     chunk's query, a non-canonical id is refused before any SQL reaches the database, and a
-#     failing client is a failed count that carries the client's error.
+#     chunk's query, a non-canonical id is refused before any SQL reaches the database, a
+#     failing client is a failed count that carries the client's error, and, with the client
+#     timeouts lowered, a count that outlasts them fails as the client's own timeout, well before
+#     the call limit, and leaves no client running in the container.
 # One disposable container per dialect runs an image built from src/db/mssql or src/db/postgres,
 # so the schema of this checkout is the one queried. The checkout's perf.sh and loadgen-check.sh
 # are sourced, each in its own subshell, and their helpers run unchanged. Only the Compose
 # boundary is routed: `docker compose ... exec -T db ARGS...` runs ARGS in the dialect's
 # container with docker exec -i, so the container's own sqlcmd or psql runs the helpers' SQL with
-# the container's own SA_PASSWORD or local postgres role, as in a live run.
+# the container's own SA_PASSWORD or local postgres role, and its login and query timeouts, as in
+# a live run. The helpers run that call under timeout(1), which still bounds the routed exec. For
+# the slow count only, the routing also puts a delay ahead of the count's own SQL.
 #
 # Usage: scripts/portfolio-insights/harness-sql-test.sh [--mssql-image IMAGE] [--postgres-image IMAGE]
 #   --mssql-image IMAGE     SQL Server image built from src/db/mssql (default: easytrade-db-mssql)
@@ -54,6 +61,10 @@ POLL_STEP_SECONDS=2
 # The PostgreSQL entrypoint runs the init scripts on a temporary server that accepts local
 # connections, and logs this line once it has stopped that server and before the final one starts.
 PG_INIT_DONE='PostgreSQL init process complete'
+# The client login and query timeouts of perf.sh and loadgen-check.sh as the slow-query checks
+# lower them, and the marker that names that query's client in the container's process list.
+SLOW_CLIENT_TIMEOUT_SECONDS=2
+SLOW_QUERY_MARKER="harness_sql_test_slow_query"
 # loadgen-check.sh's ID_CHUNK_SIZE; the chunk check also compares the sourced value with it.
 CHUNK_SIZE=100
 CHUNK_SEED_COUNT=150
@@ -126,10 +137,13 @@ h_error=""
 h_count=""
 h_queries=""
 h_chunk_size=""
-# Set only inside a helper subshell: the container its db service stands for, and the file that
-# records each client call routed there.
+# Set only inside a helper subshell: the container its db service stands for, the file that
+# records each client call routed there, and text the routing puts ahead of that call's SQL.
 ROUTE_CONTAINER=""
 ROUTE_LOG=""
+ROUTE_SQL_PREFIX=""
+# The docker command line route_docker last gave.
+ROUTED=()
 
 pass() {
     passed=$((passed + 1))
@@ -174,24 +188,52 @@ cleanup() {
 trap cleanup EXIT
 trap 'exit 130' INT TERM
 
-# docker: the Compose boundary of the sourced harnesses. Inside a helper subshell, which sets
-# ROUTE_CONTAINER, `docker compose [-p P] [-f F]... exec -T db ARGS...` runs ARGS in that
-# container with docker exec -i, as Compose runs them in the db service's container, and appends
-# the call's last argument, the SQL, to ROUTE_LOG. Every other call reaches docker unchanged.
-docker() {
+# route_docker ARGS...: sets ROUTED to the docker command line that stands for `docker ARGS...`,
+# the Compose boundary of the sourced harnesses. Inside a helper subshell, which sets
+# ROUTE_CONTAINER, `docker compose [-p P] [-f F]... exec -T db ARGS...` becomes
+# `docker exec -i ROUTE_CONTAINER ARGS...`, which runs ARGS in that container as Compose runs
+# them in the db service's container, and the call's last argument, the SQL, is appended to
+# ROUTE_LOG. A non-empty ROUTE_SQL_PREFIX is put ahead of that SQL in the routed call only, so
+# ROUTE_LOG keeps the SQL the helper sent. Every other call stays `docker ARGS...`.
+route_docker() {
     local -a args=("$@")
     local i=1
+    ROUTED=(docker "$@")
     if [[ -n "$ROUTE_CONTAINER" && "${args[0]:-}" == compose ]]; then
         while [[ "${args[i]:-}" == -p || "${args[i]:-}" == -f ]]; do
             i=$((i + 2))
         done
         if [[ "${args[i]:-}" == exec && "${args[i + 1]:-}" == -T && "${args[i + 2]:-}" == db ]]; then
             printf '%s\n' "${args[${#args[@]} - 1]}" >>"$ROUTE_LOG"
-            command docker exec -i "$ROUTE_CONTAINER" "${args[@]:i+3}"
-            return
+            ROUTED=(docker exec -i "$ROUTE_CONTAINER" "${args[@]:i+3}")
+            if [[ -n "$ROUTE_SQL_PREFIX" ]]; then
+                ROUTED[${#ROUTED[@]} - 1]="${ROUTE_SQL_PREFIX}${ROUTED[${#ROUTED[@]} - 1]}"
+            fi
         fi
     fi
-    command docker "$@"
+}
+
+# docker ARGS...: runs the command line route_docker gives for ARGS.
+docker() {
+    route_docker "$@"
+    command "${ROUTED[@]}"
+}
+
+# timeout ARGS...: the sourced harnesses run each Docker call through hard_timeout, as
+# `timeout -k GRACE DURATION docker ARGS...` or `timeout -s KILL LIMIT docker ARGS...`.
+# timeout(1) would exec the docker program on PATH and miss the routing, so in those two forms
+# the docker call is routed by route_docker and then run under timeout(1) with the same options,
+# which keeps the call's limit. Every other call reaches timeout(1) unchanged.
+timeout() {
+    local -a limits=()
+    if [[ $# -ge 4 && "$4" == docker ]] && [[ "$1" == -k || ("$1" == -s && "$2" == KILL) ]]; then
+        limits=("$1" "$2" "$3")
+        shift 4
+        route_docker "$@"
+        command timeout "${limits[@]}" "${ROUTED[@]}"
+        return
+    fi
+    command timeout "$@"
 }
 
 # Flattens a captured output file into one line for a FAIL reason.
@@ -393,6 +435,34 @@ run_read_armed_set() {
     collect_result "$subshell" "$PERF_SH"
 }
 
+# run_slow_db_query DIALECT CONTAINER SQL: in a subshell, sources perf.sh with its db service
+# routed to CONTAINER and runs db_query for DIALECT on SQL with both client timeouts lowered to
+# SLOW_CLIENT_TIMEOUT_SECONDS, leaving its output in case_dir/out, its error log as the error and
+# the seconds it took in case_dir/seconds. Then collect_result.
+# shellcheck disable=SC2034 # The timeouts are read by the sourced db_query.
+run_slow_db_query() {
+    local subshell=0
+    (
+        ROUTE_CONTAINER="$2"
+        ROUTE_LOG="$case_dir/routed"
+        TMPDIR="$case_dir"
+        load_perf
+        RUN_DIR="$case_dir"
+        DIALECT="$1"
+        DB_LOGIN_TIMEOUT_SECONDS="$SLOW_CLIENT_TIMEOUT_SECONDS"
+        DB_QUERY_TIMEOUT_SECONDS="$SLOW_CLIENT_TIMEOUT_SECONDS"
+        : >"$RUN_DIR/db-error.log"
+        rc=0
+        start=$SECONDS
+        db_query "$3" >"$case_dir/out" || rc=$?
+        printf '%s' "$((SECONDS - start))" >"$case_dir/seconds"
+        printf '%s' "$((DOCKER_CALL_TIMEOUT_SECONDS - LOG_PROBE_KILL_SECONDS))" >"$case_dir/term"
+        printf '%s' "$rc" >"$case_dir/status"
+        tr '\r\n' '  ' <"$RUN_DIR/db-error.log" >"$case_dir/error"
+    ) >"$case_dir/subshell.out" 2>"$case_dir/subshell.err" || subshell=$?
+    collect_result "$subshell" "$PERF_SH"
+}
+
 # run_db_count_ids DIALECT CONTAINER: in a subshell, sources loadgen-check.sh with its db service
 # routed to CONTAINER and runs db_count_ids for DIALECT on the ids in case_dir/ids, with RUN_DIR
 # set to case_dir. Then collect_result.
@@ -412,6 +482,35 @@ run_db_count_ids() {
         printf '%s' "$DB_ERROR" >"$case_dir/error"
         printf '%s' "$DB_COUNT" >"$case_dir/count"
         printf '%s' "$ID_CHUNK_SIZE" >"$case_dir/chunk-size"
+    ) >"$case_dir/subshell.out" 2>"$case_dir/subshell.err" || subshell=$?
+    collect_result "$subshell" "$LOADGEN_CHECK_SH"
+}
+
+# run_slow_db_count_ids DIALECT CONTAINER PREFIX: run_db_count_ids with both client timeouts
+# lowered to SLOW_CLIENT_TIMEOUT_SECONDS and PREFIX routed ahead of each count's SQL, leaving the
+# seconds db_count_ids took in case_dir/seconds and the second at which the call gets TERM in
+# case_dir/term. Then collect_result.
+# shellcheck disable=SC2034 # The timeouts are read by the sourced db_query.
+run_slow_db_count_ids() {
+    local subshell=0
+    (
+        ROUTE_CONTAINER="$2"
+        ROUTE_LOG="$case_dir/routed"
+        ROUTE_SQL_PREFIX="$3"
+        load_loadgen_check
+        RUN_DIR="$case_dir"
+        DIALECT="$1"
+        PROJECT="harness-sql-test"
+        COMPOSE_ARGS=(-f compose.dev.yaml)
+        DB_LOGIN_TIMEOUT_SECONDS="$SLOW_CLIENT_TIMEOUT_SECONDS"
+        DB_QUERY_TIMEOUT_SECONDS="$SLOW_CLIENT_TIMEOUT_SECONDS"
+        rc=0
+        start=$SECONDS
+        db_count_ids "$case_dir/ids" || rc=$?
+        printf '%s' "$((SECONDS - start))" >"$case_dir/seconds"
+        printf '%s' "$((DOCKER_CALL_TIMEOUT_SECONDS - LOG_PROBE_KILL_SECONDS))" >"$case_dir/term"
+        printf '%s' "$rc" >"$case_dir/status"
+        printf '%s' "$DB_ERROR" >"$case_dir/error"
     ) >"$case_dir/subshell.out" 2>"$case_dir/subshell.err" || subshell=$?
     collect_result "$subshell" "$LOADGEN_CHECK_SH"
 }
@@ -597,6 +696,43 @@ done
 conclude "$check"
 
 # ---------------------------------------------------------------------------------------------
+# perf.sh: db_query's client timeouts
+
+check="dbQuery_queryOutlastsClientTimeouts_failsAsClientTimeoutWithoutLeftoverClient"
+# A query that takes 30 s, longer than both lowered client timeouts together.
+declare -A slow_sql=(
+    [mssql]="WAITFOR DELAY '00:00:30'; SELECT 1 AS ${SLOW_QUERY_MARKER}"
+    [postgres]="SELECT pg_sleep(30) AS ${SLOW_QUERY_MARKER}"
+)
+# The client's own report of its query timeout, lower-cased: sqlcmd's on stdout, psql's on stderr.
+declare -A client_timeout_text=(
+    [mssql]="timeout expired"
+    [postgres]="canceling statement due to statement timeout"
+)
+for dialect in "${DIALECTS[@]}"; do
+    new_case_dir
+    run_slow_db_query "$dialect" "${db_container[$dialect]}" "${slow_sql[$dialect]}"
+    read_result out
+    reported="no"
+    if [[ "${REPLY,,} ${h_error,,}" == *"${client_timeout_text[$dialect]}"* ]]; then
+        reported="yes"
+    fi
+    # The client is gone once db_query returns: no process in the container names the query.
+    left="$(docker exec "${db_container[$dialect]}" sh -c 'ps -eo args 2>/dev/null || ps' </dev/null |
+        grep -c "$SLOW_QUERY_MARKER" || true)"
+    expect "$dialect" "status=1 client timeout reported=yes queries=1 clients left=0" \
+        "status=${h_status} client timeout reported=${reported} queries=${h_queries} clients left=${left}"
+    # It ended before the call's own limit sends TERM, so the client, not the limit, ended it.
+    read_result seconds
+    seconds="$REPLY"
+    read_result term
+    if [[ ! "$seconds" =~ ^[0-9]+$ || ! "$REPLY" =~ ^[0-9]+$ || "$seconds" -ge "$REPLY" ]]; then
+        reasons+=("$dialect: took [${seconds}] s, not less than the [${REPLY}] s at which the call gets TERM")
+    fi
+done
+conclude "$check"
+
+# ---------------------------------------------------------------------------------------------
 # loadgen-check.sh: db_count_ids
 
 check="dbCountIds_noIds_setsZeroCountWithoutQuery"
@@ -721,6 +857,34 @@ for dialect in "${DIALECTS[@]}"; do
         expect "$dialect, $row" "status=1 error=[count query failed: ...${fragment}]" \
             "status=${h_status} error=[${REPLY}]"
     done
+done
+conclude "$check"
+
+check="dbCountIds_countOutlastsClientTimeouts_failsAsClientTimeoutWithoutLeftoverClient"
+# Routed ahead of the count's own SQL: a 30 s delay, longer than both lowered client timeouts
+# together, so the database does not answer the count in time. The comment names the client in
+# the container's process list.
+declare -A slow_count_prefix=(
+    [mssql]="/* ${SLOW_QUERY_MARKER} */ WAITFOR DELAY '00:00:30'; "
+    [postgres]="/* ${SLOW_QUERY_MARKER} */ SELECT pg_sleep(30); "
+)
+for dialect in "${DIALECTS[@]}"; do
+    new_case_dir
+    printf '%s\n' "$ARMED_REV1_ID" "$ARMED_REV3_ID" >"$case_dir/ids"
+    run_slow_db_count_ids "$dialect" "${db_container[$dialect]}" "${slow_count_prefix[$dialect]}"
+    error_text "count query failed: " "${client_timeout_text[$dialect]}"
+    # The client is gone once db_count_ids returns: no process in the container names the query.
+    left="$(docker exec "${db_container[$dialect]}" sh -c 'ps -eo args 2>/dev/null || ps' </dev/null |
+        grep -c "$SLOW_QUERY_MARKER" || true)"
+    expect "$dialect" "status=1 error=[count query failed: ...${client_timeout_text[$dialect]}] queries=1 clients left=0" \
+        "status=${h_status} error=[${REPLY}] queries=${h_queries} clients left=${left}"
+    # It ended before the call's own limit sends TERM, so the client, not the limit, ended it.
+    read_result seconds
+    seconds="$REPLY"
+    read_result term
+    if [[ ! "$seconds" =~ ^[0-9]+$ || ! "$REPLY" =~ ^[0-9]+$ || "$seconds" -ge "$REPLY" ]]; then
+        reasons+=("$dialect: took [${seconds}] s, not less than the [${REPLY}] s at which the call gets TERM")
+    fi
 done
 conclude "$check"
 

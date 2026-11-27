@@ -25,7 +25,9 @@
 #       --compose-file compose.dev.yaml
 #
 # One project and one dialect per invocation. Never run it alongside perf.sh or
-# loadgen-check.sh: all three toggle the same portfolio-insights-enabled flag.
+# loadgen-check.sh: all three toggle the same portfolio-insights-enabled flag. Step 1 checks,
+# before any change, that --base-url is served by the reverse proxy of --project: a probe
+# request through it must show in that project's reverse-proxy log, or the run stops there.
 #
 # What it touches: it signs up two fresh accounts, pi-e2e-<epoch>-holder and
 # pi-e2e-<epoch>-empty, deposits to and buys on the holder only, creates alerts on them, and
@@ -81,12 +83,23 @@ LOG_LINE_TIMEOUT_SECONDS=30
 # Log windows start this far back so a host clock ahead of the Docker engine's loses no line;
 # lines already present when a window opens are counted as its baseline, never read as new.
 LOG_SKEW_MARGIN_SECONDS=30
-# Every broker-service log read runs under timeout(1), so a Docker call that never answers
-# cannot hold the run. Inside poll it may take the time left to the poll's deadline; a read
-# outside any poll may take this fixed bound. Either is a hard limit on the whole read, its
-# termination included: TERM comes LOG_PROBE_KILL_SECONDS before the limit and KILL at it.
+# Every Docker call runs under timeout(1), so a Docker engine that never answers cannot hold the
+# run or its cleanup. A broker-service log read inside poll may take the time left to the poll's
+# deadline; a read outside any poll may take this fixed bound. Either is a hard limit on the
+# whole read, its termination included: TERM comes LOG_PROBE_KILL_SECONDS before the limit and
+# KILL at it.
 LOG_PROBE_TIMEOUT_SECONDS=60
 LOG_PROBE_KILL_SECONDS=5
+# The hard limit, termination included as for log reads, of every Docker call other than a log
+# read: the compose plugin check, the running-services and container queries and docker inspect.
+# Each takes seconds on a healthy engine; one cut off fails its check as one Docker did not
+# answer.
+DOCKER_CALL_TIMEOUT_SECONDS=60
+# The target check reads the project's reverse-proxy log for its two probe lines every
+# TARGET_STEP_SECONDS until TARGET_TIMEOUT_SECONDS have passed. nginx logs a request as it
+# answers it, so a line Docker already holds needs no longer.
+TARGET_TIMEOUT_SECONDS=30
+TARGET_STEP_SECONDS=2
 # Cleanup stops sending DELETEs after this many transport errors in a row.
 MAX_CONSECUTIVE_TRANSPORT_ERRORS=5
 # The threshold domain maximum (10 integer and 8 fractional digits), sent as the exact token.
@@ -309,10 +322,24 @@ if [[ "$(jq -c '[.v, "\(.v)", (.v | tojson)]' <<<"{\"v\":$MAX_TRIGGER_VALUE}" 2>
     echo "jq must keep number literals exact (jq 1.7 or later); $(jq --version 2>/dev/null | tr -d '\r') changes $MAX_TRIGGER_VALUE." >&2
     exit 2
 fi
-if ! docker compose version >/dev/null 2>&1 </dev/null; then
-    echo "The docker compose plugin is required (docker compose version failed)." >&2
-    exit 2
-fi
+# The compose plugin check has ended, killed if need be, DOCKER_CALL_TIMEOUT_SECONDS after it
+# started, by hard_timeout's rule, spelled out here because the functions are defined further
+# down: TERM LOG_PROBE_KILL_SECONDS before the limit, KILL at it. Its status 124 or 137 means the
+# limit cut it off. Its two messages are those of check_tools in perf.sh and loadgen-check.sh.
+plugin_status=0
+MSYS_NO_PATHCONV=1 timeout -k "$LOG_PROBE_KILL_SECONDS" "$((DOCKER_CALL_TIMEOUT_SECONDS - LOG_PROBE_KILL_SECONDS))" \
+    docker compose version >/dev/null 2>&1 </dev/null || plugin_status=$?
+case "$plugin_status" in
+    0) ;;
+    124 | 137)
+        echo "The docker compose plugin is required: docker compose version timed out after $DOCKER_CALL_TIMEOUT_SECONDS s (Docker did not answer)." >&2
+        exit 2
+        ;;
+    *)
+        echo "The docker compose plugin is required (docker compose version failed)." >&2
+        exit 2
+        ;;
+esac
 
 # restrict_private_dir: limits PRIVATE_DIR to the current user, and proves it, while it is still
 # empty; every file created inside inherits that. umask 077 alone does not do it on Git Bash,
@@ -1054,10 +1081,31 @@ poll() {
 # ---------------------------------------------------------------------------------------------
 # Docker, runtime facts and logs
 
-# Arguments must reach docker unchanged: Git Bash would rewrite path-like ones to Windows
-# paths. stdin is detached so docker never consumes the input of a surrounding read loop.
+# compose ARGS...: docker compose ARGS for the project, run by compose_within with
+# DOCKER_CALL_TIMEOUT_SECONDS, so no Compose call can hold the run; status 124 or 137 means the
+# limit cut it off.
 compose() {
-    MSYS_NO_PATHCONV=1 docker compose -p "$PROJECT" -f "$COMPOSE_FILE" "$@" </dev/null
+    compose_within "$DOCKER_CALL_TIMEOUT_SECONDS" "$@"
+}
+
+# compose_within LIMIT ARGS...: docker compose ARGS for the project and its compose file, run by
+# hard_timeout, so the call has ended within LIMIT seconds, with status 124 or 137 when the limit
+# cut it off. Arguments must reach docker unchanged: Git Bash would rewrite path-like ones to
+# Windows paths, which hard_timeout prevents. stdin is detached so docker never consumes the
+# input of a surrounding read loop.
+compose_within() {
+    local limit="$1"
+    shift
+    hard_timeout "$limit" docker compose -p "$PROJECT" -f "$COMPOSE_FILE" "$@" </dev/null
+}
+
+# docker_problem WHAT STATUS LIMIT: why the Docker call WHAT, run by hard_timeout with LIMIT,
+# ended with STATUS, telling a call Docker did not answer in time from one that failed.
+docker_problem() {
+    case "$2" in
+        124 | 137) echo "$1 timed out after $3 s (Docker did not answer)" ;;
+        *) echo "$1 failed, exit $2 (see $RUN_DIR/compose.log)" ;;
+    esac
 }
 
 # hard_timeout LIMIT PROGRAM [ARGS...]: runs PROGRAM under timeout(1) so that it has ended,
@@ -1075,25 +1123,33 @@ hard_timeout() {
     fi
 }
 
+# running_services: the project's running services, one per line. The call has ended within
+# DOCKER_CALL_TIMEOUT_SECONDS (hard_timeout); one that fails, or is cut off with 124 or 137, fails
+# the function with its status, never as a list of no services.
 running_services() {
-    compose ps --status running --services 2>>"$RUN_DIR/compose.log" | tr -d '\r'
+    compose_within "$DOCKER_CALL_TIMEOUT_SECONDS" ps --status running --services 2>>"$RUN_DIR/compose.log" |
+        tr -d '\r'
 }
 
-# container_env SERVICE NAME: the value of NAME (which holds no "=") in the service container's
-# environment, byte for byte: line feeds and carriage returns inside it and at its end included.
-# The first entry named exactly NAME wins. jq hands the value over as base64, because jq on
-# Windows writes text with CRLF line ends. Prints nothing when NAME is unset; fails when the
-# service has no container. Capture it as "$(container_env S N && printf x)" and drop the x, so
-# command substitution keeps any trailing line feed.
+# container_env SERVICE NAME: the value of NAME (which holds no "=") in the service's running
+# container's environment, byte for byte: line feeds and carriage returns inside it and at its
+# end included. The first entry named exactly NAME wins. jq hands the value over as base64,
+# because jq on Windows writes text with CRLF line ends. Prints nothing when NAME is unset; fails
+# when the service has no running container. Capture it as "$(container_env S N && printf x)" and
+# drop the x, so command substitution keeps any trailing line feed. Each Docker call has ended
+# within DOCKER_CALL_TIMEOUT_SECONDS (hard_timeout); one that fails, or is cut off with 124 or
+# 137, fails the function with its status, so a failed read never passes for an unset NAME.
 container_env() {
     local cid encoded value
-    cid="$(compose ps -q "$1" 2>>"$RUN_DIR/compose.log" | tr -d '\r' | sed -n '1p')" || return 1
+    cid="$(compose_within "$DOCKER_CALL_TIMEOUT_SECONDS" ps -q "$1" 2>>"$RUN_DIR/compose.log" |
+        tr -d '\r' | sed -n '1p')" || return
     if [[ -z "$cid" ]]; then
         return 1
     fi
-    encoded="$(MSYS_NO_PATHCONV=1 docker inspect --format '{{json .Config.Env}}' "$cid" </dev/null \
-        | jq -r --arg name "$2" 'first(.[]? | select(startswith($name + "="))) | ltrimstr($name + "=") | @base64')" \
-        || return 1
+    encoded="$(hard_timeout "$DOCKER_CALL_TIMEOUT_SECONDS" docker inspect --format '{{json .Config.Env}}' "$cid" \
+        </dev/null 2>>"$RUN_DIR/compose.log" |
+        jq -r --arg name "$2" 'first(.[]? | select(startswith($name + "="))) | ltrimstr($name + "=") | @base64' \
+            2>>"$RUN_DIR/compose.log")" || return
     value="$(printf '%s' "$encoded" | tr -d '\r\n' | base64 -d && printf x)" || return 1
     printf '%s' "${value%x}"
 }
@@ -1123,8 +1179,8 @@ resolve_interval() {
 # broker_logs SINCE: broker-service output since SINCE, without colour codes or carriage
 # returns. The custom console logger pads each line and ends it with " | <CallerName>", so
 # callers match substrings only. The read has ended, killed if need be, probe_limit seconds
-# after it started (hard_timeout), and is never started once the poll's deadline has passed. On
-# failure LOG_PROBE_DETAIL tells a read Docker did not answer in time from one that failed.
+# after it started (compose_within), and is never started once the poll's deadline has passed.
+# On failure LOG_PROBE_DETAIL tells a read Docker did not answer in time from one that failed.
 broker_logs() {
     local limit rc=0
     if ! limit="$(probe_limit)"; then
@@ -1135,9 +1191,7 @@ broker_logs() {
         return 1
     fi
     LOG_PROBE_DETAIL=""
-    # compose() cannot run under timeout(1), which needs a program, so its settings are repeated.
-    hard_timeout "$limit" docker compose -p "$PROJECT" -f "$COMPOSE_FILE" \
-        logs --no-color --no-log-prefix --since "$1" broker-service </dev/null 2>>"$RUN_DIR/compose.log" \
+    compose_within "$limit" logs --no-color --no-log-prefix --since "$1" broker-service 2>>"$RUN_DIR/compose.log" \
         | sed "s/$(printf '\033')\[[0-9;]*m//g" | tr -d '\r' || rc=$?
     case "$rc" in
         0) return 0 ;;
@@ -1970,6 +2024,83 @@ readiness_once() {
     [[ "$broker" == "status 200" && "$flag" == "status 200" ]]
 }
 
+# verify_target_project CHECK: proves, read-only and before the run changes anything, that
+# BASE_URL is served by the reverse-proxy service of PROJECT, so every request through BASE_URL
+# and every Docker call of the run address one stack. It sends both readyz endpoints a GET whose
+# query carries a nonce of 16 random bytes, then reads the project's reverse-proxy log for an
+# access line of each request with status 200. The log is read every TARGET_STEP_SECONDS until
+# TARGET_TIMEOUT_SECONDS have passed, each read bounded by the smaller of
+# LOG_PROBE_TIMEOUT_SECONDS and the time left, and none started once that time is up. Both lines
+# found: PASS CHECK. Otherwise FAIL CHECK, and abort ends the run: no nonce, a probe that does
+# not answer 200, a log read that fails, a log read cut off at its own bound
+# LOG_PROBE_TIMEOUT_SECONDS or before Docker answered any read of the check (Docker did not
+# answer), or no such line by the deadline, as when BASE_URL belongs to another stack. Only once
+# Docker has answered a read without both lines does a later read bounded by the time left and
+# cut off mean the deadline passed rather than that Docker did not answer: it ends the check
+# with the no-such-line reason, noting the cut-off. No reason quotes the log or a response. The
+# text is identical in e2e.sh, perf.sh and loadgen-check.sh.
+verify_target_project() {
+    local check="$1" nonce since path deadline left limit lines line rest found rc cut="" answered=0
+    local status_re='^[0-9.]+" 200 '
+    if ! nonce="$(od -An -N16 -tx1 /dev/urandom 2>/dev/null | tr -d ' \r\n')" ||
+        [[ ! "$nonce" =~ ^[0-9a-f]{32}$ ]]; then
+        abort "$check" "no probe generated: /dev/urandom did not supply 16 random bytes"
+    fi
+    since="$(epoch_to_rfc3339 $(($(date -u +%s) - LOG_SKEW_MARGIN_SECONDS)))"
+    for path in broker-service/readyz feature-flag-service/readyz; do
+        http GET "$BASE_URL/$path?pi-target=$nonce"
+        if [[ "$HTTP_STATUS" != "200" ]]; then
+            abort "$check" "the probe GET /$path gave $(status_text), expected status 200"
+        fi
+    done
+    deadline=$((SECONDS + TARGET_TIMEOUT_SECONDS))
+    while :; do
+        left=$((deadline - SECONDS))
+        if [[ $left -le 0 ]]; then
+            break
+        fi
+        limit="$LOG_PROBE_TIMEOUT_SECONDS"
+        if [[ $left -lt $limit ]]; then
+            limit="$left"
+        fi
+        rc=0
+        lines="$(compose_within "$limit" logs --no-color --no-log-prefix --since "$since" reverse-proxy \
+            2>>"$RUN_DIR/compose.log" | sed "s/$(printf '\033')\[[0-9;]*m//g" | tr -d '\r' |
+            { grep -F "pi-target=$nonce" || true; })" || rc=$?
+        if [[ $rc -ne 0 ]]; then
+            # Cut off at the time left rather than at its own bound, after Docker answered an
+            # earlier read: the deadline, not Docker, ended the read, and no read follows it.
+            # With no read answered yet, Docker has not answered within the check's deadline.
+            if [[ $answered -eq 1 && $limit -lt $LOG_PROBE_TIMEOUT_SECONDS && ($rc -eq 124 || $rc -eq 137) ]]; then
+                cut=", and the last log read was cut off at the deadline"
+                break
+            fi
+            abort "$check" "$(docker_problem "reading the reverse-proxy log of project [$PROJECT]" "$rc" "$limit")"
+        fi
+        answered=1
+        found=0
+        for path in broker-service/readyz feature-flag-service/readyz; do
+            while IFS= read -r line; do
+                rest="${line#*"\"GET /$path?pi-target=$nonce HTTP/"}"
+                if [[ "$rest" != "$line" && "$rest" =~ $status_re ]]; then
+                    found=$((found + 1))
+                    break
+                fi
+            done <<<"$lines"
+        done
+        if [[ $found -eq 2 ]]; then
+            pass "$check"
+            info "base url $BASE_URL is served by the reverse-proxy of project [$PROJECT]"
+            return 0
+        fi
+        if [[ $((SECONDS + TARGET_STEP_SECONDS)) -ge $deadline ]]; then
+            break
+        fi
+        sleep "$TARGET_STEP_SECONDS"
+    done
+    abort "$check" "base url $BASE_URL is not served by the reverse-proxy of project [$PROJECT]: its log shows no request carrying this run's probe within $TARGET_TIMEOUT_SECONDS s$cut; give the --base-url and --project of one stack"
+}
+
 # startup_flag_default RAW: the flag's startup value for an ENABLE_PORTFOLIO_INSIGHTS of RAW, by
 # feature-flag-service's getEnvBool rule. strconv.ParseBool's true spellings give true; its false
 # spellings, an empty or unset value and anything unparsable give the shipped default, false.
@@ -1981,8 +2112,13 @@ startup_flag_default() {
 }
 
 step1_ready() {
-    local running missing="" service modifiable enabled raw_default startup_default raw_interval
-    running="$(running_services)" || running=""
+    local running missing="" service modifiable enabled raw_default startup_default raw_interval rc=0
+    # A Docker read that fails or is cut off ends the run with a reason of its own, never read as
+    # a list of no services or as an unset setting.
+    running="$(running_services)" || rc=$?
+    if [[ $rc -ne 0 ]]; then
+        abort "step 1 services running" "$(docker_problem "listing the running services of project [$PROJECT]" "$rc" "$DOCKER_CALL_TIMEOUT_SECONDS")"
+    fi
     for service in $REQUIRED_SERVICES; do
         if ! grep -qxF "$service" <<<"$running"; then
             missing="$missing $service"
@@ -1997,6 +2133,9 @@ step1_ready() {
         exit 1
     fi
     pass "step 1 readiness"
+    # Before the flag read whose value cleanup restores, and before any write: the base URL must
+    # be this project's reverse proxy.
+    verify_target_project "step 1 target project"
 
     http GET "$F"
     if [[ "$HTTP_STATUS" != "200" ]]; then
@@ -2019,8 +2158,9 @@ step1_ready() {
     # the flag and feature-flag-service's startup setting show it starts disabled. The value is
     # read byte for byte, as the service's strconv.ParseBool reads it untrimmed: the x keeps a
     # trailing line feed, and printf %q prints a value with control characters on one line.
-    if ! raw_default="$(container_env feature-flag-service ENABLE_PORTFOLIO_INSIGHTS && printf x)"; then
-        abort "step 1 flag default disabled" "ENABLE_PORTFOLIO_INSIGHTS could not be read from the feature-flag-service container of project [$PROJECT]; the run needs the shipped default, disabled"
+    raw_default="$(container_env feature-flag-service ENABLE_PORTFOLIO_INSIGHTS && printf x)" || rc=$?
+    if [[ $rc -ne 0 ]]; then
+        abort "step 1 flag default disabled" "$(docker_problem "reading ENABLE_PORTFOLIO_INSIGHTS from the feature-flag-service container of project [$PROJECT]" "$rc" "$DOCKER_CALL_TIMEOUT_SECONDS"); the run needs the shipped default, disabled"
     fi
     raw_default="${raw_default%x}"
     startup_default="$(startup_flag_default "$raw_default")"
@@ -2031,13 +2171,21 @@ step1_ready() {
     info "flag $FLAG_ID initially enabled=$FLAG_INITIAL; ENABLE_PORTFOLIO_INSIGHTS [${raw_default:+$(printf '%q' "$raw_default")}]"
 
     # The x keeps a trailing line feed of the value; printf %q prints a value with control
-    # characters on one line, as $'...'.
-    DIALECT="$(container_env db-adapter DB_TYPE && printf x)" || DIALECT=""
+    # characters on one line, as $'...'. Only a value read successfully, set or not, is judged:
+    # the broker's default interval applies to an unset or invalid one, never to a failed read.
+    DIALECT="$(container_env db-adapter DB_TYPE && printf x)" || rc=$?
+    if [[ $rc -ne 0 ]]; then
+        DIALECT=""
+        abort "step 1 runtime facts" "$(docker_problem "reading DB_TYPE from the db-adapter container of project [$PROJECT]" "$rc" "$DOCKER_CALL_TIMEOUT_SECONDS")"
+    fi
     DIALECT="${DIALECT%x}"
     if [[ "$DIALECT" != "mssql" && "$DIALECT" != "postgres" ]]; then
         abort "step 1 runtime facts" "db-adapter DB_TYPE is [${DIALECT:+$(printf '%q' "$DIALECT")}], expected mssql or postgres"
     fi
-    raw_interval="$(container_env broker-service ALERT_EVALUATION_INTERVAL_SECONDS && printf x)" || raw_interval=""
+    raw_interval="$(container_env broker-service ALERT_EVALUATION_INTERVAL_SECONDS && printf x)" || rc=$?
+    if [[ $rc -ne 0 ]]; then
+        abort "step 1 runtime facts" "$(docker_problem "reading ALERT_EVALUATION_INTERVAL_SECONDS from the broker-service container of project [$PROJECT]" "$rc" "$DOCKER_CALL_TIMEOUT_SECONDS")"
+    fi
     raw_interval="${raw_interval%x}"
     INTERVAL="$(resolve_interval "$raw_interval")"
     pass "step 1 runtime facts"

@@ -2,12 +2,14 @@
 # Tests the verification paths of scripts/portfolio-insights/e2e.sh offline, through its real
 # functions. Sourcing e2e.sh defines them without running its steps. Every outside call is a
 # stub: shell functions while sourced (http, broker_logs, container_env, running_services, poll,
-# docker, node, curl), scripts first on PATH when executed (docker, node, curl, a lossy jq), so
-# no docker daemon, network or running stack is involved:
+# docker, timeout, node, curl), scripts first on PATH when executed (docker, node, curl, a lossy
+# jq), so no docker daemon, network or running stack is involved:
 #   - the exact decimal helpers num_split, magnitude_cmp and num_cmp;
 #   - the step-9 triggerValue verdict, the step-9 instrument choice and step9_trigger with both;
 #   - alert_body, the create body of every alert request;
-#   - the step-1 startup decision and flag body: startup_flag_default and step1_ready;
+#   - the step-1 startup decision and flag body: startup_flag_default and step1_ready, including
+#     a Docker read that fails or is cut off and a base URL that another stack's reverse proxy
+#     serves;
 #   - the flag reads and PUT answers of step2_flag_off, step11_browser and
 #     step13_cleanup_and_disable;
 #   - the step-5 rendered insights log line: insights_line_logged and step5_figures;
@@ -167,12 +169,39 @@ capture() {
 }
 
 # ---------------------------------------------------------------------------------------------
-# Sourcing e2e.sh. Its preamble checks for docker and node and runs "docker compose version":
-# these functions satisfy both without a daemon, and every other docker call fails. curl fails
-# as a transport error would, so a request that missed the http stub never leaves the machine.
+# Sourcing e2e.sh. Its preamble checks for docker and node and runs "docker compose version"
+# under timeout(1): these functions satisfy both without a daemon. The project's compose logs of
+# reverse-proxy, which step 1's target check reads, print STUB_PROXY_LOG, and every other docker
+# call fails. curl fails as a transport error would, so a request that missed the http stub
+# never leaves the machine.
+
+# The named project's reverse-proxy log, and the log of the stack that serves BASE_URL, to which
+# a routed target-check probe adds its access line: one file while the base URL is the
+# project's own, another stack's log otherwise.
+STUB_PROXY_LOG="$TEST_DIR/proxy.log"
+STUB_SERVED_LOG="$STUB_PROXY_LOG"
+: >"$STUB_PROXY_LOG"
+: >"$TEST_DIR/other-proxy.log"
 
 docker() {
-    [[ "${1:-} ${2:-}" == "compose version" ]]
+    case "$*" in
+        "compose version") return 0 ;;
+        "compose -p $STUB_PROJECT -f $TEST_DIR/compose.yaml logs --no-color --no-log-prefix --since "*" reverse-proxy")
+            cat "$STUB_PROXY_LOG"
+            ;;
+        *) return 1 ;;
+    esac
+}
+
+# timeout [-k GRACE | -s SIGNAL] LIMIT COMMAND [ARGS...]: timeout(1) would exec the docker
+# program on PATH, never the function above, so this one drops the options and the limit and
+# runs COMMAND in this shell.
+timeout() {
+    while [[ "${1:-}" == -* ]]; do
+        shift 2
+    done
+    shift
+    "$@"
 }
 
 node() {
@@ -269,16 +298,30 @@ http() {
     fi
 }
 
+STUB_PS_RC=0
+# running_services: the services a shipped stack runs, or, with STUB_PS_RC not 0, nothing and
+# that status, as a services query that fails (124 or 137 when its call limit cut it off).
 running_services() {
+    if [[ $STUB_PS_RC -ne 0 ]]; then
+        return "$STUB_PS_RC"
+    fi
     tr ' ' '\n' <<<"$REQUIRED_SERVICES"
 }
 
 STUB_ENV_MODE="unset"
 STUB_ENV_VALUE=""
+STUB_INTERVAL_VALUE="60"
+STUB_FAILED_READ=""
+STUB_FAILED_RC=1
 # container_env SERVICE NAME: ENABLE_PORTFOLIO_INSIGHTS per STUB_ENV_MODE (unset, value or
-# fail), and the dialect and interval a shipped stack reports. Like the real one, it prints the
-# value byte for byte with no line feed added.
+# fail), the dialect a shipped stack reports, and the interval STUB_INTERVAL_VALUE, unset when
+# empty. The read STUB_FAILED_READ names, "SERVICE NAME", prints nothing and fails with
+# STUB_FAILED_RC instead, as a Docker read that fails or is cut off does. Like the real one, it
+# prints the value byte for byte with no line feed added.
 container_env() {
+    if [[ "$1 $2" == "$STUB_FAILED_READ" ]]; then
+        return "$STUB_FAILED_RC"
+    fi
     case "$1 $2" in
         "feature-flag-service ENABLE_PORTFOLIO_INSIGHTS")
             case "$STUB_ENV_MODE" in
@@ -288,7 +331,7 @@ container_env() {
             esac
             ;;
         "db-adapter DB_TYPE") printf '%s' postgres ;;
-        "broker-service ALERT_EVALUATION_INTERVAL_SECONDS") printf '%s' 60 ;;
+        "broker-service ALERT_EVALUATION_INTERVAL_SECONDS") printf '%s' "$STUB_INTERVAL_VALUE" ;;
         *) return 1 ;;
     esac
 }
@@ -646,6 +689,12 @@ route_response() {
         "GET $BASE_URL/broker-service/readyz" | "GET $BASE_URL/feature-flag-service/readyz")
             last_response 200 "text/plain" "Healthy"
             ;;
+        # The target check's probes, logged by the stack that serves the base URL.
+        "GET $BASE_URL/broker-service/readyz?pi-target="* | "GET $BASE_URL/feature-flag-service/readyz?pi-target="*)
+            printf '172.23.0.1 - [26/Nov/2026:21:30:41 +0000] "GET %s HTTP/1.1" 200 2 "-" "curl/8.21.0"\n' \
+                "${2#"$BASE_URL"}" >>"$STUB_SERVED_LOG"
+            last_response 200 "text/plain" "Healthy"
+            ;;
         "GET $F")
             last_response 200 "application/json; charset=utf-8" "${STUB_FLAG_BODY:-$flag}"
             ;;
@@ -670,6 +719,7 @@ step1_row() {
     case "$outcome" in
         pass)
             want_rc 0
+            want_line "PASS step 1 target project"
             want_line "PASS step 1 flag default disabled"
             want_line "INFO flag $FLAG_ID initially enabled=false; ENABLE_PORTFOLIO_INSIGHTS [$shown]"
             want_line "PASS step 1 runtime facts"
@@ -681,7 +731,7 @@ step1_row() {
             ;;
         unread)
             want_rc 1
-            want_line "FAIL step 1 flag default disabled: ENABLE_PORTFOLIO_INSIGHTS could not be read from the feature-flag-service container of project [$STUB_PROJECT]; the run needs the shipped default, disabled"
+            want_line "FAIL step 1 flag default disabled: reading ENABLE_PORTFOLIO_INSIGHTS from the feature-flag-service container of project [$STUB_PROJECT] failed, exit 1 (see $RUN_DIR/compose.log); the run needs the shipped default, disabled"
             want_no_text "runtime facts"
             ;;
     esac
@@ -706,6 +756,115 @@ step1_row startupSettingOne_abortsWithoutWrite false value 1 enabled true
 step1_row containerEnvFails_abortsWithoutWrite false fail "" unread
 step1_row flagEnabledContainerEnvFails_abortsWithoutWrite true fail "" unread
 STUB_ENV_MODE="unset"
+
+# step1_docker_row SCENARIO_RESULT PS_RC FAILED_READ FAILED_RC REQUESTS LINE: the services query
+# ends with PS_RC, or the container read FAILED_READ ("SERVICE NAME") fails with FAILED_RC, 124 and
+# 137 being a call its limit cut off. Step 1 stops there with LINE, a FAIL that names the Docker
+# problem, never a list of missing services or a default for an unset setting; it sends exactly
+# REQUESTS requests, all GETs, so nothing is written.
+step1_docker_row() {
+    local count
+    STUB_FLAG_ENABLED=false
+    STUB_PS_RC="$2"
+    STUB_FAILED_READ="$3"
+    STUB_FAILED_RC="$4"
+    : >"$TEST_DIR/requests"
+    capture step1_ready
+    want_rc 1
+    want_line "$6"
+    want_no_text "PASS step 1 runtime facts"
+    count="$(grep -c '' "$TEST_DIR/requests" || true)"
+    if [[ "$count" -ne "$5" ]]; then
+        reasons+=("$count requests sent, expected $5")
+    fi
+    if grep -qv '^GET ' "$TEST_DIR/requests"; then
+        reasons+=("a request other than GET was sent: $(flat "$(grep -v '^GET ' "$TEST_DIR/requests")")")
+    fi
+    STUB_PS_RC=0
+    STUB_FAILED_READ=""
+    STUB_FAILED_RC=1
+    conclude "step1Ready_$1"
+}
+
+FLAG_READ="feature-flag-service ENABLE_PORTFOLIO_INSIGHTS"
+DIALECT_READ="db-adapter DB_TYPE"
+INTERVAL_READ="broker-service ALERT_EVALUATION_INTERVAL_SECONDS"
+TIMED_OUT="timed out after $DOCKER_CALL_TIMEOUT_SECONDS s (Docker did not answer)"
+of_project="of project [$STUB_PROJECT]"
+step1_docker_row servicesQueryCutOff_abortsBeforeReadinessWithTimeout 137 "" 1 0 \
+    "FAIL step 1 services running: listing the running services $of_project $TIMED_OUT"
+step1_docker_row servicesQueryFails_abortsBeforeReadinessWithExitStatus 3 "" 1 0 \
+    "FAIL step 1 services running: listing the running services $of_project failed, exit 3 (see $RUN_DIR/compose.log)"
+# Past the services query, five GETs: both readyz, both target-check probes and the flag read.
+step1_docker_row flagDefaultReadCutOff_abortsWithTimeout 0 "$FLAG_READ" 137 5 \
+    "FAIL step 1 flag default disabled: reading ENABLE_PORTFOLIO_INSIGHTS from the feature-flag-service container $of_project $TIMED_OUT; the run needs the shipped default, disabled"
+step1_docker_row dialectReadCutOff_abortsRuntimeFactsWithTimeout 0 "$DIALECT_READ" 124 5 \
+    "FAIL step 1 runtime facts: reading DB_TYPE from the db-adapter container $of_project $TIMED_OUT"
+step1_docker_row dialectReadFails_abortsRuntimeFactsWithExitStatus 0 "$DIALECT_READ" 1 5 \
+    "FAIL step 1 runtime facts: reading DB_TYPE from the db-adapter container $of_project failed, exit 1 (see $RUN_DIR/compose.log)"
+step1_docker_row intervalReadCutOff_abortsRuntimeFactsWithoutDefault 0 "$INTERVAL_READ" 137 5 \
+    "FAIL step 1 runtime facts: reading ALERT_EVALUATION_INTERVAL_SECONDS from the broker-service container $of_project $TIMED_OUT"
+step1_docker_row intervalReadFails_abortsRuntimeFactsWithoutDefault 0 "$INTERVAL_READ" 1 5 \
+    "FAIL step 1 runtime facts: reading ALERT_EVALUATION_INTERVAL_SECONDS from the broker-service container $of_project failed, exit 1 (see $RUN_DIR/compose.log)"
+
+# step1_ready_fake_clock: step1_ready on a clock only sleep advances, so the target check's
+# deadline passes without waiting.
+step1_ready_fake_clock() {
+    unset SECONDS
+    SECONDS=0
+    sleep() {
+        SECONDS=$((SECONDS + $1))
+    }
+    step1_ready
+}
+
+# Two otherwise valid stacks: the base URL is served by another stack, whose reverse proxy logs
+# the probes, while the named project's log never shows them. Step 1 stops at its target check,
+# with readiness passed, before the flag read whose value cleanup restores, and so before any
+# write; its only requests are the two readyz GETs and the two probes.
+step1_target_mismatch_row() {
+    local requests want_re
+    STUB_FLAG_ENABLED=false
+    STUB_SERVED_LOG="$TEST_DIR/other-proxy.log"
+    : >"$TEST_DIR/requests"
+    capture step1_ready_fake_clock
+    want_rc 1
+    want_line "PASS step 1 readiness"
+    want_line "FAIL step 1 target project: base url $STUB_BASE_URL is not served by the reverse-proxy of project [$STUB_PROJECT]: its log shows no request carrying this run's probe within $TARGET_TIMEOUT_SECONDS s; give the --base-url and --project of one stack"
+    want_no_text "flag modifiable"
+    requests="$(<"$TEST_DIR/requests")"
+    want_re="^GET $STUB_BASE_URL/broker-service/readyz
+GET $STUB_BASE_URL/feature-flag-service/readyz
+GET $STUB_BASE_URL/broker-service/readyz\?pi-target=[0-9a-f]{32}
+GET $STUB_BASE_URL/feature-flag-service/readyz\?pi-target=[0-9a-f]{32}$"
+    if [[ ! "$requests" =~ $want_re ]]; then
+        reasons+=("requests [$(flat "$requests")], expected both readyz GETs and both probes only")
+    fi
+    STUB_SERVED_LOG="$STUB_PROXY_LOG"
+    conclude "step1Ready_$1"
+}
+
+step1_target_mismatch_row baseUrlServedByOtherStack_abortsBeforeFlagReadOrWrite
+
+# step1_interval_row SCENARIO_RESULT VALUE: an interval read successfully, VALUE unset (empty)
+# or not a valid interval, gets the broker's default, 60 s, and step 1 passes.
+step1_interval_row() {
+    local shown=""
+    STUB_FLAG_ENABLED=false
+    STUB_INTERVAL_VALUE="$2"
+    if [[ -n "$2" ]]; then
+        printf -v shown '%q' "$2"
+    fi
+    capture step1_ready
+    want_rc 0
+    want_line "PASS step 1 runtime facts"
+    want_line "INFO db type postgres; evaluation interval ${DEFAULT_INTERVAL_SECONDS}s (ALERT_EVALUATION_INTERVAL_SECONDS [$shown])"
+    STUB_INTERVAL_VALUE="60"
+    conclude "step1Ready_$1"
+}
+
+step1_interval_row intervalReadUnset_passesWithDefault ""
+step1_interval_row intervalReadInvalid_passesWithDefault abc
 
 # step1_flag_row SCENARIO_RESULT BODY REASON: the flag GET answers BODY with 200, and step 1
 # aborts at "step 1 flag modifiable" with REASON, before it reads the startup setting, sending
@@ -1798,7 +1957,7 @@ reset_alert_files
 # ---------------------------------------------------------------------------------------------
 # e2e.sh executed: the main guard, the jq literal-precision probe and the step-1 abort. PATH
 # starts with this run's own docker, node and curl, which record every call; docker answers
-# only "docker compose version".
+# "docker compose version", and compose ps as for a project with no service running.
 
 mkdir -p "$TEST_DIR/bin" "$TEST_DIR/lossy-jq" "$TEST_DIR/run-lossy" "$TEST_DIR/run-down"
 cat >"$TEST_DIR/bin/docker" <<'EOF'
@@ -1807,6 +1966,9 @@ if [[ "${1:-} ${2:-}" == "compose version" ]]; then
     exit 0
 fi
 echo "docker $*" >>"${0%/*}/calls"
+if [[ " $* " == *" ps "* ]]; then
+    exit 0
+fi
 exit 1
 EOF
 cat >"$TEST_DIR/bin/node" <<'EOF'

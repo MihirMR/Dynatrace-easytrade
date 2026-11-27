@@ -677,7 +677,8 @@ else echo "FAIL: flag state unreadable, not changed"; fi
   `localhost` form of `DB_URL`, since the dev `db` publishes 1433 and 5432;
 - `bash scripts/portfolio-insights/e2e.sh --base-url http://localhost --compose-file compose.dev.yaml --project pi-dev-<dialect>`,
   after `npm ci` in `src/loadgen` for its browser check. `perf.sh` and `loadgen-check.sh`
-  take the same options; run one script at a time.
+  take the same options; run one script at a time. Each script first checks that `--base-url`
+  is served by the reverse proxy of `--project`, and stops before any change otherwise.
 
 **Teardown**, before the next target:
 

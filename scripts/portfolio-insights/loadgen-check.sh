@@ -12,6 +12,13 @@
 # container draws the rare order_credit_card visit first and then every 30 minutes, so the
 # default M of 35 covers two of its draws and the flag-off window one.
 #
+# One build: loadgen's image must be built (or, for a registry image, pulled) before the run.
+# Before changing anything, the run resolves that image, loadgen's image key in the compose
+# files or Compose's default name PROJECT-loadgen for a build-only service, and the id of its
+# local copy, and fails when it is missing. Every recreate of loadgen then neither builds nor
+# pulls, and each window checks that its new container runs that image id. Every Docker call has
+# a hard time limit, and the db container's client a login and a query timeout.
+#
 # Usage: scripts/portfolio-insights/loadgen-check.sh --project NAME [--base-url URL]
 #            [--compose-file FILE]... [--weight N] [--minutes M] [--out FILE]
 #        scripts/portfolio-insights/loadgen-check.sh --project NAME [--base-url URL]
@@ -41,7 +48,10 @@
 # refusal names the holding run and says when that run has ended; a lock left by a run killed
 # before its cleanup is removed by hand once no run on the project is active. Never run it
 # alongside e2e.sh or perf.sh: all three toggle the same flag, and perf.sh stops loadgen to
-# measure with no visit running.
+# measure with no visit running. Once readiness passes, and before it reads anything else through
+# --base-url or changes the flag or loadgen, setup checks that --base-url is served by the reverse
+# proxy of --project: a probe request through it must show in that project's reverse-proxy log,
+# or the run stops there.
 #
 # What it touches: it toggles only portfolio-insights-enabled and restores it. It recreates
 # loadgen with the weight passed through Compose interpolation of the existing
@@ -142,21 +152,35 @@ LOG_SKEW_MARGIN_SECONDS=30
 # LOG_PROBE_KILL_SECONDS before the limit and KILL at it.
 LOG_PROBE_TIMEOUT_SECONDS=120
 LOG_PROBE_KILL_SECONDS=5
-# The hard limit, termination included as for log reads, of every other Docker call setup's
-# restorability check, the drains and the EXIT cleanup make: pausing, unpausing, stopping and
-# killing loadgen (pause_loadgen, unpause_loadgen, stop_loadgen, kill_loadgen), restoring it
-# (restore_loadgen), reading container state (running_services, container_env,
-# container_env_entry, loadgen_state, loadgen_identity, loadgen_run_state), reading what a
-# recreate would give loadgen (predicted_loadgen_hash, loadgen_declares_weight, image_id_of), and
-# creating, listing, reading and removing the twin loadgen container the restorability check
-# compares loadgen with (create_loadgen_twin, loadgen_container_ids, container_snapshot,
-# remove_loadgen_twin), wherever those functions run. Inside a drain, run B's or the one of the
-# loadgen found at start, a pause, unpause or kill takes the time left before the drain's deadline
-# instead when that is shorter, and none starts with no time left, so the drain ends by
-# QUIESCE_TIMEOUT_SECONDS; the stop that follows it and the EXIT cleanup's calls each keep this
-# bound of their own. Each takes seconds on a healthy engine. A call cut off is reported, and
-# cleanup carries on with its other steps.
+# The hard limit, termination included as for log reads, of every Docker call other than a log
+# read, loadgen's or the target check's of the reverse proxy: the compose plugin probe
+# (check_tools), every other Compose call (compose, so config, the database exec and each recreate
+# of loadgen), pausing, unpausing, stopping and killing loadgen (pause_loadgen, unpause_loadgen,
+# stop_loadgen, kill_loadgen), restoring it (restore_loadgen), reading image and container state
+# (resolve_loadgen_image, running_services, container_env, container_env_entry, container_image,
+# loadgen_state, loadgen_identity, loadgen_run_state), reading what a recreate would give loadgen
+# (predicted_loadgen_hash, loadgen_declares_weight, image_id_of), and creating, listing, reading
+# and removing the twin loadgen container setup's restorability check compares loadgen with
+# (create_loadgen_twin, loadgen_container_ids, container_snapshot, remove_loadgen_twin), wherever
+# those functions run. Inside a drain, run B's or the one of the loadgen found at start, a pause,
+# unpause or kill takes the time left before the drain's deadline instead when that is shorter,
+# and none starts with no time left, so the drain ends by QUIESCE_TIMEOUT_SECONDS; the stop that
+# follows it and the EXIT cleanup's calls each keep this bound of their own. Each takes seconds on
+# a healthy engine; a recreate neither builds nor pulls. A call cut off is reported, and cleanup
+# carries on with its other steps.
 DOCKER_CALL_TIMEOUT_SECONDS=60
+# The target check reads the project's reverse-proxy log for its two probe lines every
+# TARGET_STEP_SECONDS until TARGET_TIMEOUT_SECONDS have passed. nginx logs a request as it
+# answers it, so a line Docker already holds needs no longer.
+TARGET_TIMEOUT_SECONDS=30
+TARGET_STEP_SECONDS=2
+# The db container's client ends a count query by itself within these limits, the login's and
+# the query's, so a query whose docker CLI was cut off at DOCKER_CALL_TIMEOUT_SECONDS does not
+# run on in the database. Their sum, plus LOG_PROBE_KILL_SECONDS for the end of a sqlcmd that
+# hangs after its timeout (db_query), stays below DOCKER_CALL_TIMEOUT_SECONDS minus
+# LOG_PROBE_KILL_SECONDS, so the client reports its own timeout before the CLI gets TERM.
+DB_LOGIN_TIMEOUT_SECONDS=15
+DB_QUERY_TIMEOUT_SECONDS=30
 # The root of the per-project run lock (acquire_run_lock): /tmp, not TMPDIR, so every run on this
 # host finds the lock another run holds, whatever TMPDIR each was given.
 LOCK_ROOT="/tmp"
@@ -242,6 +266,7 @@ included: it holds the lock directory /tmp/pi-loadgen-check.NAME.lock until it e
 second invocation on the same project is refused while the first holds it. Remove a lock a
 killed run left behind only once no run on that project is active. Run one project at a time,
 never alongside e2e.sh or perf.sh.
+Build loadgen's image first: every window recreates loadgen from it, never building or pulling.
 EOF
 }
 
@@ -440,7 +465,7 @@ parse_options() {
 }
 
 check_tools() {
-    local tool missing=""
+    local tool missing="" rc=0
     for tool in bash curl jq docker timeout; do
         if ! command -v "$tool" >/dev/null 2>&1; then
             missing="$missing $tool"
@@ -450,10 +475,19 @@ check_tools() {
         echo "Missing required tools:$missing" >&2
         exit 2
     fi
-    if ! docker compose version >/dev/null 2>&1 </dev/null; then
-        echo "The docker compose plugin is required (docker compose version failed)." >&2
-        exit 2
-    fi
+    # Bounded like every other Docker call, so an engine that never answers ends the run here.
+    hard_timeout "$DOCKER_CALL_TIMEOUT_SECONDS" docker compose version >/dev/null 2>&1 </dev/null || rc=$?
+    case "$rc" in
+        0) ;;
+        124 | 137)
+            echo "The docker compose plugin is required: docker compose version timed out after $DOCKER_CALL_TIMEOUT_SECONDS s (Docker did not answer)." >&2
+            exit 2
+            ;;
+        *)
+            echo "The docker compose plugin is required (docker compose version failed)." >&2
+            exit 2
+            ;;
+    esac
 }
 
 # ---------------------------------------------------------------------------------------------
@@ -618,10 +652,11 @@ join_lines() {
 # ---------------------------------------------------------------------------------------------
 # Docker, times and logs
 
-# Arguments must reach docker unchanged: Git Bash would rewrite path-like ones to Windows paths.
-# stdin is detached so docker never consumes the input of a surrounding read loop.
+# compose ARGS...: docker compose ARGS for the project and its compose files, bounded as every
+# Docker call is: compose_within with DOCKER_CALL_TIMEOUT_SECONDS, so the call has ended within
+# that limit, with status 124 or 137 when the limit cut it off.
 compose() {
-    MSYS_NO_PATHCONV=1 docker compose -p "$PROJECT" "${COMPOSE_ARGS[@]}" "$@" </dev/null
+    compose_within "$DOCKER_CALL_TIMEOUT_SECONDS" "$@"
 }
 
 # hard_timeout LIMIT PROGRAM [ARGS...]: runs PROGRAM under timeout(1) so that it has ended,
@@ -648,9 +683,11 @@ docker_problem() {
     esac
 }
 
-# compose_within LIMIT ARGS...: compose ARGS run by hard_timeout, so the call has ended within
-# LIMIT seconds, with status 124 or 137 when the limit cut it off. compose() cannot run under
-# timeout(1), which needs a program, so its settings are repeated.
+# compose_within LIMIT ARGS...: docker compose ARGS for the project and its compose files, run by
+# hard_timeout, so the call has ended within LIMIT seconds, with status 124 or 137 when the limit
+# cut it off. Arguments reach docker unchanged: Git Bash would rewrite path-like ones to Windows
+# paths, which hard_timeout prevents. stdin is detached so docker never consumes the input of a
+# surrounding read loop.
 compose_within() {
     local limit="$1"
     shift
@@ -660,19 +697,16 @@ compose_within() {
 # recreate_loadgen WEIGHT [START [LIMIT]]: recreates loadgen alone with
 # PORTFOLIO_INSIGHTS_ALERT_WEIGHT=WEIGHT, started when START is -d (the default) and only created
 # when it is --no-start. The value reaches only this command, where it overrides the shell and
-# .env for Compose's interpolation of the declaration both compose files carry. With LIMIT, as
-# restore_loadgen calls it, the call has ended within LIMIT seconds (compose_within), with status
-# 124 or 137 when cut off, and neither builds nor pulls: the container gets the local image its
-# image reference names, the one check_loadgen_restorable found it running. Without it, as when a
-# window opens and Compose may first have to build or pull the image, the call is not bounded.
+# .env for Compose's interpolation of the declaration both compose files carry. Compose neither
+# builds nor pulls: the container gets the local image its image reference names, the one
+# resolve_loadgen_image pinned (LOADGEN_IMAGE), so every window runs that one build, and the one
+# check_loadgen_restorable found the loadgen at start running, so a restore gives it back. A
+# missing image fails the call. The call has ended within LIMIT seconds, DOCKER_CALL_TIMEOUT_SECONDS
+# by default (compose_within), whether a window opens or restore_loadgen recreates loadgen, with
+# status 124 or 137 when cut off.
 recreate_loadgen() {
-    if [[ -n "${3:-}" ]]; then
-        PORTFOLIO_INSIGHTS_ALERT_WEIGHT="$1" compose_within "$3" up "${2:--d}" --no-deps --force-recreate \
-            --no-build --pull never loadgen >>"$RUN_DIR/compose.log" 2>&1
-    else
-        PORTFOLIO_INSIGHTS_ALERT_WEIGHT="$1" compose up "${2:--d}" --no-deps --force-recreate loadgen \
-            >>"$RUN_DIR/compose.log" 2>&1
-    fi
+    PORTFOLIO_INSIGHTS_ALERT_WEIGHT="$1" compose_within "${3:-$DOCKER_CALL_TIMEOUT_SECONDS}" up "${2:--d}" \
+        --no-deps --force-recreate --no-build --pull never loadgen >>"$RUN_DIR/compose.log" 2>&1
 }
 
 # restore_loadgen: puts loadgen back as setup recorded it in LOADGEN_AT_START,
@@ -855,6 +889,21 @@ container_env_entry() {
             2>>"$RUN_DIR/compose.log")" || return
     entry="$(printf '%s' "$encoded" | tr -d '\r\n' | base64 -d && printf x)" || return 1
     printf '%s' "${entry%x}"
+}
+
+# container_image SERVICE: the id of the image the service's container was created from, as
+# docker inspect gives it, which is the id docker image inspect gives that image. Fails when the
+# service has no container or a Docker call fails. Each Docker call has ended within
+# DOCKER_CALL_TIMEOUT_SECONDS (hard_timeout); one cut off fails the function with 124 or 137.
+container_image() {
+    local cid
+    cid="$(compose_within "$DOCKER_CALL_TIMEOUT_SECONDS" ps -a -q "$1" 2>>"$RUN_DIR/compose.log" |
+        tr -d '\r' | sed -n '1p')" || return
+    if [[ -z "$cid" ]]; then
+        return 1
+    fi
+    hard_timeout "$DOCKER_CALL_TIMEOUT_SECONDS" docker inspect --format '{{.Image}}' "$cid" </dev/null \
+        2>>"$RUN_DIR/compose.log" | tr -d '\r'
 }
 
 # loadgen_state: loadgen's container as setup records it and restore_loadgen verifies it, either
@@ -1931,17 +1980,25 @@ own_unresolved() {
 # line per row, lower-cased, without carriage returns or blank lines. A SQL error exits
 # non-zero. The SA password expands inside the container from its own SA_PASSWORD, so it never
 # appears on the host, in this script or in its output; PostgreSQL uses the container's local
-# postgres role.
+# postgres role. The exec has ended within DOCKER_CALL_TIMEOUT_SECONDS (compose), with status 124
+# or 137 when cut off, and the client itself gives up after DB_LOGIN_TIMEOUT_SECONDS to log in
+# and DB_QUERY_TIMEOUT_SECONDS to run the query, so no query outlives the call. sqlcmd cancels a
+# query at its timeout and prints "Timeout expired", but then never exits, so the container's
+# timeout(1) kills it LOG_PROBE_KILL_SECONDS after both timeouts could have passed, still before
+# the exec's own limit; that kill is reported as the client's failure, not as a cut-off call.
 db_query() {
+    local client_limit=$((DB_LOGIN_TIMEOUT_SECONDS + DB_QUERY_TIMEOUT_SECONDS + LOG_PROBE_KILL_SECONDS))
     case "$DIALECT" in
         mssql)
-            # shellcheck disable=SC2016 # $SA_PASSWORD and $1 expand in the container's shell.
+            # shellcheck disable=SC2016 # $SA_PASSWORD, $1 and $rc expand in the container's shell.
             compose exec -T db sh -c \
-                '/opt/mssql-tools/bin/sqlcmd -S localhost -U sa -P "$SA_PASSWORD" -d TradeManagement -b -h -1 -W -Q "$1"' \
+                'timeout -s KILL '"$client_limit"' /opt/mssql-tools/bin/sqlcmd -S localhost -U sa -P "$SA_PASSWORD" -d TradeManagement -l '"$DB_LOGIN_TIMEOUT_SECONDS"' -t '"$DB_QUERY_TIMEOUT_SECONDS"' -b -h -1 -W -Q "$1"; rc=$?; if [ "$rc" -eq 137 ]; then echo "sqlcmd had not exited '"$client_limit"' s after it started" >&2; rc=1; fi; exit "$rc"' \
                 sh "SET NOCOUNT ON; $1"
             ;;
         postgres)
-            compose exec -T db psql -v ON_ERROR_STOP=1 -U postgres -d TradeManagement -At -F , -c "$1"
+            compose exec -T db psql -v ON_ERROR_STOP=1 -U postgres \
+                -d "dbname=TradeManagement connect_timeout=$DB_LOGIN_TIMEOUT_SECONDS options='-c statement_timeout=${DB_QUERY_TIMEOUT_SECONDS}000'" \
+                -At -F , -c "$1"
             ;;
         *)
             echo "unknown dialect [$DIALECT]" >&2
@@ -1950,21 +2007,23 @@ db_query() {
     esac 2>>"$RUN_DIR/db-error.log" | tr -d '\r' | lower | sed '/^[[:space:]]*$/d'
 }
 
-# db_count_chunk 'ID'...: the number of Alerts rows whose Id is one of the quoted ids.
+# db_count_chunk 'ID'...: the number of Alerts rows whose Id is one of the quoted ids. A failed
+# query exits with db_query's status, 124 or 137 when the call was cut off.
 db_count_chunk() {
-    local list sql out
+    local list sql out rc=0
     list="$(IFS=,; echo "$*")"
     if [[ "$DIALECT" == "mssql" ]]; then
         sql="SELECT COUNT(*) FROM [dbo].[Alerts] WHERE [Id] IN ($list)"
     else
         sql="SELECT COUNT(*) FROM \"Alerts\" WHERE \"Id\" IN ($list)"
     fi
-    if ! out="$(db_query "$sql")"; then
+    out="$(db_query "$sql")" || rc=$?
+    if [[ $rc -ne 0 ]]; then
         # sqlcmd reports SQL errors on stdout, so a failed query's output joins the error log.
         if [[ -n "$out" ]]; then
             printf '%s\n' "$out" >>"$RUN_DIR/db-error.log"
         fi
-        return 1
+        return "$rc"
     fi
     if [[ ! "$out" =~ ^[0-9]+$ ]]; then
         echo "unexpected count output [$out]" >>"$RUN_DIR/db-error.log"
@@ -1977,7 +2036,7 @@ db_count_chunk() {
 # one id per line, counted ID_CHUNK_SIZE ids per query. Each id must be a canonical lower-case
 # UUID before it is written into the SQL as a quoted literal. Sets DB_ERROR on failure.
 db_count_ids() {
-    local id n
+    local id n rc=0
     local -a chunk=()
     DB_COUNT=0
     DB_ERROR=""
@@ -1991,8 +2050,9 @@ db_count_ids() {
         fi
         chunk+=("'$id'")
         if [[ ${#chunk[@]} -ge $ID_CHUNK_SIZE ]]; then
-            if ! n="$(db_count_chunk "${chunk[@]}")"; then
-                DB_ERROR="count query failed: $(tail -n 3 "$RUN_DIR/db-error.log" | join_lines)"
+            n="$(db_count_chunk "${chunk[@]}")" || rc=$?
+            if [[ $rc -ne 0 ]]; then
+                db_count_error "$rc"
                 return 1
             fi
             DB_COUNT=$((DB_COUNT + n))
@@ -2000,12 +2060,23 @@ db_count_ids() {
         fi
     done <"$1"
     if [[ ${#chunk[@]} -gt 0 ]]; then
-        if ! n="$(db_count_chunk "${chunk[@]}")"; then
-            DB_ERROR="count query failed: $(tail -n 3 "$RUN_DIR/db-error.log" | join_lines)"
+        n="$(db_count_chunk "${chunk[@]}")" || rc=$?
+        if [[ $rc -ne 0 ]]; then
+            db_count_error "$rc"
             return 1
         fi
         DB_COUNT=$((DB_COUNT + n))
     fi
+}
+
+# db_count_error STATUS: sets DB_ERROR for a count query that ended with STATUS, telling a query
+# Docker did not answer within DOCKER_CALL_TIMEOUT_SECONDS from one the client failed, its own
+# timeouts included, whose last error lines it quotes.
+db_count_error() {
+    case "$1" in
+        124 | 137) DB_ERROR="$(docker_problem "count query" "$1" "$DOCKER_CALL_TIMEOUT_SECONDS")" ;;
+        *) DB_ERROR="count query failed: $(tail -n 3 "$RUN_DIR/db-error.log" | join_lines)" ;;
+    esac
 }
 
 
@@ -2045,26 +2116,40 @@ set_flag() {
 
 # open_window PREFIX LABEL WEIGHT: recreates loadgen with WEIGHT and opens the log window of
 # phase LABEL at T = now (WINDOW_START, WINDOW_START_EPOCH). PASS "PREFIX loadgen weight" once
-# the new container carries WEIGHT.
+# the new container carries WEIGHT, and PASS "PREFIX loadgen image" once it runs the image
+# setup resolved (LOADGEN_IMAGE_ID), so every window provably runs one build. Either check
+# failing ends the run, naming a Docker call that did not answer in time.
 open_window() {
-    local prefix="$1" label="$2" weight="$3" actual
+    local prefix="$1" label="$2" weight="$3" actual image rc=0
     WINDOW_LABEL="$label"
     WINDOW_START_EPOCH="$(date -u +%s)"
     WINDOW_START="$(epoch_to_rfc3339 "$WINDOW_START_EPOCH")"
     WINDOW_SINCE="$(epoch_to_rfc3339 $((WINDOW_START_EPOCH - LOG_SKEW_MARGIN_SECONDS)))"
     LOADGEN_TOUCHED=1
     WINDOW_OPEN=1
-    if ! recreate_loadgen "$weight"; then
-        abort "$prefix loadgen weight" "recreating loadgen with weight $weight failed (see $RUN_DIR/compose.log)"
+    recreate_loadgen "$weight" || rc=$?
+    if [[ $rc -ne 0 ]]; then
+        abort "$prefix loadgen weight" "$(docker_problem "recreating loadgen with weight $weight" "$rc" "$DOCKER_CALL_TIMEOUT_SECONDS")"
     fi
     # The x keeps a trailing line feed of the value; printf %q prints a value with control
     # characters on one line, as $'...'.
-    actual="$(container_env loadgen PORTFOLIO_INSIGHTS_ALERT_WEIGHT && printf x)" || actual=""
+    actual="$(container_env loadgen PORTFOLIO_INSIGHTS_ALERT_WEIGHT && printf x)" || rc=$?
+    if [[ $rc -ne 0 ]]; then
+        abort "$prefix loadgen weight" "$(docker_problem "reading the recreated loadgen's PORTFOLIO_INSIGHTS_ALERT_WEIGHT" "$rc" "$DOCKER_CALL_TIMEOUT_SECONDS")"
+    fi
     actual="${actual%x}"
     if [[ "$actual" != "$weight" ]]; then
         abort "$prefix loadgen weight" "the recreated container has PORTFOLIO_INSIGHTS_ALERT_WEIGHT [${actual:+$(printf '%q' "$actual")}], expected [$weight]"
     fi
     pass "$prefix loadgen weight: $weight"
+    image="$(container_image loadgen)" || rc=$?
+    if [[ $rc -ne 0 ]]; then
+        abort "$prefix loadgen image" "$(docker_problem "reading the recreated loadgen's image" "$rc" "$DOCKER_CALL_TIMEOUT_SECONDS")"
+    fi
+    if [[ "$image" != "$LOADGEN_IMAGE_ID" ]]; then
+        abort "$prefix loadgen image" "the recreated container runs image [${image:+$(printf '%q' "$image")}], expected [$LOADGEN_IMAGE_ID] of $LOADGEN_IMAGE as setup resolved it"
+    fi
+    pass "$prefix loadgen image: $LOADGEN_IMAGE_ID"
 }
 
 # close_window [STOPPED]: stops loadgen, unless STOPPED is 1 because the caller has already
@@ -2427,6 +2512,118 @@ readiness_once() {
     [[ $ok -eq 1 ]]
 }
 
+# verify_target_project CHECK: proves, read-only and before the run changes anything, that
+# BASE_URL is served by the reverse-proxy service of PROJECT, so every request through BASE_URL
+# and every Docker call of the run address one stack. It sends both readyz endpoints a GET whose
+# query carries a nonce of 16 random bytes, then reads the project's reverse-proxy log for an
+# access line of each request with status 200. The log is read every TARGET_STEP_SECONDS until
+# TARGET_TIMEOUT_SECONDS have passed, each read bounded by the smaller of
+# LOG_PROBE_TIMEOUT_SECONDS and the time left, and none started once that time is up. Both lines
+# found: PASS CHECK. Otherwise FAIL CHECK, and abort ends the run: no nonce, a probe that does
+# not answer 200, a log read that fails, a log read cut off at its own bound
+# LOG_PROBE_TIMEOUT_SECONDS or before Docker answered any read of the check (Docker did not
+# answer), or no such line by the deadline, as when BASE_URL belongs to another stack. Only once
+# Docker has answered a read without both lines does a later read bounded by the time left and
+# cut off mean the deadline passed rather than that Docker did not answer: it ends the check
+# with the no-such-line reason, noting the cut-off. No reason quotes the log or a response. The
+# text is identical in e2e.sh, perf.sh and loadgen-check.sh.
+verify_target_project() {
+    local check="$1" nonce since path deadline left limit lines line rest found rc cut="" answered=0
+    local status_re='^[0-9.]+" 200 '
+    if ! nonce="$(od -An -N16 -tx1 /dev/urandom 2>/dev/null | tr -d ' \r\n')" ||
+        [[ ! "$nonce" =~ ^[0-9a-f]{32}$ ]]; then
+        abort "$check" "no probe generated: /dev/urandom did not supply 16 random bytes"
+    fi
+    since="$(epoch_to_rfc3339 $(($(date -u +%s) - LOG_SKEW_MARGIN_SECONDS)))"
+    for path in broker-service/readyz feature-flag-service/readyz; do
+        http GET "$BASE_URL/$path?pi-target=$nonce"
+        if [[ "$HTTP_STATUS" != "200" ]]; then
+            abort "$check" "the probe GET /$path gave $(status_text), expected status 200"
+        fi
+    done
+    deadline=$((SECONDS + TARGET_TIMEOUT_SECONDS))
+    while :; do
+        left=$((deadline - SECONDS))
+        if [[ $left -le 0 ]]; then
+            break
+        fi
+        limit="$LOG_PROBE_TIMEOUT_SECONDS"
+        if [[ $left -lt $limit ]]; then
+            limit="$left"
+        fi
+        rc=0
+        lines="$(compose_within "$limit" logs --no-color --no-log-prefix --since "$since" reverse-proxy \
+            2>>"$RUN_DIR/compose.log" | sed "s/$(printf '\033')\[[0-9;]*m//g" | tr -d '\r' |
+            { grep -F "pi-target=$nonce" || true; })" || rc=$?
+        if [[ $rc -ne 0 ]]; then
+            # Cut off at the time left rather than at its own bound, after Docker answered an
+            # earlier read: the deadline, not Docker, ended the read, and no read follows it.
+            # With no read answered yet, Docker has not answered within the check's deadline.
+            if [[ $answered -eq 1 && $limit -lt $LOG_PROBE_TIMEOUT_SECONDS && ($rc -eq 124 || $rc -eq 137) ]]; then
+                cut=", and the last log read was cut off at the deadline"
+                break
+            fi
+            abort "$check" "$(docker_problem "reading the reverse-proxy log of project [$PROJECT]" "$rc" "$limit")"
+        fi
+        answered=1
+        found=0
+        for path in broker-service/readyz feature-flag-service/readyz; do
+            while IFS= read -r line; do
+                rest="${line#*"\"GET /$path?pi-target=$nonce HTTP/"}"
+                if [[ "$rest" != "$line" && "$rest" =~ $status_re ]]; then
+                    found=$((found + 1))
+                    break
+                fi
+            done <<<"$lines"
+        done
+        if [[ $found -eq 2 ]]; then
+            pass "$check"
+            info "base url $BASE_URL is served by the reverse-proxy of project [$PROJECT]"
+            return 0
+        fi
+        if [[ $((SECONDS + TARGET_STEP_SECONDS)) -ge $deadline ]]; then
+            break
+        fi
+        sleep "$TARGET_STEP_SECONDS"
+    done
+    abort "$check" "base url $BASE_URL is not served by the reverse-proxy of project [$PROJECT]: its log shows no request carrying this run's probe within $TARGET_TIMEOUT_SECONDS s$cut; give the --base-url and --project of one stack"
+}
+
+# resolve_loadgen_image: the one build every window runs. Sets LOADGEN_IMAGE to the image Compose
+# runs loadgen from, loadgen's image key in the resolved compose files or, for a service that only
+# declares build, Compose's default name PROJECT-loadgen, and LOADGEN_IMAGE_ID to the id of its
+# local copy. PASS "loadgen image" with both printed as INFO; otherwise the run ends with FAIL
+# "loadgen image" before anything is changed. The image must be built, or pulled, before the
+# run: no recreate builds or pulls it. Each Docker call has ended within
+# DOCKER_CALL_TIMEOUT_SECONDS (compose, image_id_of), and a call Docker did not answer in time is
+# named as such.
+resolve_loadgen_image() {
+    local config image_id problem rc=0
+    config="$(compose config --format json 2>>"$RUN_DIR/compose.log")" || rc=$?
+    if [[ $rc -ne 0 ]]; then
+        abort "loadgen image" "$(docker_problem "docker compose config --format json for project [$PROJECT]" "$rc" "$DOCKER_CALL_TIMEOUT_SECONDS")"
+    fi
+    LOADGEN_IMAGE="$(jq -r '.services.loadgen.image // ((.name // empty) + "-loadgen")' 2>/dev/null <<<"$config" |
+        tr -d '\r')" || LOADGEN_IMAGE=""
+    if [[ -z "$LOADGEN_IMAGE" || "$LOADGEN_IMAGE" == *$'\n'* ]]; then
+        abort "loadgen image" "docker compose config for project [$PROJECT] names no image for loadgen"
+    fi
+    image_id="$(image_id_of "$LOADGEN_IMAGE")" || rc=$?
+    if [[ $rc -ne 0 ]]; then
+        problem="$(docker_problem "docker image inspect of [$(printf '%q' "$LOADGEN_IMAGE")]" "$rc" "$DOCKER_CALL_TIMEOUT_SECONDS")"
+        if [[ $rc -ne 124 && $rc -ne 137 ]]; then
+            problem="$problem; build or pull that image before the run: every recreate of loadgen uses the local image, never building or pulling it"
+        fi
+        abort "loadgen image" "$problem"
+    fi
+    if [[ ! "$image_id" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+        abort "loadgen image" "docker image inspect gave id [${image_id:+$(printf '%q' "$image_id")}] for image [$(printf '%q' "$LOADGEN_IMAGE")], expected sha256: and 64 hex digits"
+    fi
+    LOADGEN_IMAGE_ID="$image_id"
+    pass "loadgen image"
+    info "loadgen image $LOADGEN_IMAGE, id $LOADGEN_IMAGE_ID: every window recreates loadgen from it, without building or pulling"
+}
+
 # The run lock: one invocation per Compose project runs at a time. setup, or resume_cleanup for a
 # --resume-cleanup, takes it with mkdir, which creates the directory or fails in one step, so of
 # two invocations on one project only one gets it and the other stops before it records a
@@ -2516,9 +2713,10 @@ release_run_lock() {
 }
 
 setup() {
-    local defined required running missing="" service state_rc=0
-    if ! defined="$(compose config --services 2>>"$RUN_DIR/compose.log" | tr -d '\r')"; then
-        abort "readiness" "docker compose config failed for project [$PROJECT] (see $RUN_DIR/compose.log)"
+    local defined required running missing="" service state_rc=0 config_rc=0 running_rc=0 dialect_rc=0
+    defined="$(compose config --services 2>>"$RUN_DIR/compose.log" | tr -d '\r')" || config_rc=$?
+    if [[ $config_rc -ne 0 ]]; then
+        abort "readiness" "$(docker_problem "docker compose config for project [$PROJECT]" "$config_rc" "$DOCKER_CALL_TIMEOUT_SECONDS")"
     fi
     # Before anything is recorded or changed: a run that finds the project's lock held stops here,
     # so it never takes another run's test settings for the state to restore.
@@ -2533,7 +2731,12 @@ setup() {
         grep -vxF loadgen <<<"$defined" || true
         tr ' ' '\n' <<<"$CORE_SERVICES"
     } | LC_ALL=C sort -u | join_lines)"
-    running="$(running_services)" || running=""
+    # A Docker call that fails or is cut off ends the run with a reason of its own, never read as
+    # a list of no services or as an unset setting, and before any change to the stack.
+    running="$(running_services)" || running_rc=$?
+    if [[ $running_rc -ne 0 ]]; then
+        abort "readiness" "$(docker_problem "listing the running services of project [$PROJECT]" "$running_rc" "$DOCKER_CALL_TIMEOUT_SECONDS")"
+    fi
     for service in $required; do
         if ! grep -qxF "$service" <<<"$running"; then
             missing="$missing $service"
@@ -2552,22 +2755,34 @@ setup() {
     if [[ "$LOADGEN_AT_START" == running,* ]]; then
         LOADGEN_WAS_RUNNING=1
     fi
-    # A loadgen that cleanup could not put back as it is ends the run here, before any change.
+    # A loadgen that cleanup could not put back as it is ends the run here, before any change. It
+    # sends no request through --base-url and reaches only the containers of --project, leaving
+    # them as they were, so it needs no target check first.
     check_loadgen_restorable
     if ! poll "readiness" "$READY_TIMEOUT_SECONDS" "$READY_STEP_SECONDS" readiness_once; then
         exit 1
     fi
     pass "readiness"
+    # Before the runtime facts, the image, the flag read and any flag switch or recreate: the base
+    # URL must be this project's reverse proxy.
+    verify_target_project "target project"
 
     # The x keeps a trailing line feed of the value; printf %q prints a value with control
-    # characters on one line, as $'...'.
-    DIALECT="$(container_env db-adapter DB_TYPE && printf x)" || DIALECT=""
+    # characters on one line, as $'...'. Only a value read successfully, set or not, is judged:
+    # a failed read stops the run before the flag is read or loadgen recreated.
+    DIALECT="$(container_env db-adapter DB_TYPE && printf x)" || dialect_rc=$?
+    if [[ $dialect_rc -ne 0 ]]; then
+        DIALECT=""
+        abort "runtime facts" "$(docker_problem "reading DB_TYPE from the db-adapter container of project [$PROJECT]" "$dialect_rc" "$DOCKER_CALL_TIMEOUT_SECONDS")"
+    fi
     DIALECT="${DIALECT%x}"
     if [[ "$DIALECT" != "mssql" && "$DIALECT" != "postgres" ]]; then
         abort "runtime facts" "db-adapter DB_TYPE is [${DIALECT:+$(printf '%q' "$DIALECT")}], expected mssql or postgres"
     fi
     pass "runtime facts"
     info "db type $DIALECT; loadgen at start: $(loadgen_state_text "$LOADGEN_AT_START")"
+
+    resolve_loadgen_image
 
     # Only a reply that is the flag (flag_reply) sets the value cleanup restores, and a failure
     # names the broken rule, never the reply's content.
@@ -3797,6 +4012,9 @@ main() {
     LOADGEN_CONFIG_AT_START=""
     LOADGEN_STARTED_AT=""
     RESTORE_ERROR=""
+    # The image every window runs, and its id, as setup resolves them.
+    LOADGEN_IMAGE=""
+    LOADGEN_IMAGE_ID=""
     # The container ID check_loadgen_restorable read for loadgen at start, the twin it compares
     # with while one may exist (its ID, or unknown before it is read), and remove_loadgen_twin's
     # and loadgen_twin_check's outcomes.

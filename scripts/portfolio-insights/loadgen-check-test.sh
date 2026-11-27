@@ -1437,6 +1437,10 @@ T_IMAGE_A="sha256:a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a7
 T_IMAGE_B="sha256:b2c3d4e5f6a7b2c3d4e5f6a7b2c3d4e5f6a7b2c3d4e5f6a7b2c3d4e5f6a7b8c9"
 T_IMAGE_REF="pi-test-loadgen"
 T_STARTED_AT="2026-01-01T00:00:00.123456789Z"
+# The recreate every window and the restore of a container that was running make, and the restore
+# of one stopped at start: loadgen alone, neither built nor pulled.
+T_UP_STARTED="up -d --no-deps --force-recreate --no-build --pull never loadgen"
+T_UP_CREATED="up --no-start --no-deps --force-recreate --no-build --pull never loadgen"
 
 # t_config_hash TOKEN: the 64-hex config hash the docker stub's Compose gives loadgen: a SHA-256 of
 # the other settings in $RUN_DIR/t-settings and TOKEN, the base64 of the weight value loadgen's
@@ -1495,9 +1499,12 @@ t_container_json() {
 }
 
 # t_loadgen_fixture CID RUNNING ENV [DECLARED]: a project whose loadgen container CID (none when
-# empty) runs when RUNNING is 1 and has the JSON environment ENV, answered by a docker stub. The
-# container runs T_IMAGE_A, created from T_IMAGE_REF, which names T_IMAGE_A (t-ref-image), and its
-# config-hash label is the t_config_hash of the settings in t-settings and its weight. Each
+# empty) runs when RUNNING is 1 and has the JSON environment ENV, answered by a docker stub, which
+# prints $RUN_DIR/t-proxy-log, when it exists, as the project's reverse-proxy log. Its compose
+# files declare loadgen by build only (config --format json), so the image setup resolves is
+# Compose's default name T_IMAGE_REF. The container runs T_IMAGE_A (t-image, which docker inspect
+# --format '{{.Image}}' prints), created from T_IMAGE_REF, which names T_IMAGE_A (t-ref-image), and
+# its config-hash label is the t_config_hash of the settings in t-settings and its weight. Each
 # compose up or rm of loadgen is logged to $RUN_DIR/docker-calls with the
 # PORTFOLIO_INSIGHTS_ALERT_WEIGHT it was called with, then applied: up makes a new container,
 # running for -d, that runs the image in t-ref-image with the config hash of the stub's Compose
@@ -1539,7 +1546,12 @@ t_loadgen_fixture() {
     : >"$RUN_DIR/docker-all"
     hard_timeout() {
         shift
-        "$@"
+        if [[ "$1" == "docker" ]]; then
+            shift
+            docker "$@"
+        else
+            "$@"
+        fi
     }
     docker() {
         local weight="${PORTFOLIO_INSIGHTS_ALERT_WEIGHT-(unset)}" cid twin
@@ -1583,6 +1595,8 @@ t_loadgen_fixture() {
             elif [[ -n "$twin" && "${*: -1}" == "$twin" && "$3" == "{{json .}}" &&
                 ! -f "$RUN_DIR/t-twin-inspect-fail" ]]; then
                 cat "$RUN_DIR/t-twin.json"
+            elif [[ -n "$cid" && "${*: -1}" == "$cid" && "$3" == "{{.Image}}" && ! -f "$RUN_DIR/t-inspect-fail" ]]; then
+                cat "$RUN_DIR/t-image"
             else
                 echo "Error: No such object: ${*: -1}" >&2
                 return 1
@@ -1596,6 +1610,9 @@ t_loadgen_fixture() {
         case "$*" in
             "config --services")
                 printf '%s\n' broker-service db db-adapter feature-flag-service loadgen reverse-proxy
+                ;;
+            "config --format json")
+                echo '{"name":"pi-test","services":{"loadgen":{"build":{"context":"src/loadgen"}}}}'
                 ;;
             "config --hash loadgen")
                 if [[ -f "$RUN_DIR/t-config-fail" ]]; then
@@ -1635,6 +1652,11 @@ t_loadgen_fixture() {
                     echo "$twin"
                 fi
                 ;;
+            "logs --no-color --no-log-prefix --since "*" reverse-proxy")
+                if [[ -f "$RUN_DIR/t-proxy-log" ]]; then
+                    cat "$RUN_DIR/t-proxy-log"
+                fi
+                ;;
             # check_loadgen_restorable's twin, created without starting it as Compose creates loadgen
             # now, with the weight it is called with.
             "up --no-start --no-deps --no-recreate --no-build --pull never --scale loadgen=2 loadgen")
@@ -1661,12 +1683,9 @@ t_loadgen_fixture() {
                     return 1
                 fi
                 ;;
-            # A window's recreate, and restore_loadgen's bounded recreates, which neither build nor
-            # pull.
-            "up -d --no-deps --force-recreate loadgen" | \
-                "up -d --no-deps --force-recreate --no-build --pull never loadgen" | \
-                "up --no-start --no-deps --force-recreate --no-build --pull never loadgen" | \
-                "rm --force --stop loadgen")
+            # A window's recreate and restore_loadgen's, both bounded and neither building nor
+            # pulling, and the removal of a container the run created.
+            "$T_UP_STARTED" | "$T_UP_CREATED" | "rm --force --stop loadgen")
                 echo "$* | weight $weight" >>"$RUN_DIR/docker-calls"
                 if [[ -f "$RUN_DIR/t-fail" ]]; then
                     echo "simulated compose failure" >&2
@@ -1707,12 +1726,20 @@ t_loadgen_fixture() {
 }
 
 # t_stub_flag_service: http answers 200 with the flag off and modifiable, as a ready stack does:
-# every field feature-flag-service serializes from flag/model.go's Flag.
+# every field feature-flag-service serializes from flag/model.go's Flag. Its reverse proxy logs
+# the access line of each target-check probe in $RUN_DIR/t-proxy-log, the log the docker stub
+# prints for the project's reverse-proxy.
 t_stub_flag_service() {
+    : >"$RUN_DIR/t-proxy-log"
     http() {
         HTTP_STATUS="200"
         HTTP_ERROR=""
         HTTP_BODY="{\"id\":\"$FLAG_ID\",\"enabled\":false,\"name\":\"Portfolio insights\",\"description\":\"Demo feature, not financial advice.\",\"isModifiable\":true,\"tag\":\"feature\"}"
+        # The request path follows the URL's origin, scheme and host.
+        if [[ "$2" == *"?pi-target="* ]]; then
+            printf '172.23.0.1 - [01/Jan/2026:00:00:00 +0000] "GET /%s HTTP/1.1" 200 2 "-" "curl/8.21.0"\n' \
+                "${2#*://*/}" >>"$RUN_DIR/t-proxy-log"
+        fi
     }
 }
 
@@ -1980,8 +2007,7 @@ test_restore_loadgen_runningWithWeight2_recreatesStartedWithWeight2() {
     recreate_loadgen 1
     restore_loadgen || rc=$?
     t_eq "restore_loadgen recreates loadgen started with its weight 2 after the run's weight 1, neither building nor pulling" \
-        "$(printf '%s\n' "up -d --no-deps --force-recreate loadgen | weight 1" \
-            "up -d --no-deps --force-recreate --no-build --pull never loadgen | weight 2")" "$(cat "$RUN_DIR/docker-calls")"
+        "$(printf '%s\n' "$T_UP_STARTED | weight 1" "$T_UP_STARTED | weight 2")" "$(cat "$RUN_DIR/docker-calls")"
     t_eq "restore_loadgen verifies loadgen running with weight 2" \
         "0 [] running, PORTFOLIO_INSIGHTS_ALERT_WEIGHT=2" "$rc [$RESTORE_ERROR] $(loadgen_state)"
     t_eq "restore_loadgen leaves loadgen with its image ID and config hash at start" \
@@ -1996,8 +2022,7 @@ test_restore_loadgen_stoppedWithWeight2_recreatesWithoutStarting() {
     recreate_loadgen 1
     restore_loadgen || rc=$?
     t_eq "restore_loadgen recreates a loadgen stopped at start with --no-start and weight 2" \
-        "up --no-start --no-deps --force-recreate --no-build --pull never loadgen | weight 2" \
-        "$(sed -n '2p' "$RUN_DIR/docker-calls")"
+        "$T_UP_CREATED | weight 2" "$(sed -n '2p' "$RUN_DIR/docker-calls")"
     t_eq "restore_loadgen verifies loadgen stopped with weight 2" \
         "0 [] stopped, PORTFOLIO_INSIGHTS_ALERT_WEIGHT=2" "$rc [$RESTORE_ERROR] $(loadgen_state)"
 }
@@ -2021,8 +2046,7 @@ test_restore_loadgen_weightUnsetAtStart_recreatesWithWeightUnset() {
     t_capture_start
     restore_loadgen || rc=$?
     t_eq "restore_loadgen recreates loadgen without the shell's weight, neither building nor pulling" \
-        "up -d --no-deps --force-recreate --no-build --pull never loadgen | weight (unset)" \
-        "$(cat "$RUN_DIR/docker-calls")"
+        "$T_UP_STARTED | weight (unset)" "$(cat "$RUN_DIR/docker-calls")"
     t_eq "restore_loadgen verifies loadgen running with the weight unset, leaving the shell's value" \
         "0 [] running, PORTFOLIO_INSIGHTS_ALERT_WEIGHT unset; shell 5" \
         "$rc [$RESTORE_ERROR] $(loadgen_state); shell $PORTFOLIO_INSIGHTS_ALERT_WEIGHT"
@@ -2446,6 +2470,37 @@ test_restore_loadgen_effectiveConfigurationDiffers_failsNamingEachField() {
             "up -d --no-deps --force-recreate --no-build --pull never loadgen | weight 2" \
             "$(sed -n '2p' "$RUN_DIR/docker-calls")"
     done
+}
+
+# ---------------------------------------------------------------------------------------------
+# One build across the windows (resolve_loadgen_image, open_window)
+
+test_open_window_runsAAndB_bothRunTheImageSetupPinned() {
+    unset PORTFOLIO_INSIGHTS_ALERT_WEIGHT
+    t_loadgen_fixture lg-1 1 "$T_WEIGHT_2"
+    resolve_loadgen_image
+    open_window "run A" A 0
+    open_window "run B" B 1
+    t_report_has "setup pins the build-only loadgen's default image name and its local id" \
+        "INFO loadgen image pi-test-loadgen, id $T_IMAGE_A: every window recreates loadgen from it, without building or pulling"
+    t_report_has "run A runs the pinned image" "PASS run A loadgen image: $T_IMAGE_A"
+    t_report_has "run B runs the same image" "PASS run B loadgen image: $T_IMAGE_A"
+    t_eq "both recreates neither build nor pull" \
+        "$(printf '%s\n' "$T_UP_STARTED | weight 0" "$T_UP_STARTED | weight 1")" "$(cat "$RUN_DIR/docker-calls")"
+}
+
+test_open_window_imageRebuiltBetweenRuns_failsRunBAndEndsRun() {
+    local rc=0
+    unset PORTFOLIO_INSIGHTS_ALERT_WEIGHT
+    t_loadgen_fixture lg-1 1 "$T_WEIGHT_2"
+    resolve_loadgen_image
+    open_window "run A" A 0
+    # The image is rebuilt under the same name while run A runs, so run B's recreate takes it.
+    t_image_rebuilt
+    (open_window "run B" B 1) >/dev/null 2>&1 || rc=$?
+    t_eq "run B's image check ends the run" 1 "$rc"
+    t_report_has "run B fails naming the image it got and the one setup pinned" \
+        "FAIL run B loadgen image: the recreated container runs image [$T_IMAGE_B], expected [$T_IMAGE_A] of pi-test-loadgen as setup resolved it"
 }
 
 # ---------------------------------------------------------------------------------------------

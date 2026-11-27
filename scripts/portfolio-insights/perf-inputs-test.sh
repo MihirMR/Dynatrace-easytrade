@@ -96,6 +96,17 @@ docker() {
     return 1
 }
 
+# timeout [-k GRACE | -s SIGNAL] LIMIT COMMAND [ARGS...]: perf.sh runs its Docker calls under
+# timeout(1), which would exec the docker program on PATH, never the function above, so this one
+# drops the options and the limit and runs COMMAND in this shell.
+timeout() {
+    while [[ "${1:-}" == -* ]]; do
+        shift 2
+    done
+    shift
+    "$@"
+}
+
 curl() {
     echo "curl $*" >>"$test_dir/unexpected"
     return 7
