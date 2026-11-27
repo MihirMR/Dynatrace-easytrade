@@ -158,13 +158,15 @@ load_values() {
     done
 }
 
-load_functions pass fail info abort http jget jitem jcount lower status_text describe_file \
-    body_snippet jcheck expect_forbidden own_alert own_if_created random_secret now_rfc3339 \
-    epoch_to_rfc3339 log_since_now remaining_owned delete_alert write_fixture signup \
-    step3_fixture step4_enable delete_remaining remove_private on_cleanup_signal cleanup \
-    on_signal restrict_private_dir flag_enabled media_type
+load_functions pass fail info abort transport_reason http jget jitem jcount lower status_text \
+    describe_file body_snippet jcheck expect_forbidden own_alert own_if_created random_secret \
+    now_rfc3339 epoch_to_rfc3339 log_since_now remaining_owned delete_alert write_fixture signup \
+    step3_fixture step4_enable delete_ids delete_remaining remove_private restore_run_stdout \
+    on_cleanup_signal cleanup on_signal restrict_private_dir journal_create settle_create \
+    post_create reconcile_creates response_kind flag_enabled media_type
 load_values FLAG_ID HTTP_TIMEOUT_SECONDS LOG_SKEW_MARGIN_SECONDS \
-    MAX_CONSECUTIVE_TRANSPORT_ERRORS PACKAGE_ID FORBIDDEN_BODY UUID_RE DEPOSIT_AMOUNT
+    MAX_CONSECUTIVE_TRANSPORT_ERRORS PACKAGE_ID FORBIDDEN_BODY UUID_RE PROBE_DEADLINE \
+    RUN_STDOUT_SAVED DEPOSIT_AMOUNT
 
 # Two passwords in random_secret's format, assembled here so no literal resembles a credential.
 SECRET_A="Pi-$(printf 'a1%.0s' {1..16})"
@@ -193,10 +195,12 @@ fresh_state() {
     PRIVATE_LEFT=""
     : >"$RUN_DIR/owned"
     : >"$RUN_DIR/deleted"
+    : >"$RUN_DIR/uncertain-creates"
     passed=0
     failed=0
     IN_CREATE=0
     PENDING_EXIT=""
+    UNJOURNALED_CREATES=0
     FLAG_INITIAL="false"
     FLAG_TOUCHED=0
     INTERVAL=60
@@ -644,7 +648,7 @@ scenario_http() {
 # name|status and error line http leaves|private file that must hold the response|length of
 # HTTP_BODY, the body without its NUL byte
 http_cases='response|STATUS 200 ERROR |body|20
-transportError|STATUS 000 ERROR curl: (7) Failed to connect to 127.0.0.1 port 9|curl-error|0'
+transportError|STATUS 000 ERROR curl exit 7: could not connect|curl-error|0'
 while IFS='|' read -r CURL_CASE status_line private_file body_length <&3; do
     check="http_${CURL_CASE}_keepsRawFilesInPrivateDirOnly"
     fresh_state
@@ -654,8 +658,8 @@ while IFS='|' read -r CURL_CASE status_line private_file body_length <&3; do
     if [[ ! -s "$PRIVATE_DIR/$private_file" ]]; then
         reasons+=("$PRIVATE_DIR/$private_file is missing or empty")
     fi
-    if [[ "$(entries "$RUN_DIR" '*')" != "deleted owned" || -n "$(entries "$RUN_DIR" '.[!.]*')" ]]; then
-        reasons+=("the run directory holds [$(entries "$RUN_DIR" '*') $(entries "$RUN_DIR" '.[!.]*')], expected only deleted and owned")
+    if [[ "$(entries "$RUN_DIR" '*')" != "deleted owned uncertain-creates" || -n "$(entries "$RUN_DIR" '.[!.]*')" ]]; then
+        reasons+=("the run directory holds [$(entries "$RUN_DIR" '*') $(entries "$RUN_DIR" '.[!.]*')], expected only deleted, owned and uncertain-creates")
     fi
     conclude "$check"
 
@@ -864,8 +868,8 @@ while IFS='|' read -r name format <&3; do
         reasons+=("HOLDER_INSIGHTS is not the response body step 5 reads")
     fi
     expect_absent "$RUN_DIR/insights-holder.json" "insights-holder.json"
-    if [[ "$(entries "$RUN_DIR" '*')" != "deleted owned" || -n "$(entries "$RUN_DIR" '.[!.]*')" ]]; then
-        reasons+=("the run directory holds [$(entries "$RUN_DIR" '*') $(entries "$RUN_DIR" '.[!.]*')], expected only deleted and owned")
+    if [[ "$(entries "$RUN_DIR" '*')" != "deleted owned uncertain-creates" || -n "$(entries "$RUN_DIR" '.[!.]*')" ]]; then
+        reasons+=("the run directory holds [$(entries "$RUN_DIR" '*') $(entries "$RUN_DIR" '.[!.]*')], expected only deleted, owned and uncertain-creates")
     fi
     conclude "$check"
 done 3<<<"$step4_cases"
@@ -920,7 +924,7 @@ scenario_cleanup() {
         interruptedDuringCleanup)
             http() {
                 kill -TERM "$BASHPID"
-                respond 200 application/json '{"enabled":true}'
+                respond 200 application/json '{"id":"portfolio-insights-enabled","enabled":true}'
             }
             echo "$ALERT_UUID" >"$RUN_DIR/owned"
             trap cleanup EXIT
@@ -940,7 +944,7 @@ scenario_cleanup() {
             }
             http() {
                 kill -TERM "$BASHPID"
-                respond 200 application/json '{"enabled":true}'
+                respond 200 application/json '{"id":"portfolio-insights-enabled","enabled":true}'
             }
             echo "$ALERT_UUID" >"$RUN_DIR/owned"
             trap cleanup EXIT
@@ -967,9 +971,16 @@ for cleanup_case in passingRun failedRun interruptedRun interruptedDuringCleanup
             expect_rc 1
             ;;
         interruptedRun)
-            check="cleanup_interruptedRun_removesFixtureAndExits130"
+            check="cleanup_interruptedRun_reportsInterruptRemovesFixtureAndExits130"
             expect_rc 130
             expect_no_line "$T/cleanup.out" "INFO not reached"
+            # The interrupt is a failure of its own, recorded once, which the SUMMARY counts.
+            expect_line "$T/cleanup.out" \
+                "FAIL interrupted: signal received between steps; any step not yet started did not run"
+            expect_line "$T/cleanup.out" "SUMMARY 1 passed, 1 failed"
+            if [[ "$(grep -c '^FAIL ' "$T/cleanup.out" || true)" -ne 1 ]]; then
+                reasons+=("expected one FAIL line, the interrupt's")
+            fi
             ;;
         interruptedDuringCleanup)
             check="cleanup_interruptedDuringCleanup_removesPrivateDirAndExits130"

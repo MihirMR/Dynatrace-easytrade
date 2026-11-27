@@ -16,7 +16,13 @@
 #   --evidence-dir DIR   Directory in which each run creates its own evidence directory,
 #                        pi-e2e-evidence.XXXXXX, printed at start, for the browser check
 #                        (default: the run directory)
-#   --help               Show this help and exit
+#   -h, --help           Show this help and exit
+# Each run creates two directories under $TMPDIR (default: /tmp): the run directory
+# pi-e2e.XXXXXX, printed at start and end and kept, which holds the browser evidence unless
+# --evidence-dir is given, and the private directory pi-e2e-private.XXXXXX, removed on exit.
+# Example, from the repository root:
+#   scripts/portfolio-insights/e2e.sh --project pi-dev-postgres --base-url http://localhost \
+#       --compose-file compose.dev.yaml
 #
 # One project and one dialect per invocation. Never run it alongside perf.sh or
 # loadgen-check.sh: all three toggle the same portfolio-insights-enabled flag.
@@ -24,25 +30,40 @@
 # What it touches: it signs up two fresh accounts, pi-e2e-<epoch>-holder and
 # pi-e2e-<epoch>-empty, deposits to and buys on the holder only, creates alerts on them, and
 # toggles no flag but portfolio-insights-enabled. No preset account is used. On exit, normal or
-# not, it deletes every alert it created by id and restores the flag to the value it read at
-# start; a second interrupt during that cleanup abandons it and fails the cleanup check. The two
-# accounts remain, because no account-deletion endpoint exists.
+# not, it deletes by id every alert it knows it created and restores the flag to the value it
+# read at start. A create whose outcome was lost (no response, a 201 without a readable id, a
+# status neither 201 nor 4xx) is journaled, and cleanup reconciles it within the two fixture
+# accounts, which only this run uses, by deleting every alert listed there and bound to that
+# account; any other account is only read. The cleanup check fails when ownership cannot be
+# determined, among others when a create got no response or a status neither 2xx nor 4xx, since
+# nothing then shows it finished and it may still commit an alert after cleanup has listed the
+# account; when the inventory of owned alerts cannot be computed; and when a second interrupt
+# during cleanup abandons it. The two accounts remain, because no account-deletion endpoint
+# exists.
 #
 # Prints one PASS or FAIL line per check, INFO lines (the browser check's own output among them,
 # prefixed) and a final SUMMARY line; a FAIL line never shows a fixture password. Exits 0 when
 # every check passes, 1 when any check fails, 2 on a usage error, a missing tool or a private
-# directory it cannot restrict to the current user, and 130 when interrupted. The generated
-# passwords exist only in the fixture, which sits with the raw HTTP responses in a private
-# directory outside the run directory that only the current user can open (an ACL set with
-# icacls on Windows, mode 700 elsewhere). On exit, normal, failed or interrupted, both are
-# removed, and a removal that fails fails the cleanup check. The run directory, printed at start
-# and end, keeps the working files the run derives, never a copy of a response body, and the
-# browser evidence unless --evidence-dir is given. Each run's evidence directory is new and its
-# own, so no run reads, overwrites or removes another run's evidence; it is printed at start,
-# and at end too when it is not the run directory.
+# directory it cannot restrict to the current user, and 130 when interrupted, after a FAIL
+# interrupted line that names the step the interrupt stopped. The generated passwords exist
+# only in the fixture, which sits with the raw HTTP responses, curl's messages and the raw
+# broker log reads in a private directory outside the run directory that only the current user
+# can open (an ACL set with icacls on Windows, mode 700 elsewhere). On exit, normal, failed or
+# interrupted, both are removed, and a removal that fails fails the cleanup check. The run
+# directory, printed at start and end, keeps the working files the run derives, among them the
+# validated cycle and trigger markers of the broker log, never a copy of a response body or of
+# broker output, and the browser evidence unless --evidence-dir is given. Each run's evidence
+# directory is new and its own, so no run reads, overwrites or removes another run's evidence;
+# it is printed at start, and at end too when it is not the run directory. A transport error is
+# reported by a fixed reason for curl's exit status.
 
 # shellcheck disable=SC2016 # jq filters are single-quoted on purpose: their $names are jq's own.
 set -euo pipefail
+# curl and node get their file paths in Git Bash's /c/... form, which only its path conversion
+# turns into paths they can open, so a caller's MSYS_NO_PATHCONV or MSYS2_ARG_CONV_EXCL would
+# fail every request. The docker, icacls, whoami and jq calls that need their arguments
+# unchanged set them per call.
+unset MSYS_NO_PATHCONV MSYS2_ARG_CONV_EXCL
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 
@@ -112,8 +133,14 @@ Usage: scripts/portfolio-insights/e2e.sh --project NAME [--base-url URL]
   --evidence-dir DIR   Directory in which each run creates its own evidence directory,
                        pi-e2e-evidence.XXXXXX, printed at start, for the browser check
                        (default: the run directory)
-  --help               Show this help and exit
+  -h, --help           Show this help and exit
 Run one project at a time, never alongside perf.sh or loadgen-check.sh.
+Each run creates two directories under $TMPDIR (default: /tmp): the run directory
+pi-e2e.XXXXXX, printed at start and end and kept, which holds the browser evidence unless
+--evidence-dir is given, and the private directory pi-e2e-private.XXXXXX, removed on exit.
+Example, from the repository root:
+  scripts/portfolio-insights/e2e.sh --project pi-dev-postgres --base-url http://localhost \
+      --compose-file compose.dev.yaml
 EOF
 }
 
@@ -236,7 +263,7 @@ while [[ $# -gt 0 ]]; do
             esac
             shift 2
             ;;
-        --help)
+        -h | --help)
             usage
             exit 0
             ;;
@@ -394,6 +421,9 @@ PRIVATE_LEFT=""
 : >"$RUN_DIR/deleted"
 : >"$RUN_DIR/pairs"
 : >"$RUN_DIR/triggered"
+# One line per create whose outcome is uncertain: the account it named, or unknown, and settled
+# or unsettled (see journal_create).
+: >"$RUN_DIR/uncertain-creates"
 : >"$RUN_DIR/trigger-lines"
 
 B="$BASE_URL/broker-service"
@@ -406,6 +436,10 @@ passed=0
 failed=0
 IN_CREATE=0
 PENDING_EXIT=""
+# 1 once main has saved the run's own stdout on descriptor 9, for the traps to print to.
+RUN_STDOUT_SAVED=0
+# Uncertain creates whose journal line could not be written, so cleanup cannot reconcile them.
+UNJOURNALED_CREATES=0
 FLAG_INITIAL=""
 FLAG_TOUCHED=0
 DIALECT=""
@@ -465,18 +499,54 @@ abort() {
 # ---------------------------------------------------------------------------------------------
 # HTTP and JSON
 
+# transport_reason CURL_EXIT: the fixed reason a transport error reports for curl's exit status.
+# No text curl prints, such as a private path or a multi-line message, reaches the output; it
+# stays in $PRIVATE_DIR/curl-error.
+transport_reason() {
+    case "$1" in
+        6) echo "curl exit 6: could not resolve the host" ;;
+        7) echo "curl exit 7: could not connect" ;;
+        23) echo "curl exit 23: could not write the response locally" ;;
+        26) echo "curl exit 26: could not read the request body" ;;
+        28) echo "curl exit 28: timed out" ;;
+        35) echo "curl exit 35: TLS connection failed" ;;
+        52) echo "curl exit 52: empty reply from the server" ;;
+        55) echo "curl exit 55: could not send the request" ;;
+        56) echo "curl exit 56: could not receive the response" ;;
+        60) echo "curl exit 60: TLS certificate not trusted" ;;
+        *) echo "curl exit $1" ;;
+    esac
+}
+
 # http METHOD URL [BODY]: sets HTTP_STATUS (000 on a transport error), HTTP_CTYPE, HTTP_BODY
-# (the response text; the exact bytes stay in $PRIVATE_DIR/body) and HTTP_ERROR (curl's message
-# on a transport error). Never trips set -e. BODY goes through stdin, byte for byte, so neither
-# the process list nor Git Bash path conversion ever sees it. The raw body, headers and curl
-# messages are kept in the private directory only, never in the run directory.
+# (the response text; the exact bytes stay in $PRIVATE_DIR/body) and HTTP_ERROR (the fixed
+# reason of a transport error). Never trips set -e. BODY goes through stdin, byte for byte, so
+# neither the process list nor Git Bash path conversion ever sees it. The raw body, headers and
+# curl messages are kept in the private directory only, never in the run directory. A request
+# takes at most HTTP_TIMEOUT_SECONDS, and inside a poll no longer than the time left to its
+# deadline, PROBE_DEADLINE less the clock, as poll reads it; with none left, the clock at
+# PROBE_DEADLINE or later, it is not sent and reads as a transport error.
 http() {
-    local method="$1" url="$2" out rc=0
-    local args=(-sS --max-time "$HTTP_TIMEOUT_SECONDS" -X "$method"
-        -o "$PRIVATE_DIR/body" -D "$PRIVATE_DIR/headers" -w '%{http_code} %{content_type}'
-        -H 'Accept: application/json')
+    local method="$1" url="$2" out rc=0 limit="$HTTP_TIMEOUT_SECONDS" left
     : >"$PRIVATE_DIR/body"
     : >"$PRIVATE_DIR/headers"
+    if [[ -n "$PROBE_DEADLINE" ]]; then
+        left=$((PROBE_DEADLINE - $(date -u +%s)))
+        if [[ $left -le 0 ]]; then
+            : >"$PRIVATE_DIR/curl-error"
+            HTTP_STATUS="000"
+            HTTP_CTYPE=""
+            HTTP_BODY=""
+            HTTP_ERROR="not sent: no time left before the poll deadline"
+            return 0
+        fi
+        if [[ $left -lt $limit ]]; then
+            limit=$left
+        fi
+    fi
+    local args=(-sS --max-time "$limit" -X "$method"
+        -o "$PRIVATE_DIR/body" -D "$PRIVATE_DIR/headers" -w '%{http_code} %{content_type}'
+        -H 'Accept: application/json')
     if [[ $# -ge 3 ]]; then
         args+=(-H 'Content-Type: application/json' --data-binary @-)
         out="$(printf '%s' "$3" | curl "${args[@]}" "$url" 2>"$PRIVATE_DIR/curl-error")" || rc=$?
@@ -489,7 +559,7 @@ http() {
     if [[ $rc -ne 0 ]]; then
         HTTP_STATUS="000"
         HTTP_CTYPE=""
-        HTTP_ERROR="$(tr -d '\r' <"$PRIVATE_DIR/curl-error" | { grep -v 'Debug-enabled' || true; } | head -c 300)"
+        HTTP_ERROR="$(transport_reason "$rc")"
     else
         HTTP_STATUS="${out%% *}"
         HTTP_CTYPE="${out#* }"
@@ -558,7 +628,7 @@ lower() {
     tr '[:upper:]' '[:lower:]'
 }
 
-# Status text for a failure reason, with curl's message on a transport error.
+# Status text for a failure reason, with the fixed reason of a transport error.
 status_text() {
     if [[ "$HTTP_STATUS" == "000" ]]; then
         echo "transport error (${HTTP_ERROR:-no response})"
@@ -663,12 +733,17 @@ expect_json() {
 # expect_forbidden CHECK METHOD URL [BODY]: PASS only for a 403 whose body bytes are exactly
 # {"error":"feature_disabled"} and whose media type is exactly application/json, with or without
 # parameters. read stops at the first NUL, so the body's size must also be the expected body's
-# (ASCII, one byte a character).
+# (ASCII, one byte a character). A POST to /v1/alerts is a create, sent and settled by
+# post_create, so one the broker wrongly accepts is owned or journaled; no other request can
+# create an alert.
 expect_forbidden() {
     local check="$1" content="" size media
     shift
-    http "$@"
-    own_if_created
+    if [[ "$1" == "POST" && "$2" == "$ALERTS_URL" ]]; then
+        post_create "${3-}"
+    else
+        http "$@"
+    fi
     IFS= read -r -d '' content <"$PRIVATE_DIR/body" || true
     size="$(wc -c <"$PRIVATE_DIR/body" | tr -d ' \r')" || size=""
     media="$(media_type)"
@@ -914,7 +989,8 @@ random_guid() {
 
 # random_secret: a throwaway password for a fixture account, Pi- and 16 bytes of the operating
 # system's cryptographic random source as 32 hex digits. It is written only to the fixture and
-# sent only in the signup body. Fails, printing nothing, when /dev/urandom cannot supply them.
+# sent only in the signup body; the browser check reads it from the fixture to log in as that
+# account. Fails, printing nothing, when /dev/urandom cannot supply them.
 random_secret() {
     local hex
     if ! hex="$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')" || [[ ! "$hex" =~ ^[0-9a-f]{32}$ ]]; then
@@ -938,26 +1014,40 @@ log_since_now() {
 }
 
 # poll CHECK TIMEOUT STEP COMMAND [ARGS...]: runs COMMAND every STEP seconds until it succeeds
-# or the deadline TIMEOUT seconds from now passes. On expiry it reports FAIL CHECK, with the
+# or the deadline TIMEOUT seconds from now expires. On expiry it reports FAIL CHECK, with the
 # POLL_DETAIL the last attempt left, and fails. STEP is the only sleep the script makes.
-# COMMAND's log reads see the deadline as PROBE_DEADLINE, local to this call, so it ends with
-# the poll.
+# COMMAND's requests and log reads see the deadline as PROBE_DEADLINE, local to this call, so it
+# ends with the poll. The clock is date's whole seconds and the deadline is D, the start second
+# plus TIMEOUT; the start second is rounded down, so the true deadline is at or after D. Every
+# reader of a poll's deadline applies one rule: the time is up once the clock reads D or later,
+# and the time left is D less the clock, so no request or log read starts then and each one
+# ends before D + 1. No attempt starts once the clock reads D, the first included, so a
+# TIMEOUT of 0 makes none. A success counts only while the clock still reads less than D, which
+# proves it came before the true deadline; one seen at D or later may be late and fails the
+# poll. The poll also gives up as soon as the next attempt would start at D or later.
 poll() {
-    local check="$1" timeout="$2" step="$3" deadline
+    local check="$1" timeout="$2" step="$3" deadline now
     shift 3
     deadline=$(($(date -u +%s) + timeout))
     local PROBE_DEADLINE="$deadline"
     POLL_DETAIL=""
-    while :; do
+    while [[ $(date -u +%s) -lt $deadline ]]; do
         if "$@"; then
-            return 0
-        fi
-        if [[ $(($(date -u +%s) + step)) -gt $deadline ]]; then
-            fail "$check" "deadline $timeout s expired${POLL_DETAIL:+; $POLL_DETAIL}"
+            now="$(date -u +%s)"
+            if [[ $now -lt $deadline ]]; then
+                return 0
+            fi
+            fail "$check" \
+                "deadline $timeout s expired; the result arrived at or after the deadline"
             return 1
+        fi
+        if [[ $(($(date -u +%s) + step)) -ge $deadline ]]; then
+            break
         fi
         sleep "$step"
     done
+    fail "$check" "deadline $timeout s expired${POLL_DETAIL:+; $POLL_DETAIL}"
+    return 1
 }
 
 
@@ -1038,8 +1128,9 @@ resolve_interval() {
 broker_logs() {
     local limit rc=0
     if ! limit="$(probe_limit)"; then
-        # Only poll sets a deadline, and its last attempt can start just as the deadline passes.
-        # That attempt fails at once and keeps the POLL_DETAIL of the attempt before it.
+        # Only poll sets a deadline, and the time left can run out after an attempt starts and
+        # before its log read does. That read fails at once and keeps the POLL_DETAIL of the
+        # attempt before it.
         LOG_PROBE_DETAIL="${POLL_DETAIL:-broker-service logs probe not started: no time left before the poll deadline}"
         return 1
     fi
@@ -1057,7 +1148,8 @@ broker_logs() {
 }
 
 # probe_limit: the seconds a log read may take now, the time left to PROBE_DEADLINE inside a
-# poll and LOG_PROBE_TIMEOUT_SECONDS outside one. Fails when the deadline has passed.
+# poll and LOG_PROBE_TIMEOUT_SECONDS outside one. Fails once the clock reads PROBE_DEADLINE or
+# later, the rule poll states for an expired deadline.
 probe_limit() {
     local left
     if [[ -z "$PROBE_DEADLINE" ]]; then
@@ -1075,10 +1167,11 @@ probe_limit() {
 # into $RUN_DIR/window.events as "C <outcome>" for a cycle line or "T <alert id> <revision>".
 # The outcome is completed or failed as CYCLE_RE reads it, and unknown for a cycle line that
 # does not render the whole summary, so a line whose outcome cannot be read never counts as
-# completed.
+# completed. The raw log read stays in the private directory, removed on exit, so the run
+# directory keeps only those validated markers and no unfiltered broker output.
 read_window() {
     local line id
-    broker_logs "$1" >"$RUN_DIR/window.log" || return 1
+    broker_logs "$1" >"$PRIVATE_DIR/window.log" || return 1
     : >"$RUN_DIR/window.events"
     while IFS= read -r line; do
         if [[ "$line" == *"$CYCLE_MARKER"* ]]; then
@@ -1091,7 +1184,7 @@ read_window() {
             id="$(lower <<<"${BASH_REMATCH[1]}")"
             echo "T $id ${BASH_REMATCH[2]}" >>"$RUN_DIR/window.events"
         fi
-    done < <(grep -F -e "$CYCLE_MARKER" -e "$TRIGGER_MARKER" "$RUN_DIR/window.log" || true)
+    done < <(grep -F -e "$CYCLE_MARKER" -e "$TRIGGER_MARKER" "$PRIVATE_DIR/window.log" || true)
 }
 
 # window_cycles: the cycle lines in the current window, whatever their outcome.
@@ -1187,39 +1280,121 @@ later_cycles_seen() {
 # ---------------------------------------------------------------------------------------------
 # Alerts this run owns
 
-# own_alert ID: records an alert this run created, the moment its 201 arrives.
+# own_alert ID: records an alert this run created, the moment its 201 arrives. Fails when the
+# record cannot be written.
 own_alert() {
     lower <<<"$1" >>"$RUN_DIR/owned"
 }
 
-# own_if_created: owns the id of a 201 from POST /v1/alerts, so even a request expected to be
-# refused leaves nothing behind when it is accepted.
-own_if_created() {
-    local id
-    if [[ "$HTTP_STATUS" != "201" ]]; then
-        return 0
+# journal_create ACCOUNT STATE: records a create whose outcome is uncertain in
+# $RUN_DIR/uncertain-creates, one line per create: ACCOUNT in canonical form, or unknown when
+# ACCOUNT is no canonical id, then a space and STATE. STATE is settled when the server answered
+# with a 2xx, so the request finished and whatever it committed shows in a later listing, and
+# unsettled otherwise (no response, a 5xx, a 1xx or a 3xx): nothing shows the request finished,
+# so it may still commit an alert after cleanup has listed the account. A line that cannot be
+# written is counted in UNJOURNALED_CREATES, which fails the cleanup check, and the call fails.
+journal_create() {
+    local account
+    account="$(lower <<<"$1")"
+    if [[ ! "$account" =~ $UUID_RE ]]; then
+        account="unknown"
     fi
-    id="$(jget '.id // empty' "$HTTP_BODY" | lower)"
-    if [[ "$id" =~ $UUID_RE ]]; then
-        own_alert "$id"
+    if ! echo "$account $2" >>"$RUN_DIR/uncertain-creates"; then
+        UNJOURNALED_CREATES=$((UNJOURNALED_CREATES + 1))
+        return 1
+    fi
+}
+
+# settle_create ACCOUNT: settles the last response to a POST /v1/alerts that named ACCOUNT. A 201
+# with a readable canonical id is owned at once and its id left in CREATED_ID; any 4xx is a
+# refusal, which creates nothing. Any other outcome (a transport error, a 201 without a readable
+# id or with one that cannot be recorded, any other status) may have created an alert this run
+# cannot name, so the create is journaled for the exit cleanup to reconcile: settled after a
+# 2xx, unsettled after anything else, as journal_create defines them. Fails, with CREATE_ERROR
+# saying why, unless the alert is owned.
+settle_create() {
+    local id reason state="unsettled"
+    CREATED_ID=""
+    CREATE_ERROR=""
+    if [[ "$HTTP_STATUS" == "201" ]]; then
+        id="$(jget '.id // empty' "$HTTP_BODY" | lower)"
+        if [[ ! "$id" =~ $UUID_RE ]]; then
+            reason="201 without a readable id"
+        elif ! own_alert "$id"; then
+            reason="201 with id [$id], which could not be recorded as owned"
+        else
+            CREATED_ID="$id"
+            return 0
+        fi
+    elif [[ "$HTTP_STATUS" == 4[0-9][0-9] ]]; then
+        CREATE_ERROR="$(status_text); body [$(body_snippet)]"
+        return 1
+    elif [[ "$HTTP_STATUS" == "000" ]]; then
+        reason="$(status_text)"
+    else
+        reason="$(status_text); body [$(body_snippet)]"
+    fi
+    reason="$reason; the alert may exist without an id this run knows"
+    if [[ "$HTTP_STATUS" == 2[0-9][0-9] ]]; then
+        state="settled"
+    fi
+    if journal_create "$1" "$state"; then
+        CREATE_ERROR="$reason, so the create is journaled for reconciliation on exit"
+    else
+        CREATE_ERROR="$reason, and the create could not be journaled, so the cleanup check fails"
+    fi
+    return 1
+}
+
+# own_if_created BODY: settles the last response to a POST /v1/alerts that sent BODY, as
+# settle_create does, so even a request expected to be refused leaves nothing behind unnoticed
+# when it is accepted. The account is read from BODY's text, which need not be valid JSON.
+own_if_created() {
+    local re='"accountId"[[:space:]]*:[[:space:]]*"([^"]*)"' account=""
+    if [[ "$1" =~ $re ]]; then
+        account="${BASH_REMATCH[1]}"
+    fi
+    settle_create "$account" || true
+}
+
+# post_create BODY: POST BODY, sent verbatim, to /v1/alerts, then own_if_created. An interrupt
+# that arrives meanwhile is held, as in create_alert, until the outcome is owned or journaled.
+post_create() {
+    IN_CREATE=1
+    http POST "$ALERTS_URL" "$1"
+    own_if_created "$1"
+    IN_CREATE=0
+    if [[ -n "$PENDING_EXIT" ]]; then
+        exit "$PENDING_EXIT"
     fi
 }
 
 # delete_alert ID: DELETE the alert; 204 and 404 mark it deleted, so cleanup skips it. The
-# status is left in HTTP_STATUS.
+# status is left in HTTP_STATUS. Fails only when a 204 or 404 cannot be recorded in
+# $RUN_DIR/deleted, since the inventory then still counts the alert as one to delete.
 delete_alert() {
     http DELETE "$ALERTS_URL/$1"
     if [[ "$HTTP_STATUS" == "204" || "$HTTP_STATUS" == "404" ]]; then
-        echo "$1" >>"$RUN_DIR/deleted"
+        echo "$1" >>"$RUN_DIR/deleted" || return 1
     fi
+    return 0
 }
 
 # remaining_owned: owned ids not yet deleted, into $RUN_DIR/to-delete; prints their count.
+# Fails, printing nothing, when any step fails or the count is not a whole number, so an
+# inventory that cannot be computed is never read as zero. It only reads $RUN_DIR/owned, which
+# the run only ever appends to.
 remaining_owned() {
-    LC_ALL=C sort -u "$RUN_DIR/owned" >"$RUN_DIR/owned.sorted"
-    LC_ALL=C sort -u "$RUN_DIR/deleted" >"$RUN_DIR/deleted.sorted"
-    LC_ALL=C comm -23 "$RUN_DIR/owned.sorted" "$RUN_DIR/deleted.sorted" >"$RUN_DIR/to-delete"
-    wc -l <"$RUN_DIR/to-delete" | tr -d ' '
+    local count
+    LC_ALL=C sort -u "$RUN_DIR/owned" >"$RUN_DIR/owned.sorted" || return 1
+    LC_ALL=C sort -u "$RUN_DIR/deleted" >"$RUN_DIR/deleted.sorted" || return 1
+    LC_ALL=C comm -23 "$RUN_DIR/owned.sorted" "$RUN_DIR/deleted.sorted" >"$RUN_DIR/to-delete" ||
+        return 1
+    count="$(wc -l <"$RUN_DIR/to-delete" | tr -d ' \r')" || return 1
+    if [[ ! "$count" =~ ^[0-9]+$ ]]; then
+        return 1
+    fi
+    echo "$count"
 }
 
 # alert_body ACCOUNT TYPE INSTRUMENT DIRECTION THRESHOLD: the create body. The four strings are
@@ -1237,9 +1412,10 @@ alert_body() {
 }
 
 # create_alert ACCOUNT TYPE INSTRUMENT DIRECTION THRESHOLD: POST /v1/alerts. On 201 the id is
-# owned at once and left in CREATED_ID; otherwise CREATE_ERROR says why. The response stays in
-# the HTTP_* globals for the caller's checks.
-# An interrupt that arrives while the POST is in flight is held until the id is recorded:
+# owned at once and left in CREATED_ID; otherwise CREATE_ERROR says why, and a create whose
+# outcome is uncertain is journaled, as settle_create does. The response stays in the HTTP_*
+# globals for the caller's checks.
+# An interrupt that arrives while the POST is in flight is held until the outcome is recorded:
 # exiting in between would leave an alert this run created but cannot delete.
 create_alert() {
     local rc=0
@@ -1260,21 +1436,7 @@ post_alert() {
         return 1
     fi
     http POST "$ALERTS_URL" "$(alert_body "$@")"
-    if [[ "$HTTP_STATUS" == "000" ]]; then
-        CREATE_ERROR="$(status_text); the alert may exist without an id this run knows"
-        return 1
-    fi
-    if [[ "$HTTP_STATUS" != "201" ]]; then
-        CREATE_ERROR="$(status_text); body [$(body_snippet)]"
-        return 1
-    fi
-    CREATED_ID="$(jget '.id // empty' "$HTTP_BODY" | lower)"
-    if [[ ! "$CREATED_ID" =~ $UUID_RE ]]; then
-        CREATE_ERROR="201 without a readable id; the created alert cannot be deleted by this run"
-        CREATED_ID=""
-        return 1
-    fi
-    own_alert "$CREATED_ID"
+    settle_create "$1"
 }
 
 # check_forbidden_endpoints STEP ACCOUNT ALERT INSTRUMENT: the seven feature endpoints, each
@@ -1365,10 +1527,12 @@ run_browser_check() {
     fi
     info "browser check --mode $mode started; its output follows, also in $RUN_DIR/browser-$mode.log"
     set +e
+    # Descriptor 9, the run's saved stdout, is closed for the check, so neither it nor the
+    # browser it starts can hold the run's output open.
     (cd "$REPO_ROOT/src/loadgen" &&
         node verification/portfolio-insights-page-check.mjs --base-url "$BASE_URL" \
             --mode "$mode" --fixture "$FIXTURE" --evidence-dir "$EVIDENCE_DIR") </dev/null 2>&1 \
-        | prefix_lines "browser $mode" "$RUN_DIR/browser-$mode.log"
+        9>&- | prefix_lines "browser $mode" "$RUN_DIR/browser-$mode.log"
     rc=${PIPESTATUS[0]}
     set -e
     if [[ $rc -eq 0 ]]; then
@@ -1381,20 +1545,48 @@ run_browser_check() {
 # ---------------------------------------------------------------------------------------------
 # Cleanup and exit. Every step is idempotent, so it is safe however far the run got.
 
-# shellcheck disable=SC2329 # Invoked by cleanup, the EXIT trap.
-# delete_remaining: DELETEs every owned id not yet deleted. Sets CLEANUP_LEFT to the number of
-# alerts left in place.
-delete_remaining() {
-    local id transport=0
+# shellcheck disable=SC2329 # Invoked by delete_remaining and by cleanup, the EXIT trap.
+# delete_ids FILE: DELETEs each distinct id FILE lists, and stops sending them after
+# MAX_CONSECUTIVE_TRANSPORT_ERRORS transport errors in a row. Sets CLEANUP_IDS to the number of
+# distinct entries and CLEANUP_LEFT to the number of alerts left in place, counting an entry that
+# is not a canonical id among them. A 204 or 404 that cannot be recorded is not counted as left
+# in place: the inventory still lists that alert, so cleanup's recount finds it. Fails, deleting
+# nothing, when FILE is not a regular file it can read, since a directory reads as empty.
+delete_ids() {
+    local id line seen=" " transport=0
+    local -a ids=()
+    CLEANUP_IDS=0
     CLEANUP_LEFT=0
-    remaining_owned >/dev/null
-    while IFS= read -r id; do
+    # Bash 3.2 runs this too: the braces pass a failed redirect to the !, which bash 3.2 drops on
+    # a bare loop, and ${ids[@]+...} keeps an empty list from tripping set -u before bash 4.4.
+    if [[ ! -f "$1" ]] || ! {
+        while IFS= read -r line || [[ -n "$line" ]]; do
+            ids+=("$line")
+        done <"$1"
+    }; then
+        return 1
+    fi
+    for id in ${ids[@]+"${ids[@]}"}; do
+        if [[ "$seen" == *" $id "* ]]; then
+            continue
+        fi
+        seen+="$id "
+        CLEANUP_IDS=$((CLEANUP_IDS + 1))
+        if [[ ! "$id" =~ $UUID_RE ]]; then
+            info "cleanup left an owned entry that is not a canonical alert id"
+            CLEANUP_LEFT=$((CLEANUP_LEFT + 1))
+            continue
+        fi
         if [[ $transport -ge $MAX_CONSECUTIVE_TRANSPORT_ERRORS ]]; then
             info "cleanup left alert $id: not attempted after $transport transport errors in a row"
             CLEANUP_LEFT=$((CLEANUP_LEFT + 1))
             continue
         fi
-        delete_alert "$id"
+        if ! delete_alert "$id"; then
+            transport=0
+            info "cleanup deleted alert $id ($(status_text)) but could not record it in $RUN_DIR/deleted"
+            continue
+        fi
         case "$HTTP_STATUS" in
             204 | 404) transport=0 ;;
             *)
@@ -1407,7 +1599,153 @@ delete_remaining() {
                 CLEANUP_LEFT=$((CLEANUP_LEFT + 1))
                 ;;
         esac
-    done <"$RUN_DIR/to-delete"
+    done
+}
+
+# shellcheck disable=SC2329 # Invoked by cleanup, the EXIT trap.
+# delete_remaining: DELETEs every owned id not yet deleted, as delete_ids does. Fails, deleting
+# nothing, when the inventory cannot be computed or its list cannot be read.
+delete_remaining() {
+    remaining_owned >/dev/null || return 1
+    delete_ids "$RUN_DIR/to-delete"
+}
+
+# shellcheck disable=SC2329 # Invoked by cleanup, the EXIT trap.
+# reconcile_creates: settles each distinct account $RUN_DIR/uncertain-creates names, with the
+# flag on, from one listing of its alerts. A listing counts only when it answers 200 with
+# exactly one JSON document, an object whose results array holds only objects with a string id
+# and a string accountId; anything else owns nothing. HOLDER_ID and EMPTY_ID are this run's
+# fresh signups: no preset user or loadgen visit uses them and the browser check creates no
+# alert, so every alert listed there and bound to that account is this run's. Each is owned,
+# for the delete pass to remove; a listed alert bound to another account is neither owned nor
+# deleted, and fails the check. An unsettled create there fails the check too, whatever the
+# listing shows, since it may commit an alert after the listing. Any other account is only
+# listed, never changed: a 404 ErrorResponse (no such account) shows its creates made no alert
+# there, and an empty list shows it only when every create there settled.
+# Sets RECONCILE_PROBLEMS to what could not be settled, empty when every create was.
+reconcile_creates() {
+    local entry account state seen=" " unknown=0 listing row id valid owned invalid foreign
+    local pending
+    local -a lines=() accounts=() unsettled=() rows=()
+    # "ok", then one line per listed alert: "own" when its accountId names the queried account,
+    # "other" when it does not, then its id in lower case as a JSON string, so no character of
+    # an id can split the line or pass for another field.
+    local filter='if length == 1 and (.[0] | type) == "object"
+            and (.[0].results | type) == "array"
+            and all(.[0].results[]; type == "object" and (.id | type) == "string"
+                and (.accountId | type) == "string")
+        then "ok",
+            (.[0].results[]
+             | (if (.accountId | ascii_downcase) == $account then "own " else "other " end)
+               + (.id | ascii_downcase | tojson))
+        else empty end'
+    local listing_rule="200 with one JSON object whose results array holds only objects with a string id and a string accountId"
+    local unsettled_rule="no response, or a status neither 2xx nor 4xx"
+    RECONCILE_PROBLEMS=""
+    if [[ $UNJOURNALED_CREATES -gt 0 ]]; then
+        RECONCILE_PROBLEMS="$UNJOURNALED_CREATES uncertain creates could not be journaled: ownership cannot be determined"
+    fi
+    # The reads and loops are written for bash 3.2, as in delete_ids.
+    if [[ ! -f "$RUN_DIR/uncertain-creates" ]] || ! {
+        while IFS= read -r entry || [[ -n "$entry" ]]; do
+            lines+=("$entry")
+        done <"$RUN_DIR/uncertain-creates"
+    }; then
+        RECONCILE_PROBLEMS="${RECONCILE_PROBLEMS:+$RECONCILE_PROBLEMS; }the journal of uncertain creates cannot be read from $RUN_DIR/uncertain-creates: ownership cannot be determined"
+        return 0
+    fi
+    # Each line is "ACCOUNT STATE"; one whose STATE is not exactly settled, a damaged one
+    # included, counts as unsettled.
+    for entry in ${lines[@]+"${lines[@]}"}; do
+        account="${entry%% *}"
+        state=""
+        if [[ "$entry" == *" "* ]]; then
+            state="${entry#* }"
+        fi
+        if [[ ! "$account" =~ $UUID_RE ]]; then
+            unknown=$((unknown + 1))
+            continue
+        fi
+        if [[ "$state" != "settled" ]]; then
+            unsettled+=("$account")
+        fi
+        if [[ "$seen" != *" $account "* ]]; then
+            seen+="$account "
+            accounts+=("$account")
+        fi
+    done
+    for account in ${accounts[@]+"${accounts[@]}"}; do
+        pending=0
+        for entry in ${unsettled[@]+"${unsettled[@]}"}; do
+            if [[ "$entry" == "$account" ]]; then
+                pending=$((pending + 1))
+            fi
+        done
+        http GET "$ALERTS_URL?accountId=$account"
+        # jq reads the exact response bytes and its status is checked, so trailing text after
+        # a valid document, or a document jq cannot finish, is never read as a listing.
+        valid=0
+        rows=()
+        if [[ "$HTTP_STATUS" == "200" ]] &&
+            listing="$(jq -r -s --arg account "$account" "$filter" <"$PRIVATE_DIR/body" \
+                2>/dev/null | tr -d '\r')" &&
+            [[ "$listing" == "ok" || "$listing" == "ok"$'\n'* ]]; then
+            valid=1
+            listing="${listing#ok}"
+            listing="${listing#$'\n'}"
+            if [[ -n "$listing" ]]; then
+                while IFS= read -r row; do
+                    rows+=("$row")
+                done <<<"$listing"
+            fi
+        fi
+        if [[ "$account" == "$HOLDER_ID" || "$account" == "$EMPTY_ID" ]]; then
+            if [[ $pending -gt 0 ]]; then
+                RECONCILE_PROBLEMS="${RECONCILE_PROBLEMS:+$RECONCILE_PROBLEMS; }$pending uncertain creates on fixture account [$account] are unsettled ($unsettled_rule), so an alert such a create may still commit after this listing cannot be ruled out"
+            fi
+            if [[ $valid -eq 0 ]]; then
+                RECONCILE_PROBLEMS="${RECONCILE_PROBLEMS:+$RECONCILE_PROBLEMS; }ownership cannot be determined on fixture account [$account]: its alert list gave $(status_text), not $listing_rule"
+                continue
+            fi
+            owned=0
+            invalid=0
+            foreign=0
+            for row in ${rows[@]+"${rows[@]}"}; do
+                id="${row#* }"
+                id="${id#\"}"
+                id="${id%\"}"
+                if [[ ! "$id" =~ $UUID_RE ]]; then
+                    invalid=$((invalid + 1))
+                elif [[ "$row" != "own "* ]]; then
+                    foreign=$((foreign + 1))
+                elif own_alert "$id"; then
+                    owned=$((owned + 1))
+                else
+                    RECONCILE_PROBLEMS="${RECONCILE_PROBLEMS:+$RECONCILE_PROBLEMS; }alert $id of fixture account [$account] could not be recorded as owned"
+                fi
+            done
+            if [[ $invalid -gt 0 ]]; then
+                RECONCILE_PROBLEMS="${RECONCILE_PROBLEMS:+$RECONCILE_PROBLEMS; }ownership cannot be determined on fixture account [$account]: it lists $invalid alerts without a canonical id"
+            fi
+            if [[ $foreign -gt 0 ]]; then
+                RECONCILE_PROBLEMS="${RECONCILE_PROBLEMS:+$RECONCILE_PROBLEMS; }ownership cannot be determined on fixture account [$account]: it lists $foreign alerts bound to another account, none owned or deleted"
+            fi
+            info "cleanup: fixture account [$account] lists ${#rows[@]} alerts ($(status_text)); $owned owned for deletion"
+        elif [[ "$HTTP_STATUS" == "404" && "$(response_kind)" == "error_response" ]]; then
+            info "cleanup: account [$account] does not exist ($(status_text)), so its uncertain create made no alert"
+        elif [[ $valid -eq 1 && ${#rows[@]} -eq 0 && $pending -eq 0 ]]; then
+            info "cleanup: account [$account] lists no alerts ($(status_text)), so its uncertain create made none"
+        elif [[ $valid -eq 1 && ${#rows[@]} -eq 0 ]]; then
+            RECONCILE_PROBLEMS="${RECONCILE_PROBLEMS:+$RECONCILE_PROBLEMS; }ownership cannot be determined on account [$account], which is not this run's: it lists no alerts, but $pending uncertain creates there are unsettled ($unsettled_rule), so an alert such a create may still commit cannot be ruled out"
+        elif [[ $valid -eq 1 ]]; then
+            RECONCILE_PROBLEMS="${RECONCILE_PROBLEMS:+$RECONCILE_PROBLEMS; }ownership cannot be determined on account [$account], which is not this run's: it lists ${#rows[@]} alerts, none deleted"
+        else
+            RECONCILE_PROBLEMS="${RECONCILE_PROBLEMS:+$RECONCILE_PROBLEMS; }ownership cannot be determined on account [$account]: its alert list gave $(status_text), neither a 404 ErrorResponse nor $listing_rule"
+        fi
+    done
+    if [[ $unknown -gt 0 ]]; then
+        RECONCILE_PROBLEMS="${RECONCILE_PROBLEMS:+$RECONCILE_PROBLEMS; }$unknown uncertain creates named no readable account: ownership cannot be determined"
+    fi
 }
 
 # shellcheck disable=SC2329 # Invoked by cleanup, the EXIT trap, and by its interrupt trap.
@@ -1429,12 +1767,25 @@ remove_private() {
     fi
 }
 
-# shellcheck disable=SC2329 # Invoked by cleanup's INT and TERM trap.
-# on_cleanup_signal: a second interrupt, while cleanup runs. The remaining requests are
-# abandoned, but the private directory is still removed and the run still ends with a cleanup
-# verdict and the SUMMARY line. Further interrupts are ignored, so it runs once.
+# restore_run_stdout: points stdout back at the run's own, which main saved on descriptor 9.
+# bash runs a trap inside the function it interrupts, under that function's redirections, so
+# cleanup and on_cleanup_signal, which end the run, call this before they print: their output
+# and the SUMMARY line reach the run's output, never a working file such as owned or
+# window.log. Does nothing unless main saved it.
+restore_run_stdout() {
+    if [[ $RUN_STDOUT_SAVED -eq 1 ]]; then
+        exec 1>&9
+    fi
+}
+
+# shellcheck disable=SC2329 # Invoked by the INT and TERM trap that on_signal and cleanup set.
+# on_cleanup_signal: an interrupt once the run is ending, from on_signal's exit on and while
+# cleanup runs. The remaining requests are abandoned, but the private directory is still
+# removed and the run still ends with a cleanup verdict and the SUMMARY line, on the run's
+# stdout. Further interrupts are ignored, so it runs once.
 on_cleanup_signal() {
     trap '' INT TERM
+    restore_run_stdout
     remove_private
     fail "cleanup" "interrupted before it finished: owned alerts may be left in place and flag $FLAG_ID may not be restored${PRIVATE_LEFT:+; $PRIVATE_LEFT not removed}"
     info "run dir $RUN_DIR"
@@ -1448,33 +1799,81 @@ on_cleanup_signal() {
 # shellcheck disable=SC2329 # Invoked by the EXIT trap below.
 cleanup() {
     local rc=$? remaining problems="" switched
-    trap - EXIT
+    # An exit inside a poll would leave its deadline in scope and cut cleanup's requests short.
+    local PROBE_DEADLINE=""
     # A second interrupt abandons the remaining requests, but never leaves the passwords behind
     # and still ends the run with a cleanup verdict and the SUMMARY line.
     trap on_cleanup_signal INT TERM
+    trap - EXIT
+    # The exit may have come from inside a function writing to a working file.
+    restore_run_stdout
     set +e
-    remaining="$(remaining_owned)"
-    if [[ "$remaining" -gt 0 ]]; then
-        # DELETE answers 403 while the flag is off, so the flag is switched on to delete. Only a
-        # 200 with this flag's JSON boolean true confirms it; otherwise the deletes still run,
-        # each answer deciding its id, and the switch-on is a cleanup problem of its own.
+    local after purpose creates=0
+    # An inventory that cannot be computed is never read as zero: it leaves remaining empty.
+    if ! remaining="$(remaining_owned)"; then
+        remaining=""
+    fi
+    # A create whose outcome was lost may have made an alert this run cannot name: it is
+    # reconciled first, so any such alert is owned, and deleted, like the others.
+    if [[ -s "$RUN_DIR/uncertain-creates" ]]; then
+        creates=1
+        purpose="reconcile uncertain creates and delete owned alerts"
+    elif [[ -n "$remaining" ]]; then
+        purpose="delete $remaining owned alerts"
+    else
+        purpose="delete owned alerts"
+    fi
+    if [[ $creates -eq 1 || "$remaining" != "0" ]]; then
+        # DELETE and the alert list answer 403 while the flag is off, so the flag is switched on.
+        # Only a 200 with this flag's JSON boolean true confirms it; otherwise the deletes still
+        # run, each answer deciding its id, and the switch-on is a cleanup problem of its own.
         http GET "$F"
         if [[ "$HTTP_STATUS" == "200" && "$(flag_enabled "$HTTP_BODY")" == "false" ]]; then
             FLAG_TOUCHED=1
             http PUT "$F" '{"enabled": true}'
             switched="$(flag_enabled "$HTTP_BODY")"
             if [[ "$HTTP_STATUS" != "200" ]]; then
-                problems="flag $FLAG_ID could not be switched on to delete $remaining owned alerts: $(status_text)"
+                problems="flag $FLAG_ID could not be switched on to $purpose: $(status_text)"
             elif [[ "$switched" != "true" ]]; then
-                problems="flag $FLAG_ID could not be switched on to delete $remaining owned alerts: answered [$switched]"
+                problems="flag $FLAG_ID could not be switched on to $purpose: answered [$switched]"
             else
-                info "cleanup: flag $FLAG_ID switched on to delete $remaining owned alerts"
+                info "cleanup: flag $FLAG_ID switched on to $purpose"
             fi
         fi
-        delete_remaining
-        info "cleanup: $((remaining - CLEANUP_LEFT)) of $remaining remaining owned alerts deleted or already absent"
-        if [[ $CLEANUP_LEFT -gt 0 ]]; then
-            problems="${problems:+$problems; }$CLEANUP_LEFT owned alerts left in place"
+    fi
+    reconcile_creates
+    if [[ -n "$RECONCILE_PROBLEMS" ]]; then
+        problems="${problems:+$problems; }$RECONCILE_PROBLEMS"
+    fi
+    if [[ $creates -eq 1 ]] && ! remaining="$(remaining_owned)"; then
+        remaining=""
+    fi
+    if [[ -n "$remaining" && "$remaining" != "0" ]]; then
+        if delete_remaining; then
+            info "cleanup: $((remaining - CLEANUP_LEFT)) of $remaining remaining owned alerts deleted or already absent"
+            if [[ $CLEANUP_LEFT -gt 0 ]]; then
+                problems="${problems:+$problems; }$CLEANUP_LEFT owned alerts left in place"
+            fi
+            # A deletion that could not be recorded leaves the recount above the number left in
+            # place.
+            if ! after="$(remaining_owned)"; then
+                problems="${problems:+$problems; }the owned-alert inventory could not be recomputed after the deletes"
+            elif [[ "$after" -ne "$CLEANUP_LEFT" ]]; then
+                problems="${problems:+$problems; }the owned-alert inventory still lists $after alerts after the deletes, $CLEANUP_LEFT left in place"
+            fi
+        else
+            remaining=""
+        fi
+    fi
+    if [[ -z "$remaining" ]]; then
+        # Every id the run recorded as owned is sent a DELETE, but nothing can confirm the
+        # inventory, so the check fails however they answer.
+        info "cleanup: the owned-alert inventory could not be computed; sending a DELETE to every id in $RUN_DIR/owned"
+        if delete_ids "$RUN_DIR/owned"; then
+            info "cleanup: $((CLEANUP_IDS - CLEANUP_LEFT)) of $CLEANUP_IDS owned ids deleted or already absent"
+            problems="${problems:+$problems; }the owned-alert inventory could not be reconciled, so nothing confirms the owned alerts are gone ($CLEANUP_LEFT of $CLEANUP_IDS owned ids left in place)"
+        else
+            problems="${problems:+$problems; }the owned alerts cannot be read from $RUN_DIR/owned: none was deleted"
         fi
     fi
     if [[ $FLAG_TOUCHED -eq 1 && -n "$FLAG_INITIAL" ]]; then
@@ -1516,11 +1915,43 @@ cleanup() {
 }
 
 # shellcheck disable=SC2329 # Invoked by the INT and TERM traps below.
+# on_signal: an interrupt while the steps run. It records the interruption as one FAIL line on
+# the run's stdout, which names the step it stopped and which the SUMMARY counts, and exits
+# 130; the EXIT trap still cleans up, and an interrupt from then on is on_cleanup_signal's.
+# During a create the exit waits until the id is recorded, and a further interrupt meanwhile
+# adds no second line; only the line goes to the run's stdout, since the held create goes on
+# writing where it was. Inside cleanup, before cleanup sets its own trap, it hands over to
+# on_cleanup_signal: an exit there would end the run with no cleanup. The step is the innermost
+# stepN_ function on the call stack, matched without =~ so the interrupted code's BASH_REMATCH
+# stays as it was.
 on_signal() {
-    if [[ $IN_CREATE -eq 1 ]]; then
+    local frame number out=1 during="between steps; any step not yet started did not run"
+    for frame in "${FUNCNAME[@]:1}"; do
+        if [[ "$frame" == "cleanup" ]]; then
+            on_cleanup_signal
+        fi
+    done
+    for frame in "${FUNCNAME[@]:1}"; do
+        number="${frame#step}"
+        number="${number%%_*}"
+        if [[ "$frame" == step*_* && -n "$number" && "$number" != *[!0-9]* ]]; then
+            during="during step $number; step $number did not finish and the steps after it did not run"
+            break
+        fi
+    done
+    if [[ -z "$PENDING_EXIT" ]]; then
         PENDING_EXIT=130
+        if [[ $RUN_STDOUT_SAVED -eq 1 ]]; then
+            out=9
+        fi
+        fail "interrupted" "signal received $during" >&"$out"
+    fi
+    if [[ $IN_CREATE -eq 1 ]]; then
         return 0
     fi
+    # Set before the exit: an interrupt that comes before cleanup has set its own trap is then
+    # on_cleanup_signal's, never an exit inside the EXIT trap that skips cleanup.
+    trap on_cleanup_signal INT TERM
     exit 130
 }
 
@@ -1773,9 +2204,10 @@ INSIGHTS_LINE_RE='Portfolio insights for account \[([^]]*)\] holdings \[([^]]*)\
 # VALUE, risk RISK, a whole-millisecond duration and a W3C trace id. VALUE is the number as jq
 # prints it (1E-8) and the line renders a C# decimal (1.50), so num_cmp compares the two exactly
 # whatever their form. On a miss, POLL_DETAIL names every field the last line of ACCOUNT got wrong.
+# The raw log read stays in the private directory, removed on exit, never in the run directory.
 insights_line_logged() {
     local line holdings value risk duration trace order wrong detail=""
-    if ! broker_logs "$1" >"$RUN_DIR/insights.log"; then
+    if ! broker_logs "$1" >"$PRIVATE_DIR/insights.log"; then
         POLL_DETAIL="$LOG_PROBE_DETAIL"
         return 1
     fi
@@ -1809,7 +2241,7 @@ insights_line_logged() {
             return 0
         fi
         detail="the line for account [$2] has${wrong#;}"
-    done < <(grep -iF "Portfolio insights for account [$2]" "$RUN_DIR/insights.log" || true)
+    done < <(grep -iF "Portfolio insights for account [$2]" "$PRIVATE_DIR/insights.log" || true)
     POLL_DETAIL="${detail:-no broker-service line renders insights for account [$2]} (log window since $1)"
     return 1
 }
@@ -1989,17 +2421,12 @@ expect_error() {
     fi
 }
 
-# post_error CHECK STATUS KIND BODY: POST BODY, sent verbatim, to /v1/alerts, then expect_error.
-# A 201 is owned at once, and an interrupt during the POST waits for that as in create_alert, so
-# a request the broker wrongly accepts still leaves nothing behind.
+# post_error CHECK STATUS KIND BODY: POST BODY, sent verbatim, to /v1/alerts by post_create,
+# then expect_error. A 201 is owned at once and an uncertain outcome journaled, and an interrupt
+# during the POST waits for that as in create_alert, so a request the broker wrongly accepts
+# still leaves nothing behind.
 post_error() {
-    IN_CREATE=1
-    http POST "$ALERTS_URL" "$4"
-    own_if_created
-    IN_CREATE=0
-    if [[ -n "$PENDING_EXIT" ]]; then
-        exit "$PENDING_EXIT"
-    fi
+    post_create "$4"
     expect_error "$1" "$2" "$3"
 }
 
@@ -2093,6 +2520,9 @@ step7_errors() {
 
     # Each PATCH body case targets a real alert, so only the body is wrong: a missing or null
     # enabled breaks the service's rule, while malformed JSON and a quoted enabled cannot bind.
+    # AlertService.UpdateEnabledAsync rejects a missing or null enabled before it looks the id up,
+    # so an unknown id would answer 400 too; a real alert keeps those cases on the documented 400
+    # whatever that order.
     if ! create_alert "$HOLDER_ID" TARGET_PRICE "$H1" ABOVE "$MAX_THRESHOLD"; then
         reason="creating the temporary alert gave $(status_text), body kind [$(response_kind)]; expected 201 with an id"
         fail "step 7 PATCH {} 400" "$reason"
@@ -2113,8 +2543,9 @@ step7_errors() {
     # A JSON string, not a boolean.
     http PATCH "$ALERTS_URL/$temp" '{"enabled":"true"}'
     expect_error "step 7 PATCH quoted enabled \"true\" 400" 400 problem
-    delete_alert "$temp"
-    if [[ "$HTTP_STATUS" == "204" ]]; then
+    if ! delete_alert "$temp"; then
+        fail "step 7 DELETE temporary alert 204" "$(status_text) for the temporary alert [$temp], but its deletion could not be recorded in $RUN_DIR/deleted"
+    elif [[ "$HTTP_STATUS" == "204" ]]; then
         pass "step 7 DELETE temporary alert 204"
     else
         fail "step 7 DELETE temporary alert 204" "$(status_text) for the temporary alert [$temp], expected 204"
@@ -2302,8 +2733,11 @@ step8_crud() {
         expect_alert "step 8 $type disable" 200 "$DISABLED_FILTER" "$want" "$MAX_THRESHOLD"
         http PATCH "$ALERTS_URL/$id" '{"enabled":true}'
         expect_alert "step 8 $type re-arm" 200 "$REARMED_FILTER" "$want" "$MAX_THRESHOLD"
-        delete_alert "$id"
-        expect_status "step 8 $type delete" 204
+        if delete_alert "$id"; then
+            expect_status "step 8 $type delete" 204
+        else
+            fail "step 8 $type delete" "$(status_text), but the deletion could not be recorded in $RUN_DIR/deleted"
+        fi
         http GET "$ALERTS_URL?accountId=$HOLDER_ID"
         expect_json "step 8 $type absent after delete" 200 "$LISTING_JQ
             listing(map(select(. == \"$id\")) | length
@@ -2473,7 +2907,8 @@ step9_trigger() {
         fields="$(jitem "$id" "$NOTIFICATIONS" \
             '"\(.armingRevision) \(.triggeredAt) \(.triggerValue | type) \(.triggerValue | tojson)"')"
         read -r revision triggered_at value_type value <<<"$fields"
-        info "triggered $pair $direction $id revision $revision"
+        # The revision is the server's text, so only its digits are shown, each other byte as ?.
+        info "triggered $pair $direction $id revision ${revision//[!0-9]/?}"
         echo "$id $revision $triggered_at $pair $direction" >>"$RUN_DIR/triggered"
 
         verdict="$(trigger_value_verdict "$direction" "$threshold" "$value_type" "$value")"
@@ -2745,19 +3180,29 @@ step12_untriggered_ack() {
 # Step 13: clean up and disable
 
 step13_cleanup_and_disable() {
-    local id remaining problems=""
-    remaining="$(remaining_owned)"
-    while IFS= read -r id; do
-        delete_alert "$id"
-        if [[ "$HTTP_STATUS" != "204" ]]; then
-            problems="$problems [$id] $(status_text);"
-        fi
-    done <"$RUN_DIR/to-delete"
-    if [[ -z "$problems" ]]; then
-        pass "step 13 delete owned alerts"
-        info "deleted $remaining owned alerts"
+    local id line remaining problems=""
+    local -a ids=()
+    # The read and loop are written for bash 3.2, as in delete_ids.
+    if ! remaining="$(remaining_owned)" || [[ ! -f "$RUN_DIR/to-delete" ]] || ! {
+        while IFS= read -r line || [[ -n "$line" ]]; do
+            ids+=("$line")
+        done <"$RUN_DIR/to-delete"
+    }; then
+        fail "step 13 delete owned alerts" "the owned-alert inventory cannot be computed from $RUN_DIR/owned and $RUN_DIR/deleted, so no alert was deleted here; the exit cleanup sends a DELETE to every owned id"
     else
-        fail "step 13 delete owned alerts" "expected 204 each:$problems"
+        for id in ${ids[@]+"${ids[@]}"}; do
+            if ! delete_alert "$id"; then
+                problems="$problems [$id] $(status_text), not recorded as deleted;"
+            elif [[ "$HTTP_STATUS" != "204" ]]; then
+                problems="$problems [$id] $(status_text);"
+            fi
+        done
+        if [[ -z "$problems" ]]; then
+            pass "step 13 delete owned alerts"
+            info "deleted $remaining owned alerts"
+        else
+            fail "step 13 delete owned alerts" "expected 204 each:$problems"
+        fi
     fi
 
     http GET "$ALERTS_URL/notifications?accountId=$HOLDER_ID"
@@ -2781,6 +3226,11 @@ step13_cleanup_and_disable() {
 # Main
 
 main() {
+    # Saved before any trap is set, so every trap can print to the run's stdout (see
+    # restore_run_stdout). Closed stdout leaves it unsaved, and the traps print to stdout as is.
+    if exec 9>&1; then
+        RUN_STDOUT_SAVED=1
+    fi
     trap cleanup EXIT
     trap on_signal INT TERM
 

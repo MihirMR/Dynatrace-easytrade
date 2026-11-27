@@ -194,7 +194,7 @@ const DIRECTIONS = ["ABOVE", "BELOW"]
 const DEFAULT_EVALUATION_INTERVAL_S = 60
 
 const RISK_LABELS = { LOW: "Low", MEDIUM: "Medium", HIGH: "High" }
-/** Money as `formatInPage` writes it, its small-value format included. */
+/** Money as `formatInPage` writes it, in each of its formats. */
 const CURRENCY_TEXT_PATTERN = /^-?\$\d{1,3}(,\d{3})*(\.\d+)?$/
 /** A percent as `formatInPage` writes it: two places, signed unless zero. */
 const PERCENT_TEXT_PATTERN = /^[+-]?\d{1,3}(,\d{3})*\.\d{2}%$/
@@ -2378,6 +2378,10 @@ async function settleBodies(session) {
  * In the page: the strings `FormatterContext` gives each value, from the same
  * Intl options, so Chrome's own ICU produces them. `percent` values are in
  * percent, as the broker sends them, and are formatted as ratios.
+ * `signedCurrency` values are written as `InsightsSummary` writes the signed
+ * P/L: the magnitude in the `currency` format, after a minus for a loss, with
+ * a magnitude below one cent first rounded to whole cents, and unsigned once
+ * rounded to 0.
  */
 function formatInPage(values) {
     const currency = new Intl.NumberFormat("en-US", {
@@ -2395,10 +2399,17 @@ function formatInPage(values) {
         minimumFractionDigits: 2,
         signDisplay: "exceptZero",
     })
+    const formatCurrency = (n) =>
+        (n < 0.01 ? smallCurrency : currency).format(n)
     return {
-        currency: values.currency.map((n) =>
-            (n < 0.01 ? smallCurrency : currency).format(n)
-        ),
+        currency: values.currency.map(formatCurrency),
+        signedCurrency: values.signedCurrency.map((n) => {
+            const absolute = Math.abs(n)
+            const magnitude =
+                absolute < 0.01 ? Math.round(absolute * 100) / 100 : absolute
+            const text = formatCurrency(magnitude)
+            return n < 0 && magnitude > 0 ? `-${text}` : text
+        }),
         percent: values.percent.map((p) => percent.format(p / 100)),
     }
 }
@@ -2871,8 +2882,11 @@ function comparedValue(value, verbatim) {
  * figure span and table cell holds only its value as `InsightsSummary` and
  * `AllocationTable` render it, so its trimmed text must equal that string
  * exactly: money and percents formatted as `FormatterContext` does, the
- * quantity as `String(quantity)`, and the largest position as
- * `name (percent)`, or the no-value dash when the response has none.
+ * signed P/L as its magnitude so formatted, below one cent rounded to whole
+ * cents, after a minus for a loss that does not round to 0 (`signedCurrency`
+ * of `formatInPage`), the quantity as `String(quantity)`, and the largest
+ * position as `name (percent)`, or the no-value dash when the response has
+ * none.
  *
  * A pair and a problem repeat the page's text only where it equals the
  * expected value or is in its element's defined form (`DOM_TEXT_FORMS`),
@@ -2891,9 +2905,9 @@ export async function compareInsights(page, dom, body) {
         currency: [
             body.totalValue,
             body.totalInvested,
-            body.unrealizedPnl,
             ...allocations.map((allocation) => allocation.value),
         ],
+        signedCurrency: [body.unrealizedPnl],
         percent: [
             body.unrealizedPnlPercent,
             ...allocations.map((allocation) => allocation.percent),
@@ -2931,7 +2945,7 @@ export async function compareInsights(page, dom, body) {
     compare(
         "#insights-unrealized-pnl",
         dom.unrealizedPnl,
-        formats.currency[2],
+        formats.signedCurrency[0],
         DOM_TEXT_FORMS.currency
     )
     compare(
@@ -2984,7 +2998,7 @@ export async function compareInsights(page, dom, body) {
             compare(
                 `${row} value`,
                 cells[2] ?? null,
-                formats.currency[3 + index],
+                formats.currency[2 + index],
                 DOM_TEXT_FORMS.currency
             )
             compare(

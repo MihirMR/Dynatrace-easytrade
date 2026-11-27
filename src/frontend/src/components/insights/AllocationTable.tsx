@@ -6,6 +6,29 @@ type AllocationTableProps = {
     allocations: Allocation[]
 }
 
+/**
+ * The column header row, shared with the summary's loading placeholder so its
+ * table has the same columns and header row as this one.
+ */
+export function AllocationTableHead() {
+    return (
+        <thead>
+            <tr>
+                <th scope="col">Instrument</th>
+                <th scope="col" className="col-number">
+                    Quantity
+                </th>
+                <th scope="col" className="col-number">
+                    Value
+                </th>
+                <th scope="col" className="col-number">
+                    Allocation
+                </th>
+            </tr>
+        </thead>
+    )
+}
+
 export function AllocationTable({ allocations }: AllocationTableProps) {
     const { formatCurrency, formatPercent } = useFormatter()
 
@@ -24,20 +47,7 @@ export function AllocationTable({ allocations }: AllocationTableProps) {
                 tabIndex={0}
             >
                 <table id="insights-allocations" className="data-table">
-                    <thead>
-                        <tr>
-                            <th scope="col">Instrument</th>
-                            <th scope="col" className="col-number">
-                                Quantity
-                            </th>
-                            <th scope="col" className="col-number">
-                                Value
-                            </th>
-                            <th scope="col" className="col-number">
-                                Allocation
-                            </th>
-                        </tr>
-                    </thead>
+                    <AllocationTableHead />
                     <tbody>
                         {allocations.map((allocation) => (
                             <tr key={allocation.instrumentId}>

@@ -960,8 +960,6 @@ dialog::backdrop {
 /* ---- Portfolio insights ---- */
 /* Insights feature sizes, named for the rules below */
 :root {
-    /* Narrowest summary card before the grid wraps to another row */
-    --insights-figure-min-width: 180px;
     /* Row divider hairline, as wide as the .card-header and .data-table dividers */
     --insights-divider-width: 1px;
     /* Keyboard focus ring of the insights controls */
@@ -976,14 +974,102 @@ dialog::backdrop {
     --insights-alert-list-max-width: 800px;
 }
 
+/* The figure grid, then the Allocation section or the empty state, a section gap apart as on Home */
+/* Also the size container the grid's column count is read from, in the loaded and the loading state */
+.insights-content {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-8);
+    container-type: inline-size;
+    container-name: insights-content;
+}
+
+/* The six cards sit in 1, 2, 3 or 6 equal columns, so no row is left part-filled */
+/* n columns start where n cards of 180px and the n - 1 gaps of --space-4 (16px) fit: n * 180 + (n - 1) * 16 = 376px for 2, 572px for 3, 1160px for 6 */
+/* Container conditions cannot read custom properties, so those widths are written out */
 .insights-summary {
     display: grid;
-    /* The minimum shrinks to a narrower container, so no card overflows it */
-    grid-template-columns: repeat(
-        auto-fit,
-        minmax(min(var(--insights-figure-min-width), 100%), 1fr)
-    );
+    grid-template-columns: minmax(0, 1fr);
     gap: var(--space-4);
+}
+
+@container insights-content (min-width: 376px) {
+    .insights-summary {
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+    }
+}
+
+@container insights-content (min-width: 572px) {
+    .insights-summary {
+        grid-template-columns: repeat(3, minmax(0, 1fr));
+    }
+}
+
+@container insights-content (min-width: 1160px) {
+    .insights-summary {
+        grid-template-columns: repeat(6, minmax(0, 1fr));
+    }
+}
+
+/* Loading state: the summary block is the box the loading message is placed in */
+.insights-summary-block {
+    position: relative;
+}
+
+/* The loading message takes no space: it lies over the end of the block, the placeholder's last empty table row or its empty state, so the block is as tall while loading as the summary the placeholder reserves */
+/* It paints above the placeholder, whose size container is a stacking context later in the page */
+/* It is never a scroll anchor: it moves to the block's end when the figures arrive, and the browser would scroll by that distance to follow it */
+#insights-status {
+    position: absolute;
+    inset-inline: 0;
+    inset-block-end: 0;
+    z-index: 1;
+    overflow-anchor: none;
+}
+
+/* Set as a .data-table body cell, so the message fills the row it lies over and fits inside the empty state's block */
+#insights-loading {
+    padding: var(--space-3);
+    font-size: var(--text-sm);
+}
+
+/* An empty value of the loading placeholder, drawn as a bar: in a figure card it is one value line tall */
+.insights-value-placeholder {
+    inline-size: 60%;
+    border-radius: var(--radius-sm);
+    background-color: var(--bg-hover);
+}
+
+/* In an allocation row it is inline, so a numeric cell aligns it right as it does a number, and as tall as the cell's text, centred in the line, so the row keeps its one-line height */
+.data-table .insights-value-placeholder {
+    display: inline-block;
+    vertical-align: middle;
+    block-size: 1em;
+}
+
+/* Allocation cells, loaded and placeholder, stay on one line whatever a name's length, so every row is one line tall and the loading placeholder reserves the loaded table's exact height; a longer row scrolls the table sideways instead */
+.insights-allocations-scroll .data-table td {
+    white-space: nowrap;
+}
+
+/* Error state after the placeholder showed: the error message and the placeholder share one full-width grid cell, so the block stays as tall as the placeholder made it and nothing below it moves */
+.insights-error-footprint {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr);
+}
+
+.insights-error-footprint > * {
+    grid-area: 1 / 1;
+}
+
+/* The message keeps its own height at the top of the block */
+.insights-error-footprint > #insights-error {
+    align-self: start;
+}
+
+/* The placeholder only holds the space; nothing of it is seen */
+.insights-error-footprint > .insights-content {
+    visibility: hidden;
 }
 
 .insights-figure {
@@ -994,6 +1080,9 @@ dialog::backdrop {
     display: flex;
     flex-direction: column;
     gap: var(--space-1);
+    /* An unbroken name or long amount wraps inside the card instead of overflowing it */
+    min-width: 0;
+    overflow-wrap: anywhere;
 }
 
 #alerts-list,
@@ -1102,27 +1191,29 @@ dialog::backdrop {
 /* The entry is laid out after the five links and is reached by the row's existing horizontal scroll */
 @media (max-width: 768px) {
     /* No flex basis and no intrinsic width; the negative start margin cancels the row gap the entry adds (layout.css: .sidebar-nav ul gap) */
+    /* A row of the link and its end spacer, both overflowing the item; the link stays at its content height at the top, as the other links do in their items */
     .sidebar-nav li:has(> #nav-portfolio-insights) {
+        display: flex;
+        align-items: flex-start;
         flex: 0 0 0;
         min-width: 0;
         contain: inline-size;
         margin-inline-start: calc(-1 * var(--space-1));
     }
 
-    /* The link overflows its zero-width item on one line, restores the row gap before it, and keeps the sidebar's end padding in view when keyboard focus scrolls it into the row */
+    /* The link overflows its zero-width item on one line without shrinking, restores the row gap before it, and keeps the sidebar's end padding in view when keyboard focus scrolls it into the row */
     #nav-portfolio-insights {
-        position: relative;
+        flex-shrink: 0;
         width: max-content;
         margin-inline-start: var(--space-1);
         scroll-margin-inline: var(--space-2);
     }
 
     /* Extends the row's scroll range past the link by the sidebar's end padding, so its focus ring stays in view at the end of the row */
-    #nav-portfolio-insights::after {
+    /* It follows the link instead of sitting inside it, so the link's focus ring outlines the link alone, as on the five existing links */
+    .sidebar-nav li:has(> #nav-portfolio-insights)::after {
         content: "";
-        position: absolute;
-        inset-inline-start: 100%;
-        inline-size: var(--space-2);
+        flex: 0 0 var(--space-2);
         block-size: 1px;
     }
 }

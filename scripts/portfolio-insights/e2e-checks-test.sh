@@ -563,6 +563,16 @@ assert_line step9Trigger_stringValue_failsWrongType \
     "FAIL step 9 profit_loss BELOW trigger value: triggerValue has JSON type string, expected number"
 assert_line step9Trigger_triggerLineInFirstCycle_passesLogLine "PASS step 9 target_price ABOVE trigger log line"
 
+# A revision the server sends as text reaches the INFO line as its digits only.
+STUB_NOTIFICATIONS="{\"results\":[$(notification "${ID_PREFIX}1" 12.5 |
+    jq -c '.armingRevision = "\u001b[2J7"' | tr -d '\r')]}"
+reset_alert_files
+STUB_POSTS=0
+capture step9_trigger
+want_line "INFO triggered target_price ABOVE ${ID_PREFIX}1 revision ??2?7"
+want_no_text "$(printf '\033')"
+conclude step9Trigger_textRevision_infoShowsDigitsOnly
+
 STUB_LISTING="{\"results\":[{\"id\":\"not-a-guid\",\"amount\":1,\"price\":{\"close\":12.5}},{\"id\":\"$U1\",\"amount\":\"1\",\"price\":{\"close\":12.5}}]}"
 reset_alert_files
 capture step9_trigger
@@ -1693,6 +1703,96 @@ step7_row unbindablePatchAnsweredProblem_passes 1 problem PASS
 step7_row unbindablePatchAnsweredErrorResponse_fails 1 error_response "status 400, body kind [error_response]"
 step7_row temporaryAlertRefused_failsBothBindingChecks 0 problem \
     "creating the temporary alert gave status 400, body kind [error_response]; expected 201 with an id"
+reset_alert_files
+
+# ---------------------------------------------------------------------------------------------
+# step12_untriggered_ack: a changed row's reason names the AlertDTO fields that differ and only
+# counts every other key, so a key that holds the holder's password never reaches the output,
+# whole or in part.
+
+LEAK="e2e-checks-leak-marker"
+A12="aaaaaaaa-0000-4000-8000-000000000012"
+# The disabled, untriggered state step 12 requires, beside a key AlertDTO does not have.
+ROW12="{\"id\":\"$A12\",\"enabled\":false,\"triggeredAt\":null,\"triggerValue\":null,\"acknowledged\":false,\"note\":\"$LEAK\"}"
+
+STEP12_LISTS=()
+STEP12_GETS=0
+# shellcheck disable=SC2329 # Invoked through the http stub.
+route_response() {
+    local list='{"results":[]}'
+    case "$1 $2" in
+        "POST $ALERTS_URL")
+            last_response 201 "application/json; charset=utf-8" "{\"id\":\"$A12\",\"armingRevision\":1}"
+            ;;
+        "PATCH $ALERTS_URL/$A12")
+            last_response 200 "application/json; charset=utf-8" "{\"id\":\"$A12\",\"enabled\":false}"
+            ;;
+        "POST $ALERTS_URL/$A12/acknowledge") last_response 204 "" "" ;;
+        "GET $ALERTS_URL?accountId=$HOLDER_ID")
+            if [[ $STEP12_GETS -lt ${#STEP12_LISTS[@]} ]]; then
+                list="${STEP12_LISTS[$STEP12_GETS]}"
+            fi
+            STEP12_GETS=$((STEP12_GETS + 1))
+            last_response 200 "application/json; charset=utf-8" "$list"
+            ;;
+        *) return 1 ;;
+    esac
+}
+
+# step12_with BEFORE_JQ AFTER_JQ: step12_untriggered_ack, captured, with the listing before the
+# acknowledge holding ROW12 as BEFORE_JQ changes it and the listing after it as AFTER_JQ does.
+step12_with() {
+    reset_alert_files
+    PAIRS_READY=1
+    H1="$U1"
+    EVIDENCE_DIR="$TEST_DIR/evidence-12"
+    mkdir -p "$EVIDENCE_DIR"
+    STEP12_GETS=0
+    STEP12_LISTS=(
+        "{\"results\":[$(jq -c "$1" <<<"$ROW12" | tr -d '\r')]}"
+        "{\"results\":[$(jq -c "$2" <<<"$ROW12" | tr -d '\r')]}"
+    )
+    capture step12_untriggered_ack
+}
+
+# A holder password in random_secret's format, assembled here so no literal resembles a
+# credential.
+PW12="Pi-$(printf '%02x' {16..31})"
+ACK12_FAIL="FAIL step 12 acknowledge leaves an untriggered alert unchanged"
+
+# want_no_fragment PREFIX SECRET: collect a reason when a captured OUT line holding PREFIX holds
+# any 8 consecutive characters of SECRET.
+want_no_fragment() {
+    local lines i
+    lines="$(grep -F -- "$1" <<<"$OUT" || true)"
+    for ((i = 0; i + 8 <= ${#2}; i++)); do
+        if [[ "$lines" == *"${2:i:8}"* ]]; then
+            reasons+=("a [$1] line holds the 8 password characters from offset $i")
+            return 0
+        fi
+    done
+}
+
+# step12_secret_key SCENARIO_RESULT AFTER_JQ EXPECTED: step12_untriggered_ack run as step12_with
+# '.' AFTER_JQ runs it, with PW12 as the holder's password; its step-12 FAIL line must read
+# EXPECTED and hold no 8 consecutive characters of PW12, and no output the row's LEAK value.
+step12_secret_key() {
+    HOLDER_PASSWORD="$PW12"
+    step12_with '.' "$2"
+    HOLDER_PASSWORD=""
+    want_line "$ACK12_FAIL: $3"
+    want_no_fragment "$ACK12_FAIL" "$PW12"
+    want_no_text "$LEAK"
+    conclude "step12UntriggeredAck_$1"
+}
+
+step12_secret_key passwordAsChangedKey_countsItWithoutPasswordFragment \
+    ".acknowledged = true | .[\"$PW12\"] = 1" \
+    "acknowledging changed the row: acknowledged, 1 other key"
+step12_secret_key longKeyHoldingPassword_countsItWithoutPasswordFragment \
+    ".triggeredAt = \"2026-11-26T01:02:03Z\" | .acknowledged = true | .note = \"other\"
+        | .[\"k-$PW12-$(printf 'z%.0s' {1..8})\"] = 1" \
+    "acknowledging changed the row: acknowledged, triggeredAt, 2 other keys"
 reset_alert_files
 
 # ---------------------------------------------------------------------------------------------

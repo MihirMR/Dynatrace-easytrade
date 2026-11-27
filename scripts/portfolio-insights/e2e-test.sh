@@ -3,10 +3,11 @@
 #   - option parsing, in a child bash, the configuration a valid set of options gives, and the
 #     new evidence directory each run makes;
 #   - exact decimals (dec_to_units, num_to_units, units_to_dec) and the interval rule;
-#   - broker log windows: the log read, cycle lines and their outcomes, trigger lines, alert ids
-#     and arming revisions; the trigger lines step 9 records and step 10's completed follow-up
-#     cycle after them;
-#   - alert ownership: created ids, the create guard, interrupts, deletion and its limits;
+#   - broker log windows: the log read, which stays in the private directory, cycle lines and
+#     their outcomes, trigger lines, alert ids and arming revisions; the trigger lines step 9
+#     records and step 10's completed follow-up cycle after them;
+#   - alert ownership: created ids, the journal of uncertain creates, the create guard,
+#     interrupts, deletion and its limits, and an inventory that cannot be computed;
 #   - the fixture the browser check reads, the browser check's exit code and output, and an
 #     earlier run's report it leaves alone;
 #   - step 12: the listings and untriggered state its acknowledge is compared on, the
@@ -14,7 +15,8 @@
 #     provenance and persistence of the browser's acknowledgement;
 #   - http's transport errors, the exact 403 oracle, the jq verdict and lookup helpers, and
 #     random GUIDs;
-#   - the EXIT cleanup's flag switching, restore and failure paths, and bounded polling.
+#   - the EXIT cleanup's flag switching, restore and failure paths, its reconciliation of
+#     uncertain creates and of an unusable inventory, and bounded polling.
 # scripts/portfolio-insights/e2e-credentials-test.sh covers the passwords, the private directory
 # that keeps them and the raw responses, the description of a body and their removal on exit;
 # e2e-checks-test.sh the exact number comparisons and the step checks; harness-test.sh the
@@ -103,10 +105,10 @@ BROKER_LOGS_RC=0
 # The fake docker, a process of its own, reads both.
 export CASE_DIR BROKER_LOGS_RC
 FAKE_NOW=1700000000
+SLEEP_OVERRUN=0
 NODE_OUTPUT=""
 NODE_RC=0
 NODE_REPORT=""
-SIGNAL_PID=""
 
 # ---------------------------------------------------------------------------------------------
 # Reporting. e2e.sh owns pass, fail and their counters, so the test's own have other names.
@@ -231,6 +233,7 @@ new_run() {
     : >"$RUN_DIR/deleted"
     : >"$RUN_DIR/pairs"
     : >"$RUN_DIR/triggered"
+    : >"$RUN_DIR/uncertain-creates"
     : >"$RUN_DIR/trigger-lines"
     : >"$CASE_DIR/responses"
     : >"$CASE_DIR/requests"
@@ -244,7 +247,6 @@ new_run() {
     EVIDENCE_DIR="$RUN_DIR"
     BROKER_LOGS_RC=0
     FAKE_NOW=1700000000
-    SIGNAL_PID=""
     HTTP_STATUS=""
     HTTP_CTYPE=""
     HTTP_BODY=""
@@ -254,6 +256,9 @@ new_run() {
     CREATE_ERROR=""
     IN_CREATE=0
     PENDING_EXIT=""
+    UNJOURNALED_CREATES=0
+    HOLDER_ID=""
+    EMPTY_ID=""
 }
 
 # respond STATUS CONTENT_TYPE BODY: queues the answer to the next request. BODY is printf %b
@@ -305,9 +310,6 @@ curl() {
         return 7
     fi
     IFS=$'\037' read -r status ctype body <<<"${queue[${#requests[@]} - 1]}"
-    if [[ -n "$SIGNAL_PID" ]]; then
-        kill -INT "$SIGNAL_PID"
-    fi
     if [[ "$status" == "000" ]]; then
         echo "curl: (7) $body" >&2
         return 7
@@ -384,10 +386,11 @@ date() {
     command date "$@"
 }
 
-# sleep SECONDS: advances the fake clock and records the step; no time passes.
+# sleep SECONDS: advances the fake clock by SECONDS, and by SLEEP_OVERRUN more for a sleep that
+# ends late, and records the step; no time passes.
 sleep() {
     echo "$1" >>"$CASE_DIR/sleeps"
-    FAKE_NOW=$((FAKE_NOW + $1))
+    FAKE_NOW=$((FAKE_NOW + $1 + SLEEP_OVERRUN))
 }
 
 # broker_log EVENT...: writes the broker log docker serves, one console-logger line per EVENT,
@@ -458,11 +461,29 @@ trap -p EXIT >"$TEST_TMP/exit-trap"
 # Options
 
 test_options_help_exitsZeroWithUsage() {
+    local args line
+    # Help is honoured as soon as it is parsed, so a row after --project needs no other option.
+    local -a rows=("-h" "--help" "--project e2e-unit-test -h")
+    local -a lines=(
+        "  -h, --help           Show this help and exit"
+        "Each run creates two directories under \$TMPDIR (default: /tmp): the run directory"
+        "  scripts/portfolio-insights/e2e.sh --project pi-dev-postgres --base-url http://localhost \\"
+        "      --compose-file compose.dev.yaml"
+    )
     new_run
-    run_e2e_child --help
-    row_is "status" "$CHILD_STATUS" "0"
-    row_is "first line" "$(first_line "$CASE_DIR/child.out")" \
-        "Usage: scripts/portfolio-insights/e2e.sh --project NAME [--base-url URL]"
+    for args in "${rows[@]}"; do
+        # shellcheck disable=SC2086 # The row's arguments are split on purpose.
+        run_e2e_child $args
+        row_is "[$args] status" "$CHILD_STATUS" "0"
+        row_is "[$args] first line" "$(first_line "$CASE_DIR/child.out")" \
+            "Usage: scripts/portfolio-insights/e2e.sh --project NAME [--base-url URL]"
+        for line in "${lines[@]}"; do
+            if ! has_line "$CASE_DIR/child.out" "$line"; then
+                reasons+=("[$args] stdout lacks [$line]")
+            fi
+        done
+        row_is "[$args] stderr" "$(file_text "$CASE_DIR/child.err")" ""
+    done
     conclude "options_help_exitsZeroWithUsage"
 }
 
@@ -519,6 +540,25 @@ test_options_sourced_setRunConfiguration() {
         reasons+=("the EXIT trap is [$(cat "$TEST_TMP/exit-trap")]: sourcing ran main")
     fi
     conclude "options_sourced_setRunConfiguration"
+}
+
+# A caller that turned Git Bash path conversion off would leave curl and node unable to open the
+# /c/... paths e2e.sh hands them. The child stands in for the tools e2e.sh checks for, sources it
+# with valid options and its own TMPDIR, and prints both settings as e2e.sh leaves them.
+test_options_pathConversionOffInCaller_settingsUnset() {
+    new_run
+    mkdir -p "$CASE_DIR/tmp"
+    CHILD_STATUS=0
+    # shellcheck disable=SC2016 # Expanded by the child bash.
+    MSYS_NO_PATHCONV=1 MSYS2_ARG_CONV_EXCL='*' TMPDIR="$CASE_DIR/tmp" "$BASH" -c '
+        curl() { :; }
+        node() { :; }
+        source "$1" --project e2e-unit-test --compose-file compose.dev.yaml --base-url "$2"
+        printf "%s %s" "${MSYS_NO_PATHCONV-unset}" "${MSYS2_ARG_CONV_EXCL-unset}"' \
+        e2e-test-child "$E2E" "$TEST_BASE_URL" >"$CASE_DIR/child.out" 2>"$CASE_DIR/child.err" \
+        </dev/null || CHILD_STATUS=$?
+    row_is "status and settings" "$CHILD_STATUS|$(file_text "$CASE_DIR/child.out")" "0|unset unset"
+    conclude "options_pathConversionOffInCaller_settingsUnset"
 }
 
 # source_e2e_in_case REFUSED [OPTION...]: sources e2e.sh as load_e2e does, with the compose file
@@ -775,6 +815,26 @@ test_readWindow_brokerLog_recordsOnlyCycleAndTriggerLines() {
     conclude "readWindow_brokerLog_recordsOnlyCycleAndTriggerLines"
 }
 
+test_brokerLogReads_rawOutput_keptOnlyInPrivateDir() {
+    local name marker="unrelated broker line e2e-test-marker"
+    local insights="Portfolio insights for account [$TEST_ACCOUNT] holdings [2] value [1.5]"
+    insights+=" risk [LOW] duration [3] ms trace [0123456789abcdef0123456789abcdef]"
+    new_run
+    broker_log "$marker" C "T $ID_A 1" "$insights"
+    read_window "2026-11-25T10:00:00Z" || reasons+=("read_window failed")
+    insights_line_logged "2026-11-25T10:00:00Z" "$TEST_ACCOUNT" 2 1.5 LOW ||
+        reasons+=("insights_line_logged missed the insights line: $POLL_DETAIL")
+    if grep -rqF -e "$marker" -e "Portfolio insights" -e "triggered for account" "$RUN_DIR"; then
+        reasons+=("the run directory holds broker output in [$(grep -rlF -e "$marker" -e "Portfolio insights" -e "triggered for account" "$RUN_DIR" | tr '\n' ' ')]")
+    fi
+    for name in window.log insights.log; do
+        if ! grep -qF "$marker" "$PRIVATE_DIR/$name"; then
+            reasons+=("$PRIVATE_DIR/$name does not hold the raw log read")
+        fi
+    done
+    conclude "brokerLogReads_rawOutput_keptOnlyInPrivateDir"
+}
+
 test_readWindow_cycleLine_recordsOutcome() {
     local row name event expected
     local summary="Alert evaluation cycle finished: alerts [3] triggered [1] failed [0] skipped [0]"
@@ -1002,25 +1062,41 @@ test_step10NoRepeat_followUpCycle_passesOnlyOnceCompleted() {
 # ---------------------------------------------------------------------------------------------
 # Alert ownership
 
-test_ownIfCreated_response_ownsOnlyCreatedUuid() {
-    local row status body expected
+# A 201 with a readable id is owned and any 4xx refused; every other outcome journals the
+# account the request body names, read from its text even when it is not valid JSON, as
+# settled after a 2xx, which shows the request finished, and as unsettled after anything else.
+test_ownIfCreated_response_ownsCreatedAndJournalsUncertain() {
+    local row status body request owned journaled
+    local named="{\"accountId\":\"$TEST_ACCOUNT\",\"threshold\":1}"
     local -a rows=(
-        "201|{\"id\":\"$ID_UPPER\"}|$ID_LOWER"
-        "201|{}|"
-        "201|{\"id\":\"not-a-uuid\"}|"
-        "201|not json|"
-        "400|{\"id\":\"$ID_UPPER\"}|"
-        "200|{\"id\":\"$ID_UPPER\"}|"
+        "201|{\"id\":\"$ID_UPPER\"}|$named|$ID_LOWER|"
+        "201|{}|$named||$TEST_ACCOUNT settled"
+        "201|{\"id\":\"not-a-uuid\"}|$named||$TEST_ACCOUNT settled"
+        "201|not json|$named||$TEST_ACCOUNT settled"
+        "400|{\"id\":\"$ID_UPPER\"}|$named||"
+        "403|{\"error\":\"feature_disabled\"}|$named||"
+        "404|{}|$named||"
+        "200|{\"id\":\"$ID_UPPER\"}|$named||$TEST_ACCOUNT settled"
+        "204||$named||$TEST_ACCOUNT settled"
+        "101||$named||$TEST_ACCOUNT unsettled"
+        "302||$named||$TEST_ACCOUNT unsettled"
+        "500|boom|$named||$TEST_ACCOUNT unsettled"
+        "000||$named||$TEST_ACCOUNT unsettled"
+        "000||{\"accountId\" : \"$ID_UPPER\",\"threshold\":1||$ID_LOWER unsettled"
+        "000||{\"threshold\":1}||unknown unsettled"
+        "201|{}|{\"accountId\":\"not-a-guid\"}||unknown settled"
     )
     for row in "${rows[@]}"; do
         new_run
-        IFS='|' read -r status body expected <<<"$row"
+        IFS='|' read -r status body request owned journaled <<<"$row"
         HTTP_STATUS="$status"
         HTTP_BODY="$body"
-        own_if_created
-        row_is "$status $body" "$(file_text "$RUN_DIR/owned")" "$expected"
+        own_if_created "$request"
+        row_is "$status $body, request $request" \
+            "$(file_text "$RUN_DIR/owned")|$(file_text "$RUN_DIR/uncertain-creates")" \
+            "$owned|$journaled"
     done
-    conclude "ownIfCreated_response_ownsOnlyCreatedUuid"
+    conclude "ownIfCreated_response_ownsCreatedAndJournalsUncertain"
 }
 
 test_postAlert_nonTokenThreshold_rejectedBeforeRequest() {
@@ -1036,24 +1112,57 @@ test_postAlert_nonTokenThreshold_rejectedBeforeRequest() {
     conclude "postAlert_nonTokenThreshold_rejectedBeforeRequest"
 }
 
-test_postAlert_unusableResponse_failsAndOwnsNothing() {
-    local row status body expected rc transport="transport error (curl: (7) $CONNECT_ERROR)"
+# A refusal (4xx) is not journaled; every uncertain outcome journals the account, once. The
+# reason a transport error gives is status_text's, which the expectation reads as http left it.
+test_postAlert_unusableResponse_failsJournalingOnlyUncertain() {
+    local row status body reason journaled rc expected
+    local uncertain="the alert may exist without an id this run knows, so the create is"
+    uncertain+=" journaled for reconciliation on exit"
     local -a rows=(
-        "000|$CONNECT_ERROR|$transport; the alert may exist without an id this run knows"
-        "400|{\"error\":\"invalid\"}|status 400; body [19 bytes, JSON object with 1 key [error]]"
-        "201|{}|201 without a readable id; the created alert cannot be deleted by this run"
-        "201|{\"id\":\"xyz\"}|201 without a readable id; the created alert cannot be deleted by this run"
+        "000|$CONNECT_ERROR|transport|$TEST_ACCOUNT unsettled"
+        "400|{\"error\":\"invalid\"}|status 400; body [19 bytes, JSON object with 1 key [error]]|"
+        "404|{\"error\":\"unknown\"}|status 404; body [19 bytes, JSON object with 1 key [error]]|"
+        "201|{}|201 without a readable id; $uncertain|$TEST_ACCOUNT settled"
+        "201|{\"id\":\"xyz\"}|201 without a readable id; $uncertain|$TEST_ACCOUNT settled"
+        "200|{\"id\":\"$ID_A\"}|status 200; body [45 bytes, JSON object with 1 key [id]]; $uncertain|$TEST_ACCOUNT settled"
+        "500|boom|status 500; body [4 bytes, not JSON]; $uncertain|$TEST_ACCOUNT unsettled"
     )
     for row in "${rows[@]}"; do
         new_run
-        IFS='|' read -r status body expected <<<"$row"
+        IFS='|' read -r status body reason journaled <<<"$row"
         respond "$status" "application/json" "$body"
         rc=0
         post_alert "$TEST_ACCOUNT" TARGET_PRICE "$ID_A" ABOVE 1 || rc=$?
-        row_is "$status $body" "$rc|$CREATE_ERROR|$CREATED_ID|$(file_text "$RUN_DIR/owned")" \
-            "1|$expected||"
+        expected="$reason"
+        if [[ "$reason" == "transport" ]]; then
+            expected="$(status_text); $uncertain"
+        fi
+        row_is "$status $body" \
+            "$rc|$CREATE_ERROR|$CREATED_ID|$(file_text "$RUN_DIR/owned")|$(file_text "$RUN_DIR/uncertain-creates")" \
+            "1|$expected|||$journaled"
     done
-    conclude "postAlert_unusableResponse_failsAndOwnsNothing"
+    conclude "postAlert_unusableResponse_failsJournalingOnlyUncertain"
+}
+
+# A 201 whose id cannot be recorded as owned is journaled instead; an uncertain create whose
+# journal line cannot be written is counted, which fails the cleanup check.
+test_postAlert_recordUnwritable_journalsOrCountsCreate() {
+    local uncertain="the alert may exist without an id this run knows"
+    new_run
+    break_step "owned not a file"
+    respond 201 "application/json" "{\"id\":\"$ID_UPPER\"}"
+    post_alert "$TEST_ACCOUNT" TARGET_PRICE "$ID_A" ABOVE 1 2>/dev/null || true
+    row_is "owned unwritable" \
+        "$CREATE_ERROR|$CREATED_ID|$(file_text "$RUN_DIR/uncertain-creates")|$UNJOURNALED_CREATES" \
+        "201 with id [$ID_LOWER], which could not be recorded as owned; $uncertain, so the create is journaled for reconciliation on exit||$TEST_ACCOUNT settled|0"
+
+    new_run
+    break_step "uncertain-creates not a file"
+    respond 500 "text/plain" "boom"
+    post_alert "$TEST_ACCOUNT" TARGET_PRICE "$ID_A" ABOVE 1 2>/dev/null || true
+    row_is "journal unwritable" "$CREATE_ERROR|$UNJOURNALED_CREATES" \
+        "status 500; body [4 bytes, not JSON]; $uncertain, and the create could not be journaled, so the cleanup check fails|1"
+    conclude "postAlert_recordUnwritable_journalsOrCountsCreate"
 }
 
 test_postAlert_created_ownsLowercaseId() {
@@ -1080,8 +1189,23 @@ test_postAlert_token_sentVerbatim() {
     conclude "postAlert_token_sentVerbatim"
 }
 
+# Each test that interrupts itself traps and sends TERM, never INT: a shell started in the
+# background ignores INT on entry and cannot trap it, and e2e.sh traps INT and TERM alike.
+# interrupt_when_answered: in the calling subshell, http answers each request and the subshell
+# then sends itself TERM, so the interrupt arrives while the create that sent it holds the exit.
+interrupt_when_answered() {
+    eval "answered_$(declare -f http)"
+    http() {
+        local rc=0
+        answered_http "$@" || rc=$?
+        kill -TERM "$BASHPID"
+        return "$rc"
+    }
+}
+
 test_onSignal_interrupt_heldOnlyWhileCreating() {
-    local status
+    local status between="FAIL interrupted: signal received between steps;"
+    between+=" any step not yet started did not run"
     new_run
     status=0
     (
@@ -1089,31 +1213,240 @@ test_onSignal_interrupt_heldOnlyWhileCreating() {
         on_signal
         echo "continued"
     ) >"$CASE_DIR/out" 2>&1 || status=$?
-    row_is "outside a create" "$status|$(file_text "$CASE_DIR/out")" "130|"
+    row_is "outside a create" "$status|$(file_text "$CASE_DIR/out")" "130|$between"
 
     new_run
     respond 201 "application/json" "{\"id\":\"$ID_UPPER\"}"
     status=0
     (
-        trap on_signal INT
-        SIGNAL_PID="$BASHPID"
+        trap on_signal TERM
+        interrupt_when_answered
         create_alert "$TEST_ACCOUNT" TARGET_PRICE "$ID_A" ABOVE 1
         echo "continued"
     ) >"$CASE_DIR/out" 2>&1 || status=$?
     row_is "during the POST" "$status|$(file_text "$CASE_DIR/out")|$(file_text "$RUN_DIR/owned")" \
-        "130||$ID_LOWER"
+        "130|$between|$ID_LOWER"
 
     new_run
     respond 201 "application/json" "{\"id\":\"$ID_UPPER\"}"
     status=0
     (
-        trap on_signal INT
+        trap on_signal TERM
         create_alert "$TEST_ACCOUNT" TARGET_PRICE "$ID_A" ABOVE 1
         echo "continued"
     ) >"$CASE_DIR/out" 2>&1 || status=$?
     row_is "no interrupt" "$status|$(file_text "$CASE_DIR/out")|$(file_text "$RUN_DIR/owned")" \
         "0|continued|$ID_LOWER"
     conclude "onSignal_interrupt_heldOnlyWhileCreating"
+}
+
+# The innermost step function on the call stack is named, past helpers whose names only start
+# like one. A second interrupt while a create holds the exit (IN_CREATE=1, as create_alert sets
+# it) prints no second line and leaves the exit held.
+test_onSignal_interruptInStep_failsOnceNamingStep() {
+    local status line
+    new_run
+    status=0
+    (
+        trap on_signal TERM
+        step_interrupt() {
+            kill -TERM "$BASHPID"
+            echo "continued"
+        }
+        step13_cleanup_and_disable() {
+            step_interrupt
+        }
+        step13_cleanup_and_disable
+    ) >"$CASE_DIR/out" 2>&1 || status=$?
+    line="FAIL interrupted: signal received during step 13; step 13 did not finish"
+    row_is "step 13, outside a create" "$status|$(file_text "$CASE_DIR/out")" \
+        "130|$line and the steps after it did not run"
+
+    new_run
+    status=0
+    (
+        received=0
+        trap 'received=$((received + 1)); on_signal' TERM
+        held_create() {
+            IN_CREATE=1
+            kill -TERM "$BASHPID"
+            kill -TERM "$BASHPID"
+            echo "held for exit $PENDING_EXIT after $received interrupts"
+        }
+        step9_trigger() {
+            held_create
+        }
+        step9_trigger
+    ) >"$CASE_DIR/out" 2>&1 || status=$?
+    line="FAIL interrupted: signal received during step 9; step 9 did not finish"
+    row_is "step 9, two interrupts in a held create" "$status|$(file_text "$CASE_DIR/out")" \
+        "0|$line and the steps after it did not run"$'\n'"held for exit 130 after 2 interrupts"
+    conclude "onSignal_interruptInStep_failsOnceNamingStep"
+}
+
+# shellcheck disable=SC2317,SC2329 # Invoked in a subshell of the test below.
+# interrupt_redirected SITE: runs as main runs, with the run's stdout saved on descriptor 9 and
+# both traps set. Step 9 makes SITE's call, whose stdout is a working file, and the interrupt
+# arrives inside it: in the log read of read_window and insights_line_logged, and in own_alert
+# once the id is written to owned.
+interrupt_redirected() {
+    lower_interrupts=0
+    if [[ "$1" == "own_alert" ]]; then
+        lower_interrupts=1
+    fi
+    exec 9>&1
+    RUN_STDOUT_SAVED=1
+    trap cleanup EXIT
+    trap on_signal INT TERM
+    broker_logs() {
+        echo "broker line before the interrupt"
+        kill -TERM "$BASHPID"
+    }
+    lower() {
+        command tr '[:upper:]' '[:lower:]'
+        if [[ $lower_interrupts -eq 1 ]]; then
+            lower_interrupts=0
+            kill -TERM "$BASHPID"
+        fi
+    }
+    step9_trigger() {
+        case "$1" in
+            read_window) read_window "2026-11-25T10:00:00Z" ;;
+            insights_line_logged)
+                insights_line_logged "2026-11-25T10:00:00Z" "$TEST_ACCOUNT" 2 1.5 LOW
+                ;;
+            own_alert) own_alert "$ID_UPPER" ;;
+        esac
+    }
+    step9_trigger "$1"
+    echo "INFO not reached"
+}
+
+# bash runs a trap inside the call it interrupts, under that call's redirections. With the run's
+# stdout saved, the FAIL line, cleanup's output and the SUMMARY line still reach the run's stdout
+# and none of them the working file: owned keeps only the id, and the raw log reads go with the
+# private directory.
+test_onSignal_interruptInRedirectedCall_verdictOnRunStdout() {
+    local site status expected owned requests
+    local interrupted="FAIL interrupted: signal received during step 9; step 9 did not finish"
+    interrupted+=" and the steps after it did not run"
+    for site in read_window insights_line_logged own_alert; do
+        new_run
+        cleanup_state true 0 0 0
+        expected="$interrupted"
+        owned=""
+        requests=""
+        if [[ "$site" == "own_alert" ]]; then
+            respond 200 "application/json" '{"id":"portfolio-insights-enabled","enabled":true}'
+            respond 204 "" ""
+            expected+=$'\n'"INFO cleanup: 1 of 1 remaining owned alerts deleted or already absent"
+            owned="$ID_LOWER"
+            requests="GET $F"$'\n'"DELETE $ALERTS_URL/$ID_LOWER"
+        fi
+        expected+=$'\n'"INFO cleanup: fixture and private working files removed"
+        expected+=$'\n'"PASS cleanup"$'\n'"INFO run dir $RUN_DIR"$'\n'"SUMMARY 1 passed, 1 failed"
+        status=0
+        (interrupt_redirected "$site") >"$CASE_DIR/out" 2>&1 || status=$?
+        row_is "$site: status and run output" "$status|$(file_text "$CASE_DIR/out")" \
+            "130|$expected"
+        row_is "$site: owned and requests" \
+            "$(file_text "$RUN_DIR/owned")|$(file_text "$CASE_DIR/requests")" "$owned|$requests"
+        if [[ -e "$PRIVATE_DIR" ]]; then
+            reasons+=("$site: the private directory, with the raw log read, remains")
+        fi
+    done
+    conclude "onSignal_interruptInRedirectedCall_verdictOnRunStdout"
+}
+
+# shellcheck disable=SC2317,SC2329 # Invoked in a subshell of the test below.
+# signal_as_cleanup_starts CASE: an interrupt as the EXIT trap starts, with the run's stdout
+# saved and both traps set as main sets them. secondAfterExit: step 9 is interrupted, and a
+# second interrupt arrives right after on_signal's exit, before cleanup could set its own trap.
+# insideCleanup: the run exits 0 and the interrupt arrives inside cleanup, before cleanup sets
+# its own trap. Nothing can run inside e2e.sh's cleanup before that line, so a stand-in named
+# cleanup takes its place.
+signal_as_cleanup_starts() {
+    exec 9>&1
+    RUN_STDOUT_SAVED=1
+    trap on_signal INT TERM
+    case "$1" in
+        secondAfterExit)
+            exit_trap_start() {
+                kill -TERM "$BASHPID"
+                cleanup
+            }
+            trap exit_trap_start EXIT
+            step9_trigger() {
+                kill -TERM "$BASHPID"
+            }
+            step9_trigger
+            ;;
+        insideCleanup)
+            cleanup() {
+                kill -TERM "$BASHPID"
+                echo "INFO cleanup went on"
+            }
+            trap cleanup EXIT
+            exit 0
+            ;;
+    esac
+    echo "INFO not reached"
+}
+
+# An interrupt as the EXIT trap starts is on_cleanup_signal's: the run still ends with the
+# cleanup verdict, the SUMMARY line and exit status 130, and the private directory is removed,
+# where an exit inside the EXIT trap would end it with none of them.
+test_onSignal_signalAsCleanupStarts_endsRunThroughCleanupSignal() {
+    local name status expected
+    local first="FAIL interrupted: signal received during step 9; step 9 did not finish and the"
+    first+=" steps after it did not run"
+    local abandoned="FAIL cleanup: interrupted before it finished: owned alerts may be left in"
+    abandoned+=" place and flag $FLAG_ID may not be restored"
+    for name in secondAfterExit insideCleanup; do
+        new_run
+        cleanup_state true 0 0 0
+        case "$name" in
+            secondAfterExit)
+                expected="$first"$'\n'"$abandoned"$'\n'"INFO run dir $RUN_DIR"
+                expected+=$'\n'"SUMMARY 0 passed, 2 failed"
+                ;;
+            insideCleanup)
+                expected="$abandoned"$'\n'"INFO run dir $RUN_DIR"$'\n'"SUMMARY 0 passed, 1 failed"
+                ;;
+        esac
+        status=0
+        (signal_as_cleanup_starts "$name") >"$CASE_DIR/out" 2>&1 || status=$?
+        row_is "$name: status and run output" "$status|$(file_text "$CASE_DIR/out")" \
+            "130|$expected"
+        if [[ -e "$PRIVATE_DIR" ]]; then
+            reasons+=("$name: the private directory remains")
+        fi
+    done
+    conclude "onSignal_signalAsCleanupStarts_endsRunThroughCleanupSignal"
+}
+
+# Closed stdout leaves main nothing to save on descriptor 9. It goes on unsaved, its first line
+# then ends the run under errexit, and the EXIT trap still removes the private directory.
+test_main_stdoutClosed_runsUnsavedAndRemovesPrivateDir() {
+    local run_dirs private_dirs
+    new_run
+    mkdir -p "$CASE_DIR/tmp"
+    CHILD_STATUS=0
+    # shellcheck disable=SC2016 # Expanded by the child bash.
+    TMPDIR="$CASE_DIR/tmp" "$BASH" -c '
+        curl() { :; }
+        node() { :; }
+        source "$1" --project e2e-unit-test --compose-file compose.dev.yaml --base-url "$2"
+        main' e2e-test-child "$E2E" "$TEST_BASE_URL" >&- 2>"$CASE_DIR/child.err" </dev/null ||
+        CHILD_STATUS=$?
+    run_dirs="$(compgen -G "$CASE_DIR/tmp/pi-e2e.*" || true)"
+    private_dirs="$(compgen -G "$CASE_DIR/tmp/pi-e2e-private.*" || true)"
+    row_is "status" "$CHILD_STATUS" "1"
+    if [[ -z "$run_dirs" ]]; then
+        reasons+=("no run directory, so the run ended before main")
+    fi
+    row_is "private directories left" "$private_dirs" ""
+    conclude "main_stdoutClosed_runsUnsavedAndRemovesPrivateDir"
 }
 
 test_remainingOwned_ownedAndDeleted_listsUndeleted() {
@@ -1126,6 +1459,66 @@ test_remainingOwned_ownedAndDeleted_listsUndeleted() {
     printf '%s\n' "$ID_A" "$ID_B" >>"$RUN_DIR/deleted"
     row_is "all deleted" "$(remaining_owned)|$(file_text "$RUN_DIR/to-delete")" "0|"
     conclude "remainingOwned_ownedAndDeleted_listsUndeleted"
+}
+
+# shellcheck disable=SC2317,SC2329 # Invoked by remaining_owned and delete_alert in a subshell.
+# break_step STEP: makes STEP fail in the calling subshell: sort, comm or wc fails as a command
+# that writes nothing, "wc garbage" prints no number, "owned missing" removes $RUN_DIR/owned,
+# "owned not a file", "deleted not a file" and "uncertain-creates not a file" replace that file
+# with a directory.
+break_step() {
+    case "$1" in
+        sort) sort() { return 2; } ;;
+        comm) comm() { return 1; } ;;
+        wc) wc() { return 1; } ;;
+        "wc garbage") wc() { echo "wc: ?"; } ;;
+        "owned missing") rm -f "$RUN_DIR/owned" ;;
+        "owned not a file" | "deleted not a file" | "uncertain-creates not a file")
+            rm -f "$RUN_DIR/${1%% *}"
+            mkdir "$RUN_DIR/${1%% *}"
+            ;;
+    esac
+}
+
+test_remainingOwned_stepFails_failsPrintingNothing() {
+    local step status out
+    for step in sort comm wc "wc garbage" "owned missing" "deleted not a file"; do
+        new_run
+        echo "$ID_A" >"$RUN_DIR/owned"
+        status=0
+        out="$(
+            break_step "$step"
+            remaining_owned 2>/dev/null
+        )" || status=$?
+        row_is "$step: status and output" "$status|$out" "1|"
+    done
+    conclude "remainingOwned_stepFails_failsPrintingNothing"
+}
+
+test_deleteAlert_recordUnwritable_failsKeepingStatus() {
+    local row name status record expected rc
+    local -a rows=(
+        "204 recorded|204|file|0 204 $ID_A"
+        "404 recorded|404|file|0 404 $ID_A"
+        "204 not recordable|204|directory|1 204 "
+        "500, nothing to record|500|directory|0 500 "
+    )
+    for row in "${rows[@]}"; do
+        IFS='|' read -r name status record expected <<<"$row"
+        new_run
+        if [[ "$record" == "directory" ]]; then
+            break_step "deleted not a file"
+        fi
+        respond "$status" "" ""
+        rc=0
+        delete_alert "$ID_A" 2>/dev/null || rc=$?
+        if [[ -f "$RUN_DIR/deleted" ]]; then
+            row_is "$name" "$rc $HTTP_STATUS $(file_text "$RUN_DIR/deleted")" "$expected"
+        else
+            row_is "$name" "$rc $HTTP_STATUS " "$expected"
+        fi
+    done
+    conclude "deleteAlert_recordUnwritable_failsKeepingStatus"
 }
 
 test_deleteRemaining_statuses_mark204And404Deleted() {
@@ -1170,6 +1563,43 @@ test_deleteRemaining_transportErrors_stopAfterMaxConsecutive() {
         row_is "$name: requests and left" "${#requests[@]} $CLEANUP_LEFT" "$expected"
     done
     conclude "deleteRemaining_transportErrors_stopAfterMaxConsecutive"
+}
+
+# delete_ids reads the owned file directly when the inventory cannot be computed: each distinct
+# id gets one DELETE, and an entry that is not a canonical id gets none and is left in place.
+# The last line is an entry whether or not a newline ends it.
+test_deleteIds_rawOwnedList_deletesEachCanonicalIdOnce() {
+    local ending rc
+    for ending in "final newline" "no final newline"; do
+        new_run
+        printf '%s\n' "$ID_A" "not-an-id" "$ID_A" "" >"$RUN_DIR/owned"
+        if [[ "$ending" == "final newline" ]]; then
+            echo "$ID_B" >>"$RUN_DIR/owned"
+        else
+            printf '%s' "$ID_B" >>"$RUN_DIR/owned"
+        fi
+        respond 204 "" ""
+        respond 204 "" ""
+        rc=0
+        delete_ids "$RUN_DIR/owned" >"$CASE_DIR/out" || rc=$?
+        row_is "$ending: status, distinct entries and left" "$rc $CLEANUP_IDS $CLEANUP_LEFT" "0 4 2"
+        row_is "$ending: requests" "$(file_text "$CASE_DIR/requests")" \
+            "$(printf 'DELETE %s\n' "$ALERTS_URL/$ID_A" "$ALERTS_URL/$ID_B")"
+        if ! has_line "$CASE_DIR/out" "INFO cleanup left an owned entry that is not a canonical alert id"; then
+            reasons+=("$ending: no INFO line names the entry left in place: [$(file_text "$CASE_DIR/out")]")
+        fi
+    done
+    conclude "deleteIds_rawOwnedList_deletesEachCanonicalIdOnce"
+}
+
+test_deleteRemaining_transportError_infoCarriesFixedReason() {
+    new_run
+    echo "$ID_A" >"$RUN_DIR/owned"
+    respond 000 "" "Failed writing body to $PRIVATE_DIR/body"
+    delete_remaining >"$CASE_DIR/out"
+    row_is "cleanup output" "$(file_text "$CASE_DIR/out")" \
+        "INFO cleanup left alert $ID_A: transport error (curl exit 7: could not connect)"
+    conclude "deleteRemaining_transportError_infoCarriesFixedReason"
 }
 
 # ---------------------------------------------------------------------------------------------
@@ -1313,6 +1743,29 @@ test_runBrowserCheck_invocation_passesModeAndFixture() {
     row_is "directory and arguments" "$(file_text "$CASE_DIR/node-call")" \
         "$(printf '%s\n%s' "$CASE_DIR/repo/src/loadgen" "$args")"
     conclude "runBrowserCheck_invocation_passesModeAndFixture"
+}
+
+# With the run's stdout saved on descriptor 9, as main saves it, the browser check, and so the
+# browser it starts, runs without that descriptor and cannot hold the run's output open.
+test_runBrowserCheck_runStdoutSaved_descriptorClosedForCheck() {
+    new_run
+    (
+        exec 9>&1
+        RUN_STDOUT_SAVED=1
+        node() {
+            if { true >&9; } 2>/dev/null; then
+                echo "descriptor 9 open"
+            else
+                echo "descriptor 9 closed"
+            fi
+        }
+        node >"$CASE_DIR/control"
+        browser_check flag-on 1
+    ) >"$CASE_DIR/subshell.out" 2>&1
+    row_is "outside the check, then inside it" \
+        "$(file_text "$CASE_DIR/control")|$(file_text "$RUN_DIR/browser-flag-on.log")" \
+        "descriptor 9 open|descriptor 9 closed"
+    conclude "runBrowserCheck_runStdoutSaved_descriptorClosedForCheck"
 }
 
 # report_state FILE: "absent", "a directory", or the text FILE holds.
@@ -1632,17 +2085,29 @@ test_step12UntriggeredAck_browserReport_acceptsOnlyThisRunsAcknowledgement() {
 # ---------------------------------------------------------------------------------------------
 # Response oracles
 
-test_http_transportErrorWithoutMessage_reportsStatus000() {
-    local row name stderr expected status
+# Whatever curl prints, the reason is fixed by its exit status, and curl's own bytes stay in
+# $PRIVATE_DIR/curl-error.
+test_http_transportError_reportsStatus000WithFixedReason() {
+    local row name stderr code expected status
     local debug="WARNING: this libcurl is Debug-enabled, do not use in production"
+    local private="/tmp/pi-e2e-private.Ab12Cd/body"
     local -a rows=(
-        "empty curl stderr||"
-        "only a Debug-enabled line|$debug\\n|"
-        "a message|curl: (7) $CONNECT_ERROR\\n|curl: (7) $CONNECT_ERROR"
-        "a Debug-enabled line, then a CRLF message|$debug\\r\\ncurl: (28) timed out\\r\\n|curl: (28) timed out"
+        "empty curl stderr||7|curl exit 7: could not connect"
+        "only a Debug-enabled line|$debug\\n|7|curl exit 7: could not connect"
+        "a message|curl: (7) $CONNECT_ERROR\\n|7|curl exit 7: could not connect"
+        "a multi-line message with a private path|curl: (23) Failure writing output to destination, passed 5 returned 0\\ncurl: (23) $private\\n|23|curl exit 23: could not write the response locally"
+        "a Debug-enabled line, then a CRLF message|$debug\\r\\ncurl: (28) timed out\\r\\n|28|curl exit 28: timed out"
+        "unresolvable host|curl: (6) Could not resolve host: e2e-test.invalid\\n|6|curl exit 6: could not resolve the host"
+        "unreadable request body|curl: (26) read error\\n|26|curl exit 26: could not read the request body"
+        "TLS connect error|curl: (35) schannel: failed\\n|35|curl exit 35: TLS connection failed"
+        "empty reply|curl: (52) Empty reply from server\\n|52|curl exit 52: empty reply from the server"
+        "send failure|curl: (55) Send failure\\n|55|curl exit 55: could not send the request"
+        "receive failure|curl: (56) Recv failure\\n|56|curl exit 56: could not receive the response"
+        "untrusted certificate|curl: (60) SSL certificate problem\\n|60|curl exit 60: TLS certificate not trusted"
+        "an exit status without a named reason|curl: (3) URL rejected\\n|3|curl exit 3"
     )
     for row in "${rows[@]}"; do
-        IFS='|' read -r name stderr expected <<<"$row"
+        IFS='|' read -r name stderr code expected <<<"$row"
         new_run
         # The subshell keeps errexit on, as e2e.sh runs http: a failing pipeline in http ends it
         # before its last line prints.
@@ -1652,7 +2117,7 @@ test_http_transportErrorWithoutMessage_reportsStatus000() {
             # shellcheck disable=SC2317,SC2329 # Invoked by http.
             curl() {
                 printf '%b' "$stderr" >&2
-                return 7
+                return "$code"
             }
             http GET "$INSIGHTS_URL/$TEST_ACCOUNT"
             printf '%s|%s|%s|still running' "$HTTP_STATUS" "$HTTP_CTYPE" "$HTTP_ERROR"
@@ -1660,8 +2125,65 @@ test_http_transportErrorWithoutMessage_reportsStatus000() {
         status=$?
         set -e
         row_is "$name" "$status|$(file_text "$CASE_DIR/out")" "0|000||$expected|still running"
+        if ! printf '%b' "$stderr" | cmp -s - "$PRIVATE_DIR/curl-error"; then
+            reasons+=("$name: $PRIVATE_DIR/curl-error does not hold curl's own message")
+        fi
     done
-    conclude "http_transportErrorWithoutMessage_reportsStatus000"
+    conclude "http_transportError_reportsStatus000WithFixedReason"
+}
+
+test_http_pollDeadline_boundsRequestOrSendsNothing() {
+    local row name left expected
+    local sent="status 200, error [], body [{}], files [{}]"
+    local unsent="status 000, error [not sent: no time left before the poll deadline], body [], files []"
+    # name|seconds left to PROBE_DEADLINE, empty outside a poll|requests and what http leaves
+    local -a rows=(
+        "outside a poll||--max-time 15; $sent"
+        "deadline far ahead|100|--max-time 15; $sent"
+        "15 s left|15|--max-time 15; $sent"
+        "14 s left|14|--max-time 14; $sent"
+        "1 s left|1|--max-time 1; $sent"
+        "no time left|0|; $unsent"
+        "deadline passed|-5|; $unsent"
+    )
+    for row in "${rows[@]}"; do
+        IFS='|' read -r name left expected <<<"$row"
+        new_run
+        printf 'stale' >"$PRIVATE_DIR/body"
+        printf 'stale' >"$PRIVATE_DIR/headers"
+        (
+            # shellcheck disable=SC2317,SC2329 # Invoked by http.
+            curl() {
+                local max="" body_file=""
+                while [[ $# -gt 0 ]]; do
+                    case "$1" in
+                        --max-time)
+                            max="$2"
+                            shift 2
+                            ;;
+                        -o)
+                            body_file="$2"
+                            shift 2
+                            ;;
+                        -D | -X | -w | -H) shift 2 ;;
+                        *) shift ;;
+                    esac
+                done
+                echo "--max-time $max" >>"$CASE_DIR/requests"
+                printf '{}' >"$body_file"
+                printf '200 application/json'
+            }
+            PROBE_DEADLINE=""
+            if [[ -n "$left" ]]; then
+                PROBE_DEADLINE=$((FAKE_NOW + left))
+            fi
+            http GET "$INSIGHTS_URL/$TEST_ACCOUNT"
+            printf 'status %s, error [%s], body [%s], files [%s]' "$HTTP_STATUS" "$HTTP_ERROR" \
+                "$HTTP_BODY" "$(file_text "$PRIVATE_DIR/body")$(file_text "$PRIVATE_DIR/headers")"
+        ) >"$CASE_DIR/out"
+        row_is "$name" "$(file_text "$CASE_DIR/requests"); $(file_text "$CASE_DIR/out")" "$expected"
+    done
+    conclude "http_pollDeadline_boundsRequestOrSendsNothing"
 }
 
 test_expectForbidden_response_passesOnlyExact403() {
@@ -1709,6 +2231,47 @@ test_expectForbidden_createdInstead_failsAndOwnsId() {
     row_is "verdict and owned ids" "${verdict%%,*}|$(file_text "$RUN_DIR/owned")" \
         "FAIL POST accepted: status 201|$ID_LOWER"
     conclude "expectForbidden_createdInstead_failsAndOwnsId"
+}
+
+# Only a POST to /v1/alerts is a create: its uncertain outcome is journaled, and an interrupt
+# during it is held until then. A lost GET, PATCH, DELETE or acknowledge journals nothing.
+test_expectForbidden_postUncertain_heldAndJournaled() {
+    local row method url journaled status
+    local body="{\"accountId\":\"$TEST_ACCOUNT\",\"threshold\":1}"
+    local -a rows=(
+        "POST|$ALERTS_URL|$TEST_ACCOUNT unsettled"
+        "GET|$ALERTS_URL?accountId=$TEST_ACCOUNT|"
+        "PATCH|$ALERTS_URL/$ID_A|"
+        "DELETE|$ALERTS_URL/$ID_A|"
+        "POST|$ALERTS_URL/$ID_A/acknowledge|"
+    )
+    for row in "${rows[@]}"; do
+        IFS='|' read -r method url journaled <<<"$row"
+        new_run
+        respond 000 "" "$CONNECT_ERROR"
+        if [[ "$method" == "GET" || "$method" == "DELETE" || "$url" == */acknowledge ]]; then
+            expect_forbidden "lost" "$method" "$url" >"$CASE_DIR/out"
+        else
+            expect_forbidden "lost" "$method" "$url" "$body" >"$CASE_DIR/out"
+        fi
+        row_is "$method $url: verdict and journal" \
+            "$(first_line "$CASE_DIR/out" | cut -c1-10)|$(file_text "$RUN_DIR/uncertain-creates")" \
+            "FAIL lost:|$journaled"
+    done
+
+    new_run
+    respond 000 "" "$CONNECT_ERROR"
+    status=0
+    (
+        trap on_signal TERM
+        interrupt_when_answered
+        expect_forbidden "interrupted" POST "$ALERTS_URL" "$body"
+        echo "continued"
+    ) >"$CASE_DIR/out" 2>&1 || status=$?
+    row_is "interrupt during the POST: status, journal, continued" \
+        "$status|$(file_text "$RUN_DIR/uncertain-creates")|$(has_line "$CASE_DIR/out" continued && echo yes)" \
+        "130|$TEST_ACCOUNT unsettled|"
+    conclude "expectForbidden_postUncertain_heldAndJournaled"
 }
 
 test_jcheck_verdict_passesOnlyOk() {
@@ -1864,7 +2427,7 @@ test_cleanup_switchOnUnconfirmed_failsCleanupAndStillDeletes() {
         "answers a string true|200|application/json|{\"id\":\"portfolio-insights-enabled\",\"enabled\":\"true\"}|204|answered [id is portfolio-insights-enabled, enabled is a JSON string]"
         "leaves the flag off|200|application/json|{\"id\":\"portfolio-insights-enabled\",\"enabled\":false}|204|answered [false]"
         "answers no JSON|200|text/plain|ok|204|answered [not JSON]"
-        "unreachable|000||$CONNECT_ERROR|204|transport error (curl: (7) $CONNECT_ERROR)"
+        "unreachable|000||$CONNECT_ERROR|204|transport error (curl exit 7: could not connect)"
         "answers 500, delete 403|500|text/plain|boom|403|status 500; 1 owned alerts left in place"
     )
     for row in "${rows[@]}"; do
@@ -1924,7 +2487,7 @@ test_cleanup_flagNotRestored_failsCleanup() {
         "restore leaves the flag on|200|{\"id\":\"portfolio-insights-enabled\",\"enabled\":true}|status 200"
         "restore answers a string false|200|{\"id\":\"portfolio-insights-enabled\",\"enabled\":\"false\"}|status 200"
         "restore answers another flag|200|{\"id\":\"db_not_responding\",\"enabled\":false}|status 200"
-        "restore unreachable|000|$CONNECT_ERROR|transport error (curl: (7) $CONNECT_ERROR)"
+        "restore unreachable|000|$CONNECT_ERROR|transport error (curl exit 7: could not connect)"
     )
     for row in "${rows[@]}"; do
         IFS='|' read -r name status body expected <<<"$row"
@@ -1963,6 +2526,401 @@ test_cleanup_earlierFailure_neverExitsZero() {
     conclude "cleanup_earlierFailure_neverExitsZero"
 }
 
+# shellcheck disable=SC2317,SC2329 # Invoked by delete_alert in a subshell.
+# unrecordable_deletes: in the calling subshell, each DELETE http sends turns $RUN_DIR/deleted
+# into a directory once it is answered, so delete_alert cannot record it.
+unrecordable_deletes() {
+    eval "answered_$(declare -f http)"
+    http() {
+        answered_http "$@"
+        if [[ "$1" == "DELETE" && -f "$RUN_DIR/deleted" ]]; then
+            rm -f "$RUN_DIR/deleted"
+            mkdir "$RUN_DIR/deleted"
+        fi
+    }
+}
+
+# shellcheck disable=SC2317,SC2329 # Invoked by cleanup in a subshell.
+# lost_deletes: in the calling subshell, delete_alert sends its DELETE, records nothing and
+# reports success, as an append that failed unnoticed would.
+lost_deletes() {
+    delete_alert() {
+        http DELETE "$ALERTS_URL/$1"
+    }
+}
+
+# Owned A, B and A again, nothing deleted, the flag on; every DELETE answers 204.
+test_cleanup_inventoryUnusable_failsAndExitsOne() {
+    local fault expected requests
+    local both
+    both="$(printf '%s\n' "GET $F" "DELETE $ALERTS_URL/$ID_A" "DELETE $ALERTS_URL/$ID_B")"
+    for fault in sort comm "owned not a file" unrecordable lost; do
+        new_run
+        cleanup_state true 0 0 0
+        printf '%s\n' "$ID_A" "$ID_B" "$ID_A" >"$RUN_DIR/owned"
+        respond 200 "application/json" '{"id":"portfolio-insights-enabled","enabled":true}'
+        respond 204 "" ""
+        respond 204 "" ""
+        requests="$both"
+        case "$fault" in
+            sort | comm)
+                expected="the owned-alert inventory could not be reconciled, so nothing confirms"
+                expected+=" the owned alerts are gone (0 of 2 owned ids left in place)"
+                ;;
+            "owned not a file")
+                expected="the owned alerts cannot be read from $RUN_DIR/owned: none was deleted"
+                requests="GET $F"
+                ;;
+            unrecordable)
+                expected="the owned-alert inventory could not be recomputed after the deletes"
+                ;;
+            lost)
+                expected="the owned-alert inventory still lists 2 alerts after the deletes, 0 left"
+                expected+=" in place"
+                ;;
+        esac
+        CLEANUP_STATUS=0
+        (
+            case "$fault" in
+                unrecordable) unrecordable_deletes ;;
+                lost) lost_deletes ;;
+                *) break_step "$fault" ;;
+            esac
+            trap cleanup EXIT
+            exit 0
+        ) >"$CASE_DIR/out" 2>&1 || CLEANUP_STATUS=$?
+        row_is "$fault: status, verdict and requests" \
+            "$CLEANUP_STATUS|$(verdicts "$CASE_DIR/out")|$(file_text "$CASE_DIR/requests")" \
+            "1|FAIL cleanup: $expected|$requests"
+    done
+    conclude "cleanup_inventoryUnusable_failsAndExitsOne"
+}
+
+# Step 13 runs under errexit, as main runs it: a failing inventory or record is a FAIL line of its
+# own, and the step goes on to its other checks.
+test_step13_inventoryUnusable_failsAndContinues() {
+    local fault expected status
+    for fault in sort unrecordable; do
+        new_run
+        echo "$ID_A" >"$RUN_DIR/owned"
+        respond 204 "" ""
+        case "$fault" in
+            sort)
+                expected="the owned-alert inventory cannot be computed from $RUN_DIR/owned and"
+                expected+=" $RUN_DIR/deleted, so no alert was deleted here; the exit cleanup sends a"
+                expected+=" DELETE to every owned id"
+                ;;
+            unrecordable) expected="expected 204 each: [$ID_A] status 204, not recorded as deleted;" ;;
+        esac
+        set +e
+        (
+            set -e
+            HOLDER_ID="$TEST_ACCOUNT"
+            case "$fault" in
+                unrecordable) unrecordable_deletes ;;
+                *) break_step "$fault" ;;
+            esac
+            step13_cleanup_and_disable
+            echo "continued"
+        ) >"$CASE_DIR/out" 2>/dev/null
+        status=$?
+        set -e
+        row_is "$fault: status, first verdict and last line" \
+            "$status|$(first_line "$CASE_DIR/out")|$(last_line "$CASE_DIR/out")" \
+            "0|FAIL step 13 delete owned alerts: $expected|continued"
+        if [[ "$fault" == sort ]] && has_line "$CASE_DIR/requests" "DELETE $ALERTS_URL/$ID_A"; then
+            reasons+=("$fault: step 13 sent a DELETE without an inventory")
+        fi
+    done
+    conclude "step13_inventoryUnusable_failsAndContinues"
+}
+
+# shellcheck disable=SC2317,SC2329 # Invoked by the steps in a subshell.
+# routed_alerts: in the calling subshell, http answers by route instead of from the queue: a
+# create at the domain-maximum threshold gets 201 with ID_A, then ID_B; a DELETE gets 204; any
+# other request gets a 400 ErrorResponse.
+routed_alerts() {
+    ROUTED_POSTS=0
+    http() {
+        local status=400 body='{"statusCode":400,"message":"routed"}'
+        echo "$1 $2" >>"$CASE_DIR/requests"
+        if [[ "$1 $2" == "POST $ALERTS_URL" && "${3-}" == *"$MAX_THRESHOLD"* ]]; then
+            ROUTED_POSTS=$((ROUTED_POSTS + 1))
+            status=201
+            body="{\"id\":\"$ID_A\"}"
+            if [[ $ROUTED_POSTS -gt 1 ]]; then
+                body="{\"id\":\"$ID_B\"}"
+            fi
+        elif [[ "$1" == "DELETE" ]]; then
+            status=204
+            body=""
+        fi
+        HTTP_STATUS="$status"
+        HTTP_CTYPE="application/json"
+        HTTP_BODY="$body"
+        HTTP_ERROR=""
+        printf '%s' "$body" >"$PRIVATE_DIR/body"
+        : >"$PRIVATE_DIR/headers"
+    }
+}
+
+# A step's own DELETE that answers 204 but cannot be recorded fails that step's delete check;
+# the step goes on under errexit, as main runs it.
+test_stepDeletes_deletionUnrecordable_failsCheckAndContinues() {
+    local step status line
+    local -a expected
+    for step in step7_errors step8_crud; do
+        new_run
+        HOLDER_ID="$TEST_ACCOUNT"
+        EMPTY_ID="$ID_LOWER"
+        H1="$ID_B"
+        case "$step" in
+            step7_errors)
+                expected=("FAIL step 7 DELETE temporary alert 204: status 204 for the temporary alert [$ID_A], but its deletion could not be recorded in $RUN_DIR/deleted")
+                ;;
+            step8_crud)
+                expected=(
+                    "FAIL step 8 TARGET_PRICE delete: status 204, but the deletion could not be recorded in $RUN_DIR/deleted"
+                    "FAIL step 8 PROFIT_LOSS delete: status 204, but the deletion could not be recorded in $RUN_DIR/deleted"
+                )
+                ;;
+        esac
+        set +e
+        (
+            set -e
+            routed_alerts
+            break_step "deleted not a file"
+            "$step"
+            echo "continued"
+        ) >"$CASE_DIR/out" 2>/dev/null
+        status=$?
+        set -e
+        row_is "$step: status and last line" "$status|$(last_line "$CASE_DIR/out")" "0|continued"
+        for line in "${expected[@]}"; do
+            if ! has_line "$CASE_DIR/out" "$line"; then
+                reasons+=("$step: no line [$line]")
+            fi
+        done
+    done
+    conclude "stepDeletes_deletionUnrecordable_failsCheckAndContinues"
+}
+
+# Two creates on the holder, each answered with CREATES' status in turn: 201 without an id
+# (settled) or a transport error (000, unsettled). The run owns ID_A. The flag starts off, so
+# cleanup switches it on to list and delete, then restores it. Every listed alert bound to the
+# holder, whatever the case of its accountId, is owned and deleted, so cleanup passes when both
+# creates settled; an unsettled one fails it, with the listing empty or not, since it may commit
+# an alert after the listing. A switch-on the PUT does not confirm is a problem of its own, named
+# for the reconciliation, and the listing's problems are added to it, never put in its place.
+test_cleanup_uncertainFixtureCreate_deletesListedAndFailsUnlessSettled() {
+    local flag_off='{"id":"portfolio-insights-enabled","enabled":false}'
+    local flag_on='{"id":"portfolio-insights-enabled","enabled":true}'
+    local settlement="are unsettled (no response, or a status neither 2xx nor 4xx), so an alert"
+    settlement+=" such a create may still commit after this listing cannot be ruled out"
+    local refused="flag portfolio-insights-enabled could not be switched on to reconcile uncertain"
+    refused+=" creates and delete owned alerts: status 500"
+    local row name switch creates list deletes counts expected status upper id requests create
+    upper="$(tr '[:lower:]' '[:upper:]' <<<"$TEST_ACCOUNT")"
+    # name|PUT answer: on, or 500|creates|listed alerts|DELETEs|INFO counts|verdict
+    local -a rows=(
+        "settled|on|201 201|{\"id\":\"$ID_UPPER\",\"accountId\":\"$upper\"},{\"id\":\"$ID_A\",\"accountId\":\"$TEST_ACCOUNT\"}|$ID_A $ID_LOWER|2 alerts (status 200); 2|PASS cleanup"
+        "unsettled, list empty|on|000 201||$ID_A|0 alerts (status 200); 0|FAIL cleanup: 1 uncertain creates on fixture account [$TEST_ACCOUNT] $settlement"
+        "unsettled, alert listed|on|000 000|{\"id\":\"$ID_UPPER\",\"accountId\":\"$TEST_ACCOUNT\"}|$ID_A $ID_LOWER|1 alerts (status 200); 1|FAIL cleanup: 2 uncertain creates on fixture account [$TEST_ACCOUNT] $settlement"
+        "unsettled, switch-on refused|500|000 201||$ID_A|0 alerts (status 200); 0|FAIL cleanup: $refused; 1 uncertain creates on fixture account [$TEST_ACCOUNT] $settlement"
+    )
+    for row in "${rows[@]}"; do
+        IFS='|' read -r name switch creates list deletes counts expected <<<"$row"
+        new_run
+        cleanup_state false 0 0 0
+        HOLDER_ID="$TEST_ACCOUNT"
+        EMPTY_ID="$ID_B"
+        for create in $creates; do
+            if [[ "$create" == "000" ]]; then
+                respond 000 "" "$CONNECT_ERROR"
+            else
+                respond "$create" "application/json" "{}"
+            fi
+            post_alert "$TEST_ACCOUNT" TARGET_PRICE "$ID_B" ABOVE 1 2>/dev/null || true
+        done
+        # The creates' requests are not under test here: the log and queue start over.
+        : >"$CASE_DIR/requests"
+        : >"$CASE_DIR/responses"
+        echo "$ID_A" >"$RUN_DIR/owned"
+        respond 200 "application/json" "$flag_off"
+        if [[ "$switch" == "on" ]]; then
+            respond 200 "application/json" "$flag_on"
+        else
+            respond "$switch" "text/plain" "boom"
+        fi
+        respond 200 "application/json; charset=utf-8" "{\"results\":[$list]}"
+        requests="$(printf '%s\n' "GET $F" "PUT $F {\"enabled\": true}" \
+            "GET $ALERTS_URL?accountId=$TEST_ACCOUNT")"
+        for id in $deletes; do
+            respond 204 "" ""
+            requests+=$'\n'"DELETE $ALERTS_URL/$id"
+        done
+        respond 200 "application/json" "$flag_off"
+        requests+=$'\n'"PUT $F {\"enabled\": false}"
+        status=1
+        if [[ "$expected" == "PASS cleanup" ]]; then
+            status=0
+        fi
+        run_cleanup 0
+        row_is "$name: status, verdict and requests" \
+            "$CLEANUP_STATUS|$(verdicts "$CASE_DIR/out")|$(file_text "$CASE_DIR/requests")" \
+            "$status|$expected|$requests"
+        if ! has_line "$CASE_DIR/out" \
+            "INFO cleanup: fixture account [$TEST_ACCOUNT] lists $counts owned for deletion"; then
+            reasons+=("$name: no INFO line reports the reconciliation: [$(file_text "$CASE_DIR/out")]")
+        fi
+    done
+    conclude "cleanup_uncertainFixtureCreate_deletesListedAndFailsUnlessSettled"
+}
+
+# The holder is TEST_ACCOUNT and the empty account ID_B; OTHER is neither. Each row journals one
+# create, settled or unsettled. The flag is on and nothing is owned, so the only requests are
+# the flag read and the list, never a DELETE, and no listed alert becomes owned: a listing that
+# is no single valid document, a fixture alert bound to another account and any alert on
+# another account all fail the check instead. On another account a 404 ErrorResponse settles
+# any create, and an empty list only a settled one; a line without its state counts as unsettled.
+test_cleanup_uncertainCreate_settlesByAccountNeverDeletingOthers() {
+    local name journal status ctype body expected requests
+    local other="cccccccc-0000-4000-8000-00000000000c" undetermined="ownership cannot be determined"
+    local listing="200 with one JSON object whose results array holds only objects with a string id"
+    listing+=" and a string accountId"
+    local -a rows=(
+        "fixture list fails|$ID_B settled|500|text/plain|boom"
+        "fixture list without results|$ID_B settled|200|application/json|{\"results\":{}}"
+        "fixture list forbidden|$ID_B settled|403|application/json|$FORBIDDEN_BODY"
+        "fixture list with trailing text|$TEST_ACCOUNT settled|200|application/json|{\"results\":[{\"id\":\"$ID_A\",\"accountId\":\"$TEST_ACCOUNT\"}]} trailing"
+        "fixture list of two documents|$TEST_ACCOUNT settled|200|application/json|{\"results\":[]}\n{\"results\":[{\"id\":\"$ID_A\",\"accountId\":\"$TEST_ACCOUNT\"}]}"
+        "fixture items without string id and accountId|$TEST_ACCOUNT settled|200|application/json|{\"results\":[{\"id\":\"$ID_A\"},{\"id\":5,\"accountId\":\"$TEST_ACCOUNT\"},7]}"
+        "fixture ids not canonical|$TEST_ACCOUNT settled|200|application/json|{\"results\":[{\"id\":\"x\",\"accountId\":\"$TEST_ACCOUNT\"},{\"id\":\"$ID_A x\",\"accountId\":\"$TEST_ACCOUNT\"},{\"id\":\"\",\"accountId\":\"$other\"}]}"
+        "fixture alert bound to another account|$TEST_ACCOUNT settled|200|application/json|{\"results\":[{\"id\":\"$ID_A\",\"accountId\":\"$other\"}]}"
+        "fixture alert unrecordable|$TEST_ACCOUNT settled|200|application/json|{\"results\":[{\"id\":\"$ID_A\",\"accountId\":\"$TEST_ACCOUNT\"}]}"
+        "other account unknown, unsettled|$other unsettled|404|application/json|{\"statusCode\":404,\"message\":\"Account not found\"}"
+        "other account empty, settled|$other settled|200|application/json|{\"results\":[]}"
+        "other account empty, settled, journal without a final newline|$other settled|200|application/json|{\"results\":[]}"
+        "other account empty, unsettled|$other unsettled|200|application/json|{\"results\":[]}"
+        "other account empty, state missing|$other|200|application/json|{\"results\":[]}"
+        "other account lists alerts|$other settled|200|application/json|{\"results\":[{\"id\":\"$ID_A\",\"accountId\":\"$other\"}]}"
+        "other account list with trailing text|$other settled|200|application/json|{\"results\":[]}x"
+        "other account routing 404|$other settled|404|text/plain|not found"
+        "other account list fails|$other settled|503|text/plain|down"
+        "no readable account|unknown unsettled|||"
+        "create not journaled||||"
+        "journal unreadable||||"
+    )
+    local row account
+    for row in "${rows[@]}"; do
+        IFS='|' read -r name journal status ctype body <<<"$row"
+        account="${journal%% *}"
+        new_run
+        cleanup_state true 0 0 0
+        HOLDER_ID="$TEST_ACCOUNT"
+        EMPTY_ID="$ID_B"
+        respond 200 "application/json" '{"id":"portfolio-insights-enabled","enabled":true}'
+        if [[ -n "$status" ]]; then
+            respond "$status" "$ctype" "$body"
+        fi
+        requests="$(printf '%s\n' "GET $F" "GET $ALERTS_URL?accountId=$account")"
+        case "$name" in
+            "fixture list"* | "fixture items"*)
+                expected="FAIL cleanup: $undetermined on fixture account [$account]: its alert list"
+                expected+=" gave status $status, not $listing"
+                ;;
+            "fixture ids not canonical")
+                expected="FAIL cleanup: $undetermined on fixture account [$TEST_ACCOUNT]: it lists 3"
+                expected+=" alerts without a canonical id"
+                ;;
+            "fixture alert bound to another account")
+                expected="FAIL cleanup: $undetermined on fixture account [$TEST_ACCOUNT]: it lists 1"
+                expected+=" alerts bound to another account, none owned or deleted"
+                ;;
+            "fixture alert unrecordable")
+                break_step "owned not a file"
+                expected="FAIL cleanup: alert $ID_A of fixture account [$TEST_ACCOUNT] could not be"
+                expected+=" recorded as owned; the owned alerts cannot be read from $RUN_DIR/owned:"
+                expected+=" none was deleted"
+                ;;
+            "other account unknown"* | "other account empty, settled"*) expected="PASS cleanup" ;;
+            "other account empty"*)
+                expected="FAIL cleanup: $undetermined on account [$other], which is not this run's:"
+                expected+=" it lists no alerts, but 1 uncertain creates there are unsettled (no"
+                expected+=" response, or a status neither 2xx nor 4xx), so an alert such a create"
+                expected+=" may still commit cannot be ruled out"
+                ;;
+            "other account lists alerts")
+                expected="FAIL cleanup: $undetermined on account [$other], which is not this run's:"
+                expected+=" it lists 1 alerts, none deleted"
+                ;;
+            "other account"*)
+                expected="FAIL cleanup: $undetermined on account [$other]: its alert list gave status"
+                expected+=" $status, neither a 404 ErrorResponse nor $listing"
+                ;;
+            "no readable account")
+                expected="FAIL cleanup: 1 uncertain creates named no readable account: $undetermined"
+                requests="GET $F"
+                ;;
+            "create not journaled")
+                UNJOURNALED_CREATES=2
+                expected="FAIL cleanup: 2 uncertain creates could not be journaled: $undetermined"
+                requests=""
+                ;;
+            "journal unreadable")
+                break_step "uncertain-creates not a file"
+                expected="FAIL cleanup: the journal of uncertain creates cannot be read from"
+                expected+=" $RUN_DIR/uncertain-creates: $undetermined"
+                requests="any"
+                ;;
+        esac
+        if [[ "$name" == *"without a final newline" ]]; then
+            printf '%s' "$journal" >"$RUN_DIR/uncertain-creates"
+        elif [[ -n "$journal" ]]; then
+            echo "$journal" >"$RUN_DIR/uncertain-creates"
+        fi
+        run_cleanup 0
+        row_is "$name: verdict" "$(verdicts "$CASE_DIR/out")" "$expected"
+        if [[ "$expected" == "PASS cleanup" ]]; then
+            row_is "$name: status" "$CLEANUP_STATUS" "0"
+        else
+            row_is "$name: status" "$CLEANUP_STATUS" "1"
+        fi
+        if [[ "$requests" != "any" ]]; then
+            row_is "$name: requests" "$(file_text "$CASE_DIR/requests")" "$requests"
+        elif grep -q '^DELETE ' "$CASE_DIR/requests"; then
+            reasons+=("$name: a DELETE was sent")
+        fi
+        if [[ -f "$RUN_DIR/owned" ]]; then
+            row_is "$name: owned" "$(file_text "$RUN_DIR/owned")" ""
+        fi
+    done
+    conclude "cleanup_uncertainCreate_settlesByAccountNeverDeletingOthers"
+}
+
+# shellcheck disable=SC2317,SC2329 # Invoked through poll.
+# exit_after SECONDS: a poll command that takes SECONDS of fake time, then ends the run, as an
+# abort or an interrupt inside a poll does.
+exit_after() {
+    FAKE_NOW=$((FAKE_NOW + $1))
+    exit 1
+}
+
+test_cleanup_exitInsideExpiredPoll_stillSendsItsRequests() {
+    new_run
+    cleanup_state false 1 0 0
+    respond 200 "application/json" '{"id":"portfolio-insights-enabled","enabled":false}'
+    CLEANUP_STATUS=0
+    (
+        trap cleanup EXIT
+        poll "step x" 10 5 exit_after 20
+    ) >"$CASE_DIR/out" 2>&1 || CLEANUP_STATUS=$?
+    row_is "status, verdict and requests" \
+        "$CLEANUP_STATUS|$(verdicts "$CASE_DIR/out")|$(file_text "$CASE_DIR/requests")" \
+        "1|PASS cleanup|PUT $F {\"enabled\": false}"
+    conclude "cleanup_exitInsideExpiredPoll_stillSendsItsRequests"
+}
+
 test_cleanup_evidenceDir_printedAfterRunDirWhenSeparate() {
     local row name end separate status lines expected
     # name|end: cleanup, or a second interrupt while it runs|evidence dir of its own|exit status|
@@ -1993,7 +2951,6 @@ test_cleanup_evidenceDir_printedAfterRunDirWhenSeparate() {
     done
     conclude "cleanup_evidenceDir_printedAfterRunDirWhenSeparate"
 }
-
 
 POLL_ATTEMPTS=0
 SUCCEED_AT=1
@@ -2034,12 +2991,113 @@ test_poll_commandSucceeds_returnsWithoutFurtherSleep() {
 
 test_poll_deadline_failsWithDetail() {
     new_run
+    # A third attempt would start at the deadline, so the poll gives up without sleeping into
+    # it, and the second attempt's detail stands.
     row_is "detail" "$(run_poll 10 5 0 "last attempt said no")" \
-        "1 3 [5 5] 10 | FAIL step x: deadline 10 s expired; last attempt said no"
+        "1 2 [5] 5 | FAIL step x: deadline 10 s expired; last attempt said no"
     row_is "uneven deadline" "$(run_poll 12 5 0 "no")" \
         "1 3 [5 5] 10 | FAIL step x: deadline 12 s expired; no"
-    row_is "no detail" "$(run_poll 0 5 0 "")" "1 1 [] 0 | FAIL step x: deadline 0 s expired"
+    row_is "no detail" "$(run_poll 3 5 0 "")" "1 1 [] 0 | FAIL step x: deadline 3 s expired"
     conclude "poll_deadline_failsWithDetail"
+}
+
+test_poll_zeroBudget_failsWithoutAttempt() {
+    new_run
+    row_is "command that would succeed" "$(run_poll 0 5 1 "")" \
+        "1 0 [] 0 | FAIL step x: deadline 0 s expired"
+    row_is "command that would fail" "$(run_poll 0 5 0 "no")" \
+        "1 0 [] 0 | FAIL step x: deadline 0 s expired"
+    conclude "poll_zeroBudget_failsWithoutAttempt"
+}
+
+# An 11 s poll with 5 s steps whose first sleep ends late: an attempt starts after it only while
+# the clock reads less than the deadline.
+test_poll_deadlinePassesDuringSleep_startsNoFurtherAttempt() {
+    local row name overrun expected
+    local miss="FAIL step x: deadline 11 s expired; no"
+    # name|seconds the sleep ends late|what run_poll prints
+    local -a rows=(
+        "sleep ends in the last second|5|1 2 [5] 10 | $miss"
+        "sleep ends at the deadline|6|1 1 [5] 11 | $miss"
+        "sleep ends after the deadline|9|1 1 [5] 14 | $miss"
+    )
+    for row in "${rows[@]}"; do
+        IFS='|' read -r name overrun expected <<<"$row"
+        new_run
+        row_is "$name" "$(SLEEP_OVERRUN="$overrun" run_poll 11 5 0 "no")" "$expected"
+    done
+    conclude "poll_deadlinePassesDuringSleep_startsNoFurtherAttempt"
+}
+
+# shellcheck disable=SC2317,SC2329 # Invoked through poll.
+# late_success SECONDS: a poll command whose attempt takes SECONDS of fake time and succeeds.
+late_success() {
+    FAKE_NOW=$((FAKE_NOW + $1))
+}
+
+# The clock reads whole seconds and the start second is rounded down, so a success seen while it
+# reads the deadline's own second may have come after the true deadline.
+test_poll_successAtOrAfterDeadline_failsAsLate() {
+    local row name seconds expected rc
+    local late="FAIL step x: deadline 10 s expired; the result arrived at or after the deadline"
+    local -a rows=(
+        "result in the last second before the deadline|9|0 []"
+        "result in the deadline's own second|10|1 [$late]"
+        "result 3 s after the deadline|13|1 [$late]"
+    )
+    for row in "${rows[@]}"; do
+        IFS='|' read -r name seconds expected <<<"$row"
+        new_run
+        rc=0
+        poll "step x" 10 5 late_success "$seconds" >"$CASE_DIR/out" || rc=$?
+        row_is "$name" "$rc [$(file_text "$CASE_DIR/out")]" "$expected"
+    done
+    conclude "poll_successAtOrAfterDeadline_failsAsLate"
+}
+
+# shellcheck disable=SC2317,SC2329 # Invoked through poll.
+# request_after SECONDS: a poll command that takes SECONDS of fake time, then sends one request;
+# it succeeds on a 200 and otherwise leaves the request's status and error as its POLL_DETAIL.
+request_after() {
+    FAKE_NOW=$((FAKE_NOW + $1))
+    http GET "$INSIGHTS_URL/$TEST_ACCOUNT"
+    if [[ "$HTTP_STATUS" == "200" ]]; then
+        return 0
+    fi
+    POLL_DETAIL="status $HTTP_STATUS, error [$HTTP_ERROR]"
+    return 1
+}
+
+# A 10 s poll hands its deadline to http: a request takes no longer than the time left, and
+# none is sent once the clock reads the deadline.
+test_poll_requestNearDeadline_boundedToTimeLeftOrNotSent() {
+    local row name seconds expected rc
+    local unsent="status 000, error [not sent: no time left before the poll deadline]"
+    # name|seconds the attempt takes before its request|--max-time sent; poll status [output]
+    local -a rows=(
+        "request 6 s before the deadline|4|--max-time 6; 0 []"
+        "request in the last second|9|--max-time 1; 0 []"
+        "request at the deadline|10|; 1 [FAIL step x: deadline 10 s expired; $unsent]"
+    )
+    for row in "${rows[@]}"; do
+        IFS='|' read -r name seconds expected <<<"$row"
+        new_run
+        rc=0
+        (
+            # shellcheck disable=SC2317,SC2329 # Invoked by http.
+            curl() {
+                while [[ $# -gt 0 && "$1" != "--max-time" ]]; do
+                    shift
+                done
+                echo "--max-time ${2:-none}" >>"$CASE_DIR/requests"
+                printf '200 application/json'
+            }
+            poll "step x" 10 5 request_after "$seconds"
+        ) >"$CASE_DIR/out" || rc=$?
+        row_is "$name" "$(file_text "$CASE_DIR/requests"); $rc [$(file_text "$CASE_DIR/out")]" \
+            "$expected"
+    done
+    conclude "poll_requestNearDeadline_boundedToTimeLeftOrNotSent"
 }
 
 # ---------------------------------------------------------------------------------------------
@@ -2048,6 +3106,7 @@ test_poll_deadline_failsWithDetail() {
 test_options_help_exitsZeroWithUsage
 test_options_invalid_exitTwoWithUsageError
 test_options_sourced_setRunConfiguration
+test_options_pathConversionOffInCaller_settingsUnset
 test_options_evidenceDir_newDirectoryPerRun
 test_decToUnits_plainTokens_matchUnits
 test_decToUnits_invalidText_rejected
@@ -2058,32 +3117,45 @@ test_decimals_roundTrip_normaliseToken
 test_resolveInterval_setting_matchesBrokerRule
 test_readWindow_brokerLog_recordsOnlyCycleAndTriggerLines
 test_readWindow_cycleLine_recordsOutcome
+test_brokerLogReads_rawOutput_keptOnlyInPrivateDir
 test_windowCycles_window_countsCycleLines
 test_triggerPosition_events_locateOwnArming
 test_triggerLogged_brokerLog_findsArmingByLowercaseId
 test_laterCyclesSeen_window_needsCompletedCycleAfterTriggeringCycle
 test_step9Trigger_triggerLines_recordLoggedArmingsOnly
 test_step10NoRepeat_followUpCycle_passesOnlyOnceCompleted
-test_ownIfCreated_response_ownsOnlyCreatedUuid
+test_ownIfCreated_response_ownsCreatedAndJournalsUncertain
 test_postAlert_nonTokenThreshold_rejectedBeforeRequest
-test_postAlert_unusableResponse_failsAndOwnsNothing
+test_postAlert_unusableResponse_failsJournalingOnlyUncertain
+test_postAlert_recordUnwritable_journalsOrCountsCreate
 test_postAlert_created_ownsLowercaseId
 test_postAlert_token_sentVerbatim
 test_onSignal_interrupt_heldOnlyWhileCreating
+test_onSignal_interruptInStep_failsOnceNamingStep
+test_onSignal_interruptInRedirectedCall_verdictOnRunStdout
+test_onSignal_signalAsCleanupStarts_endsRunThroughCleanupSignal
+test_main_stdoutClosed_runsUnsavedAndRemovesPrivateDir
 test_remainingOwned_ownedAndDeleted_listsUndeleted
+test_remainingOwned_stepFails_failsPrintingNothing
+test_deleteAlert_recordUnwritable_failsKeepingStatus
 test_deleteRemaining_statuses_mark204And404Deleted
 test_deleteRemaining_transportErrors_stopAfterMaxConsecutive
+test_deleteRemaining_transportError_infoCarriesFixedReason
+test_deleteIds_rawOwnedList_deletesEachCanonicalIdOnce
 test_writeFixture_alerts_matchBrowserCheckShape
 test_prefixLines_browserOutput_infoPrefixedAndLogged
 test_runBrowserCheck_exitCode_reportsPassOrFail
 test_runBrowserCheck_invocation_passesModeAndFixture
+test_runBrowserCheck_runStdoutSaved_descriptorClosedForCheck
 test_runBrowserCheck_earlierReport_neitherReadNorDeleted
 test_step12UntriggeredAck_listings_passOnlyUnchangedUntriggeredRow
 test_step12UntriggeredAck_changedRow_namesFieldsWithoutRowsInJqArguments
 test_step12UntriggeredAck_browserReport_acceptsOnlyThisRunsAcknowledgement
-test_http_transportErrorWithoutMessage_reportsStatus000
+test_http_transportError_reportsStatus000WithFixedReason
+test_http_pollDeadline_boundsRequestOrSendsNothing
 test_expectForbidden_response_passesOnlyExact403
 test_expectForbidden_createdInstead_failsAndOwnsId
+test_expectForbidden_postUncertain_heldAndJournaled
 test_jcheck_verdict_passesOnlyOk
 test_jitemJcount_mixedCaseIds_matchLowercaseId
 test_jgetJitemJcount_input_printOnlyForOneDocument
@@ -2094,9 +3166,19 @@ test_cleanup_switchOnUnconfirmed_failsCleanupAndStillDeletes
 test_cleanup_deleteLeftInPlace_failsAndExitsOne
 test_cleanup_flagNotRestored_failsCleanup
 test_cleanup_earlierFailure_neverExitsZero
+test_cleanup_inventoryUnusable_failsAndExitsOne
+test_step13_inventoryUnusable_failsAndContinues
+test_stepDeletes_deletionUnrecordable_failsCheckAndContinues
+test_cleanup_uncertainFixtureCreate_deletesListedAndFailsUnlessSettled
+test_cleanup_uncertainCreate_settlesByAccountNeverDeletingOthers
+test_cleanup_exitInsideExpiredPoll_stillSendsItsRequests
 test_cleanup_evidenceDir_printedAfterRunDirWhenSeparate
 test_poll_commandSucceeds_returnsWithoutFurtherSleep
 test_poll_deadline_failsWithDetail
+test_poll_zeroBudget_failsWithoutAttempt
+test_poll_deadlinePassesDuringSleep_startsNoFurtherAttempt
+test_poll_successAtOrAfterDeadline_failsAsLate
+test_poll_requestNearDeadline_boundedToTimeLeftOrNotSent
 
 echo "SUMMARY $tests_passed passed, $tests_failed failed"
 if [[ $tests_failed -gt 0 ]]; then

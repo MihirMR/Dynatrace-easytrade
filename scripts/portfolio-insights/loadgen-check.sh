@@ -14,6 +14,8 @@
 #
 # Usage: scripts/portfolio-insights/loadgen-check.sh --project NAME [--base-url URL]
 #            [--compose-file FILE]... [--weight N] [--minutes M] [--out FILE]
+#        scripts/portfolio-insights/loadgen-check.sh --project NAME [--base-url URL]
+#            [--compose-file FILE]... --resume-cleanup DIR
 #   --project NAME       Compose project of the running stack (required)
 #   --base-url URL       Reverse-proxy origin of that stack (default: http://localhost)
 #   --compose-file FILE  Compose file of that project, relative to the current directory
@@ -21,6 +23,8 @@
 #   --weight N           Visit weight of run B and the flag-off phase (default: 1)
 #   --minutes M          Length of runs A and B in minutes (default: 35)
 #   --out FILE           Per-family markdown table (default: loadgen-families.md in the run dir)
+#   --resume-cleanup DIR Resume the owned-alert cleanup of the earlier run with run directory DIR
+#                        instead of making a run (see Recovery below)
 #   --help               Show this help and exit
 #
 # One project per invocation. Never run it alongside e2e.sh or perf.sh: all three toggle the same
@@ -43,11 +47,26 @@
 # interrupt while loadgen runs, cannot be tied to an id and is not deleted; an unconfirmed
 # create is printed with its threshold marker.
 #
+# Recovery: cleanup sends a DELETE that ends in a transport error up to three times, two seconds
+# apart, and after five ids in a row with nothing but transport errors it stops sending them.
+# Whatever it leaves stays recorded in the run directory: the file recovery names the project,
+# base URL and Compose files of the run, owned lists every alert id the run owned and deleted
+# every one a cleanup deleted or found absent. A cleanup that leaves alerts prints the command
+# that resumes it, with --resume-cleanup and the run directory. That command, given the same
+# --project and --base-url, checks them against the record and, through Docker, that the
+# project's running reverse-proxy has its port 80 published where --base-url points, both before
+# any request, so it never reaches another stack. It then reads the flag and DELETEs by id only
+# the owned ids not yet deleted, switching the flag on while it is off and restoring it after,
+# and adds each id it deletes to the deleted list, so it can be repeated until its cleanup check
+# passes. It never creates an alert, never deletes by account, touches no loadgen and writes no
+# table.
+#
 # Prints one PASS or FAIL line per check, writes the per-family table to --out and ends with a
-# SUMMARY line. Exits 0 when every check passes, 1 when any check fails, 2 on a usage error or a
-# missing tool, and 130 on an interrupt. Working files stay in the run directory printed at
-# start and end. The loadgen output kept there is reduced to the validated lines the checks
-# read, so no DEBUG line, typed value or error detail is retained.
+# SUMMARY line. Exits 0 when every check passes, 1 when any check fails, 2 on a usage error, a
+# missing tool or a run directory or stack --resume-cleanup refuses, and 130 on an interrupt.
+# Working files stay in the run directory printed at start and end. The loadgen output kept there
+# is reduced to the validated lines the checks read, so no DEBUG line, typed value or error detail
+# is retained.
 
 set -euo pipefail
 
@@ -93,10 +112,20 @@ LOG_PROBE_KILL_SECONDS=5
 # drain and the EXIT cleanup make: pausing, unpausing, stopping and killing loadgen
 # (pause_loadgen, unpause_loadgen, stop_loadgen, kill_loadgen), restoring it (restore_loadgen)
 # and reading container state (running_services, container_env, container_env_entry,
-# loadgen_state), wherever those functions run. Each takes seconds on a healthy engine. A call
-# cut off is reported, and cleanup carries on with its other steps.
+# loadgen_state), wherever those functions run. Inside the run B drain a pause, unpause or kill
+# takes the time left before the drain's deadline instead when that is shorter, and none starts
+# with no time left, so the drain ends by QUIESCE_TIMEOUT_SECONDS; the stop that follows it and
+# the EXIT cleanup's calls each keep this bound of their own. Each takes seconds on a healthy
+# engine. A call cut off is reported, and cleanup carries on with its other steps.
 DOCKER_CALL_TIMEOUT_SECONDS=60
-# Cleanup stops sending DELETEs after this many transport errors in a row.
+# Cleanup sends a DELETE that ends in a transport error again, CLEANUP_RETRY_STEP_SECONDS later,
+# until it has made CLEANUP_RETRY_ATTEMPTS attempts; any answer is final. It stops sending DELETEs
+# after MAX_CONSECUTIVE_TRANSPORT_ERRORS ids in a row whose every attempt ended in a transport
+# error. One id takes at most CLEANUP_RETRY_ATTEMPTS x HTTP_TIMEOUT_SECONDS plus
+# (CLEANUP_RETRY_ATTEMPTS - 1) x CLEANUP_RETRY_STEP_SECONDS, 49 s. The ids left stay owned in the
+# run directory for --resume-cleanup.
+CLEANUP_RETRY_ATTEMPTS=3
+CLEANUP_RETRY_STEP_SECONDS=2
 MAX_CONSECUTIVE_TRANSPORT_ERRORS=5
 ID_CHUNK_SIZE=100
 # Keeps minutes x 60 within shell arithmetic and a weight within loadgen's safe-integer check.
@@ -137,6 +166,8 @@ usage() {
     cat <<'EOF'
 Usage: scripts/portfolio-insights/loadgen-check.sh --project NAME [--base-url URL]
            [--compose-file FILE]... [--weight N] [--minutes M] [--out FILE]
+       scripts/portfolio-insights/loadgen-check.sh --project NAME [--base-url URL]
+           [--compose-file FILE]... --resume-cleanup DIR
   --project NAME       Compose project of the running stack (required)
   --base-url URL       Reverse-proxy origin of that stack (default: http://localhost)
   --compose-file FILE  Compose file of that project, relative to the current directory
@@ -147,6 +178,13 @@ Usage: scripts/portfolio-insights/loadgen-check.sh --project NAME [--base-url UR
                        positive integer (default: 1); run A always uses 0
   --minutes M          Length of runs A and B in minutes, a positive integer (default: 35)
   --out FILE           Per-family markdown table (default: loadgen-families.md in the run dir)
+  --resume-cleanup DIR Instead of a run, delete by id only the alerts that the earlier run with
+                       run directory DIR owned and its cleanup left in place, then end. DIR must
+                       be a run against the same --project and --base-url, and that project's
+                       running reverse-proxy must have its port 80 published where --base-url
+                       points; --weight, --minutes and --out are refused. No loadgen is touched
+                       and no table written. A cleanup that leaves alerts prints this command;
+                       repeat it until it passes.
   --help               Show this help and exit
 Takes roughly 2 x M + 20 minutes. Run one project at a time, never alongside e2e.sh or perf.sh.
 EOF
@@ -259,16 +297,17 @@ is_base_origin() {
 }
 
 parse_options() {
-    local file out_dir
+    local file out_dir run_option=""
     BASE_URL="http://localhost"
     COMPOSE_FILES=()
     PROJECT=""
     WEIGHT="1"
     MINUTES="35"
     OUT_FILE=""
+    RESUME_RUN_DIR=""
     while [[ $# -gt 0 ]]; do
         case "$1" in
-            --base-url | --compose-file | --project | --weight | --minutes | --out)
+            --base-url | --compose-file | --project | --weight | --minutes | --out | --resume-cleanup)
                 if [[ $# -lt 2 || -z "$2" || "$2" == -* ]]; then
                     usage_error "Option $1 requires a value."
                 fi
@@ -279,6 +318,11 @@ parse_options() {
                     --weight) WEIGHT="$2" ;;
                     --minutes) MINUTES="$2" ;;
                     --out) OUT_FILE="$2" ;;
+                    --resume-cleanup) RESUME_RUN_DIR="$2" ;;
+                esac
+                # The first option that only a new run takes.
+                case "$1" in
+                    --weight | --minutes | --out) run_option="${run_option:-$1}" ;;
                 esac
                 shift 2
                 ;;
@@ -299,6 +343,9 @@ parse_options() {
 
     if [[ -z "$PROJECT" ]]; then
         usage_error "Option --project is required."
+    fi
+    if [[ -n "$RESUME_RUN_DIR" && -n "$run_option" ]]; then
+        usage_error "Option $run_option cannot be combined with --resume-cleanup, which takes only --project, --base-url and --compose-file."
     fi
     # The refused value is never echoed, since it can hold credentials.
     if ! is_base_origin "$BASE_URL"; then
@@ -573,25 +620,26 @@ stop_loadgen() {
     fi
 }
 
-# pause_loadgen: freezes every loadgen process, so loadgen neither logs nor acts until it is
-# unpaused or killed. LOADGEN_PAUSED is set first, so a stop that cuts the pause short kills
-# loadgen rather than thawing it. Bounded as stop_loadgen is.
+# pause_loadgen [LIMIT]: freezes every loadgen process, so loadgen neither logs nor acts until it
+# is unpaused or killed. LOADGEN_PAUSED is set first, so a stop that cuts the pause short kills
+# loadgen rather than thawing it. Bounded as stop_loadgen is, or by LIMIT seconds when given.
 pause_loadgen() {
     LOADGEN_PAUSED=1
-    compose_within "$DOCKER_CALL_TIMEOUT_SECONDS" pause loadgen >>"$RUN_DIR/compose.log" 2>&1
+    compose_within "${1:-$DOCKER_CALL_TIMEOUT_SECONDS}" pause loadgen >>"$RUN_DIR/compose.log" 2>&1
 }
 
-# unpause_loadgen: lets a paused loadgen run on. Bounded as stop_loadgen is.
+# unpause_loadgen [LIMIT]: lets a paused loadgen run on. Bounded as stop_loadgen is, or by LIMIT
+# seconds when given.
 unpause_loadgen() {
-    compose_within "$DOCKER_CALL_TIMEOUT_SECONDS" unpause loadgen >>"$RUN_DIR/compose.log" 2>&1 || return
+    compose_within "${1:-$DOCKER_CALL_TIMEOUT_SECONDS}" unpause loadgen >>"$RUN_DIR/compose.log" 2>&1 || return
     LOADGEN_PAUSED=0
 }
 
-# kill_loadgen: ends loadgen with SIGKILL. A paused loadgen dies without being thawed, so it logs
-# nothing after the freeze. Killing a loadgen that no longer runs succeeds. Bounded as
-# stop_loadgen is.
+# kill_loadgen [LIMIT]: ends loadgen with SIGKILL. A paused loadgen dies without being thawed, so
+# it logs nothing after the freeze. Killing a loadgen that no longer runs succeeds. Bounded as
+# stop_loadgen is, or by LIMIT seconds when given.
 kill_loadgen() {
-    compose_within "$DOCKER_CALL_TIMEOUT_SECONDS" kill -s SIGKILL loadgen >>"$RUN_DIR/compose.log" 2>&1 || return
+    compose_within "${1:-$DOCKER_CALL_TIMEOUT_SECONDS}" kill -s SIGKILL loadgen >>"$RUN_DIR/compose.log" 2>&1 || return
     LOADGEN_PAUSED=0
 }
 
@@ -889,21 +937,40 @@ report_outcomes() {
 }
 
 # poll CHECK TIMEOUT STEP COMMAND [ARGS...]: runs COMMAND every STEP seconds until it succeeds or
-# the deadline TIMEOUT seconds from now passes. On expiry it reports FAIL CHECK, with the
-# POLL_DETAIL the last attempt left, and fails. STEP is the poll's only sleep; every wait in this
-# script is such a fixed step under an explicit deadline. COMMAND's log reads see the deadline
-# as PROBE_DEADLINE, local to this call, so it ends with the poll.
+# the deadline TIMEOUT seconds from now passes. An attempt starts only while time is left before
+# the deadline, and a success seen in the deadline's second or later does not count. The clock is
+# whole epoch seconds, rounded down, so the deadline, the start's second plus TIMEOUT, is at most
+# TIMEOUT after the real start, and a success seen before that second ended within TIMEOUT. On
+# expiry it reports FAIL CHECK, with the POLL_DETAIL the last attempt left, and fails, as it does
+# for a late success. STEP is the poll's only sleep, never taken when no time would be left after
+# it; every wait in this script is such a fixed step under an explicit deadline. COMMAND's log
+# reads and readiness requests see the deadline as PROBE_DEADLINE, local to this call, so it ends
+# with the poll.
 poll() {
-    local check="$1" timeout="$2" step="$3" deadline
+    local check="$1" timeout="$2" step="$3" deadline now late
     shift 3
     deadline=$(($(date -u +%s) + timeout))
     local PROBE_DEADLINE="$deadline"
     POLL_DETAIL=""
     while :; do
+        if [[ $(date -u +%s) -ge $deadline ]]; then
+            fail "$check" "deadline $timeout s expired${POLL_DETAIL:+; $POLL_DETAIL}"
+            return 1
+        fi
         if "$@"; then
+            now="$(date -u +%s)"
+            if [[ $now -ge $deadline ]]; then
+                late=""
+                if [[ $now -gt $deadline ]]; then
+                    late=", $((now - deadline)) s late"
+                fi
+                fail "$check" "attempt succeeded at or after the deadline of $timeout s$late"
+                return 1
+            fi
             return 0
         fi
-        if [[ $(($(date -u +%s) + step)) -gt $deadline ]]; then
+        # After the sleep no time would be left for an attempt.
+        if [[ $(($(date -u +%s) + step)) -ge $deadline ]]; then
             fail "$check" "deadline $timeout s expired${POLL_DETAIL:+; $POLL_DETAIL}"
             return 1
         fi
@@ -1022,9 +1089,10 @@ resolved_ids() {
         -e 's/.*Alert \[([0-9a-fA-F-]{36})\] already absent.*/\1/p' "$1" | lower | canonical_ids
 }
 
-# canonical_ids: the canonical UUIDs of stdin, sorted and unique.
+# canonical_ids: the canonical UUIDs of stdin, sorted and unique. Fails when stdin cannot be read:
+# grep exits 1 when no line matches, and above 1 when it fails.
 canonical_ids() {
-    { grep -E "$UUID_RE" || true; } | LC_ALL=C sort -u
+    { grep -E "$UUID_RE" || [[ $? -eq 1 ]]; } | LC_ALL=C sort -u
 }
 
 # unresolved_ids FILE: created ids in FILE with no resolution line in FILE.
@@ -1034,51 +1102,172 @@ unresolved_ids() {
     LC_ALL=C comm -23 "$RUN_DIR/ids.created" "$RUN_DIR/ids.resolved"
 }
 
+# owned_id_violations FILE: where FILE, one read of a window's output, breaks the visit's
+# one-to-one ownership, as "<id> <reason>" lines in log order. A visit logging with the tags
+# [visit:portfolio_insights_alert][id:<visit id>] owns the one alert it logged as created, and
+# that visit alone resolves it, once and after the create. The reasons: created without the
+# visit tag, created again, second create of its visit, resolved without the visit tag, resolved
+# again, resolved by another visit, resolved before its create, resolved without a create. Alert
+# and visit ids compare lower-cased. A line whose alert id is not a canonical UUID is not read, as
+# created_ids and resolved_ids skip it. Only canonical ids and those fixed reasons are printed,
+# never a line's text.
+owned_id_violations() {
+    LC_ALL=C awk -v tag="[visit:$VISIT][id:" '
+        # rep(s, n): s repeated n times. Patterns avoid interval operators, which some awks lack.
+        function rep(s, n,   r) {
+            r = ""
+            while (n-- > 0) {
+                r = r s
+            }
+            return r
+        }
+        # id_at(s, p): the 36 characters of s from position p, lower-cased, when they are a
+        # canonical UUID followed by "]"; otherwise "".
+        function id_at(s, p,   id) {
+            id = tolower(substr(s, p, 36))
+            if (id ~ uuid && substr(s, p + 36, 1) == "]") {
+                return id
+            }
+            return ""
+        }
+        # breach(id, reason): a violation, kept in log order. An empty reason is settled at the
+        # end, once every create is known.
+        function breach(id, reason) {
+            n++
+            ids[n] = id
+            reasons[n] = reason
+        }
+        BEGIN {
+            h = "[0-9a-f]"
+            uuid = "^" rep(h, 8) "-" rep(h, 4) "-" rep(h, 4) "-" rep(h, 4) "-" rep(h, 12) "$"
+            n = 0
+        }
+        {
+            kind = ""
+            id = ""
+            if ((p = index($0, "Created alert [")) > 0) {
+                kind = "created"
+                id = id_at($0, p + 15)
+            } else if ((p = index($0, "Deleted alert [")) > 0) {
+                rest = substr($0, p + 51)
+                if (substr(rest, 1, 8) == "] via ui" || substr(rest, 1, 9) == "] via api") {
+                    kind = "resolved"
+                    id = id_at($0, p + 15)
+                }
+            } else if ((p = index($0, "Alert [")) > 0) {
+                if (substr($0, p + 43, 16) == "] already absent") {
+                    kind = "resolved"
+                    id = id_at($0, p + 7)
+                }
+            }
+            if (id == "") {
+                next
+            }
+            visit = ""
+            if ((t = index($0, tag)) > 0) {
+                visit = id_at($0, t + length(tag))
+            }
+            if (kind == "created") {
+                if (visit == "") {
+                    breach(id, "created without the visit tag")
+                } else if (id in creator) {
+                    breach(id, "created again")
+                } else if (visit in creates) {
+                    breach(id, "second create of its visit")
+                }
+                if (!(id in creator)) {
+                    creator[id] = visit
+                }
+                if (visit != "") {
+                    creates[visit] = 1
+                }
+                next
+            }
+            if (visit == "") {
+                breach(id, "resolved without the visit tag")
+            } else if (id in resolved) {
+                breach(id, "resolved again")
+            } else if (!(id in creator)) {
+                breach(id, "")
+            } else if (creator[id] != "" && creator[id] != visit) {
+                # A create without the visit tag is already a violation of its own.
+                breach(id, "resolved by another visit")
+            }
+            resolved[id] = 1
+        }
+        END {
+            for (i = 1; i <= n; i++) {
+                if (reasons[i] == "") {
+                    if (ids[i] in creator) {
+                        reasons[i] = "resolved before its create"
+                    } else {
+                        reasons[i] = "resolved without a create"
+                    }
+                }
+                print ids[i] " " reasons[i]
+            }
+        }
+    ' "$1"
+}
+
 # observe_window FILE: adds the created and resolved ids of FILE, one read of the open window's
 # output, to the window's observed sets, so an id stays known after log rotation drops its lines
 # from a later read. The first read holding a line records that line as the window's first line.
+# Fails when a step fails, so a read whose ids went unrecorded never passes for an observed one.
 observe_window() {
     local first="$RUN_DIR/observed-first-$WINDOW_LABEL"
-    created_ids "$1" >>"$RUN_DIR/observed-created-$WINDOW_LABEL"
-    resolved_ids "$1" >>"$RUN_DIR/observed-resolved-$WINDOW_LABEL"
+    created_ids "$1" >>"$RUN_DIR/observed-created-$WINDOW_LABEL" || return 1
+    resolved_ids "$1" >>"$RUN_DIR/observed-resolved-$WINDOW_LABEL" || return 1
     if [[ ! -s "$first" ]]; then
-        head -n 1 "$1" >"$first"
+        head -n 1 "$1" >"$first" || return 1
     fi
 }
 
 # observed_ids created|resolved: the ids of that kind any read of the open window's output saw,
-# sorted and unique; none when no read was observed.
+# sorted and unique; none when no read was observed. Fails when the observed set exists but
+# cannot be read.
 observed_ids() {
     local file="$RUN_DIR/observed-$1-$WINDOW_LABEL"
-    if [[ -f "$file" ]]; then
+    if [[ -e "$file" ]]; then
         canonical_ids <"$file"
     fi
 }
 
 # read_window FILE: the open window's output since WINDOW_SINCE into FILE, observed by
-# observe_window. Fails when the output is unreadable.
+# observe_window. Fails, with LOG_PROBE_DETAIL, when the output is unreadable or recording its
+# ids fails.
 read_window() {
     loadgen_logs "$WINDOW_SINCE" >"$1" || return 1
-    observe_window "$1"
+    if ! observe_window "$1"; then
+        LOG_PROBE_DETAIL="recording the alert ids of this read of loadgen's output in $RUN_DIR failed"
+        return 1
+    fi
 }
 
 # window_ids FILE: writes the ids created in FILE, the open window's final output, or in any
 # earlier read of it to $RUN_DIR/ids.created.union, and the ids resolved there to
-# $RUN_DIR/ids.resolved.union.
+# $RUN_DIR/ids.resolved.union. Fails when a step fails, so a union file it leaves may be
+# incomplete and must not be read as the window's ids.
 window_ids() {
-    { created_ids "$1"; observed_ids created; } | canonical_ids >"$RUN_DIR/ids.created.union"
-    { resolved_ids "$1"; observed_ids resolved; } | canonical_ids >"$RUN_DIR/ids.resolved.union"
+    { created_ids "$1" && observed_ids created; } | canonical_ids >"$RUN_DIR/ids.created.union" ||
+        return 1
+    { resolved_ids "$1" && observed_ids resolved; } | canonical_ids >"$RUN_DIR/ids.resolved.union" ||
+        return 1
 }
 
 # own_unresolved FILE: adds to the owned list, which cleanup deletes through REST, every id not
 # owned yet that FILE, the open window's final output, or an earlier read of that window logged
-# as created and none logged as resolved, and writes those ids to $RUN_DIR/new-owned.
+# as created and none logged as resolved, and writes those ids to $RUN_DIR/new-owned. Fails when
+# a step fails, so close_window leaves the window to cleanup, which owns them again; owning
+# again adds no id that is owned already.
 own_unresolved() {
-    window_ids "$1"
+    : >"$RUN_DIR/new-owned" || return 1
+    window_ids "$1" || return 1
     LC_ALL=C comm -23 "$RUN_DIR/ids.created.union" "$RUN_DIR/ids.resolved.union" \
-        >"$RUN_DIR/ids.unresolved"
-    LC_ALL=C sort -u "$RUN_DIR/owned" >"$RUN_DIR/owned.sorted"
-    LC_ALL=C comm -23 "$RUN_DIR/ids.unresolved" "$RUN_DIR/owned.sorted" >"$RUN_DIR/new-owned"
+        >"$RUN_DIR/ids.unresolved" || return 1
+    LC_ALL=C sort -u "$RUN_DIR/owned" >"$RUN_DIR/owned.sorted" || return 1
+    LC_ALL=C comm -23 "$RUN_DIR/ids.unresolved" "$RUN_DIR/owned.sorted" >"$RUN_DIR/new-owned" ||
+        return 1
     cat "$RUN_DIR/new-owned" >>"$RUN_DIR/owned"
 }
 
@@ -1215,10 +1404,26 @@ open_window() {
 # killed it, keeps the phase's whole output in $RUN_DIR/LABEL.log, writes the error-line counts of
 # the stretch its breakdown covers to $RUN_DIR/errors-LABEL, and owns every alert the phase logged
 # as created and never resolved, in that output or an earlier read of it, so cleanup deletes it.
-# Sets CLOSE_ERROR on failure; WINDOW_OPEN stays 1 when the stop itself was not confirmed.
+# The lines after the breakdown's stats line, through the stop, are the phase's late stretch:
+# visits the breakdown does not count. When that output holds the stats line, they go to
+# $RUN_DIR/LABEL.late.log and their error-line counts to $RUN_DIR/errors-late-LABEL; otherwise,
+# or when a step extracting them fails, the stretch stays unknown (late_known). A failed step for
+# the covered stretch leaves $RUN_DIR/errors-LABEL absent, its counts unknown.
+# It owns those alerts, and writes the ids it has just owned to $RUN_DIR/new-owned, on every
+# outcome: when the stop fails, from the earlier reads alone, since loadgen may still run; when
+# the final read fails, from those reads and whatever lines the failed read gave. Fails with
+# CLOSE_ERROR when the stop, the read or recording the owned ids failed. The stop and the read
+# are tracked apart: WINDOW_OPEN stays 1 while the stop is not confirmed, and WINDOW_UNREAD stays
+# 1 until the final output has been read and its alerts owned. An exit before then, as on INT or
+# TERM, leaves the window to cleanup, which reads the stopped loadgen's output again and owns
+# them; owning again adds no id that is owned already.
 close_window() {
-    local label="$WINDOW_LABEL" covered="" rc=0 stop_call="compose stop loadgen"
+    local label="$WINDOW_LABEL" covered="" rc=0 stop_call="compose stop loadgen" found=1
+    local stretches="covered late" stretch part counts status unknown=""
+    local err="$RUN_DIR/close-error.log"
     CLOSE_ERROR=""
+    WINDOW_UNREAD=1
+    rm -f "$RUN_DIR/$label.late.log" "$RUN_DIR/errors-late-$label" "$RUN_DIR/errors-$label"
     if [[ "${1:-0}" != "1" ]]; then
         if [[ $LOADGEN_PAUSED -eq 1 ]]; then
             stop_call="compose kill loadgen"
@@ -1226,32 +1431,98 @@ close_window() {
         stop_loadgen || rc=$?
         if [[ $rc -ne 0 ]]; then
             CLOSE_ERROR="$(docker_problem "$stop_call" "$rc" "$DOCKER_CALL_TIMEOUT_SECONDS")"
+            own_unresolved /dev/null
             return 1
         fi
     fi
     WINDOW_OPEN=0
     if ! loadgen_logs "$WINDOW_SINCE" >"$RUN_DIR/$label.log"; then
         CLOSE_ERROR="reading the window since $WINDOW_SINCE: $LOG_PROBE_DETAIL"
+        # A cut-off read keeps only lines the sanitizer validated, so each create it holds is real.
+        own_unresolved "$RUN_DIR/$label.log"
         return 1
     fi
     # Error lines up to the breakdown's stats line, so the table's error column and its totals
-    # describe the same stretch; without a breakdown, the whole window.
+    # describe the same stretch; without a breakdown, the whole window. The lines after it make
+    # the late stretch, which the verdicts read too, so each judges its run through the stop.
+    # close_or_abort runs this with errexit off, so each step's status is checked. A stretch's
+    # lines and counts are written beside their place and moved there, the counts last, once
+    # every step for that stretch has succeeded. A failed step leaves the stretch absent, so the
+    # table shows its error lines as unknown and the late verdicts fail (late_known) rather than
+    # read a cut-off stretch as one without errors. INFO says so; close-error.log holds why.
     if [[ -s "$RUN_DIR/breakdown-$label.line" ]]; then
-        covered="$(grep -n -x -F -f "$RUN_DIR/breakdown-$label.line" "$RUN_DIR/$label.log" |
-            sed -n '1s/:.*//p')" || covered=""
+        # grep exits 1 when no line matches, and above 1 when it fails.
+        found=0
+        covered="$(grep -n -x -F -f "$RUN_DIR/breakdown-$label.line" "$RUN_DIR/$label.log" \
+            2>>"$err" | sed -n '1s/:.*//p')" || found=$?
+        if [[ $found -eq 0 && ! "$covered" =~ ^[0-9]+$ ]]; then
+            found=2
+        fi
     fi
-    if [[ -n "$covered" ]]; then
-        head -n "$covered" "$RUN_DIR/$label.log" >"$RUN_DIR/$label.covered.log"
-    else
-        cp "$RUN_DIR/$label.log" "$RUN_DIR/$label.covered.log"
+    case $found in
+        0)
+            head -n "$covered" "$RUN_DIR/$label.log" >"$RUN_DIR/$label.covered.part" 2>>"$err" ||
+                unknown="covered"
+            tail -n "+$((covered + 1))" "$RUN_DIR/$label.log" >"$RUN_DIR/$label.late.part" \
+                2>>"$err" || unknown="${unknown:+$unknown }late"
+            ;;
+        1)
+            # No breakdown, or its stats line is not in this output: the whole window is the
+            # covered stretch, and the late one stays unknown unless there is no breakdown.
+            stretches="covered"
+            cp "$RUN_DIR/$label.log" "$RUN_DIR/$label.covered.part" 2>>"$err" || unknown="covered"
+            ;;
+        *)
+            unknown="covered late"
+            ;;
+    esac
+    for stretch in $stretches; do
+        if [[ " $unknown " == *" $stretch "* ]]; then
+            continue
+        fi
+        part="$RUN_DIR/$label.$stretch"
+        counts="$RUN_DIR/errors-$label"
+        if [[ "$stretch" == "late" ]]; then
+            counts="$RUN_DIR/errors-late-$label"
+        fi
+        # error_counts_file's counts, with grep's "no error line" (1) told apart from a failure.
+        status=0
+        grep -F "$ERROR_MARKER" "$part.part" >"$part.errors" 2>>"$err" || status=$?
+        if [[ $status -le 1 ]]; then
+            status=0
+            { sed -n 's/.*\[visit:\([^]]*\)\].*/\1/p' "$part.errors" | LC_ALL=C sort | uniq -c |
+                sed 's/^[[:space:]]*//' >"$part.counts"; } 2>>"$err" || status=$?
+        fi
+        if [[ $status -eq 0 ]]; then
+            mv -f "$part.part" "$part.log" 2>>"$err" || status=$?
+        fi
+        if [[ $status -eq 0 ]]; then
+            mv -f "$part.counts" "$counts" 2>>"$err" || status=$?
+        fi
+        if [[ $status -ne 0 ]]; then
+            rm -f "$part.log" "$counts"
+            unknown="${unknown:+$unknown }$stretch"
+        fi
+    done
+    if [[ " $unknown " == *" covered "* ]]; then
+        info "window $label: its error-line counts for the table are unknown: extracting them from its final output failed (see $err)"
     fi
-    error_counts_file "$RUN_DIR/$label.covered.log" >"$RUN_DIR/errors-$label"
-    own_unresolved "$RUN_DIR/$label.log"
+    if [[ " $unknown " == *" late "* ]]; then
+        info "window $label: the visits after the breakdown, through the stop, are unknown: extracting them from its final output failed (see $err)"
+    fi
+    if ! own_unresolved "$RUN_DIR/$label.log"; then
+        CLOSE_ERROR="recording the window's unresolved alert ids in $RUN_DIR/owned failed"
+        return 1
+    fi
+    # Last, once its alerts are owned: until here an exit leaves the window to cleanup.
+    WINDOW_UNREAD=0
 }
 
-# close_or_abort PREFIX [STOPPED]: close_window STOPPED as the check "PREFIX loadgen stopped".
+# close_or_abort PREFIX [STOPPED]: close_window STOPPED as the check "PREFIX loadgen stopped". On
+# failure the ids close_window has just owned are reported before the run ends.
 close_or_abort() {
     if ! close_window "${2:-0}"; then
+        report_new_owned "$1"
         abort "$1 loadgen stopped" "$CLOSE_ERROR"
     fi
     pass "$1 loadgen stopped"
@@ -1339,42 +1610,120 @@ check_families() {
     done
 }
 
-# check_visit_fail_rate PREFIX LABEL JSON: PASS when portfolio_insights_alert ran with failRate 0.
-check_visit_fail_rate() {
-    local prefix="$1" label="$2" json="$3" rate
-    rate="$(fail_rate "$VISIT" "$json")"
-    if [[ -z "$rate" ]]; then
-        check_result "$prefix" "$label" "$VISIT" "$VISIT failRate" 0 "visit not drawn"
-    elif jq -e --arg n "$VISIT" '.[$n].failRate == 0' >/dev/null 2>&1 <<<"$json"; then
-        check_result "$prefix" "$label" "$VISIT" "$VISIT failRate" 1 \
-            "0 over $(jget ".$VISIT.total" "$json") visits"
-    else
-        check_result "$prefix" "$label" "$VISIT" "$VISIT failRate" 0 "failRate [$rate]"
+# A breakdown is the last stats snapshot before the deadline, and loadgen runs on until its
+# window closes. Each visit that fails logs one worker error line, so the failures after the
+# snapshot are the error lines of the late stretch close_window records. The checks below judge a
+# run through its stop, and fail with LATE_UNKNOWN when that stretch is unknown.
+LATE_UNKNOWN="the visits after the breakdown, through the stop, are unknown: the window's final output lacks the breakdown's stats line, or they could not be extracted from it"
+# The checks fail with LATE_UNREAD when close_window recorded that stretch but reading its record
+# failed, so a failed read never passes for a stretch without errors.
+LATE_UNREAD="the visits after the breakdown, through the stop, are unknown: reading the record close_window kept of them failed"
+
+# late_known LABEL: whether phase LABEL's late stretch is known: close_window read the window's
+# final output, found the breakdown's stats line in it and recorded the lines after it and their
+# error-line counts, every step succeeding. A phase without a breakdown has no late stretch.
+late_known() {
+    [[ ! -s "$RUN_DIR/breakdown-$1.line" || -f "$RUN_DIR/errors-late-$1" ]]
+}
+
+# late_error_count LABEL NAME: the error lines visit NAME logged in phase LABEL's late stretch.
+# Fails, printing nothing, when the recorded counts cannot be read.
+late_error_count() {
+    local count=""
+    if [[ -f "$RUN_DIR/errors-late-$1" ]]; then
+        count="$(awk -v n="$2" '$2 == n { print $1 }' "$RUN_DIR/errors-late-$1")" || return 1
+    fi
+    echo "${count:-0}"
+}
+
+# late_failing LABEL FAMILY: the visit names of FAMILY with an error line in phase LABEL's late
+# stretch, one per line, sorted. Fails when the recorded counts cannot be read.
+late_failing() {
+    if [[ -f "$RUN_DIR/errors-late-$1" ]]; then
+        awk -v f="$2" '$2 == f || index($2, f "_") == 1 { print $2 }' "$RUN_DIR/errors-late-$1" |
+            LC_ALL=C sort -u
     fi
 }
 
-# compare_failures: per existing family, the run B visit names with failRate > 0 must be a
-# subset of run A's for that family.
+# check_visit_fail_rate PREFIX LABEL JSON: PASS when portfolio_insights_alert ran with failRate 0
+# in phase LABEL's breakdown JSON and logged no visit error after it, through the stop.
+check_visit_fail_rate() {
+    local prefix="$1" label="$2" json="$3" rate total late
+    rate="$(fail_rate "$VISIT" "$json")"
+    if [[ -z "$rate" ]]; then
+        check_result "$prefix" "$label" "$VISIT" "$VISIT failRate" 0 "visit not drawn"
+    elif ! jq -e --arg n "$VISIT" '.[$n].failRate == 0' >/dev/null 2>&1 <<<"$json"; then
+        check_result "$prefix" "$label" "$VISIT" "$VISIT failRate" 0 "failRate [$rate]"
+    else
+        total="$(jget ".$VISIT.total" "$json")"
+        if ! late_known "$label"; then
+            check_result "$prefix" "$label" "$VISIT" "$VISIT failRate" 0 \
+                "failRate 0 over $total visits at the breakdown, but $LATE_UNKNOWN"
+        elif ! late="$(late_error_count "$label" "$VISIT")"; then
+            check_result "$prefix" "$label" "$VISIT" "$VISIT failRate" 0 \
+                "failRate 0 over $total visits at the breakdown, but $LATE_UNREAD"
+        elif [[ "$late" != "0" ]]; then
+            check_result "$prefix" "$label" "$VISIT" "$VISIT failRate" 0 \
+                "failRate 0 over $total visits at the breakdown, but $late visit errors after it, through the stop"
+        elif [[ -f "$RUN_DIR/errors-late-$label" ]]; then
+            check_result "$prefix" "$label" "$VISIT" "$VISIT failRate" 1 \
+                "0 over $total visits, and no visit error after the breakdown, through the stop"
+        else
+            check_result "$prefix" "$label" "$VISIT" "$VISIT failRate" 1 "0 over $total visits"
+        fi
+    fi
+}
+
+# compare_failures: per existing family, the run B visit names that failed must be a subset of
+# run A's for that family. Both runs are judged through their stop: a name failed when its
+# breakdown failRate is above 0 or it logged a visit error in the run's late stretch. While
+# either run's late stretch is unknown, every family's check fails, and a family's check fails
+# when reading either run's late record for it fails.
 compare_failures() {
-    local a_json b_json family a_failing b_failing extra
+    local a_json b_json family a_failing b_failing extra late_a late_b late unknown="" unread
     if [[ ! -s "$RUN_DIR/breakdown-A.json" ]]; then
         fail "run B comparison" "run A has no breakdown to compare with"
         return 0
     fi
     a_json="$(cat "$RUN_DIR/breakdown-A.json")"
     b_json="$(cat "$RUN_DIR/breakdown-B.json")"
+    if ! late_known A; then
+        unknown="run A"
+    fi
+    if ! late_known B; then
+        unknown="${unknown:+$unknown and }run B"
+    fi
     for family in $EXISTING_FAMILIES; do
-        family_failing "$family" "$a_json" >"$RUN_DIR/failing-A"
-        family_failing "$family" "$b_json" >"$RUN_DIR/failing-B"
+        if [[ -n "$unknown" ]]; then
+            check_result "run B" B "$family" "no new failures $family" 0 "$unknown: $LATE_UNKNOWN"
+            continue
+        fi
+        unread=""
+        late_failing A "$family" >"$RUN_DIR/late-failing-A" || unread="run A"
+        late_failing B "$family" >"$RUN_DIR/late-failing-B" || unread="${unread:+$unread and }run B"
+        if [[ -n "$unread" ]]; then
+            check_result "run B" B "$family" "no new failures $family" 0 "$unread: $LATE_UNREAD"
+            continue
+        fi
+        { family_failing "$family" "$a_json"; cat "$RUN_DIR/late-failing-A"; } | LC_ALL=C sort -u \
+            >"$RUN_DIR/failing-A"
+        { family_failing "$family" "$b_json"; cat "$RUN_DIR/late-failing-B"; } | LC_ALL=C sort -u \
+            >"$RUN_DIR/failing-B"
         a_failing="$(join_lines <"$RUN_DIR/failing-A")"
         b_failing="$(join_lines <"$RUN_DIR/failing-B")"
+        late_a="$(join_lines <"$RUN_DIR/late-failing-A")"
+        late_b="$(join_lines <"$RUN_DIR/late-failing-B")"
+        late=""
+        if [[ -n "$late_a$late_b" ]]; then
+            late="; failing after the breakdown, through the stop: run B [${late_b:-none}], run A [${late_a:-none}]"
+        fi
         extra="$(LC_ALL=C comm -13 "$RUN_DIR/failing-A" "$RUN_DIR/failing-B" | join_lines)"
         if [[ -z "$extra" ]]; then
             check_result "run B" B "$family" "no new failures $family" 1 \
-                "failing [${b_failing:-none}], run A failing [${a_failing:-none}]"
+                "failing [${b_failing:-none}], run A failing [${a_failing:-none}]$late"
         else
             check_result "run B" B "$family" "no new failures $family" 0 \
-                "failing in run B but not in run A: $extra"
+                "failing in run B but not in run A: $extra$late"
         fi
     done
 }
@@ -1383,15 +1732,32 @@ compare_failures() {
 # ---------------------------------------------------------------------------------------------
 # Setup
 
+# readiness_once: one readiness attempt, a GET of broker-service's and then feature-flag-service's
+# readyz, which succeeds when both answer 200. Inside a poll each request may take the time left
+# before PROBE_DEADLINE, at most HTTP_TIMEOUT_SECONDS, so the attempt has ended by the poll's
+# deadline; a request due with no time left is not sent, and the attempt fails saying so.
 # shellcheck disable=SC2329 # Invoked through poll.
 readiness_once() {
-    local broker flag
-    http GET "$BASE_URL/broker-service/readyz"
-    broker="$(status_text)"
-    http GET "$BASE_URL/feature-flag-service/readyz"
-    flag="$(status_text)"
-    POLL_DETAIL="broker-service readyz gave $broker, feature-flag-service readyz gave $flag"
-    [[ "$broker" == "status 200" && "$flag" == "status 200" ]]
+    local service left limit="$HTTP_TIMEOUT_SECONDS" answers="" ok=1
+    # Each request's --max-time, which http reads.
+    local HTTP_TIMEOUT_SECONDS="$limit"
+    for service in broker-service feature-flag-service; do
+        if [[ -n "$PROBE_DEADLINE" ]]; then
+            left=$((PROBE_DEADLINE - $(date -u +%s)))
+            if [[ $left -le 0 ]]; then
+                POLL_DETAIL="${answers:+$answers, }$service readyz not requested: no time left before the readiness deadline"
+                return 1
+            fi
+            HTTP_TIMEOUT_SECONDS=$((left < limit ? left : limit))
+        fi
+        http GET "$BASE_URL/$service/readyz"
+        answers="${answers:+$answers, }$service readyz gave $(status_text)"
+        if [[ "$HTTP_STATUS" != "200" ]]; then
+            ok=0
+        fi
+    done
+    POLL_DETAIL="$answers"
+    [[ $ok -eq 1 ]]
 }
 
 setup() {
@@ -1488,26 +1854,51 @@ run_window() {
     pass "$prefix breakdown: saved to $RUN_DIR/breakdown-$label.json"
 }
 
+# run_a: run A, whose checks follow the close of its window, so they judge it through its stop:
+# no portfolio_insights_alert visit may run, in its breakdown or in its late stretch.
 run_a() {
-    local rc=0 json names ok=1
+    local rc=0 json names detail late ok=1 status=0
     run_window A false 0 || rc=$?
+    close_or_abort "run A"
+    report_new_owned "run A"
     if [[ $rc -eq 0 ]]; then
         json="$(cat "$RUN_DIR/breakdown-A.json")"
         # shellcheck disable=SC2086 # The family list splits into one argument per family.
         check_families "run A" A "$json" $EXISTING_FAMILIES
         names="$(family_names "$VISIT" "$json" | join_lines)"
+        detail="${names:+entries [$names] at weight 0}"
         if [[ -n "$names" ]]; then
             ok=0
         fi
-        check_result "run A" A "$VISIT" "no $VISIT" "$ok" "${names:+entries [$names] at weight 0}"
+        if ! late_known A; then
+            ok=0
+            detail="${detail:+$detail; }$LATE_UNKNOWN"
+        elif [[ -f "$RUN_DIR/A.late.log" ]]; then
+            # grep -c exits 1 when it counts no line, and above 1 when the read fails.
+            late="$(grep -cF "$RUNNING_MARKER$VISIT]" "$RUN_DIR/A.late.log")" || status=$?
+            if [[ $status -gt 1 || ! "$late" =~ ^[0-9]+$ ]]; then
+                ok=0
+                detail="${detail:+$detail; }$LATE_UNREAD"
+            elif [[ "$late" != "0" ]]; then
+                ok=0
+                detail="${detail:+$detail; }$late lines [$RUNNING_MARKER$VISIT]] after the breakdown, through the stop"
+            fi
+        fi
+        check_result "run A" A "$VISIT" "no $VISIT" "$ok" "$detail"
     fi
-    close_or_abort "run A"
-    report_new_owned "run A"
 }
 
+# run_b: run B. audit_owned_ids drains loadgen to Q and closes the window before the breakdown
+# checks, so they judge run B through its stop, as run A's judge run A.
 run_b() {
     local rc=0 json
     run_window B true "$WEIGHT" || rc=$?
+    if [[ $rc -eq 2 ]]; then
+        close_or_abort "run B"
+        report_new_owned "run B"
+        return 0
+    fi
+    audit_owned_ids
     if [[ $rc -eq 0 ]]; then
         json="$(cat "$RUN_DIR/breakdown-B.json")"
         # shellcheck disable=SC2086 # The family list splits into one argument per family.
@@ -1515,12 +1906,6 @@ run_b() {
         compare_failures
         check_visit_fail_rate "run B" B "$json"
     fi
-    if [[ $rc -eq 2 ]]; then
-        close_or_abort "run B"
-        report_new_owned "run B"
-        return 0
-    fi
-    audit_owned_ids
 }
 
 # creates_in_flight FILE: how many portfolio_insights_alert visits in FILE have opened the page
@@ -1564,7 +1949,8 @@ quiescent() {
 # frozen_log: reads the output of the paused loadgen into $RUN_DIR/frozen.log, again every
 # QUIESCE_FLUSH_STEP_SECONDS until two reads in a row match. Fails, with POLL_DETAIL, on an
 # unreadable log or when no two reads match within QUIESCE_FLUSH_TIMEOUT_SECONDS. Its reads see
-# that deadline, or the drain's when it comes first, as PROBE_DEADLINE, local to this call.
+# that deadline, or the drain's when it comes first, as PROBE_DEADLINE, local to this call, and
+# it never sleeps up to or past that deadline, where no read could start.
 frozen_log() {
     local deadline reads=0
     deadline=$(($(date -u +%s) + QUIESCE_FLUSH_TIMEOUT_SECONDS))
@@ -1582,12 +1968,29 @@ frozen_log() {
         fi
         mv -f "$RUN_DIR/frozen.next" "$RUN_DIR/frozen.log"
         reads=$((reads + 1))
-        if [[ $(($(date -u +%s) + QUIESCE_FLUSH_STEP_SECONDS)) -gt $deadline ]]; then
-            POLL_DETAIL="paused loadgen's output still changing after ${QUIESCE_FLUSH_TIMEOUT_SECONDS}s"
+        if [[ $(($(date -u +%s) + QUIESCE_FLUSH_STEP_SECONDS)) -ge $PROBE_DEADLINE ]]; then
+            if [[ $PROBE_DEADLINE -lt $deadline ]]; then
+                POLL_DETAIL="paused loadgen's output still changing at the drain deadline"
+            else
+                POLL_DETAIL="paused loadgen's output still changing after ${QUIESCE_FLUSH_TIMEOUT_SECONDS}s"
+            fi
             return 1
         fi
         sleep "$QUIESCE_FLUSH_STEP_SECONDS"
     done
+}
+
+# drain_call_limit DEADLINE: sets DRAIN_CALL_LIMIT to the seconds a Docker call of the run B drain
+# may take now, the smaller of DOCKER_CALL_TIMEOUT_SECONDS and the time left before DEADLINE
+# (epoch seconds). Fails when no time is left. It sets a variable rather than print, so the drain
+# starts no subshell for it.
+drain_call_limit() {
+    local left
+    left=$(($1 - $(date -u +%s)))
+    if [[ $left -le 0 ]]; then
+        return 1
+    fi
+    DRAIN_CALL_LIMIT=$((left < DOCKER_CALL_TIMEOUT_SECONDS ? left : DOCKER_CALL_TIMEOUT_SECONDS))
 }
 
 # drain_loadgen: ends run B at an instant Q after which loadgen neither logs nor acts. Every
@@ -1596,11 +1999,15 @@ frozen_log() {
 # again, since a visit may have opened the page or created an alert after the running read. When
 # that holds too, it kills the paused loadgen, and that is Q; otherwise it unpauses loadgen and
 # polls on. Returns 0 at Q and 1 when the deadline passes or Compose fails, with DRAIN_DETAIL
-# describing the outcome; loadgen may then still run or be paused, for close_window to stop.
-# Each pause, unpause and kill has ended within DOCKER_CALL_TIMEOUT_SECONDS, and DRAIN_DETAIL
-# tells one Docker did not answer in time from one that failed.
+# describing the outcome; loadgen may then still run or be paused, for close_window to stop
+# under its own bound. The deadline holds for every step: the log reads take at most the time
+# left, each pause, unpause and kill the smaller of that and DOCKER_CALL_TIMEOUT_SECONDS
+# (drain_call_limit), a step due with no time left is not started, and a kill seen to end in the
+# deadline's second or later is no Q: on the whole-second clock only a kill seen before that
+# second ended within QUIESCE_TIMEOUT_SECONDS of the drain's start. DRAIN_DETAIL tells a call
+# Docker did not answer within its limit from one that failed.
 drain_loadgen() {
-    local deadline rc
+    local deadline rc now late
     DRAIN_DETAIL=""
     deadline=$(($(date -u +%s) + QUIESCE_TIMEOUT_SECONDS))
     # The log reads of the drain see this deadline, local to this call, so the closing read of
@@ -1614,28 +2021,50 @@ drain_loadgen() {
         elif ! quiescent "$RUN_DIR/quiesce.log"; then
             DRAIN_DETAIL="$POLL_DETAIL"
         else
-            pause_loadgen || rc=$?
+            if ! drain_call_limit "$deadline"; then
+                DRAIN_DETAIL="drain deadline of $QUIESCE_TIMEOUT_SECONDS s reached before pausing loadgen"
+                return 1
+            fi
+            pause_loadgen "$DRAIN_CALL_LIMIT" || rc=$?
             if [[ $rc -ne 0 ]]; then
-                DRAIN_DETAIL="$(docker_problem "pausing loadgen" "$rc" "$DOCKER_CALL_TIMEOUT_SECONDS")"
+                DRAIN_DETAIL="$(docker_problem "pausing loadgen" "$rc" "$DRAIN_CALL_LIMIT")"
                 return 1
             fi
             if frozen_log && quiescent "$RUN_DIR/frozen.log"; then
-                kill_loadgen || rc=$?
+                if ! drain_call_limit "$deadline"; then
+                    DRAIN_DETAIL="drain deadline of $QUIESCE_TIMEOUT_SECONDS s reached before killing the paused loadgen"
+                    return 1
+                fi
+                kill_loadgen "$DRAIN_CALL_LIMIT" || rc=$?
                 if [[ $rc -ne 0 ]]; then
-                    DRAIN_DETAIL="$(docker_problem "killing the paused loadgen" "$rc" "$DOCKER_CALL_TIMEOUT_SECONDS")"
+                    DRAIN_DETAIL="$(docker_problem "killing the paused loadgen" "$rc" "$DRAIN_CALL_LIMIT")"
+                    return 1
+                fi
+                now="$(date -u +%s)"
+                if [[ $now -ge $deadline ]]; then
+                    late=""
+                    if [[ $now -gt $deadline ]]; then
+                        late=", $((now - deadline)) s late"
+                    fi
+                    DRAIN_DETAIL="paused loadgen killed at or after the drain deadline of $QUIESCE_TIMEOUT_SECONDS s$late, so no Q"
                     return 1
                 fi
                 DRAIN_DETAIL="Q at $(now_rfc3339) with $(($(created_ids "$RUN_DIR/frozen.log" | wc -l))) created alerts, all resolved, and no create in flight; loadgen killed while paused"
                 return 0
             fi
             DRAIN_DETAIL="paused: $POLL_DETAIL"
-            unpause_loadgen || rc=$?
+            if ! drain_call_limit "$deadline"; then
+                DRAIN_DETAIL="$DRAIN_DETAIL; drain deadline of $QUIESCE_TIMEOUT_SECONDS s reached before unpausing loadgen"
+                return 1
+            fi
+            unpause_loadgen "$DRAIN_CALL_LIMIT" || rc=$?
             if [[ $rc -ne 0 ]]; then
-                DRAIN_DETAIL="$DRAIN_DETAIL; $(docker_problem "unpausing loadgen" "$rc" "$DOCKER_CALL_TIMEOUT_SECONDS")"
+                DRAIN_DETAIL="$DRAIN_DETAIL; $(docker_problem "unpausing loadgen" "$rc" "$DRAIN_CALL_LIMIT")"
                 return 1
             fi
         fi
-        if [[ $(($(date -u +%s) + QUIESCE_STEP_SECONDS)) -gt $deadline ]]; then
+        # After the sleep no time would be left for a read.
+        if [[ $(($(date -u +%s) + QUIESCE_STEP_SECONDS)) -ge $deadline ]]; then
             DRAIN_DETAIL="not quiescent within ${QUIESCE_TIMEOUT_SECONDS}s: $DRAIN_DETAIL"
             return 1
         fi
@@ -1647,12 +2076,18 @@ drain_loadgen() {
 # be cut off before loadgen logs its id. After the stop, "owned-id evidence" fails when run B's
 # final output, $RUN_DIR/B.log, lacks a created id, a resolution or the first line that an earlier
 # read of run B saw, as after log rotation. The audit, created and rows checks then judge every
-# create seen in any read: the final output joined with those earlier reads. The in-flight and
-# outcomes checks judge the final output. Without Q, quiescence fails, loadgen is stopped all the
-# same, and the same checks run.
+# create seen in any read: the final output joined with those earlier reads. The audit also
+# holds the final output, the one read whose line order and repeats are exact, to one create and
+# one later resolution per id, both by the same tagged visit (owned_id_violations). The in-flight
+# and outcomes checks judge the final output. Without Q, quiescence fails, loadgen is stopped all
+# the same, and the same checks run. When reading or writing the ids those checks compare fails,
+# the evidence check, or the audit, created and rows checks, fail rather than judge an empty or
+# partial set.
 audit_owned_ids() {
-    local stopped=0 count unresolved in_flight lines ok lost_created lost_resolved first_line="kept"
+    local stopped=0 count unresolved violations="" violation detail in_flight lines ok lost_created
+    local lost_resolved first_line="kept" evidence_read=1 union_read=1
     local first_file="$RUN_DIR/observed-first-$WINDOW_LABEL"
+    local ids_unread="the alert ids run B's reads logged could not be read or written in $RUN_DIR"
     if drain_loadgen; then
         stopped=1
         check_result "" B "$VISIT" "owned-id quiescence" 1 "$DRAIN_DETAIL"
@@ -1661,14 +2096,18 @@ audit_owned_ids() {
     fi
     close_or_abort "run B" "$stopped"
 
-    created_ids "$RUN_DIR/B.log" >"$RUN_DIR/ids.created.all"
-    resolved_ids "$RUN_DIR/B.log" >"$RUN_DIR/ids.resolved.all"
-    lost_created=$(($(observed_ids created | LC_ALL=C comm -23 - "$RUN_DIR/ids.created.all" | wc -l)))
-    lost_resolved=$(($(observed_ids resolved | LC_ALL=C comm -23 - "$RUN_DIR/ids.resolved.all" | wc -l)))
+    if ! created_ids "$RUN_DIR/B.log" >"$RUN_DIR/ids.created.all" ||
+        ! resolved_ids "$RUN_DIR/B.log" >"$RUN_DIR/ids.resolved.all" ||
+        ! lost_created=$(($(observed_ids created | LC_ALL=C comm -23 - "$RUN_DIR/ids.created.all" | wc -l))) ||
+        ! lost_resolved=$(($(observed_ids resolved | LC_ALL=C comm -23 - "$RUN_DIR/ids.resolved.all" | wc -l))); then
+        evidence_read=0
+    fi
     if [[ -s "$first_file" ]] && ! grep -qxF -f "$first_file" "$RUN_DIR/B.log"; then
         first_line="missing"
     fi
-    if [[ $lost_created -eq 0 && $lost_resolved -eq 0 && "$first_line" == "kept" ]]; then
+    if [[ $evidence_read -eq 0 ]]; then
+        check_result "" B "$VISIT" "owned-id evidence" 0 "$ids_unread, so not every create can be proven"
+    elif [[ $lost_created -eq 0 && $lost_resolved -eq 0 && "$first_line" == "kept" ]]; then
         check_result "" B "$VISIT" "owned-id evidence" 1 \
             "the final output keeps every created id, resolution and first line an earlier read saw"
     else
@@ -1678,16 +2117,35 @@ audit_owned_ids() {
 
     # Every later check but in flight and outcomes judges what any read of run B saw, so an id
     # seen once is never dropped; close_window has owned the unresolved ones.
-    window_ids "$RUN_DIR/B.log"
-    count=$(($(wc -l <"$RUN_DIR/ids.created.union")))
-    unresolved="$(LC_ALL=C comm -23 "$RUN_DIR/ids.created.union" "$RUN_DIR/ids.resolved.union" |
-        join_lines)"
-    if [[ -z "$unresolved" ]]; then
+    if ! window_ids "$RUN_DIR/B.log" ||
+        ! count=$(($(wc -l <"$RUN_DIR/ids.created.union"))) ||
+        ! unresolved="$(LC_ALL=C comm -23 "$RUN_DIR/ids.created.union" "$RUN_DIR/ids.resolved.union" |
+            join_lines)"; then
+        union_read=0
+        count=0
+        unresolved=""
+    fi
+    # Pairing needs line order and repeats, which only one read holds: the final output, whose
+    # losses the evidence check above reports.
+    owned_id_violations "$RUN_DIR/B.log" >"$RUN_DIR/ids.violations"
+    while IFS= read -r violation; do
+        violations="${violations:+$violations, }$violation"
+    done <"$RUN_DIR/ids.violations"
+    if [[ $union_read -eq 1 && -z "$unresolved" && -z "$violations" ]]; then
         check_result "" B "$VISIT" "owned-id audit" 1 \
             "$count created alerts, each deleted via ui, via api or already absent"
     else
-        check_result "" B "$VISIT" "owned-id audit" 0 \
-            "not resolved by loadgen, deleted on exit: $unresolved"
+        detail=""
+        if [[ $union_read -eq 0 ]]; then
+            detail="$ids_unread, so no create can be paired with its resolution"
+        fi
+        if [[ -n "$violations" ]]; then
+            detail="${detail:+$detail; }not one-to-one: $violations"
+        fi
+        if [[ -n "$unresolved" ]]; then
+            detail="${detail:+$detail; }not resolved by loadgen, deleted on exit: $unresolved"
+        fi
+        check_result "" B "$VISIT" "owned-id audit" 0 "$detail"
     fi
 
     in_flight="$(creates_in_flight "$RUN_DIR/B.log")"
@@ -1709,6 +2167,12 @@ audit_owned_ids() {
     check_result "" B "$VISIT" "owned-id outcomes" "$ok" \
         "$lines lines report an alert left in place or an unknown outcome since $WINDOW_START"
 
+    if [[ $union_read -eq 0 ]]; then
+        check_result "" B "$VISIT" "owned-id created" 0 \
+            "$ids_unread, so the alerts created in run B cannot be counted"
+        check_result "" B "$VISIT" "owned-id rows" 0 "$ids_unread, so no Alerts row was counted"
+        return 0
+    fi
     ok=0
     if [[ $count -ge 1 ]]; then
         ok=1
@@ -1777,17 +2241,21 @@ flag_off_window() {
 # Table
 
 # verdict_of LABEL FAMILY: FAIL when a check of FAMILY in phase LABEL failed, PASS when one
-# passed and none failed, "not checked" otherwise.
+# passed and none failed, "not checked" otherwise. Fails, printing nothing, when the verdicts
+# file is missing, not a regular file or cannot be read: awk skips a directory with a warning
+# and exit status 0, which would otherwise read as "not checked".
 verdict_of() {
-    local results
-    results="$(awk -F '\t' -v l="$1" -v f="$2" '$1 == l && $2 == f { print $3 }' "$RUN_DIR/verdicts")"
-    if grep -qx FAIL <<<"$results"; then
-        echo "FAIL"
-    elif grep -qx PASS <<<"$results"; then
-        echo "PASS"
-    else
-        echo "not checked"
+    local verdict
+    if [[ ! -f "$RUN_DIR/verdicts" ]]; then
+        echo "verdict_of: $RUN_DIR/verdicts is not a regular file" >&2
+        return 1
     fi
+    verdict="$(awk -F '\t' -v l="$1" -v f="$2" '
+        $1 == l && $2 == f && $3 == "FAIL" { failed = 1 }
+        $1 == l && $2 == f && $3 == "PASS" { passed = 1 }
+        END { print (failed ? "FAIL" : (passed ? "PASS" : "not checked")) }' "$RUN_DIR/verdicts")" ||
+        return 1
+    echo "$verdict"
 }
 
 # phase_families LABEL: the families phase LABEL is checked on. Run B and the flag-off phase
@@ -1800,47 +2268,92 @@ phase_families() {
 }
 
 # table_rows LABEL: one row per visit name of phase LABEL's breakdown, plus one per checked family
-# the breakdown has no name of.
+# the breakdown has no name of. Returns non-zero at the first step that fails (reading the
+# breakdown, jq, awk, a verdict or a write), so its caller never takes a short table for a whole
+# one. No step relies on errexit, which a caller's if condition switches off: each is checked,
+# and jq writes to a file, not a process substitution, so its own status is seen.
 table_rows() {
-    local label="$1" file="$RUN_DIR/breakdown-$1.json" json name total rate completions family errors
+    local label="$1" file="$RUN_DIR/breakdown-$1.json" raw="$RUN_DIR/table-$1.raw"
+    local tsv="$RUN_DIR/table-$1.tsv" json name total rate completions family families names
+    local errors verdict
     if [[ ! -s "$file" ]]; then
-        echo "| $label | - | - | - | - | - | - | no breakdown |"
+        echo "| $label | - | - | - | - | - | - | no breakdown |" || return 1
         return 0
     fi
-    json="$(cat "$file")"
+    json="$(cat "$file")" || return 1
+    jq -r 'to_entries[] | [.key, .value.total, .value.failRate,
+        (.value.total * (1 - .value.failRate) + 0.5 | floor)] | @tsv' <<<"$json" >"$raw" || return 1
+    tr -d '\r' <"$raw" >"$tsv" || return 1
     while IFS=$'\t' read -r name total rate completions; do
-        family="$(family_of "$name")"
+        family="$(family_of "$name")" || return 1
         errors="?"
         if [[ -f "$RUN_DIR/errors-$label" ]]; then
-            errors="$(awk -v n="$name" '$2 == n { print $1 }' "$RUN_DIR/errors-$label")"
+            errors="$(awk -v n="$name" '$2 == n { print $1 }' "$RUN_DIR/errors-$label")" || return 1
         fi
-        echo "| $label | $family | $name | $total | $rate | $completions | ${errors:-0} | $(verdict_of "$label" "$family") |"
-    done < <(jq -r 'to_entries[] | [.key, .value.total, .value.failRate,
-        (.value.total * (1 - .value.failRate) + 0.5 | floor)] | @tsv' <<<"$json" | tr -d '\r')
-    for family in $(phase_families "$label"); do
-        if [[ -z "$(family_names "$family" "$json")" ]]; then
-            echo "| $label | $family | - | 0 | - | 0 | 0 | $(verdict_of "$label" "$family") |"
+        verdict="$(verdict_of "$label" "$family")" || return 1
+        echo "| $label | $family | $name | $total | $rate | $completions | ${errors:-0} | $verdict |" ||
+            return 1
+    done <"$tsv" || return 1
+    families="$(phase_families "$label")" || return 1
+    for family in $families; do
+        # family_names reads a jq failure as no name; here it must fail the rows instead.
+        names="$(jq -r --arg f "$family" "keys[] | select($FAMILY_JQ)" <<<"$json")" || return 1
+        if [[ -z "$names" ]]; then
+            verdict="$(verdict_of "$label" "$family")" || return 1
+            echo "| $label | $family | - | 0 | - | 0 | 0 | $verdict |" || return 1
         fi
     done
 }
 
+# write_table: the per-family table of runs A, B and the flag-off phase, published at OUT_FILE.
+# PASS "table: OUT_FILE" once it is published there; otherwise FAIL "table" with the step that
+# failed and OUT_FILE as it was, with no partial file left: the rows are generated into the run
+# dir first, then the whole report is written to a temporary file beside OUT_FILE and renamed
+# over it. Beside OUT_FILE, not in the run dir, so that the rename stays on one file system and
+# replaces OUT_FILE in one step; across file systems mv copies, and a failed copy leaves a short
+# OUT_FILE. Every step is checked on its own rather than through errexit, which this function's
+# callers may have off (cleanup runs with set +e). The temporary file gets the mode a plain
+# redirection would give, since mktemp creates it readable by its owner only.
 write_table() {
-    local label
+    local label tmp="" mode reason="" log="$RUN_DIR/table-error.log"
     TABLE_WRITTEN=1
-    if {
-        echo "# Loadgen live run"
-        echo
-        echo "Project \`$PROJECT\`, db type ${DIALECT:-unknown}, weight $WEIGHT, runs of $MINUTES minutes, started $STARTED_AT."
-        echo
-        echo "| run | family | visit name | total | failRate | completions | error lines | verdict |"
-        echo "| --- | --- | --- | --- | --- | --- | --- | --- |"
-        for label in A B B-flag-off; do
-            table_rows "$label"
-        done
-    } >"$OUT_FILE" 2>>"$RUN_DIR/table-error.log"; then
+    for label in A B B-flag-off; do
+        if ! table_rows "$label" 2>>"$log" >"$RUN_DIR/table-$label.rows"; then
+            reason="could not generate the rows of run $label"
+            break
+        fi
+    done
+    if [[ -z "$reason" ]]; then
+        printf -v mode '%04o' $((0666 & ~$(umask)))
+        if ! tmp="$(mktemp -- "$OUT_FILE.XXXXXX" 2>>"$log")"; then
+            tmp=""
+            reason="could not write $OUT_FILE"
+        elif ! chmod -- "$mode" "$tmp" 2>>"$log"; then
+            reason="could not write $OUT_FILE"
+        elif ! {
+            echo "# Loadgen live run" &&
+                echo &&
+                echo "Project \`$PROJECT\`, db type ${DIALECT:-unknown}, weight $WEIGHT, runs of $MINUTES minutes, started $STARTED_AT." &&
+                echo &&
+                echo "| run | family | visit name | total | failRate | completions | error lines | verdict |" &&
+                echo "| --- | --- | --- | --- | --- | --- | --- | --- |" &&
+                cat "$RUN_DIR/table-A.rows" "$RUN_DIR/table-B.rows" "$RUN_DIR/table-B-flag-off.rows"
+        } 2>>"$log" >"$tmp"; then
+            reason="could not write $OUT_FILE"
+        elif ! mv -f -T -- "$tmp" "$OUT_FILE" 2>>"$log"; then
+            # -T: an OUT_FILE that is a directory fails the rename instead of receiving the file.
+            reason="could not publish $OUT_FILE"
+        else
+            tmp=""
+        fi
+    fi
+    if [[ -n "$tmp" ]] && ! rm -f -- "$tmp" 2>>"$log"; then
+        reason="$reason; partial file $tmp not removed"
+    fi
+    if [[ -z "$reason" ]]; then
         pass "table: $OUT_FILE"
     else
-        fail "table" "could not write $OUT_FILE (see $RUN_DIR/table-error.log)"
+        fail "table" "$reason (see $log)"
     fi
 }
 
@@ -1854,30 +2367,84 @@ finish_run() {
 # Cleanup. Every step is idempotent and runs on any exit, normal or not.
 
 # remaining_owned: writes the owned ids not yet deleted to $RUN_DIR/to-delete and prints their
-# number.
+# number. Fails, printing no number, when a list cannot be read or written or the ids written
+# cannot be counted: an unread owned list must never pass for an empty one.
 remaining_owned() {
-    LC_ALL=C sort -u "$RUN_DIR/owned" >"$RUN_DIR/owned.sorted"
-    LC_ALL=C sort -u "$RUN_DIR/deleted" >"$RUN_DIR/deleted.sorted"
-    LC_ALL=C comm -23 "$RUN_DIR/owned.sorted" "$RUN_DIR/deleted.sorted" >"$RUN_DIR/to-delete"
-    wc -l <"$RUN_DIR/to-delete" | tr -d ' '
+    local count
+    LC_ALL=C sort -u "$RUN_DIR/owned" >"$RUN_DIR/owned.sorted" || return 1
+    LC_ALL=C sort -u "$RUN_DIR/deleted" >"$RUN_DIR/deleted.sorted" || return 1
+    LC_ALL=C comm -23 "$RUN_DIR/owned.sorted" "$RUN_DIR/deleted.sorted" >"$RUN_DIR/to-delete" || return 1
+    count="$(wc -l <"$RUN_DIR/to-delete")" || return 1
+    count="${count//[[:space:]]/}"
+    if [[ ! "$count" =~ ^[0-9]+$ ]]; then
+        return 1
+    fi
+    echo "$count"
 }
 
-# delete_remaining: DELETEs every owned id not yet deleted. 204 and 404 are clean; any other
-# outcome is printed with its id and status. Sets CLEANUP_LEFT to the number left in place.
+# write_recovery_record: writes $RUN_DIR/recovery, one JSON object holding the project, base URL
+# and Compose files of this run. --resume-cleanup deletes the owned ids of a run directory only
+# for the project and base URL its record names. As for docker, Git Bash must not rewrite a
+# path-like value into a Windows path on its way to jq.
+write_recovery_record() {
+    MSYS_NO_PATHCONV=1 jq -n --arg project "$PROJECT" --arg baseUrl "$BASE_URL" \
+        '{project: $project, baseUrl: $baseUrl, composeFiles: $ARGS.positional}' \
+        --args "${COMPOSE_FILES[@]}" >"$RUN_DIR/recovery"
+}
+
+# resume_command: the command line, each value quoted for the shell, that deletes through
+# --resume-cleanup the owned alerts this run directory still holds.
+resume_command() {
+    local file text
+    printf -v text 'scripts/portfolio-insights/loadgen-check.sh --project %q --base-url %q' \
+        "$PROJECT" "$BASE_URL"
+    for file in "${COMPOSE_FILES[@]}"; do
+        printf -v text '%s --compose-file %q' "$text" "$file"
+    done
+    printf '%s --resume-cleanup %q\n' "$text" "$RUN_DIR"
+}
+
+# delete_remaining COUNT: DELETEs every owned id not yet deleted, the COUNT lines remaining_owned
+# wrote to $RUN_DIR/to-delete, each a canonical UUID; a line that is not one, which only an edited
+# run directory can hold, is refused and never sent. 204 and 404 are clean once the id is added to
+# the deleted list; an id that list cannot record stays left, as do the lines a failed read of
+# to-delete never reached. A transport error is retried as CLEANUP_RETRY_ATTEMPTS sets out; any
+# other outcome is printed with its id and status. Sets CLEANUP_LEFT to the number left in place,
+# and CLEANUP_REFUSED to how many of those were refused.
 delete_remaining() {
-    local id transport=0
+    local id attempt line=0 transport=0
     CLEANUP_LEFT=0
+    CLEANUP_REFUSED=0
     while IFS= read -r id; do
+        line=$((line + 1))
+        if [[ ! "$id" =~ $UUID_RE ]]; then
+            # The line is not printed: it is not an id loadgen logged, so it may be any text.
+            info "cleanup refused line $line of $RUN_DIR/to-delete: not a canonical alert id, never sent"
+            CLEANUP_LEFT=$((CLEANUP_LEFT + 1))
+            CLEANUP_REFUSED=$((CLEANUP_REFUSED + 1))
+            continue
+        fi
         if [[ $transport -ge $MAX_CONSECUTIVE_TRANSPORT_ERRORS ]]; then
             info "cleanup left alert $id: not attempted after $transport transport errors in a row"
             CLEANUP_LEFT=$((CLEANUP_LEFT + 1))
             continue
         fi
+        attempt=1
         http DELETE "$ALERTS_URL/$id"
+        while [[ "$HTTP_STATUS" == "000" && $attempt -lt $CLEANUP_RETRY_ATTEMPTS ]]; do
+            sleep "$CLEANUP_RETRY_STEP_SECONDS"
+            attempt=$((attempt + 1))
+            http DELETE "$ALERTS_URL/$id"
+        done
         case "$HTTP_STATUS" in
             204 | 404)
                 transport=0
-                echo "$id" >>"$RUN_DIR/deleted"
+                # The alert is gone. An id the deleted list cannot record still counts as left, so
+                # the check fails and a resume sends its DELETE again, which a 404 answers cleanly.
+                if ! echo "$id" >>"$RUN_DIR/deleted"; then
+                    info "cleanup left alert $id: gone (status $HTTP_STATUS), but $RUN_DIR/deleted could not record it; a resume DELETEs it again"
+                    CLEANUP_LEFT=$((CLEANUP_LEFT + 1))
+                fi
                 ;;
             *)
                 if [[ "$HTTP_STATUS" == "000" ]]; then
@@ -1890,39 +2457,55 @@ delete_remaining() {
                 ;;
         esac
     done <"$RUN_DIR/to-delete"
+    # A read of to-delete that fails ends the loop as its end would.
+    if [[ $line -lt $1 ]]; then
+        info "cleanup left $(($1 - line)) owned alerts: $RUN_DIR/to-delete could not be read past line $line"
+        CLEANUP_LEFT=$((CLEANUP_LEFT + $1 - line))
+    fi
 }
 
 # shellcheck disable=SC2329 # Invoked by the EXIT trap below.
 cleanup() {
-    local rc=$? remaining problems=""
+    local rc=$? remaining problems="" stopped closed
     trap - EXIT
     set +e
     # An exit inside a poll, the quiescence wait or the progress watch leaves that wait's deadline
     # in scope here, so the closing log read below would inherit it; cleanup reads with the fixed
     # bound instead. Every Docker call below has a hard limit, so none can hold the exit.
     PROBE_DEADLINE=""
-    if [[ $WINDOW_OPEN -eq 1 ]]; then
-        # A run ended mid-phase: loadgen stops first, so no visit runs while the flag is switched
-        # for deletion, and whatever the phase created and did not resolve is owned. A loadgen
-        # the run B drain left paused is killed without being thawed.
+    if [[ $WINDOW_OPEN -eq 1 || $WINDOW_UNREAD -eq 1 ]]; then
+        # A run ended mid-phase, or its window's closing read failed: the leg still pending is
+        # retried. loadgen stops first, so no visit runs while the flag is switched for deletion;
+        # a loadgen the run B drain left paused is killed without being thawed. A loadgen whose
+        # stop was confirmed has its window read again. Whatever the phase created and did not
+        # resolve is owned on either outcome, from the reads that succeeded.
         # When the stop is not confirmed, because Docker did not answer within its limit or the
         # call failed, cleanup still deletes the owned alerts and restores the flag. Skipping them
         # would leave those alerts and a changed flag behind for certain; a loadgen that is still
         # running risks less, since each of its visits deletes its own alert and logs the id of
         # one it cannot. The cleanup check then fails, naming loadgen as not confirmed stopped.
-        if close_window; then
-            report_new_owned "cleanup"
-        elif [[ $WINDOW_OPEN -eq 1 ]]; then
+        stopped=0
+        if [[ $WINDOW_OPEN -eq 0 ]]; then
+            stopped=1
+        fi
+        close_window "$stopped"
+        closed=$?
+        report_new_owned "cleanup"
+        if [[ $closed -ne 0 && $WINDOW_OPEN -eq 1 ]]; then
             problems="loadgen not confirmed stopped: $CLOSE_ERROR"
-        else
+        elif [[ $closed -ne 0 ]]; then
             problems="loadgen stopped, but its window was not read: $CLOSE_ERROR"
         fi
     fi
     if [[ $LOADGEN_TOUCHED -eq 1 && $TABLE_WRITTEN -eq 0 ]]; then
         write_table
     fi
-    remaining="$(remaining_owned)"
-    if [[ "$remaining" -gt 0 ]]; then
+    if ! remaining="$(remaining_owned)"; then
+        # Without the lists nothing tells which owned ids are left, so none is deleted, the flag
+        # is not switched for it, and the steps below still restore the flag and loadgen.
+        problems="${problems:+$problems; }owned-alert lists of the run dir could not be read or written, owned alerts not deleted"
+        info "cleanup: to delete the owned alerts left, and only those, run: $(resume_command)"
+    elif [[ "$remaining" -gt 0 ]]; then
         # DELETE answers 403 while the flag is off, so the flag is switched on to delete.
         http GET "$FLAG_URL"
         if [[ "$HTTP_STATUS" == "200" && "$(jget '.enabled' "$HTTP_BODY")" == "false" ]]; then
@@ -1930,10 +2513,14 @@ cleanup() {
             http PUT "$FLAG_URL" '{"enabled": true}'
             info "cleanup: flag $FLAG_ID switched on to delete $remaining owned alerts ($(status_text))"
         fi
-        delete_remaining
+        delete_remaining "$remaining"
         info "cleanup: $((remaining - CLEANUP_LEFT)) of $remaining owned alerts deleted or already absent"
         if [[ $CLEANUP_LEFT -gt 0 ]]; then
             problems="${problems:+$problems; }$CLEANUP_LEFT owned alerts left in place"
+        fi
+        # Refused lines are not ids, so a later run could not delete them either.
+        if [[ $CLEANUP_LEFT -gt $CLEANUP_REFUSED ]]; then
+            info "cleanup: to delete the owned alerts left, and only those, run: $(resume_command)"
         fi
     fi
     if [[ $FLAG_TOUCHED -eq 1 && -n "$FLAG_INITIAL" ]]; then
@@ -1967,19 +2554,172 @@ cleanup() {
 }
 
 # ---------------------------------------------------------------------------------------------
+# Resuming a cleanup
+
+# resume_refused REASON: ends a --resume-cleanup run, before any request, with exit status 2.
+resume_refused() {
+    echo "Cannot resume the cleanup of $RESUME_RUN_DIR: $1." >&2
+    exit 2
+}
+
+# open_resumed_run_dir: makes RESUME_RUN_DIR the run directory once it holds the recovery record
+# of a run against this --project and --base-url, and that run's owned and deleted lists.
+open_resumed_run_dir() {
+    local verdict list
+    if [[ ! -f "$RESUME_RUN_DIR/recovery" || ! -r "$RESUME_RUN_DIR/recovery" ]]; then
+        resume_refused "it holds no readable recovery record"
+    fi
+    # Compared inside jq, so no value of the record is printed: an edited record may hold any text.
+    verdict="$(MSYS_NO_PATHCONV=1 jq -r --arg project "$PROJECT" --arg baseUrl "$BASE_URL" '
+        if type != "object" or (.project | type) != "string" or (.baseUrl | type) != "string"
+            or (.composeFiles | type) != "array" or any(.composeFiles[]; type != "string")
+        then "malformed"
+        elif .project != $project then "project"
+        elif .baseUrl != $baseUrl then "base-url"
+        else "match" end' <"$RESUME_RUN_DIR/recovery" 2>/dev/null | tr -d '\r')" || verdict=""
+    case "$verdict" in
+        match) ;;
+        project) resume_refused "its run was against another Compose project than --project" ;;
+        base-url) resume_refused "its run was against another base URL than --base-url" ;;
+        *) resume_refused "its recovery record is not one this script writes" ;;
+    esac
+    for list in owned deleted; do
+        if [[ ! -f "$RESUME_RUN_DIR/$list" || ! -r "$RESUME_RUN_DIR/$list" ]]; then
+            resume_refused "its $list list is missing or unreadable"
+        fi
+    done
+    if [[ ! -w "$RESUME_RUN_DIR" || ! -w "$RESUME_RUN_DIR/deleted" ]]; then
+        resume_refused "it is not writable, so no deletion could be recorded"
+    fi
+    RUN_DIR="$RESUME_RUN_DIR"
+}
+
+# resume_origin_bound: refuses the resume through resume_refused unless --base-url reaches the
+# reverse proxy of the Compose project --project names, so that no request of the resume can
+# switch another stack's flag or record its 404s as deletions while the alerts stay in this one.
+# The project must run its reverse-proxy service, and docker compose port must print where its
+# port 80 is published as HOST:PORT, Compose's form for the first binding, with an IPv6 HOST
+# unbracketed. PORT must be the base URL's port: the one it names, else 80 for http:// and 443 for
+# https://. HOST must be the base URL's host; or a wildcard, 0.0.0.0 or ::, when that host is
+# localhost, 127.0.0.1 or [::1]; or 127.0.0.1 or ::1 when it is localhost. Nothing shows that any
+# other base URL host reaches the binding, so any other pair is refused. Each Docker call has
+# ended within DOCKER_CALL_TIMEOUT_SECONDS (hard_timeout), and its errors go to compose.log in the
+# run directory. The reasons are fixed text: no output of Docker is printed until validated.
+resume_origin_bound() {
+    local running published bound_host bound_port authority host port reaches rc=0
+    running="$(running_services)" || rc=$?
+    if [[ $rc -ne 0 ]]; then
+        resume_refused "$(docker_problem "listing the running services of --project" "$rc" "$DOCKER_CALL_TIMEOUT_SECONDS")"
+    fi
+    if ! grep -qxF reverse-proxy <<<"$running"; then
+        resume_refused "reverse-proxy is not running in --project, so the stack at --base-url may be another project's"
+    fi
+    published="$(compose_within "$DOCKER_CALL_TIMEOUT_SECONDS" port reverse-proxy 80 2>>"$RUN_DIR/compose.log" |
+        tr -d '\r')" || rc=$?
+    if [[ $rc -ne 0 ]]; then
+        resume_refused "$(docker_problem "reading where --project publishes port 80 of reverse-proxy" "$rc" "$DOCKER_CALL_TIMEOUT_SECONDS")"
+    fi
+    bound_port="${published##*:}"
+    bound_host="${published%:*}"
+    bound_host="${bound_host#\[}"
+    bound_host="${bound_host%\]}"
+    bound_host="${bound_host,,}"
+    if [[ "$published" != *:* ]] || ! is_port_number "$bound_port" ||
+        ! { is_ipv4_address "$bound_host" || is_ipv6_address "$bound_host"; }; then
+        resume_refused "docker compose port printed no HOST:PORT for port 80 of reverse-proxy in --project"
+    fi
+    # BASE_URL passed is_base_origin and lost its trailing slash, so it splits as there.
+    authority="${BASE_URL#*://}"
+    if [[ "$authority" == \[* ]]; then
+        host="${authority%%\]*}"
+        host="${host#\[}"
+        port="${authority#*\]}"
+    else
+        host="${authority%%:*}"
+        port="${authority#"$host"}"
+    fi
+    host="${host,,}"
+    port="${port#:}"
+    if [[ -z "$port" ]]; then
+        case "$BASE_URL" in
+            https://*) port=443 ;;
+            *) port=80 ;;
+        esac
+    fi
+    if ((10#$bound_port != 10#$port)); then
+        resume_refused "port 80 of reverse-proxy in --project is published on another port than --base-url names"
+    fi
+    # The binding hosts besides its own that the base URL's host reaches.
+    case "$host" in
+        localhost) reaches="0.0.0.0 :: 127.0.0.1 ::1" ;;
+        127.0.0.1 | ::1) reaches="0.0.0.0 ::" ;;
+        *) reaches="" ;;
+    esac
+    if [[ "$bound_host" != "$host" && " $reaches " != *" $bound_host "* ]]; then
+        resume_refused "port 80 of reverse-proxy in --project is published on a host address that --base-url is not shown to reach"
+    fi
+    info "resume: --base-url reaches reverse-proxy of project [$PROJECT], port 80 published at $published"
+}
+
+# resume_cleanup: the --resume-cleanup run. It checks that --base-url is the origin of --project
+# (resume_origin_bound) and reads the flag, then ends through cleanup, which DELETEs by id the
+# owned ids of the run directory no earlier cleanup deleted, switching the flag on to delete while
+# it is off and restoring it after, and appends each id deleted or found absent to the deleted
+# list, so a later resume goes on from there. It sends no POST, deletes nothing by account,
+# touches no loadgen, opens no window and writes no table.
+resume_cleanup() {
+    local enabled remaining
+    trap 'exit 130' INT TERM
+    info "run dir $RUN_DIR"
+    info "resuming the owned-alert cleanup of project [$PROJECT], base url $BASE_URL"
+    resume_origin_bound
+    http GET "$FLAG_URL"
+    enabled="$(jq -r --arg id "$FLAG_ID" \
+        'if type == "object" and .id == $id and (.enabled | type) == "boolean" then .enabled
+        else "invalid" end' <<<"$HTTP_BODY" 2>/dev/null | tr -d '\r')" || enabled=""
+    # Without the flag's value cleanup could not restore it, so nothing is deleted.
+    if [[ "$HTTP_STATUS" != "200" ]]; then
+        fail "resume flag" "GET $FLAG_ID gave $(status_text); nothing was deleted"
+    elif [[ "$enabled" != "true" && "$enabled" != "false" ]]; then
+        fail "resume flag" "GET $FLAG_ID answered without its id and a boolean enabled; nothing was deleted"
+    fi
+    if [[ $failed -gt 0 ]]; then
+        echo "SUMMARY $passed passed, $failed failed"
+        exit 1
+    fi
+    FLAG_INITIAL="$enabled"
+    pass "resume flag: enabled=$FLAG_INITIAL"
+    # Without a count nothing is printed for it; cleanup then fails on the same lists.
+    if remaining="$(remaining_owned)"; then
+        info "resume: $remaining owned alerts of this run directory are not deleted yet"
+    fi
+    trap cleanup EXIT
+    exit 0
+}
+
+# ---------------------------------------------------------------------------------------------
 # Main
 
 main() {
     parse_options "$@"
     check_tools
-    if ! RUN_DIR="$(mktemp -d "${TMPDIR:-/tmp}/pi-loadgen.XXXXXX")"; then
-        echo "Could not create a run directory under ${TMPDIR:-/tmp}." >&2
-        exit 2
+    if [[ -n "$RESUME_RUN_DIR" ]]; then
+        open_resumed_run_dir
+    else
+        if ! RUN_DIR="$(mktemp -d "${TMPDIR:-/tmp}/pi-loadgen.XXXXXX")"; then
+            echo "Could not create a run directory under ${TMPDIR:-/tmp}." >&2
+            exit 2
+        fi
+        : >"$RUN_DIR/owned"
+        : >"$RUN_DIR/deleted"
+        : >"$RUN_DIR/new-owned"
+        : >"$RUN_DIR/verdicts"
+        # Written before anything is owned, so every alert the run leaves behind can be resumed.
+        if ! write_recovery_record 2>/dev/null; then
+            echo "Could not write the recovery record $RUN_DIR/recovery." >&2
+            exit 2
+        fi
     fi
-    : >"$RUN_DIR/owned"
-    : >"$RUN_DIR/deleted"
-    : >"$RUN_DIR/new-owned"
-    : >"$RUN_DIR/verdicts"
     OUT_FILE="${OUT_FILE:-$RUN_DIR/loadgen-families.md}"
     FLAG_URL="$BASE_URL/feature-flag-service/v1/flags/$FLAG_ID"
     ALERTS_URL="$BASE_URL/broker-service/v1/alerts"
@@ -1993,6 +2733,7 @@ main() {
     RESTORE_ERROR=""
     DIALECT=""
     WINDOW_OPEN=0
+    WINDOW_UNREAD=0
     WINDOW_LABEL=""
     WINDOW_SINCE=""
     LOADGEN_PAUSED=0
@@ -2003,6 +2744,9 @@ main() {
     LOG_PROBE_DETAIL=""
     STARTED_AT="$(now_rfc3339)"
 
+    if [[ -n "$RESUME_RUN_DIR" ]]; then
+        resume_cleanup
+    fi
     trap cleanup EXIT
     trap 'exit 130' INT TERM
     info "run dir $RUN_DIR"

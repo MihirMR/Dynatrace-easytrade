@@ -114,6 +114,7 @@ t_fresh_run_dir() {
     RESTORE_ERROR=""
     DIALECT=""
     WINDOW_OPEN=0
+    WINDOW_UNREAD=0
     WINDOW_LABEL=""
     WINDOW_SINCE=""
     LOADGEN_PAUSED=0
@@ -168,11 +169,14 @@ t_drain_resolved() {
 #   - date -u +%s and now_rfc3339 read the fake clock in $RUN_DIR/clock; sleep advances it.
 #   - compose appends its arguments to $RUN_DIR/compose.calls and fails for a subcommand listed
 #     in $RUN_DIR/compose.fail. compose_within, the bounded form the stop, pause, unpause and
-#     kill use, runs compose without the time limit, which harness-test.sh covers.
+#     kill use, appends "SUBCOMMAND LIMIT" to $RUN_DIR/compose.limits, moves the clock on by the
+#     seconds $RUN_DIR/takes.SUBCOMMAND holds, as a call answering that late whatever its limit,
+#     and runs compose without the time limit, which harness-test.sh covers.
 #   - loadgen_logs prints $RUN_DIR/logs.N on its Nth read, the highest N there is from then on,
 #     and $RUN_DIR/logs.final, when it exists, once Compose has stopped or killed loadgen. A
 #     fixture holding the line !unreadable makes the read fail with the LOG_PROBE_DETAIL the
-#     real read sets for a log Docker could not give.
+#     real read sets for a log Docker could not give. The Nth read takes the seconds
+#     $RUN_DIR/takes.logs.N holds on the clock.
 #   - db_query appends its SQL to $RUN_DIR/db.sql and prints the count in $RUN_DIR/db.count.
 t_drain_stubs() {
     echo "$T_DRAIN_CLOCK_START" >"$RUN_DIR/clock"
@@ -180,6 +184,7 @@ t_drain_stubs() {
     echo 0 >"$RUN_DIR/db.count"
     : >"$RUN_DIR/compose.calls"
     : >"$RUN_DIR/compose.fail"
+    : >"$RUN_DIR/compose.limits"
     : >"$RUN_DIR/db.sql"
     date() {
         if [[ "$*" == "-u +%s" ]]; then
@@ -198,6 +203,10 @@ t_drain_stubs() {
         ! grep -qxF -- "$1" "$RUN_DIR/compose.fail"
     }
     compose_within() {
+        echo "$2 $1" >>"$RUN_DIR/compose.limits"
+        if [[ -f "$RUN_DIR/takes.$2" ]]; then
+            echo $(($(cat "$RUN_DIR/clock") + $(cat "$RUN_DIR/takes.$2"))) >"$RUN_DIR/clock"
+        fi
         shift
         compose "$@"
     }
@@ -205,6 +214,9 @@ t_drain_stubs() {
         local n file
         n=$(($(cat "$RUN_DIR/logs.n") + 1))
         echo "$n" >"$RUN_DIR/logs.n"
+        if [[ -f "$RUN_DIR/takes.logs.$n" ]]; then
+            echo $(($(cat "$RUN_DIR/clock") + $(cat "$RUN_DIR/takes.logs.$n"))) >"$RUN_DIR/clock"
+        fi
         while [[ ! -f "$RUN_DIR/logs.$n" && $n -gt 1 ]]; do
             n=$((n - 1))
         done
@@ -366,6 +378,56 @@ test_audit_owned_ids_noCreate_failsCreatedAndSkipsRows() {
     t_report_has "audit_owned_ids skips the rows query without a created id" \
         "INFO owned-id rows: skipped, no created id to count"
     t_eq "audit_owned_ids queries no row without a created id" "" "$(t_drain_queried)"
+}
+
+test_audit_owned_ids_idsUnreadable_failsOwnedIdChecksClosed() {
+    local c fault evidence
+    # FAULT;EVIDENCE: what fails once run B's window is closed and its unresolved ids owned, and
+    # the evidence check. Every create is resolved, so ids taken for an empty set would pass the
+    # audit; the created and rows checks fail rather than count none or query none. The observed
+    # set of created ids becoming unreadable fails the evidence check too; comm failing to compare
+    # the window's created and resolved ids fails only the checks that read them.
+    for c in "observed set unreadable;FAIL owned-id evidence: @IDS@, so not every create can be proven" \
+        "union comparison fails;PASS owned-id evidence: the final output keeps every created id, resolution and first line an earlier read saw"; do
+        IFS=';' read -r fault evidence <<<"$c"
+        (
+            local ids
+            t_fresh_run_dir
+            t_drain_stubs
+            t_drain_window
+            ids="the alert ids run B's reads logged could not be read or written in $RUN_DIR"
+            {
+                t_drain_resolved "$T_DRAIN_RUN_1" "$T_DRAIN_ALERT_1" ui
+                t_drain_resolved "$T_DRAIN_RUN_2" "$T_DRAIN_ALERT_2" api
+            } >"$RUN_DIR/logs.1"
+            # close_or_abort as the script defines it, under another name, for the stub to call.
+            eval "t_close_or_abort() $(declare -f close_or_abort | sed 1d)"
+            # shellcheck disable=SC2329 # Invoked by audit_owned_ids.
+            close_or_abort() {
+                t_close_or_abort "$@"
+                if [[ "$fault" == "observed set unreadable" ]]; then
+                    rm -f "$RUN_DIR/observed-created-B"
+                    mkdir "$RUN_DIR/observed-created-B"
+                fi
+            }
+            # shellcheck disable=SC2329 # Invoked by audit_owned_ids.
+            comm() {
+                if [[ "$fault" == "union comparison fails" && $WINDOW_UNREAD -eq 0 &&
+                    "${*: -1}" == "$RUN_DIR/ids.resolved.union" ]]; then
+                    return 2
+                fi
+                command comm "$@"
+            }
+            # The failed read's own error message is not under test.
+            audit_owned_ids 2>/dev/null
+            t_eq "audit_owned_ids fails the checks reading the window's ids when the $fault" \
+                "PASS owned-id quiescence: Q at 2026-01-01T00:00:01Z with 2 created alerts, all resolved, and no create in flight; loadgen killed while paused|PASS run B loadgen stopped|${evidence//@IDS@/$ids}|FAIL owned-id audit: $ids, so no create can be paired with its resolution|PASS owned-id in flight: every visit that opened the page logged a create outcome|PASS owned-id outcomes: 0 lines report an alert left in place or an unknown outcome since 2026-01-01T00:00:00Z|FAIL owned-id created: $ids, so the alerts created in run B cannot be counted|FAIL owned-id rows: $ids, so no Alerts row was counted" \
+                "$(t_drain_checks)"
+            t_eq "audit_owned_ids queries no row when the $fault" "" "$(t_drain_queried)"
+            t_eq "audit_owned_ids records FAIL verdicts for the window's ids when the $fault" FAIL \
+                "$(verdict_of B "$VISIT")"
+        )
+    done
 }
 
 test_creates_in_flight_noCreateOutcome_closesWindow() {
@@ -1180,15 +1242,20 @@ t_stats_line() {
         "$STATS_MARKER" "$total" "$fail_rate" "$rate" "$1"
 }
 
-# t_flag_off_window BREAKDOWN: runs flag_off_window with the flag, loadgen and log reads stubbed.
-# Its B-flag-off.log holds the visit's skip line, no create and a cumulative stats line whose
-# breakdown, BREAKDOWN, flag_off_window saves as breakdown-B-flag-off.json.
+# t_flag_off_window BREAKDOWN [LINE...]: runs flag_off_window with the flag, loadgen and log reads
+# stubbed. Its B-flag-off.log holds the visit's skip line, no create, a cumulative stats line
+# whose breakdown, BREAKDOWN, flag_off_window saves as breakdown-B-flag-off.json, and then each
+# LINE, logged after that breakdown and before the stop.
 t_flag_off_window() {
+    local line
     {
         echo "[2026-01-01 00:00:01+00:00][worker:0][INFO]: Running visit [order_credit_card]"
         echo "[2026-01-01 00:00:02+00:00][worker:1][INFO]: Running visit [$VISIT]"
         echo "[2026-01-01 00:00:02+00:00][worker:1][visit:$VISIT][id:7d0c8a52-0b8e-4d4e-9a49-2f1c0e6b9a11][INFO]: $SKIP_LINE"
         t_stats_line "$1"
+        for line in "${@:2}"; do
+            echo "$line"
+        done
     } >"$RUN_DIR/fixture.log"
     set_flag() {
         pass "$1"
@@ -1207,10 +1274,13 @@ t_flag_off_window() {
         local file="${*: -1}"
         extract_breakdown "$RUN_DIR/fixture.log" "${file%.json}.line" >"$file"
     }
-    close_or_abort() {
-        WINDOW_OPEN=0
-        cp "$RUN_DIR/fixture.log" "$RUN_DIR/$WINDOW_LABEL.log"
-        pass "$1 loadgen stopped"
+    # close_or_abort closes the window as in a run: loadgen's stop succeeds, and its final
+    # output is the fixture.
+    stop_loadgen() {
+        :
+    }
+    loadgen_logs() {
+        cat "$RUN_DIR/fixture.log"
     }
     report_new_owned() {
         :
@@ -1266,6 +1336,1098 @@ test_table_rows_flagOffLabel_listsOrderCreditCardRow() {
                 "no row [$row] in [$(tr '\n' '|' <"$RUN_DIR/rows")]"
         fi
     done
+}
+
+# ---------------------------------------------------------------------------------------------
+# Owned-id one-to-one audit (owned_id_violations, audit_owned_ids)
+
+# The second fixture visit and alert, upper-cased as a log line may carry them.
+T_PAIR_RUN_2_UPPER="5E1F2A3B-0000-4000-8000-00000000000B"
+T_PAIR_ALERT_2_UPPER="0A1B2C3D-0000-4000-8000-000000000002"
+
+# t_untagged_line MESSAGE: a worker line without a visit tag, a form sanitize_loadgen_log keeps.
+t_untagged_line() {
+    echo "[2026-01-01 00:00:10+00:00][worker:0][INFO]: $1"
+}
+
+# t_pairing_log CASE: run B's output for CASE: clean, or one way of breaking the rule that each
+# visit creates one alert and resolves it once, after the create.
+t_pairing_log() {
+    case "$1" in
+        clean)
+            # Interleaved visits; the second logs its create, visit id and alert id, upper-cased
+            # and its resolution lower-cased.
+            t_drain_created "$T_DRAIN_RUN_1" "$T_DRAIN_ALERT_1"
+            t_drain_opened "$T_PAIR_RUN_2_UPPER"
+            t_drain_line "$T_PAIR_RUN_2_UPPER" "Created alert [$T_PAIR_ALERT_2_UPPER] threshold [1000000.40271937]"
+            t_drain_line "$T_DRAIN_RUN_1" "Deleted alert [$T_DRAIN_ALERT_1] via ui"
+            t_drain_line "$T_DRAIN_RUN_2" "Alert [$T_DRAIN_ALERT_2] already absent"
+            ;;
+        "one id created by two visits")
+            t_drain_created "$T_DRAIN_RUN_1" "$T_DRAIN_ALERT_1"
+            t_drain_created "$T_DRAIN_RUN_2" "$T_DRAIN_ALERT_1"
+            t_drain_line "$T_DRAIN_RUN_1" "Deleted alert [$T_DRAIN_ALERT_1] via ui"
+            ;;
+        "one id resolved twice")
+            t_drain_resolved "$T_DRAIN_RUN_1" "$T_DRAIN_ALERT_1" ui
+            t_drain_line "$T_DRAIN_RUN_1" "Alert [$T_DRAIN_ALERT_1] already absent"
+            ;;
+        "one visit creating two alerts")
+            t_drain_created "$T_DRAIN_RUN_1" "$T_DRAIN_ALERT_1"
+            t_drain_line "$T_DRAIN_RUN_1" "Created alert [$T_DRAIN_ALERT_2] threshold [1000000.40271937]"
+            t_drain_line "$T_DRAIN_RUN_1" "Deleted alert [$T_DRAIN_ALERT_1] via ui"
+            t_drain_line "$T_DRAIN_RUN_1" "Deleted alert [$T_DRAIN_ALERT_2] via api"
+            ;;
+        "a resolution by another visit")
+            t_drain_created "$T_DRAIN_RUN_1" "$T_DRAIN_ALERT_1"
+            t_drain_line "$T_DRAIN_RUN_2" "Deleted alert [$T_DRAIN_ALERT_1] via api"
+            ;;
+        "a resolution before its create")
+            t_drain_opened "$T_DRAIN_RUN_1"
+            t_drain_line "$T_DRAIN_RUN_1" "Deleted alert [$T_DRAIN_ALERT_1] via ui"
+            t_drain_line "$T_DRAIN_RUN_1" "Created alert [$T_DRAIN_ALERT_1] threshold [1000000.40271936]"
+            ;;
+        "a resolution without a create")
+            t_drain_resolved "$T_DRAIN_RUN_1" "$T_DRAIN_ALERT_1" ui
+            t_drain_line "$T_DRAIN_RUN_2" "Alert [$T_DRAIN_ALERT_2] already absent"
+            ;;
+        "an untagged create")
+            t_untagged_line "Created alert [$T_DRAIN_ALERT_1] threshold [1000000.40271936]"
+            t_drain_line "$T_DRAIN_RUN_1" "Deleted alert [$T_DRAIN_ALERT_1] via ui"
+            ;;
+        "an untagged resolution")
+            t_drain_created "$T_DRAIN_RUN_1" "$T_DRAIN_ALERT_1"
+            t_untagged_line "Deleted alert [$T_DRAIN_ALERT_1] via ui"
+            ;;
+        "a breach and an unresolved create")
+            t_drain_created "$T_DRAIN_RUN_1" "$T_DRAIN_ALERT_1"
+            t_drain_line "$T_DRAIN_RUN_1" "Created alert [$T_DRAIN_ALERT_2] threshold [1000000.40271937]"
+            t_drain_line "$T_DRAIN_RUN_1" "Deleted alert [$T_DRAIN_ALERT_1] via ui"
+            ;;
+    esac
+}
+
+test_audit_owned_ids_createResolutionPairing_passesOnlyOneToOne() {
+    local c scenario owned line
+    # SCENARIO|OWNED|LINE: run B's output is t_pairing_log SCENARIO; the audit reports LINE and
+    # cleanup owns OWNED.
+    for c in "clean||PASS owned-id audit: 2 created alerts, each deleted via ui, via api or already absent" \
+        "one id created by two visits||FAIL owned-id audit: not one-to-one: $T_DRAIN_ALERT_1 created again" \
+        "one id resolved twice||FAIL owned-id audit: not one-to-one: $T_DRAIN_ALERT_1 resolved again" \
+        "one visit creating two alerts||FAIL owned-id audit: not one-to-one: $T_DRAIN_ALERT_2 second create of its visit" \
+        "a resolution by another visit||FAIL owned-id audit: not one-to-one: $T_DRAIN_ALERT_1 resolved by another visit" \
+        "a resolution before its create||FAIL owned-id audit: not one-to-one: $T_DRAIN_ALERT_1 resolved before its create" \
+        "a resolution without a create||FAIL owned-id audit: not one-to-one: $T_DRAIN_ALERT_2 resolved without a create" \
+        "an untagged create||FAIL owned-id audit: not one-to-one: $T_DRAIN_ALERT_1 created without the visit tag" \
+        "an untagged resolution||FAIL owned-id audit: not one-to-one: $T_DRAIN_ALERT_1 resolved without the visit tag" \
+        "a breach and an unresolved create|$T_DRAIN_ALERT_2|FAIL owned-id audit: not one-to-one: $T_DRAIN_ALERT_2 second create of its visit; not resolved by loadgen, deleted on exit: $T_DRAIN_ALERT_2"; do
+        IFS='|' read -r scenario owned line <<<"$c"
+        t_fresh_run_dir
+        t_drain_stubs
+        t_drain_window
+        t_pairing_log "$scenario" >"$RUN_DIR/logs.1"
+        audit_owned_ids
+        t_report_has "audit_owned_ids judges $scenario" "$line"
+        t_eq "audit_owned_ids owns the unresolved ids of $scenario" "$owned" "$(t_drain_owned)"
+    done
+}
+
+test_owned_id_violations_unreadLines_reportsNothing() {
+    # After one clean pair, each line would be a breach if it were read as a create or a
+    # resolution: its alert id is not a canonical UUID, or its message is no resolution.
+    {
+        t_drain_resolved "$T_DRAIN_RUN_1" "$T_DRAIN_ALERT_1" ui
+        t_drain_line "$T_DRAIN_RUN_1" "Created alert [------------------------------------] threshold [1000000.40271937]"
+        t_drain_line "$T_DRAIN_RUN_2" "Created alert [{$T_DRAIN_ALERT_2}] threshold [1000000.40271938]"
+        t_drain_line "$T_DRAIN_RUN_2" "Deleted alert [$T_DRAIN_ALERT_2] via smoke"
+        t_drain_line "$T_DRAIN_RUN_2" "Alert [$T_DRAIN_ALERT_2] left in place: 500"
+        t_drain_line "$T_DRAIN_RUN_2" "Create unconfirmed threshold [1000000.40271939], outcome unknown"
+    } >"$RUN_DIR/B.log"
+    t_eq "owned_id_violations reads only canonical creates and resolutions" "" \
+        "$(owned_id_violations "$RUN_DIR/B.log")"
+}
+
+# ---------------------------------------------------------------------------------------------
+# Window close on every outcome (close_window, close_or_abort, cleanup)
+
+# t_close_fixture LEG: run B's window, open after a read that logged the unresolved create of
+# T_DRAIN_ALERT_1, under the drain's stubs. LEG stop makes loadgen's stop fail; read lets the
+# stop succeed and makes the final read fail.
+t_close_fixture() {
+    t_drain_stubs
+    t_drain_window
+    t_drain_created "$T_DRAIN_RUN_1" "$T_DRAIN_ALERT_1" >"$RUN_DIR/logs.1"
+    read_window "$RUN_DIR/progress.log"
+    if [[ "$1" == "stop" ]]; then
+        echo stop >"$RUN_DIR/compose.fail"
+    else
+        echo '!unreadable' >"$RUN_DIR/logs.final"
+    fi
+}
+
+test_close_window_stopOrFinalReadFails_ownsObservedUnresolvedAndFails() {
+    local c leg open reads error
+    # LEG;WINDOW_OPEN;READS;CLOSE_ERROR, in which @RUN_DIR@ stands for the run directory. READS
+    # counts the reads of loadgen's output: the earlier one, and the final one unless the stop
+    # failed, as no read may start while loadgen may still run.
+    for c in "stop;1;1;compose stop loadgen failed, exit 1 (see @RUN_DIR@/compose.log)" \
+        "read;0;2;reading the window since 2026-01-01T00:00:00Z: loadgen logs unreadable, exit 1 (see @RUN_DIR@/compose.log)"; do
+        IFS=';' read -r leg open reads error <<<"$c"
+        (
+            local rc=0
+            t_fresh_run_dir
+            t_close_fixture "$leg"
+            close_window || rc=$?
+            t_eq "close_window fails when the $leg fails" 1 "$rc"
+            t_eq "close_window error when the $leg fails" "${error//@RUN_DIR@/$RUN_DIR}" "$CLOSE_ERROR"
+            t_eq "close_window WINDOW_OPEN and WINDOW_UNREAD when the $leg fails" "$open 1" \
+                "$WINDOW_OPEN $WINDOW_UNREAD"
+            t_eq "close_window reads of loadgen's output when the $leg fails" "$reads" \
+                "$(cat "$RUN_DIR/logs.n")"
+            t_eq "close_window owns the unresolved create an earlier read saw when the $leg fails" \
+                "$T_DRAIN_ALERT_1" "$(t_drain_owned)"
+            t_eq "close_window lists that create as just owned when the $leg fails" \
+                "$T_DRAIN_ALERT_1" "$(join_lines <"$RUN_DIR/new-owned")"
+        )
+    done
+}
+
+test_close_or_abort_closeFails_reportsOwnedIdsBeforeAbort() {
+    local c leg error rc
+    # LEG;DETAIL: the failed check's detail, in which @RUN_DIR@ stands for the run directory.
+    for c in "stop;compose stop loadgen failed, exit 1 (see @RUN_DIR@/compose.log)" \
+        "read;reading the window since 2026-01-01T00:00:00Z: loadgen logs unreadable, exit 1 (see @RUN_DIR@/compose.log)"; do
+        IFS=';' read -r leg error <<<"$c"
+        t_fresh_run_dir
+        t_close_fixture "$leg"
+        rc=0
+        (close_or_abort "run B") || rc=$?
+        t_eq "close_or_abort ends the run when the $leg fails" 1 "$rc"
+        t_eq "close_or_abort reports the just-owned create, then fails, when the $leg fails" \
+            "INFO run B: alert [$T_DRAIN_ALERT_1] was logged as created and never resolved by loadgen; it is deleted on exit|FAIL run B loadgen stopped: ${error//@RUN_DIR@/$RUN_DIR}" \
+            "$(paste -s -d '|' "$RUN_DIR/report" | tr -d '\r')"
+    done
+}
+
+test_cleanup_windowUnread_retriesReadAndOwnsNewIds() {
+    local c retry owned deleted verdict
+    # RETRY;OWNED;DELETED;VERDICT: cleanup's second read of a stopped loadgen's window, after the
+    # closing read failed, either reads a create no earlier read saw or fails again. Either way
+    # the create the earlier read saw is deleted, and loadgen is not stopped again.
+    for c in "reads;$T_DRAIN_ALERT_2;2 of 2;PASS cleanup" \
+        "fails;;1 of 1;FAIL cleanup: loadgen stopped, but its window was not read: reading the window since 2026-01-01T00:00:00Z: loadgen logs unreadable, exit 1 (see @RUN_DIR@/compose.log)"; do
+        IFS=';' read -r retry owned deleted verdict <<<"$c"
+        t_fresh_run_dir
+        t_close_fixture read
+        close_window || true
+        if [[ "$retry" == "reads" ]]; then
+            {
+                t_drain_created "$T_DRAIN_RUN_1" "$T_DRAIN_ALERT_1"
+                t_drain_created "$T_DRAIN_RUN_2" "$T_DRAIN_ALERT_2"
+            } >"$RUN_DIR/logs.final"
+        fi
+        : >"$RUN_DIR/http.calls"
+        http() {
+            echo "$1 $2" >>"$RUN_DIR/http.calls"
+            HTTP_ERROR=""
+            HTTP_CTYPE="application/json"
+            HTTP_STATUS="204"
+            HTTP_BODY=""
+            if [[ "$1" == "GET" ]]; then
+                HTTP_STATUS="200"
+                HTTP_BODY="{\"id\":\"$FLAG_ID\",\"enabled\":true,\"isModifiable\":true}"
+            fi
+        }
+        TABLE_WRITTEN=1
+        (cleanup) >/dev/null 2>&1 || true
+        t_eq "cleanup reads the window of a stopped loadgen again without stopping it when the retry $retry" \
+            "stop --timeout 0 loadgen" "$(t_drain_calls)"
+        if [[ -n "$owned" ]]; then
+            t_report_has "cleanup reports the create its retry read found" \
+                "INFO cleanup: alert [$owned] was logged as created and never resolved by loadgen; it is deleted on exit"
+        fi
+        t_eq "cleanup deletes every owned create when the retry $retry" \
+            "$(printf 'DELETE %s/%s\n' "$ALERTS_URL" "$T_DRAIN_ALERT_1" ${owned:+"$ALERTS_URL" "$owned"} | join_lines)" \
+            "$(grep '^DELETE ' "$RUN_DIR/http.calls" | join_lines)"
+        t_report_has "cleanup counts the owned creates deleted when the retry $retry" \
+            "INFO cleanup: $deleted owned alerts deleted or already absent"
+        t_report_has "cleanup verdict when the retry $retry" "${verdict//@RUN_DIR@/$RUN_DIR}"
+    done
+}
+
+# t_record FILE: FILE's lines separated by |, or "absent" when there is no FILE.
+t_record() {
+    if [[ -e "$1" ]]; then
+        paste -s -d '|' "$1" | tr -d '\r'
+    else
+        echo absent
+    fi
+}
+
+# t_close_fault FAULT: makes one step of run B's close fail as an I/O error would, in the calling
+# subshell only. FAULT is one of:
+#   none           nothing fails;
+#   stats line     grep fails reading run B's final output for the breakdown's stats line;
+#   covered lines  head fails cutting the lines up to that stats line from the final output;
+#   late lines     tail fails cutting the lines after that stats line from the final output;
+#   error lines    grep fails reading those lines for visit errors;
+#   counts         sed fails reading the visit errors it counts;
+#   move           mv fails moving the late stretch's counts into place;
+#   whole window   cp fails copying a final output that lacks the stats line.
+t_close_fault() {
+    case "$1" in
+        "covered lines")
+            # shellcheck disable=SC2329 # Invoked by close_window.
+            head() {
+                if [[ "${*: -1}" == "$RUN_DIR/B.log" ]]; then
+                    echo "head: error reading '$RUN_DIR/B.log': Input/output error" >&2
+                    return 1
+                fi
+                command head "$@"
+            }
+            ;;
+        "whole window")
+            # shellcheck disable=SC2329 # Invoked by close_window.
+            cp() {
+                if [[ "${1:-}" == "$RUN_DIR/B.log" ]]; then
+                    echo "cp: error reading '$RUN_DIR/B.log': Input/output error" >&2
+                    return 1
+                fi
+                command cp "$@"
+            }
+            ;;
+        "stats line" | "error lines")
+            T_CLOSE_FAULT_FILE="$RUN_DIR/B.log"
+            if [[ "$1" == "error lines" ]]; then
+                T_CLOSE_FAULT_FILE="$RUN_DIR/B.late.part"
+            fi
+            # shellcheck disable=SC2329 # Invoked by close_window.
+            grep() {
+                if [[ "${*: -1}" == "$T_CLOSE_FAULT_FILE" ]]; then
+                    echo "grep: $T_CLOSE_FAULT_FILE: Input/output error" >&2
+                    return 2
+                fi
+                command grep "$@"
+            }
+            ;;
+        "late lines")
+            # shellcheck disable=SC2329 # Invoked by close_window.
+            tail() {
+                if [[ "${*: -1}" == "$RUN_DIR/B.log" ]]; then
+                    echo "tail: error reading '$RUN_DIR/B.log': Input/output error" >&2
+                    return 1
+                fi
+                command tail "$@"
+            }
+            ;;
+        counts)
+            # shellcheck disable=SC2329 # Invoked by close_window.
+            sed() {
+                if [[ "${*: -1}" == "$RUN_DIR/B.late.errors" ]]; then
+                    echo "sed: read error on $RUN_DIR/B.late.errors: Input/output error" >&2
+                    return 4
+                fi
+                command sed "$@"
+            }
+            ;;
+        move)
+            # shellcheck disable=SC2329 # Invoked by close_window.
+            mv() {
+                if [[ "${*: -1}" == "$RUN_DIR/errors-late-B" ]]; then
+                    echo "mv: cannot move to '$RUN_DIR/errors-late-B': Read-only file system" >&2
+                    return 1
+                fi
+                command mv "$@"
+            }
+            ;;
+    esac
+}
+
+test_close_window_lateStretchExtractionFails_failsLateVerdicts() {
+    local c fault late covered unknown
+    # FAULT;LATE;COVERED;UNKNOWN: the step of run B's close that fails (t_close_fault), the late
+    # error counts close_window records, whether it records the counts for the table, and the
+    # stretches it reports unknown. Run B's final output holds the breakdown's stats line, except
+    # for whole window, and then a visit error of portfolio_insights_alert and one of
+    # long_sell_error, so a failed step taken for an empty stretch would pass both run B checks.
+    # An earlier close of the window, as before cleanup's retry, left records of its own.
+    for c in "none;1 long_sell_error|1 $VISIT;recorded;" \
+        "stats line;absent;absent;covered late" \
+        "covered lines;1 long_sell_error|1 $VISIT;absent;covered" \
+        "late lines;absent;recorded;late" \
+        "error lines;absent;recorded;late" \
+        "counts;absent;recorded;late" \
+        "move;absent;recorded;late" \
+        "whole window;absent;absent;covered"; do
+        IFS=';' read -r fault late covered unknown <<<"$c"
+        (
+            local rc=0 stretch reported="" late_log="absent" covered_record="absent" logged="logged"
+            local fails=5 rate="$LATE_UNKNOWN" long_sell="run B: $LATE_UNKNOWN" unknown_covered
+            local unknown_late
+            t_fresh_run_dir
+            unknown_covered="INFO window B: its error-line counts for the table are unknown: extracting them from its final output failed (see $RUN_DIR/close-error.log)"
+            unknown_late="INFO window B: the visits after the breakdown, through the stop, are unknown: extracting them from its final output failed (see $RUN_DIR/close-error.log)"
+            if [[ "$late" != "absent" ]]; then
+                rate="1 visit errors after it, through the stop"
+                long_sell="failing in run B but not in run A: long_sell_error; failing after the breakdown, through the stop: run B [long_sell_error], run A [none]"
+                fails=1
+                late_log="$( {
+                    t_visit_error "$VISIT"
+                    t_visit_error long_sell_error
+                    t_drain_created "$T_DRAIN_RUN_1" "$T_DRAIN_ALERT_1"
+                } | paste -s -d '|' -)"
+            fi
+            # A recorded count for the table is empty: no visit error precedes the stats line.
+            if [[ "$covered" == "recorded" ]]; then
+                covered_record=""
+            fi
+            if [[ "$fault" == "none" ]]; then
+                logged="empty"
+            fi
+            for stretch in $unknown; do
+                if [[ "$stretch" == "covered" ]]; then
+                    reported="$reported|$unknown_covered"
+                else
+                    reported="$reported|$unknown_late"
+                fi
+            done
+            t_drain_stubs
+            t_drain_window
+            t_closed_phase A "$T_FLAG_OFF_BREAKDOWN"
+            # Run B closed after loadgen stopped, as t_closed_phase closes it.
+            WINDOW_LABEL="B"
+            printf '%s\n' "$T_FLAG_OFF_BREAKDOWN" >"$RUN_DIR/breakdown-B.json"
+            t_stats_line "$T_FLAG_OFF_BREAKDOWN" >"$RUN_DIR/breakdown-B.line"
+            {
+                echo "$T_DRAIN_FIRST_LINE"
+                if [[ "$fault" != "whole window" ]]; then
+                    cat "$RUN_DIR/breakdown-B.line"
+                fi
+                t_visit_error "$VISIT"
+                t_visit_error long_sell_error
+                t_drain_created "$T_DRAIN_RUN_1" "$T_DRAIN_ALERT_1"
+            } >"$RUN_DIR/logs.1"
+            echo 0 >"$RUN_DIR/logs.n"
+            echo "9 $VISIT" >"$RUN_DIR/errors-B"
+            echo "9 $VISIT" >"$RUN_DIR/errors-late-B"
+            : >"$RUN_DIR/B.late.log"
+            t_close_fault "$fault"
+            close_window 1 || rc=$?
+            t_eq "close_window closes run B's window when $fault fails" "0 0 0" \
+                "$rc $WINDOW_OPEN $WINDOW_UNREAD"
+            t_eq "close_window late error counts when $fault fails" "$late" \
+                "$(t_record "$RUN_DIR/errors-late-B")"
+            t_eq "close_window late lines when $fault fails" "$late_log" \
+                "$(t_record "$RUN_DIR/B.late.log")"
+            t_eq "close_window error-line counts for the table when $fault fails" "$covered_record" \
+                "$(t_record "$RUN_DIR/errors-B")"
+            t_eq "close_window reports the stretches left unknown when $fault fails" \
+                "${reported#|}" \
+                "$({ grep -F 'INFO window B: ' "$RUN_DIR/report" || true; } | paste -s -d '|' - | tr -d '\r')"
+            t_eq "close_window logs why a step failed when $fault fails" "$logged" \
+                "$([[ -s "$RUN_DIR/close-error.log" ]] && echo logged || echo empty)"
+            t_eq "close_window owns run B's unresolved create when $fault fails" \
+                "$T_DRAIN_ALERT_1" "$(t_drain_owned)"
+            check_visit_fail_rate "run B" B "$T_FLAG_OFF_BREAKDOWN"
+            compare_failures
+            t_report_has "check_visit_fail_rate fails run B's failRate when $fault fails" \
+                "FAIL run B $VISIT failRate: failRate 0 over 3 visits at the breakdown, but $rate"
+            t_report_has "compare_failures fails long_sell when $fault fails" \
+                "FAIL run B no new failures long_sell: $long_sell"
+            t_eq "compare_failures failed families when $fault fails" "$fails" \
+                "$(grep -c '^FAIL run B no new failures ' "$RUN_DIR/report" || true)"
+        )
+    done
+}
+
+test_cleanup_closeEndedAroundOwnership_rereadsWindowAndOwnsEachIdOnce() {
+    local c point status reported stopped
+    # POINT;STATUS;REPORTED;STOPPED: how run B's close ends once loadgen stopped and its final
+    # output was read: INT or TERM lands before the window's unresolved create is owned, or after
+    # it is owned but before the window counts as read; or recording that create fails. STATUS is
+    # the run's exit status, REPORTED how many times cleanup reports the create as just owned,
+    # and STOPPED the failed "loadgen stopped" check, in which @RUN_DIR@ is the run directory.
+    for c in "a signal before the transfer;130;1;" "a signal after the transfer;130;0;" \
+        "a failed transfer;1;1;FAIL run B loadgen stopped: recording the window's unresolved alert ids in @RUN_DIR@/owned failed"; do
+        IFS=';' read -r point status reported stopped <<<"$c"
+        (
+            local rc=0
+            t_fresh_run_dir
+            t_drain_stubs
+            t_drain_window
+            # The final output holds a create no earlier read saw.
+            t_drain_created "$T_DRAIN_RUN_1" "$T_DRAIN_ALERT_1" >"$RUN_DIR/logs.1"
+            # own_unresolved as the script defines it, under another name, for the stub to call.
+            eval "t_own_unresolved() $(declare -f own_unresolved | sed 1d)"
+            # The first transfer is where the close ends. A signal ends it as the script's INT and
+            # TERM trap does, exiting 130, which runs cleanup, the EXIT trap.
+            # shellcheck disable=SC2329 # Invoked by close_window.
+            own_unresolved() {
+                if [[ ! -e "$RUN_DIR/ended" ]]; then
+                    : >"$RUN_DIR/ended"
+                    case "$point" in
+                        "a signal before the transfer")
+                            exit 130
+                            ;;
+                        "a signal after the transfer")
+                            t_own_unresolved "$@"
+                            exit 130
+                            ;;
+                        "a failed transfer")
+                            return 1
+                            ;;
+                    esac
+                fi
+                t_own_unresolved "$@"
+            }
+            : >"$RUN_DIR/http.calls"
+            # shellcheck disable=SC2329 # Invoked by cleanup.
+            http() {
+                echo "$1 $2" >>"$RUN_DIR/http.calls"
+                HTTP_ERROR=""
+                HTTP_CTYPE="application/json"
+                HTTP_STATUS="204"
+                HTTP_BODY=""
+                if [[ "$1" == "GET" ]]; then
+                    HTTP_STATUS="200"
+                    HTTP_BODY="{\"id\":\"$FLAG_ID\",\"enabled\":true,\"isModifiable\":true}"
+                fi
+            }
+            TABLE_WRITTEN=1
+            (
+                trap cleanup EXIT
+                close_or_abort "run B"
+            ) >/dev/null 2>&1 || rc=$?
+            t_eq "cleanup exit status when the close ends at $point" "$status" "$rc"
+            t_eq "close_or_abort loadgen stopped check when the close ends at $point" \
+                "${stopped//@RUN_DIR@/$RUN_DIR}" \
+                "$({ grep '^FAIL run B loadgen stopped' "$RUN_DIR/report" || true; } | tr -d '\r')"
+            t_eq "cleanup reads the stopped window again, without stopping it, when the close ends at $point" \
+                "stop --timeout 0 loadgen; 2 reads" \
+                "$(t_drain_calls); $(cat "$RUN_DIR/logs.n") reads"
+            t_eq "cleanup owns the window's unresolved create once when the close ends at $point" \
+                "$T_DRAIN_ALERT_1" "$(t_record "$RUN_DIR/owned")"
+            t_eq "cleanup reports the create as just owned when the close ends at $point" \
+                "$reported" \
+                "$(grep -cxF "INFO cleanup: alert [$T_DRAIN_ALERT_1] was logged as created and never resolved by loadgen; it is deleted on exit" \
+                    "$RUN_DIR/report" || true)"
+            t_eq "cleanup deletes the create once when the close ends at $point" \
+                "DELETE $ALERTS_URL/$T_DRAIN_ALERT_1" \
+                "$(grep '^DELETE ' "$RUN_DIR/http.calls" | join_lines)"
+            t_report_has "cleanup verdict when the close ends at $point" "PASS cleanup"
+        )
+    done
+}
+
+# t_fault_once: whether the one-shot fault t_transfer_fault armed is still due, disarming it.
+t_fault_once() {
+    [[ -e "$RUN_DIR/fault.once" ]] && rm -f "$RUN_DIR/fault.once"
+}
+
+# t_transfer_fault STEP: makes one step of own_unresolved, the transfer of a window's unresolved
+# ids into the owned list, fail once as an I/O error would, in the calling subshell only. STEP
+# is one of:
+#   new-owned list  the list of ids just owned cannot be emptied: it is a directory;
+#   created ids     sed fails reading the creates of run B's final output;
+#   observed ids    the set of created ids an earlier read observed cannot be read: it is a
+#                   directory;
+#   resolved ids    sed fails reading the resolutions of run B's final output;
+#   unresolved ids  comm fails comparing the window's created and resolved ids;
+#   owned list      sort fails reading the owned list;
+#   new owned ids   comm fails comparing the unresolved ids with the owned list;
+#   transfer        cat fails appending the ids just owned to the owned list.
+# A step made to fail by a directory fails until t_transfer_restore puts its file back.
+t_transfer_fault() {
+    T_TRANSFER_FAULT="$1"
+    : >"$RUN_DIR/fault.once"
+    case "$1" in
+        "new-owned list")
+            rm -f "$RUN_DIR/new-owned"
+            mkdir "$RUN_DIR/new-owned"
+            ;;
+        "observed ids")
+            mv "$RUN_DIR/observed-created-B" "$RUN_DIR/observed-created-B.kept"
+            mkdir "$RUN_DIR/observed-created-B"
+            ;;
+        "created ids" | "resolved ids")
+            # shellcheck disable=SC2329 # Invoked by own_unresolved.
+            sed() {
+                local marker="Created alert"
+                if [[ "$T_TRANSFER_FAULT" == "resolved ids" ]]; then
+                    marker="Deleted alert"
+                fi
+                if [[ "${*: -1}" == "$RUN_DIR/B.log" && "$*" == *"$marker"* ]] && t_fault_once; then
+                    return 4
+                fi
+                command sed "$@"
+            }
+            ;;
+        "unresolved ids" | "new owned ids")
+            # shellcheck disable=SC2329 # Invoked by own_unresolved.
+            comm() {
+                local operand="$RUN_DIR/ids.resolved.union"
+                if [[ "$T_TRANSFER_FAULT" == "new owned ids" ]]; then
+                    operand="$RUN_DIR/owned.sorted"
+                fi
+                if [[ "${*: -1}" == "$operand" ]] && t_fault_once; then
+                    return 2
+                fi
+                command comm "$@"
+            }
+            ;;
+        "owned list")
+            # shellcheck disable=SC2329 # Invoked by own_unresolved.
+            sort() {
+                if [[ "${*: -1}" == "$RUN_DIR/owned" ]] && t_fault_once; then
+                    return 2
+                fi
+                command sort "$@"
+            }
+            ;;
+        transfer)
+            # shellcheck disable=SC2329 # Invoked by own_unresolved.
+            cat() {
+                if [[ "${1:-}" == "$RUN_DIR/new-owned" ]] && t_fault_once; then
+                    return 1
+                fi
+                command cat "$@"
+            }
+            ;;
+    esac
+}
+
+# t_transfer_restore: puts back the file t_transfer_fault replaced with a directory, as when the
+# I/O error has passed.
+t_transfer_restore() {
+    case "$T_TRANSFER_FAULT" in
+        "new-owned list")
+            rmdir "$RUN_DIR/new-owned"
+            : >"$RUN_DIR/new-owned"
+            ;;
+        "observed ids")
+            rmdir "$RUN_DIR/observed-created-B"
+            mv "$RUN_DIR/observed-created-B.kept" "$RUN_DIR/observed-created-B"
+            ;;
+    esac
+}
+
+test_close_window_ownershipTransferStepFails_failsAndCleanupOwnsIds() {
+    local step
+    # Run B's final output holds the unresolved create an earlier read saw and one no earlier read
+    # saw. When a step of their transfer into the owned list fails, the close fails and leaves the
+    # window unread, owning nothing it could have recorded partly; cleanup's retry, once the I/O
+    # error has passed, owns and deletes both, each once.
+    for step in "new-owned list" "created ids" "observed ids" "resolved ids" "unresolved ids" \
+        "owned list" "new owned ids" transfer; do
+        (
+            local rc=0
+            t_fresh_run_dir
+            t_drain_stubs
+            t_drain_window
+            t_drain_created "$T_DRAIN_RUN_1" "$T_DRAIN_ALERT_1" >"$RUN_DIR/logs.1"
+            read_window "$RUN_DIR/progress.log"
+            {
+                t_drain_created "$T_DRAIN_RUN_1" "$T_DRAIN_ALERT_1"
+                t_drain_created "$T_DRAIN_RUN_2" "$T_DRAIN_ALERT_2"
+            } >"$RUN_DIR/logs.final"
+            t_transfer_fault "$step"
+            # The failed step's own error message is not under test.
+            close_window 2>/dev/null || rc=$?
+            t_eq "close_window fails when the transfer's $step step fails" 1 "$rc"
+            t_eq "close_window error when the transfer's $step step fails" \
+                "recording the window's unresolved alert ids in $RUN_DIR/owned failed" "$CLOSE_ERROR"
+            t_eq "close_window leaves the stopped window unread when the transfer's $step step fails" \
+                "0 1" "$WINDOW_OPEN $WINDOW_UNREAD"
+            t_eq "close_window owns no id when the transfer's $step step fails" "" "$(t_drain_owned)"
+            t_transfer_restore
+            : >"$RUN_DIR/http.calls"
+            # shellcheck disable=SC2329 # Invoked by cleanup.
+            http() {
+                echo "$1 $2" >>"$RUN_DIR/http.calls"
+                HTTP_ERROR=""
+                HTTP_CTYPE="application/json"
+                HTTP_STATUS="204"
+                HTTP_BODY=""
+                if [[ "$1" == "GET" ]]; then
+                    HTTP_STATUS="200"
+                    HTTP_BODY="{\"id\":\"$FLAG_ID\",\"enabled\":true,\"isModifiable\":true}"
+                fi
+            }
+            TABLE_WRITTEN=1
+            (cleanup) >/dev/null 2>&1 || true
+            t_eq "cleanup reads the stopped window again, without stopping it, after the transfer's $step step failed" \
+                "stop --timeout 0 loadgen" "$(t_drain_calls)"
+            t_eq "cleanup owns both unresolved creates once after the transfer's $step step failed" \
+                "$T_DRAIN_ALERT_1|$T_DRAIN_ALERT_2" "$(t_record "$RUN_DIR/owned")"
+            t_eq "cleanup deletes both unresolved creates after the transfer's $step step failed" \
+                "DELETE $ALERTS_URL/$T_DRAIN_ALERT_1 DELETE $ALERTS_URL/$T_DRAIN_ALERT_2" \
+                "$(grep '^DELETE ' "$RUN_DIR/http.calls" | join_lines)"
+            t_report_has "cleanup verdict after the transfer's $step step failed" "PASS cleanup"
+        )
+    done
+}
+
+test_read_window_idsNotRecorded_failsWithDetail() {
+    local fault
+    # FAULT: the record of this read of run B's output that cannot be written: the observed set of
+    # created ids or of resolved ids, each a directory here, or the window's first line, which
+    # head fails to read.
+    for fault in "created set" "resolved set" "first line"; do
+        (
+            local rc=0
+            t_fresh_run_dir
+            t_drain_stubs
+            t_drain_window
+            t_drain_resolved "$T_DRAIN_RUN_1" "$T_DRAIN_ALERT_1" ui >"$RUN_DIR/logs.1"
+            case "$fault" in
+                "created set") mkdir "$RUN_DIR/observed-created-B" ;;
+                "resolved set") mkdir "$RUN_DIR/observed-resolved-B" ;;
+                "first line")
+                    # shellcheck disable=SC2329 # Invoked by observe_window.
+                    head() {
+                        if [[ "${*: -1}" == "$RUN_DIR/progress.log" ]]; then
+                            return 1
+                        fi
+                        command head "$@"
+                    }
+                    ;;
+            esac
+            read_window "$RUN_DIR/progress.log" 2>/dev/null || rc=$?
+            t_eq "read_window fails when the $fault is not recorded" 1 "$rc"
+            t_eq "read_window says why when the $fault is not recorded" \
+                "recording the alert ids of this read of loadgen's output in $RUN_DIR failed" \
+                "$LOG_PROBE_DETAIL"
+        )
+    done
+}
+
+# ---------------------------------------------------------------------------------------------
+# Verdicts through the stop (close_window's late stretch, check_visit_fail_rate,
+# compare_failures, run_a, run_b, flag_off_window)
+
+# t_visit_error NAME: the worker error line loadgen-core logs for a failed visit NAME, as
+# sanitize_loadgen_log keeps it, stamped after the breakdown of t_stats_line.
+t_visit_error() {
+    echo "[2026-01-01 00:05:10+00:00][worker:1][visit:$1][id:$T_DRAIN_RUN_2][WARN]: $ERROR_MARKER"
+}
+
+# t_closed_phase LABEL BREAKDOWN [LINE...]: phase LABEL closed by close_window after loadgen
+# stopped, under the drain's stubs. Its breakdown BREAKDOWN is saved as run_window saves it, and
+# its final output holds T_DRAIN_FIRST_LINE, that breakdown's stats line and then each LINE.
+t_closed_phase() {
+    local label="$1" line
+    WINDOW_LABEL="$label"
+    printf '%s\n' "$2" >"$RUN_DIR/breakdown-$label.json"
+    t_stats_line "$2" >"$RUN_DIR/breakdown-$label.line"
+    {
+        echo "$T_DRAIN_FIRST_LINE"
+        cat "$RUN_DIR/breakdown-$label.line"
+        for line in "${@:3}"; do
+            echo "$line"
+        done
+    } >"$RUN_DIR/logs.1"
+    echo 0 >"$RUN_DIR/logs.n"
+    close_window 1
+}
+
+# t_reported_before NAME FIRST SECOND: PASS NAME when the script reported exactly the line FIRST,
+# and later exactly the line SECOND.
+t_reported_before() {
+    local first second
+    first="$(grep -n -x -F -- "$2" "$RUN_DIR/report" | sed -n '1s/:.*//p')"
+    second="$(grep -n -x -F -- "$3" "$RUN_DIR/report" | sed -n '1s/:.*//p')"
+    if [[ -n "$first" && -n "$second" && $first -lt $second ]]; then
+        t_pass "$1"
+    else
+        t_fail "$1" "[$2] at report line [$first], [$3] at report line [$second]"
+    fi
+}
+
+# t_read_fault PROGRAM FILE...: makes PROGRAM, awk or grep, fail with status 2, as on an I/O
+# error, whenever its last argument is one of the FILEs, in the calling subshell only. The
+# program's error message is left out, so the suite's output holds only its own lines.
+t_read_fault() {
+    T_READ_FAULT_FILES=("${@:2}")
+    case "$1" in
+        awk)
+            # shellcheck disable=SC2329 # Invoked by the script's late verdicts.
+            awk() {
+                if t_read_faulted "$@"; then
+                    return 2
+                fi
+                command awk "$@"
+            }
+            ;;
+        grep)
+            # shellcheck disable=SC2329 # Invoked by the script's late verdicts.
+            grep() {
+                if t_read_faulted "$@"; then
+                    return 2
+                fi
+                command grep "$@"
+            }
+            ;;
+    esac
+}
+
+# t_read_faulted ARGS...: whether the last of ARGS is a file t_read_fault made unreadable.
+t_read_faulted() {
+    local file
+    for file in "${T_READ_FAULT_FILES[@]}"; do
+        if [[ $# -gt 0 && "${*: -1}" == "$file" ]]; then
+            return 0
+        fi
+    done
+    return 1
+}
+
+test_run_b_visitErrorAfterBreakdown_failsFailRateAfterStop() {
+    local line="FAIL run B $VISIT failRate: failRate 0 over 3 visits at the breakdown, but 1 visit errors after it, through the stop"
+    t_drain_stubs
+    t_drain_window
+    t_closed_phase A "$(t_breakdown 'del(.portfolio_insights_alert)')"
+    t_drain_window
+    # run_window as it returns after saving run B's breakdown, the window left open.
+    run_window() {
+        printf '%s\n' "$T_FLAG_OFF_BREAKDOWN" >"$RUN_DIR/breakdown-B.json"
+        t_stats_line "$T_FLAG_OFF_BREAKDOWN" >"$RUN_DIR/breakdown-B.line"
+    }
+    # After the breakdown, a visit deletes its alert through the UI and then fails, as at logout.
+    {
+        t_drain_resolved "$T_DRAIN_RUN_1" "$T_DRAIN_ALERT_1" ui
+        t_stats_line "$T_FLAG_OFF_BREAKDOWN"
+        t_drain_resolved "$T_DRAIN_RUN_2" "$T_DRAIN_ALERT_2" ui
+        t_visit_error "$VISIT"
+    } >"$RUN_DIR/logs.1"
+    echo 0 >"$RUN_DIR/logs.n"
+    run_b
+    t_report_has "run_b fails the failRate of a visit that failed after the breakdown" "$line"
+    t_eq "run_b records that failRate verdict" FAIL "$(verdict_of B "$VISIT")"
+    t_eq "close_window counts the visit error after the breakdown in its late stretch" \
+        "1 $VISIT" "$(cat "$RUN_DIR/errors-late-B")"
+    t_eq "close_window keeps the error column to the stretch the breakdown covers" \
+        "" "$(cat "$RUN_DIR/errors-B")"
+    t_reported_before "run_b judges the breakdown only after loadgen stopped" \
+        "PASS run B loadgen stopped" "$line"
+}
+
+test_run_b_lateRecordUnreadable_failsFailRateAndComparison() {
+    local c unreadable fail_rate runs
+    # UNREADABLE;FAILRATE;RUNS: the runs whose late error-line counts, recorded by close_window,
+    # awk fails to read, run B's failRate check, and the runs every family's comparison names.
+    # Neither run logged a visit error after its breakdown, so a failed read taken for an empty
+    # record would pass every check.
+    for c in "B;FAIL run B $VISIT failRate: failRate 0 over 3 visits at the breakdown, but $LATE_UNREAD;run B" \
+        "A;PASS run B $VISIT failRate: 0 over 3 visits, and no visit error after the breakdown, through the stop;run A" \
+        "A B;FAIL run B $VISIT failRate: failRate 0 over 3 visits at the breakdown, but $LATE_UNREAD;run A and run B"; do
+        IFS=';' read -r unreadable fail_rate runs <<<"$c"
+        (
+            local label files=()
+            t_fresh_run_dir
+            t_drain_stubs
+            t_drain_window
+            t_closed_phase A "$(t_breakdown 'del(.portfolio_insights_alert)')"
+            t_drain_window
+            # run_window as it returns after saving run B's breakdown, the window left open.
+            # shellcheck disable=SC2329 # Invoked by run_b.
+            run_window() {
+                printf '%s\n' "$T_FLAG_OFF_BREAKDOWN" >"$RUN_DIR/breakdown-B.json"
+                t_stats_line "$T_FLAG_OFF_BREAKDOWN" >"$RUN_DIR/breakdown-B.line"
+            }
+            {
+                t_drain_resolved "$T_DRAIN_RUN_1" "$T_DRAIN_ALERT_1" ui
+                t_stats_line "$T_FLAG_OFF_BREAKDOWN"
+            } >"$RUN_DIR/logs.1"
+            echo 0 >"$RUN_DIR/logs.n"
+            for label in $unreadable; do
+                files+=("$RUN_DIR/errors-late-$label")
+            done
+            t_read_fault awk "${files[@]}"
+            run_b
+            for label in $unreadable; do
+                t_eq "close_window records run $label's late error-line counts that the verdicts fail to read" \
+                    "recorded" "$([[ -f "$RUN_DIR/errors-late-$label" ]] && echo recorded || echo absent)"
+            done
+            t_report_has "run_b failRate check when the late record of $runs is unreadable" \
+                "$fail_rate"
+            t_eq "run_b fails every family's comparison when the late record of $runs is unreadable" 5 \
+                "$(grep -cxF -e "FAIL run B no new failures deposit_and_buy: $runs: $LATE_UNREAD" \
+                    -e "FAIL run B no new failures deposit_and_long_buy: $runs: $LATE_UNREAD" \
+                    -e "FAIL run B no new failures long_sell: $runs: $LATE_UNREAD" \
+                    -e "FAIL run B no new failures sell_and_withdraw: $runs: $LATE_UNREAD" \
+                    -e "FAIL run B no new failures order_credit_card: $runs: $LATE_UNREAD" \
+                    "$RUN_DIR/report" || true)"
+        )
+    done
+}
+
+test_compare_failures_legacyNameFailingAfterBreakdown_judgedThroughStop() {
+    local c scenario a_late verdict line
+    # SCENARIO;A_LATE;VERDICT;LINE: long_sell_error fails after run B's breakdown, and after run
+    # A's too when A_LATE is 1; both breakdowns hold no failure.
+    for c in "never in run A;0;FAIL;FAIL run B no new failures long_sell: failing in run B but not in run A: long_sell_error; failing after the breakdown, through the stop: run B [long_sell_error], run A [none]" \
+        "after run A's breakdown too;1;PASS;PASS run B no new failures long_sell: failing [long_sell_error], run A failing [long_sell_error]; failing after the breakdown, through the stop: run B [long_sell_error], run A [long_sell_error]"; do
+        IFS=';' read -r scenario a_late verdict line <<<"$c"
+        t_fresh_run_dir
+        t_drain_stubs
+        t_drain_window
+        if [[ "$a_late" == "1" ]]; then
+            t_closed_phase A "$T_FLAG_OFF_BREAKDOWN" "$(t_visit_error long_sell_error)"
+        else
+            t_closed_phase A "$T_FLAG_OFF_BREAKDOWN"
+        fi
+        t_closed_phase B "$T_FLAG_OFF_BREAKDOWN" "$(t_visit_error long_sell_error)"
+        compare_failures
+        t_report_has "compare_failures judges long_sell when it fails $scenario" "$line"
+        t_eq "compare_failures long_sell verdict when it fails $scenario" "$verdict" \
+            "$(verdict_of B long_sell)"
+        t_eq "compare_failures passes the other families when long_sell fails $scenario" 4 \
+            "$(grep -cE '^PASS run B no new failures (deposit_and_buy|deposit_and_long_buy|sell_and_withdraw|order_credit_card): ' \
+                "$RUN_DIR/report" || true)"
+    done
+}
+
+test_close_window_finalOutputLacksBreakdownLine_failsLateVerdicts() {
+    local c lost label unknown fail_rate
+    # LOST;UNKNOWN;FAILRATE: the runs whose final output lost its breakdown's stats line, as log
+    # rotation can, the runs compare_failures names, and run B's failRate check.
+    for c in "A;run A;PASS run B $VISIT failRate: 0 over 3 visits, and no visit error after the breakdown, through the stop" \
+        "B;run B;FAIL run B $VISIT failRate: failRate 0 over 3 visits at the breakdown, but $LATE_UNKNOWN" \
+        "A B;run A and run B;FAIL run B $VISIT failRate: failRate 0 over 3 visits at the breakdown, but $LATE_UNKNOWN"; do
+        IFS=';' read -r lost unknown fail_rate <<<"$c"
+        t_fresh_run_dir
+        t_drain_stubs
+        t_drain_window
+        t_closed_phase A "$T_FLAG_OFF_BREAKDOWN"
+        t_closed_phase B "$T_FLAG_OFF_BREAKDOWN"
+        # A lost run's final output keeps every line but the stats line, a visit error included.
+        for label in $lost; do
+            WINDOW_LABEL="$label"
+            t_visit_error long_sell_error >"$RUN_DIR/logs.1"
+            echo 0 >"$RUN_DIR/logs.n"
+            close_window 1
+            t_eq "close_window records no late stretch for run $label without its stats line" \
+                "no late record" "$([[ -e "$RUN_DIR/errors-late-$label" ]] && echo "recorded" || echo "no late record")"
+        done
+        compare_failures
+        t_eq "compare_failures fails every family while $unknown's late stretch is unknown" 5 \
+            "$(grep -cxF -e "FAIL run B no new failures deposit_and_buy: $unknown: $LATE_UNKNOWN" \
+                -e "FAIL run B no new failures deposit_and_long_buy: $unknown: $LATE_UNKNOWN" \
+                -e "FAIL run B no new failures long_sell: $unknown: $LATE_UNKNOWN" \
+                -e "FAIL run B no new failures sell_and_withdraw: $unknown: $LATE_UNKNOWN" \
+                -e "FAIL run B no new failures order_credit_card: $unknown: $LATE_UNKNOWN" \
+                "$RUN_DIR/report" || true)"
+        check_visit_fail_rate "run B" B "$T_FLAG_OFF_BREAKDOWN"
+        t_report_has "check_visit_fail_rate of run B when $unknown lost its stats line" "$fail_rate"
+    done
+}
+
+test_run_a_visitAfterBreakdown_failsNoVisitCheck() {
+    local c scenario line
+    # SCENARIO;LINE: run A's final output holds its breakdown's stats line and nothing after it,
+    # that line and then a visit run, or no stats line, as after log rotation; or it holds that
+    # line and nothing after it, but grep fails reading the late lines close_window recorded.
+    # LINE is the check.
+    for c in "nothing late;PASS run A no $VISIT" \
+        "a late visit run;FAIL run A no $VISIT: 1 lines [Running visit [$VISIT]] after the breakdown, through the stop" \
+        "no stats line;FAIL run A no $VISIT: $LATE_UNKNOWN" \
+        "unreadable late lines;FAIL run A no $VISIT: $LATE_UNREAD"; do
+        IFS=';' read -r scenario line <<<"$c"
+        t_fresh_run_dir
+        t_drain_stubs
+        t_drain_window
+        WINDOW_LABEL="A"
+        # run_window as it returns after saving run A's breakdown, the window left open.
+        run_window() {
+            t_breakdown 'del(.portfolio_insights_alert)' >"$RUN_DIR/breakdown-A.json"
+            t_stats_line "$(cat "$RUN_DIR/breakdown-A.json")" >"$RUN_DIR/breakdown-A.line"
+        }
+        {
+            echo "$T_DRAIN_FIRST_LINE"
+            case "$scenario" in
+                "nothing late" | "unreadable late lines")
+                    t_stats_line "$(t_breakdown 'del(.portfolio_insights_alert)')"
+                    ;;
+                "a late visit run")
+                    t_stats_line "$(t_breakdown 'del(.portfolio_insights_alert)')"
+                    t_drain_opened "$T_DRAIN_RUN_1"
+                    ;;
+            esac
+        } >"$RUN_DIR/logs.final"
+        if [[ "$scenario" == "unreadable late lines" ]]; then
+            (
+                t_read_fault grep "$RUN_DIR/A.late.log"
+                run_a
+            )
+        else
+            run_a
+        fi
+        t_report_has "run_a judges $VISIT through the stop with $scenario" "$line"
+        t_reported_before "run_a judges $VISIT only after loadgen stopped with $scenario" \
+            "PASS run A loadgen stopped" "$line"
+    done
+}
+
+test_flag_off_window_visitErrorAfterBreakdown_judgesFailRateThroughStop() {
+    local c scenario line
+    # SCENARIO;LINE: whether the visit fails after the flag-off breakdown, and the check's line.
+    for c in "no late failure;PASS flag-off $VISIT failRate: 0 over 3 visits, and no visit error after the breakdown, through the stop" \
+        "a late failure;FAIL flag-off $VISIT failRate: failRate 0 over 3 visits at the breakdown, but 1 visit errors after it, through the stop"; do
+        IFS=';' read -r scenario line <<<"$c"
+        t_fresh_run_dir
+        if [[ "$scenario" == "a late failure" ]]; then
+            t_flag_off_window "$T_FLAG_OFF_BREAKDOWN" "$(t_visit_error "$VISIT")"
+        else
+            t_flag_off_window "$T_FLAG_OFF_BREAKDOWN"
+        fi
+        t_report_has "flag_off_window judges the failRate through the stop with $scenario" "$line"
+    done
+}
+
+# ---------------------------------------------------------------------------------------------
+# Run-B drain deadline (drain_loadgen, drain_call_limit, frozen_log)
+
+# t_drain_limits: the "SUBCOMMAND LIMIT" of each bounded Compose call so far, separated by |.
+t_drain_limits() {
+    paste -s -d '|' "$RUN_DIR/compose.limits" | tr -d '\r'
+}
+
+test_drain_loadgen_dockerCalls_limitedToTimeLeftBeforeDeadline() {
+    local rc=0
+    t_drain_stubs
+    t_drain_window
+    QUIESCE_TIMEOUT_SECONDS=30
+    DOCKER_CALL_TIMEOUT_SECONDS=22
+    # Each pause takes 4 s. The first frozen output has a visit in flight, so the drain unpauses
+    # loadgen, and the next read, 10 s in, finds that visit's create resolved.
+    echo 4 >"$RUN_DIR/takes.pause"
+    t_drain_resolved "$T_DRAIN_RUN_1" "$T_DRAIN_ALERT_1" ui >"$RUN_DIR/logs.1"
+    {
+        cat "$RUN_DIR/logs.1"
+        t_drain_opened "$T_DRAIN_RUN_2"
+    } >"$RUN_DIR/logs.2"
+    cp "$RUN_DIR/logs.2" "$RUN_DIR/logs.3"
+    {
+        cat "$RUN_DIR/logs.2"
+        t_drain_line "$T_DRAIN_RUN_2" "Created alert [$T_DRAIN_ALERT_2] threshold [1000000.40271936]"
+        t_drain_line "$T_DRAIN_RUN_2" "Deleted alert [$T_DRAIN_ALERT_2] via ui"
+    } >"$RUN_DIR/logs.4"
+    drain_loadgen || rc=$?
+    t_eq "drain_loadgen reaches Q with every Docker call limited" 0 "$rc"
+    t_eq "drain_loadgen limits each Docker call to its bound or the time left, whichever is shorter" \
+        "pause 22|unpause 22|pause 20|kill 15" "$(t_drain_limits)"
+    t_eq "drain_loadgen reaches Q before its deadline" \
+        "Q at 2026-01-01T00:00:15Z with 2 created alerts, all resolved, and no create in flight; loadgen killed while paused" \
+        "$DRAIN_DETAIL"
+}
+
+# t_drain_deadline_case CASE RC PAUSED CALLS LIMITS DETAIL: drain_loadgen with a 30 s deadline,
+# in a fresh run directory, over a run B whose one create its visit deleted. It returns RC with
+# DETAIL, leaves LOADGEN_PAUSED at PAUSED and makes the Compose calls CALLS with the limits
+# LIMITS. CASE says what takes the time: pausing, the running read takes all 30 s; killing, the
+# pause takes 25 s and the second frozen read the 4 s left; unpausing, the same with a visit in
+# flight in the frozen output; late kill, the kill answers 2 s after the deadline; kill ending,
+# it answers in the deadline's second; kill in the last second, in the second before it.
+t_drain_deadline_case() {
+    (
+        local rc=0
+        t_fresh_run_dir
+        t_drain_stubs
+        t_drain_window
+        QUIESCE_TIMEOUT_SECONDS=30
+        t_drain_resolved "$T_DRAIN_RUN_1" "$T_DRAIN_ALERT_1" ui >"$RUN_DIR/logs.1"
+        case "$1" in
+            pausing)
+                echo 30 >"$RUN_DIR/takes.logs.1"
+                ;;
+            killing | unpausing)
+                echo 25 >"$RUN_DIR/takes.pause"
+                echo 4 >"$RUN_DIR/takes.logs.3"
+                ;;
+            "late kill")
+                echo 31 >"$RUN_DIR/takes.kill"
+                ;;
+            "kill ending")
+                echo 29 >"$RUN_DIR/takes.kill"
+                ;;
+            "kill in the last second")
+                echo 28 >"$RUN_DIR/takes.kill"
+                ;;
+        esac
+        if [[ "$1" == "unpausing" ]]; then
+            {
+                cat "$RUN_DIR/logs.1"
+                t_drain_opened "$T_DRAIN_RUN_2"
+            } >"$RUN_DIR/logs.2"
+        fi
+        drain_loadgen || rc=$?
+        t_eq "drain_loadgen status, $1 at the deadline" "$2" "$rc"
+        t_eq "drain_loadgen LOADGEN_PAUSED, $1 at the deadline" "$3" "$LOADGEN_PAUSED"
+        t_eq "drain_loadgen Compose calls, $1 at the deadline" "$4" "$(t_drain_calls)"
+        t_eq "drain_loadgen call limits, $1 at the deadline" "$5" "$(t_drain_limits)"
+        t_eq "drain_loadgen detail, $1 at the deadline" "$6" "$DRAIN_DETAIL"
+    )
+}
+
+test_drain_loadgen_stepDueAtDeadline_startsNoCallAndLeavesPauseState() {
+    t_drain_deadline_case pausing 1 0 "" "" \
+        "drain deadline of 30 s reached before pausing loadgen"
+    t_drain_deadline_case killing 1 1 "pause loadgen" "pause 30" \
+        "drain deadline of 30 s reached before killing the paused loadgen"
+    t_drain_deadline_case unpausing 1 1 "pause loadgen" "pause 30" \
+        "paused: 1 visits between opening the page and their create outcome; drain deadline of 30 s reached before unpausing loadgen"
+}
+
+test_drain_loadgen_killEndsAfterDeadline_failsWithoutQ() {
+    t_drain_deadline_case "late kill" 1 0 "pause loadgen|kill -s SIGKILL loadgen" "pause 30|kill 29" \
+        "paused loadgen killed at or after the drain deadline of 30 s, 2 s late, so no Q"
+}
+
+# The kill starts 1 s in, after the frozen read's step. Seen in the deadline's second, it may have
+# ended up to a second past the 30 s, so only a kill seen in the second before is Q.
+test_drain_loadgen_killEndingNearDeadline_reachesQOnlyBeforeDeadlineSecond() {
+    t_drain_deadline_case "kill ending" 1 0 "pause loadgen|kill -s SIGKILL loadgen" "pause 30|kill 29" \
+        "paused loadgen killed at or after the drain deadline of 30 s, so no Q"
+    t_drain_deadline_case "kill in the last second" 0 0 "pause loadgen|kill -s SIGKILL loadgen" \
+        "pause 30|kill 29" \
+        "Q at 2026-01-01T00:00:29Z with 1 created alerts, all resolved, and no create in flight; loadgen killed while paused"
+}
+
+test_drain_loadgen_neverQuiescent_endsAtLastStepBeforeDeadline() {
+    local rc=0
+    t_drain_stubs
+    t_drain_window
+    QUIESCE_TIMEOUT_SECONDS=30
+    t_drain_created "$T_DRAIN_RUN_1" "$T_DRAIN_ALERT_1" >"$RUN_DIR/logs.1"
+    drain_loadgen || rc=$?
+    t_eq "drain_loadgen fails when never quiescent" 1 "$rc"
+    t_eq "drain_loadgen keeps the last read's detail" \
+        "not quiescent within 30s: unresolved: $T_DRAIN_ALERT_1" "$DRAIN_DETAIL"
+    t_eq "drain_loadgen reads every step and ends rather than sleep into its deadline" \
+        "6 reads, ended at $((T_DRAIN_CLOCK_START + 25))" \
+        "$(cat "$RUN_DIR/logs.n") reads, ended at $(cat "$RUN_DIR/clock")"
+}
+
+test_frozen_log_drainDeadlineFirst_failsBeforeSleepingIntoIt() {
+    local rc=0
+    t_drain_stubs
+    t_drain_window
+    # An output that never settles: each read holds one line more than the read before.
+    # shellcheck disable=SC2329 # Invoked by frozen_log through read_window.
+    loadgen_logs() {
+        local n
+        n=$(($(cat "$RUN_DIR/logs.n") + 1))
+        echo "$n" >"$RUN_DIR/logs.n"
+        seq "$n"
+    }
+    PROBE_DEADLINE=$((T_DRAIN_CLOCK_START + 3))
+    frozen_log || rc=$?
+    t_eq "frozen_log fails at the drain deadline" 1 "$rc"
+    t_eq "frozen_log names the drain deadline" \
+        "paused loadgen's output still changing at the drain deadline" "$POLL_DETAIL"
+    t_eq "frozen_log reads until the step before the drain deadline" \
+        "3 reads, ended at $((T_DRAIN_CLOCK_START + 2))" \
+        "$(cat "$RUN_DIR/logs.n") reads, ended at $(cat "$RUN_DIR/clock")"
 }
 
 # ---------------------------------------------------------------------------------------------

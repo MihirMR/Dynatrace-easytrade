@@ -460,6 +460,8 @@ load_script() {
         source "$TEST_DIR/lib-$1.sh"
     fi
     RUN_DIR="$CASE_DIR"
+    # e2e.sh keeps the raw output of its log reads in its private directory.
+    PRIVATE_DIR="$CASE_DIR"
     PROJECT="harness-test"
     COMPOSE_FILE="fake-compose.yaml"
     COMPOSE_ARGS=(-f "$COMPOSE_FILE")
@@ -1003,12 +1005,14 @@ done
 # 6. Bounded Docker calls. A case that waits on a limit has ended within the time of its baseline
 # run, plus the wait that limit allows beyond the baseline run's own, plus TIMING_MARGIN_MS. The
 # baseline run (run_baseline), made just before the case, is the same case with the calls that
-# would hang failing at once; a few cases also give it a step or window that ends sooner. It
-# holds the case's own work and process start-ups, and grows with the host's load as the case
-# does. The margin covers the kill of the hung call and a change of load between the two runs.
-# With the limit under test broken, a case would end at hard_timeout's next signal, at the next
-# limit of the code or when the fake's wait ends by itself: at least 2 s past its wait, so at
-# least 1 s past its bound.
+# would hang failing at once; a few cases also give it a step or window that ends sooner. The
+# hard_timeout rows and the run B drain take as theirs the failing case just before them, which
+# does the same. It holds the case's own work and process start-ups, and grows with the host's
+# load as the case does. The margin covers the kill of the hung call and a change of load between
+# the two runs. With the limit under test broken, a case would end at hard_timeout's next signal,
+# at the next limit of the code or when the fake's wait ends by itself: at least 2 s past its
+# wait, so at least 1 s past its bound. Cleanup's cases are bounded instead by a cleanup run with
+# Docker answering at once, plus their cut-off calls and 1 s.
 TIMING_MARGIN_MS=1000
 
 # e2e.sh: a poll whose log reads never answer ends at its deadline and says why. The poll
@@ -1381,13 +1385,13 @@ expect_docker_calls logs 0
 expect_within_ms $((cleanup_baseline_ms + 5000))
 conclude "cleanup_pausedLoadgenKillAndUpNeverAnswer_deletesAlertsAndRestoresFlag"
 
-# case_drain_pause_hang: loadgen-check.sh's run B drain over a quiescent window, one create
-# deleted by its visit, with loadgen's pause never answering. The drain ends by the call limit,
-# names the pause as timed out, and leaves LOADGEN_PAUSED at 1, so the stop that follows kills.
+# case_drain_pause MODE: loadgen-check.sh's run B drain over a quiescent window, one create
+# deleted by its visit, with loadgen's pause, the drain's first Docker call after its log read,
+# in fake docker MODE.
 # shellcheck disable=SC2034 # The variables are the run state drain_loadgen reads.
-case_drain_pause_hang() {
+case_drain_pause() {
     load_script loadgen-check
-    export FAKE_DOCKER_MODE_pause=hang-ignore-term
+    export FAKE_DOCKER_MODE_pause="$1"
     local tags="[2026-01-01 00:00:00+00:00][worker:0][visit:portfolio_insights_alert][id:$VISIT_RUN_ID][INFO]:"
     printf '%s\n' "$tags Opening portfolio insights page" \
         "$tags Created alert [$ALERT_ID_1] threshold [1.5]" \
@@ -1403,11 +1407,26 @@ case_drain_pause_hang() {
     printf 'detail %s\n' "$DRAIN_DETAIL"
     printf 'paused %s\n' "$LOADGEN_PAUSED"
 }
-# The pause's 2 s call limit is the whole wait; the baseline run also reads and checks the window
-# before its pause fails at once.
-run_baseline drain-pause-hangs-baseline case_drain_pause_hang
+
+# The pause failing at once: the drain fails, naming the exit status, and leaves LOADGEN_PAUSED
+# at 1, so the stop that follows kills. Up to the pause's answer the drain does what it does
+# below: it also reads and checks the window first. This run is the baseline run of the case
+# below.
+run_case drain-pause-fails case_drain_pause fail
+expect_status 0
+expect_line "status 1"
 expect_line "detail pausing loadgen failed, exit 3 (see $CASE_DIR/compose.log)"
-run_case drain-pause-hangs case_drain_pause_hang
+expect_line "paused 1"
+expect_docker_calls logs 1
+expect_docker_calls pause 1
+expect_docker_calls kill 0
+conclude "drainLoadgen_pauseFails_failsWithExitStatusAndLeavesKillToStop"
+BASELINE_MS="$CASE_MS"
+
+# The pause never answering: the drain ends by the 2 s call limit, names the pause as timed out,
+# and leaves LOADGEN_PAUSED at 1, as above. The pause's 2 s call limit is the whole wait; under
+# the 60 s default limit, or none, the fake's 15 s wait would end the pause instead.
+run_case drain-pause-hangs case_drain_pause hang-ignore-term
 expect_status 0
 expect_line "status 1"
 expect_line "detail pausing loadgen timed out after 2 s (Docker did not answer)"

@@ -284,6 +284,34 @@ for (const quantityText of ["1,0", "1,00", "100.0", "1e2", "0100"]) {
     })
 }
 
+/** `HOLDER` at a loss of more than two places; each figure is compared alone. */
+const HOLDER_AT_LOSS = {
+    ...HOLDER,
+    unrealizedPnl: -1.56839895,
+    unrealizedPnlPercent: -0.62735958,
+}
+
+for (const [pnlText, mismatched] of [
+    ["-$1.57", []],
+    // FormatterContext's own format for a value below 0.01, as every loss is.
+    ["-$1.56839895", ["#insights-unrealized-pnl"]],
+]) {
+    test(`compareInsights_lossPnl_expectsTwoPlacesAfterSign (${pnlText})`, async () => {
+        const dom = {
+            ...HOLDER_DOM,
+            unrealizedPnl: pnlText,
+            unrealizedPnlPercent: "-0.63%",
+        }
+
+        const result = await compareInsights(fakePage({}), dom, HOLDER_AT_LOSS)
+
+        assert.deepEqual(mismatchesOf(result), {
+            problems: mismatched.length,
+            mismatched,
+        })
+    })
+}
+
 for (const phase of ["readInsightsDom", "formatInPage"]) {
     test(`compareWithLastInsights_newerResponseDuringRead_repeatsReadAgainstNewerResponse (${phase})`, async (t) => {
         // The first read sees the page showing HOLDER, which it matches; the

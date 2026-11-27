@@ -1,6 +1,9 @@
 import "@testing-library/jest-dom/vitest"
 import { render, renderHook, screen, within } from "@testing-library/react"
-import { InsightsSummary } from "../../components/insights/InsightsSummary"
+import {
+    InsightsSummary,
+    InsightsSummaryPlaceholder,
+} from "../../components/insights/InsightsSummary"
 import { useFormatter } from "../../contexts/FormatterContext/context"
 import { FormatterWrapper } from "../providers"
 import type {
@@ -58,6 +61,64 @@ const responses: ReadonlyArray<{ label: string; insights: PortfolioInsights }> =
         { label: "lower value first", insights: lowerValueFirst },
     ]
 
+type PnlFigures = Pick<
+    PortfolioInsights,
+    "unrealizedPnl" | "unrealizedPnlPercent"
+>
+
+/** Class of the P/L amount and of its percent; `null` is no class. */
+type PnlClasses = { amount: string | null; percent: string | null }
+
+const pnlColours: ReadonlyArray<{
+    sign: string
+    figures: PnlFigures
+    expected: PnlClasses
+}> = [
+    {
+        sign: "gain",
+        figures: { unrealizedPnl: 8.04, unrealizedPnlPercent: 6.65 },
+        expected: { amount: "text-success", percent: "text-success" },
+    },
+    {
+        sign: "loss",
+        figures: { unrealizedPnl: -1.56839895, unrealizedPnlPercent: -6.65 },
+        expected: { amount: "text-danger", percent: "text-danger" },
+    },
+    {
+        sign: "zero",
+        figures: { unrealizedPnl: 0, unrealizedPnlPercent: 0 },
+        expected: { amount: null, percent: null },
+    },
+    // A negative cost basis gives the two figures opposite signs.
+    {
+        sign: "loss with a positive percent",
+        figures: { unrealizedPnl: -20, unrealizedPnlPercent: 12.5 },
+        expected: { amount: "text-danger", percent: "text-success" },
+    },
+]
+
+// A loss shows the format of the gain of the same size, signed.
+const pnlAmounts: ReadonlyArray<{ sign: string; pnl: number; text: string }> = [
+    { sign: "gain", pnl: 8.04, text: "$8.04" },
+    { sign: "loss", pnl: -1.56839895, text: "-$1.57" },
+    { sign: "zero", pnl: 0, text: "$0" },
+]
+
+// Below one cent the amount is rounded to whole cents: from half a cent it
+// shows one cent, signed for a loss; below that the unsigned zero. Its
+// colour still follows the received sign.
+const subCentPnls: ReadonlyArray<{
+    pnl: number
+    expected: { text: string; className: string }
+}> = [
+    { pnl: 0.006, expected: { text: "$0.01", className: "text-success" } },
+    { pnl: -0.006, expected: { text: "-$0.01", className: "text-danger" } },
+    { pnl: 0.005, expected: { text: "$0.01", className: "text-success" } },
+    { pnl: -0.005, expected: { text: "-$0.01", className: "text-danger" } },
+    { pnl: 0.004, expected: { text: "$0", className: "text-success" } },
+    { pnl: -0.004, expected: { text: "$0", className: "text-danger" } },
+]
+
 /** The production formatter, so expectations follow the FormatterContext contract. */
 function productionFormatter(): Formatter {
     const { result } = renderHook(() => useFormatter(), {
@@ -84,6 +145,10 @@ function getById(id: string): HTMLElement {
 
 function textOf(id: string): string | null {
     return getById(id).textContent
+}
+
+function classOf(id: string): string | null {
+    return getById(id).getAttribute("class")
 }
 
 type FigureId =
@@ -119,15 +184,31 @@ function readRenderedSummary(): RenderedSummary {
     }
 }
 
+/**
+ * Signed money as `InsightsSummary` writes it: the sign, then the magnitude,
+ * rounded to whole cents below one cent; a magnitude rounded to 0 is unsigned.
+ */
+function signedCurrency(n: number, { formatCurrency }: Formatter): string {
+    const absolute = Math.abs(n)
+    const magnitude =
+        absolute < 0.01 ? Math.round(absolute * 100) / 100 : absolute
+    const text = formatCurrency(magnitude)
+    return n < 0 && magnitude > 0 ? `-${text}` : text
+}
+
 function expectedSummary(
     insights: PortfolioInsights,
-    { formatCurrency, formatPercent }: Formatter
+    formatter: Formatter
 ): RenderedSummary {
+    const { formatCurrency, formatPercent } = formatter
     return {
         figures: {
             "insights-total-value": formatCurrency(insights.totalValue),
             "insights-total-invested": formatCurrency(insights.totalInvested),
-            "insights-unrealized-pnl": formatCurrency(insights.unrealizedPnl),
+            "insights-unrealized-pnl": signedCurrency(
+                insights.unrealizedPnl,
+                formatter
+            ),
             "insights-unrealized-pnl-percent": formatPercent(
                 insights.unrealizedPnlPercent / 100
             ),
@@ -169,6 +250,39 @@ describe("InsightsSummary", () => {
         }
     )
 
+    it.each(pnlAmounts)(
+        "insightsSummary_pnlSign_showsSignedAmountInGainFormat ($sign)",
+        ({ pnl, text }) => {
+            renderSummary({ ...twoHoldings, unrealizedPnl: pnl })
+
+            expect(textOf("insights-unrealized-pnl")).toBe(text)
+        }
+    )
+
+    it.each(subCentPnls)(
+        "insightsSummary_pnlBelowOneCent_showsWholeCentsColouredBySign ($pnl)",
+        ({ pnl, expected }) => {
+            renderSummary({ ...twoHoldings, unrealizedPnl: pnl })
+
+            expect({
+                text: textOf("insights-unrealized-pnl"),
+                className: classOf("insights-unrealized-pnl"),
+            }).toEqual(expected)
+        }
+    )
+
+    it.each(pnlColours)(
+        "insightsSummary_pnlSign_coloursAmountAndPercent ($sign)",
+        ({ figures, expected }) => {
+            renderSummary({ ...twoHoldings, ...figures })
+
+            expect({
+                amount: classOf("insights-unrealized-pnl"),
+                percent: classOf("insights-unrealized-pnl-percent"),
+            }).toEqual(expected)
+        }
+    )
+
     it("insightsSummary_allocations_exposeColumnHeadersInNamedScrollRegion", () => {
         renderSummary(twoHoldings)
 
@@ -207,4 +321,158 @@ describe("InsightsSummary", () => {
             formatPercent(easyTravel.percent / 100)
         )
     })
+})
+
+/** The markup that sets a summary's size, which the placeholder must repeat. */
+type SummaryOutline = {
+    rootClassName: string | undefined
+    figureLabels: Array<string | null>
+    heading: string | null | undefined
+    columnHeaders: Array<string | null>
+    bodyRowCellClasses: string[][]
+    emptyStateClasses: string[]
+}
+
+function readOutline(container: HTMLElement): SummaryOutline {
+    return {
+        rootClassName: container.firstElementChild?.className,
+        figureLabels: Array.from(
+            container.querySelectorAll(
+                ".insights-summary > .insights-figure > .form-label"
+            ),
+            (label) => label.textContent
+        ),
+        heading: container.querySelector("h3.section-heading")?.textContent,
+        columnHeaders: Array.from(
+            container.querySelectorAll("table.data-table thead th"),
+            (header) => header.textContent
+        ),
+        bodyRowCellClasses: Array.from(
+            container.querySelectorAll("table.data-table tbody tr"),
+            (row) => Array.from(row.children, (cell) => cell.className)
+        ),
+        emptyStateClasses: Array.from(
+            container.querySelectorAll(".insights-content > p"),
+            (paragraph) => paragraph.className
+        ),
+    }
+}
+
+/**
+ * A placeholder body cell: `"bar"` when a skeleton bar is all it holds, else
+ * its text.
+ */
+function readPlaceholderCell(cell: Element): string | null {
+    const [only, ...others] = Array.from(cell.childNodes)
+    const isBar =
+        others.length === 0 &&
+        only instanceof HTMLSpanElement &&
+        only.className === "insights-value-placeholder" &&
+        !only.hasChildNodes()
+    return isBar ? "bar" : cell.textContent
+}
+
+const barRow = ["bar", "bar", "bar", "bar"]
+const emptyLineRow = ["\u00a0", "\u00a0", "\u00a0", "\u00a0"]
+
+/**
+ * Markup that puts an element in the Tab order. An overflowing scroll
+ * container is a Tab stop in Chrome without any of it, which jsdom does not
+ * lay out, so the placeholder's scroll wrapper is checked to be inert instead.
+ */
+const focusableMarkup =
+    "[tabindex], [contenteditable], a, area, button, input, select, textarea, iframe, summary, audio[controls], video[controls]"
+
+/** `count` holdings with distinct ids, as the broker lists them. */
+function holdings(count: number): PortfolioInsights {
+    if (count === 0) {
+        return noHoldings
+    }
+    return {
+        ...twoHoldings,
+        allocations: Array.from({ length: count }, (_, index) => ({
+            ...easyTravel,
+            instrumentId: `c0000000-0000-4000-8000-${String(index + 1).padStart(12, "0")}`,
+        })),
+    }
+}
+
+describe("InsightsSummaryPlaceholder", () => {
+    // The page reserves the row count it last showed for the account: 0 is
+    // the empty state, and 1 is also what it reserves for an unknown account.
+    it.each([0, 1, 15])(
+        "insightsSummaryPlaceholder_render_mirrorsSummaryWithAsManyHoldingsInertWithoutIds (%i rows)",
+        (rows) => {
+            const loaded = render(
+                <FormatterWrapper>
+                    <InsightsSummary insights={holdings(rows)} />
+                </FormatterWrapper>
+            ).container
+            const placeholder = render(
+                <InsightsSummaryPlaceholder allocationRows={rows} />
+            ).container
+            const root = placeholder.firstElementChild
+
+            expect(readOutline(placeholder)).toEqual(readOutline(loaded))
+            expect({
+                hidden: root?.getAttribute("aria-hidden"),
+                inert: root?.hasAttribute("inert"),
+                ids: Array.from(
+                    placeholder.querySelectorAll("[id]"),
+                    (element) => element.id
+                ),
+                focusable: placeholder.querySelectorAll(focusableMarkup).length,
+                scrollWrappersInInertRoot: Array.from(
+                    placeholder.querySelectorAll(
+                        ".insights-allocations-scroll"
+                    ),
+                    (wrapper) => wrapper.closest("[inert]") === root
+                ),
+                valueLines: Array.from(
+                    placeholder.querySelectorAll(
+                        ".insights-figure > .insights-value-placeholder"
+                    ),
+                    (value) => value.textContent
+                ),
+                emptyStateLines: Array.from(
+                    placeholder.querySelectorAll(".insights-content > p"),
+                    (paragraph) => paragraph.textContent
+                ),
+            }).toEqual({
+                hidden: "true",
+                inert: true,
+                ids: [],
+                focusable: 0,
+                scrollWrappersInInertRoot: rows === 0 ? [] : [true],
+                valueLines: Array.from({ length: 6 }, () => "\u00a0"),
+                emptyStateLines: rows === 0 ? ["\u00a0"] : [],
+            })
+        }
+    )
+
+    // Every row but the last draws a bar in each cell, so the reserved table
+    // reads as loading; the last row stays an empty line, because the page's
+    // loading message lies over it.
+    it.each([
+        { rows: 1, barRows: 0 },
+        { rows: 2, barRows: 1 },
+        { rows: 15, barRows: 14 },
+    ])(
+        "insightsSummaryPlaceholder_rows_drawBarsInEveryRowButTheLast ($rows rows)",
+        ({ rows, barRows }) => {
+            const placeholder = render(
+                <InsightsSummaryPlaceholder allocationRows={rows} />
+            ).container
+
+            expect(
+                Array.from(
+                    placeholder.querySelectorAll("table.data-table tbody tr"),
+                    (row) => Array.from(row.children, readPlaceholderCell)
+                )
+            ).toEqual([
+                ...Array.from({ length: barRows }, () => barRow),
+                emptyLineRow,
+            ])
+        }
+    )
 })

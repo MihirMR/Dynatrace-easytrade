@@ -13,7 +13,10 @@
 #   - the read-only Alerts count: SQL and client per dialect, refusal of non-canonical ids,
 #     chunking, aggregation across chunks and client failures;
 #   - run B's outcomes check, the per-family table, the end of the run and the cleanup run on
-#     exit: owned alerts deleted, the flag restored, and the exit status.
+#     exit: owned alerts deleted, a DELETE retried after a transport error, owned and deleted
+#     lists that cannot be read or written, the flag restored, and the exit status;
+#   - the recovery record of a run directory and the --resume-cleanup run that deletes the owned
+#     alerts a cleanup left, once Docker shows that --base-url reaches the project's reverse proxy.
 # loadgen-check-test.sh covers the rest: run B's drain and owned-id audit, loadgen's log
 # sanitizer, the restore of loadgen and the flag-off window. harness-test.sh covers
 # container_env, the time limits of the bounded Docker calls and the cleanup of a window still
@@ -60,7 +63,7 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-for t_tool in jq awk sed grep sort comm paste tr wc mktemp cmp; do
+for t_tool in jq awk sed grep sort comm paste tr wc mktemp cmp stat; do
     if ! command -v "$t_tool" >/dev/null 2>&1; then
         echo "$t_tool is required on PATH." >&2
         exit 2
@@ -252,6 +255,7 @@ t_new_case() {
     LOADGEN_PAUSED=0
     RESTORE_ERROR=""
     WINDOW_OPEN=0
+    WINDOW_UNREAD=0
     WINDOW_LABEL="B"
     WINDOW_SINCE="2026-01-01T00:00:00Z"
     WINDOW_START="2026-01-01T00:00:30Z"
@@ -269,6 +273,8 @@ t_new_case() {
     STUB_DB_OUTPUT=""
     STUB_LOGS_STATUS=0
     STUB_STOP_STATUS=0
+    STUB_PS_STATUS=0
+    STUB_PORT_STATUS=0
     STUB_UP_STATUS=0
     STUB_LOADGEN_WEIGHT=""
     STUB_VERSION_STATUS=0
@@ -305,7 +311,9 @@ t_print_file() {
 # prints the entries of STUB_DIR/env.SERVICE as the JSON array container_env and
 # container_env_entry read; any other format fails. The compose subcommand after the -p
 # and -f options plays as follows: config prints STUB_DIR/services; ps ... --services prints
-# STUB_DIR/running, and ps ... SERVICE prints cid-SERVICE when STUB_DIR/env.SERVICE exists; logs
+# STUB_DIR/running and exits STUB_PS_STATUS, and ps ... SERVICE prints cid-SERVICE when
+# STUB_DIR/env.SERVICE exists; port SERVICE PORT prints STUB_DIR/port.SERVICE, the published
+# HOST:PORT, or, when STUB_PORT_STATUS is not 0, prints Compose's error and exits with it; logs
 # prints STUB_DIR/loadgen.log and exits STUB_LOGS_STATUS; up records the
 # PORTFOLIO_INSIGHTS_ALERT_WEIGHT it gets in STUB_DIR/up.env and exits STUB_UP_STATUS, giving
 # loadgen that weight, or STUB_LOADGEN_WEIGHT when set, on success; stop, and the kill that ends
@@ -336,9 +344,17 @@ docker() {
         ps)
             if [[ "$last" == "--services" ]]; then
                 t_print_file "$STUB_DIR/running"
+                return "$STUB_PS_STATUS"
             elif [[ -f "$STUB_DIR/env.$last" ]]; then
                 echo "cid-$last"
             fi
+            ;;
+        port)
+            if [[ $STUB_PORT_STATUS -ne 0 ]]; then
+                echo "service \"${args[i + 1]:-}\" is not running" >&2
+                return "$STUB_PORT_STATUS"
+            fi
+            t_print_file "$STUB_DIR/port.${args[i + 1]:-}"
             ;;
         logs)
             t_print_file "$STUB_DIR/loadgen.log"
@@ -422,8 +438,10 @@ t_db_client() {
 
 # curl: answers http()'s request from STUB_DIR/http.responses, lines METHOD<TAB>URL<TAB>STATUS
 # <TAB>BODY whose first match on METHOD and URL answers; BODY @request echoes the request body.
-# Status 000, or no matching line, is a transport error. Each request is recorded in
-# STUB_DIR/http.calls as METHOD URL [BODY].
+# Status 000, or no matching line, is a transport error. A request STUB_DIR/http.transient lists
+# as METHOD URL is a transport error first, once per such line (t_respond_transient). Each request
+# is recorded in STUB_DIR/http.calls as METHOD URL [BODY], and its --max-time in
+# STUB_DIR/http.max-times.
 curl() {
     local method="GET" out="" url="" body="" status="" reply="" r_method r_url r_status r_body
     while [[ $# -gt 0 ]]; do
@@ -436,7 +454,11 @@ curl() {
                 out="$2"
                 shift 2
                 ;;
-            -D | -w | -H | --max-time)
+            -D | -w | -H)
+                shift 2
+                ;;
+            --max-time)
+                printf '%s\n' "$2" >>"$STUB_DIR/http.max-times"
                 shift 2
                 ;;
             --data-binary)
@@ -453,6 +475,10 @@ curl() {
         esac
     done
     printf '%s %s%s\n' "$method" "$url" "${body:+ $body}" >>"$STUB_DIR/http.calls"
+    if [[ -s "$STUB_DIR/http.transient" ]] && t_take_transient "$method $url"; then
+        echo "$T_CURL_REFUSED" >&2
+        return 7
+    fi
     while IFS=$'\t' read -r r_method r_url r_status r_body; do
         if [[ "$r_method" == "$method" && "$r_url" == "$url" ]]; then
             status="$r_status"
@@ -489,6 +515,35 @@ sleep() {
 # t_respond METHOD URL STATUS [BODY]: the stub curl's answer to METHOD URL.
 t_respond() {
     printf '%s\t%s\t%s\t%s\n' "$1" "$2" "$3" "${4:-}" >>"$STUB_DIR/http.responses"
+}
+
+# t_respond_transient METHOD URL COUNT: the next COUNT requests METHOD URL end in a transport
+# error before the stub curl answers them from STUB_DIR/http.responses.
+t_respond_transient() {
+    local i
+    for ((i = 0; i < $3; i++)); do
+        printf '%s %s\n' "$1" "$2" >>"$STUB_DIR/http.transient"
+    done
+}
+
+# t_take_transient KEY: removes the first line KEY from STUB_DIR/http.transient; fails when no
+# line is KEY. The stub curl runs in http()'s command substitution, so the count lives in a file.
+t_take_transient() {
+    local i
+    local -a lines=()
+    mapfile -t lines <"$STUB_DIR/http.transient"
+    for i in "${!lines[@]}"; do
+        if [[ "${lines[i]}" == "$1" ]]; then
+            unset 'lines[i]'
+            if [[ ${#lines[@]} -gt 0 ]]; then
+                printf '%s\n' "${lines[@]}" >"$STUB_DIR/http.transient"
+            else
+                : >"$STUB_DIR/http.transient"
+            fi
+            return 0
+        fi
+    done
+    return 1
 }
 
 # t_query_sizes: the number of quoted ids in each recorded query, separated by spaces.
@@ -567,6 +622,60 @@ t_succeed_on() {
     t_attempts=$((t_attempts + 1))
     POLL_DETAIL="attempt $t_attempts"
     [[ $t_attempts -ge $1 ]]
+}
+
+# t_attempt_lasting SECONDS STATUS: a poll attempt that takes SECONDS of the fake clock, leaves
+# POLL_DETAIL and returns STATUS.
+t_attempt_lasting() {
+    t_attempts=$((t_attempts + 1))
+    FAKE_NOW=$((FAKE_NOW + $1))
+    POLL_DETAIL="attempt $t_attempts"
+    return "$2"
+}
+
+# t_succeed_lasting N SECONDS: t_succeed_on N, whose succeeding Nth attempt takes SECONDS of the
+# fake clock.
+t_succeed_lasting() {
+    t_succeed_on "$1" || return 1
+    FAKE_NOW=$((FAKE_NOW + $2))
+}
+
+# t_poll_outcome TIMEOUT STEP COMMAND [ARGS...]: poll "readiness" TIMEOUT STEP COMMAND ARGS in a
+# fresh case. Sets T_OUTCOME to STATUS|ATTEMPTS|SLEEPS|REPORT: the poll's status, the attempts
+# COMMAND counted, the sleeps the poll took and the lines it printed.
+t_poll_outcome() {
+    local status=0
+    t_new_case
+    t_attempts=0
+    poll "readiness" "$@" >"$T_CASE_DIR/poll.out" || status=$?
+    T_OUTCOME="$status|$t_attempts|$(t_lines "$STUB_DIR/sleeps")|$(<"$T_CASE_DIR/poll.out")"
+}
+
+# t_readiness_outcome: readiness_once with the case's PROBE_DEADLINE. Sets T_OUTCOME to
+# STATUS|MAX_TIMES|REQUESTS|DETAIL: its status, the --max-time of each request it sent, those
+# requests and the POLL_DETAIL it left.
+t_readiness_outcome() {
+    local status=0
+    : >"$STUB_DIR/http.calls"
+    : >"$STUB_DIR/http.max-times"
+    readiness_once || status=$?
+    T_OUTCOME="$status|$(t_lines "$STUB_DIR/http.max-times")|$(t_lines "$STUB_DIR/http.calls")|$POLL_DETAIL"
+}
+
+# t_readiness_ticking: prints the T_OUTCOME of t_readiness_outcome under a clock that each
+# date -u +%s moves on by 7 s, as when the broker-service request takes 7 s. Run it in a subshell,
+# so that only the subshell keeps that clock.
+t_readiness_ticking() {
+    echo "$FAKE_NOW" >"$STUB_DIR/clock"
+    # shellcheck disable=SC2329 # Invoked by readiness_once.
+    date() {
+        local now
+        now="$(<"$STUB_DIR/clock")"
+        echo $((now + 7)) >"$STUB_DIR/clock"
+        echo "$now"
+    }
+    t_readiness_outcome
+    echo "$T_OUTCOME"
 }
 
 # t_exit_through_cleanup STATUS: ends a subshell with STATUS through the script's EXIT trap, as
@@ -687,6 +796,35 @@ t_expect "help" "$T_STATUS|$first" \
     "0|Usage: scripts/portfolio-insights/loadgen-check.sh --project NAME [--base-url URL]"
 t_conclude "$check"
 
+# t_resume_settings ARGS...: parse_options ARGS, then the run directory to resume.
+t_resume_settings() {
+    parse_options "$@"
+    printf 'RESUME_RUN_DIR=%s\n' "$RESUME_RUN_DIR"
+}
+
+check="parseOptions_resumeCleanup_takesRunDirAndRefusesNewRunOptions"
+t_new_case
+: >"$T_CASE_DIR/compose.yaml"
+t_run_sub t_resume_settings --project et-test --compose-file "$T_CASE_DIR/compose.yaml" \
+    --resume-cleanup "$T_CASE_DIR/run dir"
+t_expect "run dir taken" "$T_STATUS|$(<"$T_CASE_DIR/out")" "0|RESUME_RUN_DIR=$T_CASE_DIR/run dir"
+t_run_sub t_resume_settings --project et-test --compose-file "$T_CASE_DIR/compose.yaml"
+t_expect "a new run by default" "$T_STATUS|$(<"$T_CASE_DIR/out")" "0|RESUME_RUN_DIR="
+t_expect_usage_error "value missing" "Option --resume-cleanup requires a value." \
+    --project et-test --resume-cleanup
+for t_name in --weight --minutes --out; do
+    case "$t_name" in
+        --weight) t_value=2 ;;
+        --minutes) t_value=5 ;;
+        --out) t_value="$T_CASE_DIR/table.md" ;;
+    esac
+    t_expect_usage_error "$t_name" \
+        "Option $t_name cannot be combined with --resume-cleanup, which takes only --project, --base-url and --compose-file." \
+        --project et-test --compose-file "$T_CASE_DIR/compose.yaml" --resume-cleanup "$RUN_DIR" \
+        "$t_name" "$t_value"
+done
+t_conclude "$check"
+
 check="checkTools_toolsAndComposePlugin_exitsTwoWhenOneIsMissing"
 t_new_case
 t_run_sub check_tools
@@ -731,9 +869,77 @@ set +e
 poll "readiness" 10 5 t_succeed_on 99 >"$T_CASE_DIR/poll.out"
 status=$?
 set -e
+# The second attempt leaves 5 s, one step: the poll ends there rather than sleep into its deadline
+# and start an attempt with no time left.
 t_expect "deadline expired" \
     "$status|$t_attempts|$(t_lines "$STUB_DIR/sleeps")|$(<"$T_CASE_DIR/poll.out")" \
-    "1|3|5 5|FAIL readiness: deadline 10 s expired; attempt 3"
+    "1|2|5|FAIL readiness: deadline 10 s expired; attempt 2"
+t_conclude "$check"
+
+check="poll_attemptEndingAtOrAfterDeadline_failsAsLateSuccess"
+t_poll_outcome 10 5 t_attempt_lasting 20 0
+t_expect "success 10 s late" "$T_OUTCOME" \
+    "1|1||FAIL readiness: attempt succeeded at or after the deadline of 10 s, 10 s late"
+# Seen in the deadline's second, a success may have ended up to a second past TIMEOUT.
+t_poll_outcome 10 5 t_attempt_lasting 10 0
+t_expect "success at the deadline" "$T_OUTCOME" \
+    "1|1||FAIL readiness: attempt succeeded at or after the deadline of 10 s"
+t_conclude "$check"
+
+check="poll_lastAttemptAfterSteps_acceptsSuccessOnlyBeforeDeadlineSecond"
+# Three 3 s steps start the fourth attempt 9 s into a 10 s poll, the last second before the
+# deadline. A success seen in that second counts. The same attempt taking one second more is
+# seen in the deadline's second, as a last request capped at the one second left ends.
+t_poll_outcome 10 3 t_succeed_lasting 4 0
+t_expect "success one second before the deadline" "$T_OUTCOME" "0|4|3 3 3|"
+t_poll_outcome 10 3 t_succeed_lasting 4 1
+t_expect "success at the deadline second" "$T_OUTCOME" \
+    "1|4|3 3 3|FAIL readiness: attempt succeeded at or after the deadline of 10 s"
+t_conclude "$check"
+
+check="poll_noTimeLeft_startsNoAttemptAndNoSleep"
+t_poll_outcome 0 5 t_succeed_on 1
+t_expect "deadline already reached" "$T_OUTCOME" "1|0||FAIL readiness: deadline 0 s expired"
+t_poll_outcome 10 5 t_attempt_lasting 7 1
+t_expect "failed attempt leaving less than a step" "$T_OUTCOME" \
+    "1|1||FAIL readiness: deadline 10 s expired; attempt 1"
+t_conclude "$check"
+
+check="readinessOnce_timeLeft_capsEachRequestAndSendsNoneWithoutTime"
+t_new_case
+t_respond GET "$BASE_URL/broker-service/readyz" 200 'ok'
+t_respond GET "$BASE_URL/feature-flag-service/readyz" 200 'ok'
+T_BROKER_READYZ="GET $BASE_URL/broker-service/readyz"
+T_READYZ_CALLS="$T_BROKER_READYZ GET $BASE_URL/feature-flag-service/readyz"
+T_READYZ_200="broker-service readyz gave status 200, feature-flag-service readyz gave status 200"
+T_NO_TIME="readyz not requested: no time left before the readiness deadline"
+t_readiness_outcome
+t_expect "outside a poll" "$T_OUTCOME" "0|15 15|$T_READYZ_CALLS|$T_READYZ_200"
+PROBE_DEADLINE=$((FAKE_NOW + 300))
+t_readiness_outcome
+t_expect "300 s left" "$T_OUTCOME" "0|15 15|$T_READYZ_CALLS|$T_READYZ_200"
+PROBE_DEADLINE=$((FAKE_NOW + 7))
+t_readiness_outcome
+t_expect "7 s left" "$T_OUTCOME" "0|7 7|$T_READYZ_CALLS|$T_READYZ_200"
+t_run_sub t_readiness_ticking
+t_expect "time runs out during the first request" "$T_STATUS|$(<"$T_CASE_DIR/out")" \
+    "0|1|7|$T_BROKER_READYZ|broker-service readyz gave status 200, feature-flag-service $T_NO_TIME"
+PROBE_DEADLINE="$FAKE_NOW"
+t_readiness_outcome
+t_expect "no time left" "$T_OUTCOME" "1|||broker-service $T_NO_TIME"
+PROBE_DEADLINE=""
+: >"$STUB_DIR/http.max-times"
+set +e
+poll "readiness" 7 5 readiness_once >"$T_CASE_DIR/poll.out"
+status=$?
+set -e
+t_expect "through a 7 s poll" "$status|$(t_lines "$STUB_DIR/http.max-times")|$PROBE_DEADLINE" "0|7 7|"
+t_new_case
+t_respond GET "$BASE_URL/broker-service/readyz" 503 'unhealthy'
+t_respond GET "$BASE_URL/feature-flag-service/readyz" 200 'ok'
+t_readiness_outcome
+t_expect "broker-service not ready" "$T_OUTCOME" \
+    "1|15 15|$T_READYZ_CALLS|broker-service readyz gave status 503, feature-flag-service readyz gave status 200"
 t_conclude "$check"
 
 check="loadgenLogs_colouredCrlfOutput_printsPlainLines"
@@ -1502,11 +1708,200 @@ t_expect_line "settings" "$OUT_FILE" \
 t_expect_line "header" "$OUT_FILE" "| run | family | visit name | total | failRate | completions | error lines | verdict |"
 t_expect_line "run A row" "$OUT_FILE" "| A | order_credit_card | order_credit_card | 1 | 0 | 1 | ? | not checked |"
 t_expect_line "run B row" "$OUT_FILE" "| B | - | - | - | - | - | - | no breakdown |"
+t_expect "temporary file renamed" "$(compgen -G "$OUT_FILE.*" || true)" ""
+printf -v t_mode '%o' $((0666 & ~$(umask)))
+t_expect "mode of a plain redirection" "$(stat -c '%a' "$OUT_FILE")" "$t_mode"
 t_new_case
 OUT_FILE="$T_CASE_DIR/absent/table.md"
 write_table >"$T_CASE_DIR/out" 2>"$T_CASE_DIR/err"
 t_expect "directory missing" "$(<"$T_CASE_DIR/out")" \
     "FAIL table: could not write $OUT_FILE (see $RUN_DIR/table-error.log)"
+t_conclude "$check"
+
+# t_with_fault FAULT COMMAND [ARGS...]: COMMAND with FAULT injected, failing one call as an I/O
+# error would. Run it in a subshell, so that only the subshell gets the stub. FAULT is one of:
+#   none            nothing injected;
+#   verdicts-read   awk fails reading the verdicts file;
+#   errors-read     awk fails reading run A's error counts;
+#   breakdown-read  cat fails reading run A's breakdown;
+#   full-disk       COMMAND writes to /dev/full, where every write fails;
+#   copy            cat, copying the generated rows into the report, writes run A's rows and then
+#                   fails, as a write to a full disk does;
+#   mode            chmod fails setting the report's mode;
+#   rename          mv fails publishing the report, as in a read-only directory;
+#   rename-remove   mv fails publishing the report, and rm then fails removing it.
+t_with_fault() {
+    local fault="$1"
+    shift
+    case "$fault" in
+        verdicts-read | errors-read)
+            T_FAULT_FILE="$RUN_DIR/verdicts"
+            if [[ "$fault" == "errors-read" ]]; then
+                T_FAULT_FILE="$RUN_DIR/errors-A"
+            fi
+            # shellcheck disable=SC2329 # Invoked by the command under test.
+            awk() {
+                if [[ "${*: -1}" == "$T_FAULT_FILE" ]]; then
+                    echo "awk: read error (Input/output error)" >&2
+                    return 2
+                fi
+                command awk "$@"
+            }
+            ;;
+        breakdown-read)
+            # shellcheck disable=SC2329 # Invoked by the command under test.
+            cat() {
+                if [[ "${1:-}" == "$RUN_DIR/breakdown-A.json" ]]; then
+                    echo "cat: $1: Input/output error" >&2
+                    return 1
+                fi
+                command cat "$@"
+            }
+            ;;
+        full-disk)
+            "$@" >/dev/full
+            return
+            ;;
+        copy)
+            # shellcheck disable=SC2329 # Invoked by the command under test.
+            cat() {
+                if [[ "${1:-}" == "$RUN_DIR/table-A.rows" ]]; then
+                    command cat "$1"
+                    echo "cat: write error: No space left on device" >&2
+                    return 1
+                fi
+                command cat "$@"
+            }
+            ;;
+        mode)
+            # shellcheck disable=SC2329 # Invoked by the command under test.
+            chmod() {
+                echo "chmod: changing permissions: Operation not permitted" >&2
+                return 1
+            }
+            ;;
+        rename | rename-remove)
+            # shellcheck disable=SC2329 # Invoked by the command under test.
+            mv() {
+                echo "mv: cannot move to the table: Permission denied" >&2
+                return 1
+            }
+            if [[ "$fault" == "rename-remove" ]]; then
+                # shellcheck disable=SC2329 # Invoked by the command under test.
+                rm() {
+                    echo "rm: cannot remove: Permission denied" >&2
+                    return 1
+                }
+            fi
+            ;;
+    esac
+    "$@"
+}
+
+# t_write_table_failed: write_table, then the failed count it leaves.
+t_write_table_failed() {
+    write_table
+    echo "failed=$failed"
+}
+
+check="verdictOf_verdictsFile_printsNotCheckedOrFailsWhenUnreadable"
+# ROW:VERDICTS:FAULT:STATUS:OUTPUT. A family without a verdict is "not checked"; a verdicts file
+# that is missing, a directory, which awk would skip with status 0, or unreadable fails the
+# lookup.
+for row in "no verdict of the family:file:none:0:not checked" "verdicts missing:missing:none:1:" \
+    "verdicts a directory:directory:none:1:" "verdicts unreadable:file:verdicts-read:1:"; do
+    IFS=: read -r t_label t_verdicts t_fault t_status t_output <<<"$row"
+    t_new_case
+    record_verdict A long_sell PASS
+    case "$t_verdicts" in
+        missing) rm -f "$RUN_DIR/verdicts" ;;
+        directory) rm -f "$RUN_DIR/verdicts" && mkdir "$RUN_DIR/verdicts" ;;
+    esac
+    t_run_sub t_with_fault "$t_fault" verdict_of A deposit_and_buy
+    t_expect "$t_label" "$T_STATUS|$(<"$T_CASE_DIR/out")" "$t_status|$t_output"
+done
+t_conclude "$check"
+
+check="tableRows_failedStep_failsWithoutRows"
+# ROW;FAULT: each row fails one step of run A's rows: jq on a breakdown that does not parse or a
+# total it cannot multiply, reading the breakdown, the error counts or the verdicts, and writing
+# a row. Before, the jq rows printed every family as missing and returned 0.
+for row in "breakdown does not parse;none" "total is null;none" "breakdown not read;breakdown-read" \
+    "error counts not read;errors-read" "verdicts missing;none" "verdicts unreadable;verdicts-read" \
+    "row not written;full-disk"; do
+    IFS=';' read -r t_label t_fault <<<"$row"
+    t_new_case
+    printf '%s\n' "$RUN_A_JSON" >"$RUN_DIR/breakdown-A.json"
+    case "$t_label" in
+        "breakdown does not parse") printf '%s\n' '{"long_sell_error":' >"$RUN_DIR/breakdown-A.json" ;;
+        "total is null")
+            printf '%s\n' '{"long_sell_error":{"total":null,"avgDurationMs":1,"failRate":0}}' \
+                >"$RUN_DIR/breakdown-A.json"
+            ;;
+        "error counts not read") echo "1 order_credit_card" >"$RUN_DIR/errors-A" ;;
+        "verdicts missing") rm -f "$RUN_DIR/verdicts" ;;
+    esac
+    t_run_sub t_with_fault "$t_fault" table_rows A
+    t_expect "$t_label" "$T_STATUS|$(<"$T_CASE_DIR/out")" "1|"
+done
+t_conclude "$check"
+
+check="writeTable_failedStep_failsTableCheckAndLeavesOutFileAsItWas"
+# ROW;BEFORE;FAULT;LOG: BEFORE is what OUT_FILE is when write_table starts (absent, an earlier
+# table, or a directory holding one), and must still be after it; LOG is a line the step that
+# failed leaves in table-error.log. Only a temporary file rm could not remove may stay beside
+# OUT_FILE, and the verdict then names it.
+for row in "rows not generated;absent;none;^jq: " \
+    "verdict not read;file;none;^verdict_of: .* is not a regular file$" \
+    "mode not set;absent;mode;^chmod: " \
+    "write fails mid-table;absent;copy;^cat: write error" \
+    "out file is a directory;directory;none;^mv: " \
+    "rename refused;file;rename;^mv: cannot move" \
+    "partial file not removed;file;rename-remove;^rm: cannot remove"; do
+    IFS=';' read -r t_label t_before t_fault t_log <<<"$row"
+    t_new_case
+    printf '%s\n' "$RUN_A_JSON" >"$RUN_DIR/breakdown-A.json"
+    case "$t_label" in
+        "rows not generated") printf '%s\n' '{"long_sell_error":' >"$RUN_DIR/breakdown-B.json" ;;
+        "verdict not read") rm -f "$RUN_DIR/verdicts" ;;
+        "out file is a directory") OUT_FILE="$T_CASE_DIR/table.md" ;;
+    esac
+    case "$t_before" in
+        file) echo "earlier table" >"$OUT_FILE" ;;
+        directory) mkdir "$OUT_FILE" && echo "earlier table" >"$OUT_FILE/kept.md" ;;
+    esac
+    t_run_sub t_with_fault "$t_fault" t_write_table_failed
+    t_left="$(compgen -G "$OUT_FILE.*" || true)"
+    t_left_expected=""
+    case "$t_label" in
+        "rows not generated") t_reason="could not generate the rows of run B" ;;
+        "verdict not read") t_reason="could not generate the rows of run A" ;;
+        "mode not set" | "write fails mid-table") t_reason="could not write $OUT_FILE" ;;
+        "out file is a directory" | "rename refused") t_reason="could not publish $OUT_FILE" ;;
+        "partial file not removed")
+            t_left_expected="$t_left"
+            t_reason="could not publish $OUT_FILE; partial file $t_left not removed"
+            t_expect "$t_label: one partial file" \
+                "$([[ "$t_left" == "$OUT_FILE".* && "$t_left" != *$'\n'* ]] && echo one)" one
+            ;;
+    esac
+    t_expect "$t_label: verdict" "$T_STATUS|$(<"$T_CASE_DIR/out")" \
+        "0|FAIL table: $t_reason (see $RUN_DIR/table-error.log)
+failed=1"
+    if [[ -d "$OUT_FILE" ]]; then
+        t_after="directory $(compgen -G "$OUT_FILE/*" || true) $(<"$OUT_FILE/kept.md")"
+        t_expected="directory $OUT_FILE/kept.md earlier table"
+    elif [[ -f "$OUT_FILE" ]]; then
+        t_after="file $(<"$OUT_FILE")"
+        t_expected="file earlier table"
+    else
+        t_after="absent"
+        t_expected="absent"
+    fi
+    t_expect "$t_label: out file" "$t_after" "$t_expected"
+    t_expect "$t_label: partial file" "$t_left" "$t_left_expected"
+    t_expect_match "$t_label: error log" "$RUN_DIR/table-error.log" "$t_log"
+done
 t_conclude "$check"
 
 check="finishRun_endOfRun_writesTableAndRestoresFlagOrEndsRun"
@@ -1527,8 +1922,79 @@ t_expect_line "restore refused: verdict" "$T_CASE_DIR/out" \
     "FAIL flag restored: PUT {\"enabled\": true} gave status 500"
 t_conclude "$check"
 
+# t_finish_through_cleanup: finish_run, ended through the script's EXIT trap as a run ends.
+t_finish_through_cleanup() {
+    trap cleanup EXIT
+    finish_run
+}
+
+check="finishRun_tableNotGenerated_failsTableAndExitsOne"
+t_new_case
+FLAG_INITIAL="true"
+printf '%s\n' '{"long_sell_error":' >"$RUN_DIR/breakdown-B.json"
+t_respond PUT "$FLAG_URL" 200 '@request'
+t_respond GET "$FLAG_URL" 200 '{"id":"portfolio-insights-enabled","enabled":true}'
+t_run_sub t_finish_through_cleanup
+t_expect "exit status" "$T_STATUS" 1
+t_expect_line "table verdict" "$T_CASE_DIR/out" \
+    "FAIL table: could not generate the rows of run B (see $RUN_DIR/table-error.log)"
+t_expect_line "flag still restored" "$T_CASE_DIR/out" "PASS flag restored"
+t_expect_line "summary" "$T_CASE_DIR/out" "SUMMARY 2 passed, 1 failed"
+t_expect "no table" "$([[ -e "$OUT_FILE" ]] && echo present || echo absent)" "absent"
+t_conclude "$check"
+
 # ---------------------------------------------------------------------------------------------
 # Cleanup
+
+# t_remaining_owned_with_wc OUTPUT STATUS: remaining_owned with a wc that prints OUTPUT and
+# returns STATUS, as a full disk or a broken tool would leave it. Run it in a subshell, so that
+# only the subshell gets the stub.
+t_remaining_owned_with_wc() {
+    local output="$1" status="$2"
+    # shellcheck disable=SC2329 # Invoked by remaining_owned.
+    wc() {
+        printf '%s' "$output"
+        return "$status"
+    }
+    remaining_owned
+}
+
+check="remainingOwned_ledgerSteps_printsCountOrFailsWithoutOne"
+# ROW|STATUS|OUTPUT: the lists of the run directory, or the wc, of ROW, and the status and output
+# of remaining_owned. A list it cannot read or write and a count it cannot take each fail it with
+# no number, so an unread owned list never passes for an empty one.
+for row in "nothing owned|0|0" "one deleted, one owned twice|0|1" "all deleted|0|0" \
+    "owned list a directory|1|" "deleted list a directory|1|" "sorted owned list not writable|1|" \
+    "sorted deleted list not writable|1|" "to-delete not writable|1|" "count fails|1|" \
+    "count not a number|1|"; do
+    IFS='|' read -r t_label t_status t_output <<<"$row"
+    t_new_case
+    case "$t_label" in
+        "one deleted, one owned twice")
+            printf '%s\n' "$ID2" "$ID1" "$ID2" >"$RUN_DIR/owned"
+            printf '%s\n' "$ID1" >"$RUN_DIR/deleted"
+            ;;
+        "all deleted")
+            printf '%s\n' "$ID1" >"$RUN_DIR/owned"
+            printf '%s\n' "$ID1" >"$RUN_DIR/deleted"
+            ;;
+        "owned list a directory") rm -f "$RUN_DIR/owned" && mkdir "$RUN_DIR/owned" ;;
+        "deleted list a directory") rm -f "$RUN_DIR/deleted" && mkdir "$RUN_DIR/deleted" ;;
+        "sorted owned list not writable") mkdir "$RUN_DIR/owned.sorted" ;;
+        "sorted deleted list not writable") mkdir "$RUN_DIR/deleted.sorted" ;;
+        "to-delete not writable") mkdir "$RUN_DIR/to-delete" ;;
+    esac
+    case "$t_label" in
+        "count fails") t_run_sub t_remaining_owned_with_wc "" 1 ;;
+        "count not a number") t_run_sub t_remaining_owned_with_wc "lines: 1" 0 ;;
+        *) t_run_sub remaining_owned ;;
+    esac
+    t_expect "$t_label: status and output" "$T_STATUS|$(<"$T_CASE_DIR/out")" "$t_status|$t_output"
+    if [[ "$t_label" == "one deleted, one owned twice" ]]; then
+        t_expect "$t_label: to-delete" "$(t_lines "$RUN_DIR/to-delete")" "$ID2"
+    fi
+done
+t_conclude "$check"
 
 check="deleteRemaining_statuses_deletes204And404AndLeavesOthers"
 t_new_case
@@ -1537,7 +2003,7 @@ t_respond DELETE "$ALERTS_URL/$ID1" 204
 t_respond DELETE "$ALERTS_URL/$ID2" 404 '{"error":"not_found"}'
 t_respond DELETE "$ALERTS_URL/$ID3" 500 '{"error":"internal"}'
 t_respond DELETE "$ALERTS_URL/$ID5" 403 '{"error":"feature_disabled"}'
-delete_remaining >"$T_CASE_DIR/out"
+delete_remaining 5 >"$T_CASE_DIR/out"
 t_expect "deleted and left" "$(t_lines "$RUN_DIR/deleted")|$CLEANUP_LEFT" "$ID1 $ID2|3"
 t_expect "left lines" "$(<"$T_CASE_DIR/out")" "INFO cleanup left alert $ID3: status 500
 INFO cleanup left alert $ID4: transport error ($T_CURL_REFUSED)
@@ -1545,10 +2011,13 @@ INFO cleanup left alert $ID5: status 403"
 t_conclude "$check"
 
 check="deleteRemaining_consecutiveTransportErrors_stopsAttemptingAtLimit"
+# Each id that meets only transport errors gets three attempts two seconds apart, so five such
+# ids make 15 requests and 10 waits.
 t_new_case
 t_ids 1 7 >"$RUN_DIR/to-delete"
-delete_remaining >"$T_CASE_DIR/out"
-t_expect "seven transport errors" "$(t_count "$STUB_DIR/http.calls")|$CLEANUP_LEFT" "5|7"
+delete_remaining 7 >"$T_CASE_DIR/out"
+t_expect "seven transport errors" "$(t_count "$STUB_DIR/http.calls")|$CLEANUP_LEFT" "15|7"
+t_expect "waits" "$(t_lines "$STUB_DIR/sleeps")" "2 2 2 2 2 2 2 2 2 2"
 for t_n in 6 7; do
     printf -v t_line 'INFO cleanup left alert %08x-0000-4000-8000-%012x: not attempted after 5 transport errors in a row' \
         "$t_n" "$t_n"
@@ -1558,9 +2027,89 @@ t_new_case
 t_ids 1 14 >"$RUN_DIR/to-delete"
 t_respond DELETE "$ALERTS_URL/$ID5" 204
 t_respond DELETE "$ALERTS_URL/$(t_ids 10 10)" 500 '{"error":"internal"}'
-delete_remaining >"$T_CASE_DIR/out"
+delete_remaining 14 >"$T_CASE_DIR/out"
 t_expect "four errors, a 204, four errors, a 500, four errors" \
-    "$(t_count "$STUB_DIR/http.calls")|$CLEANUP_LEFT" "14|13"
+    "$(t_count "$STUB_DIR/http.calls")|$CLEANUP_LEFT" "38|13"
+t_conclude "$check"
+
+check="deleteRemaining_transportErrorThenAnswer_retriesUntilAnsweredWithinAttempts"
+# ROW:ERRORS:STATUS:CALLS:WAITS:LEFT: ERRORS transport errors come before the answer STATUS. A
+# transport error is retried two seconds later, up to three attempts; any answer is final.
+for row in "one error then 204:1:204:2:2:0" "two errors then 404:2:404:3:2 2:0" \
+    "one error then 500:1:500:2:2:1" "500 at once:0:500:1::1" "errors on every attempt:3:204:3:2 2:1"; do
+    IFS=: read -r t_label t_errors t_status t_calls t_waits t_left <<<"$row"
+    t_new_case
+    printf '%s\n' "$ID1" >"$RUN_DIR/to-delete"
+    t_respond_transient DELETE "$ALERTS_URL/$ID1" "$t_errors"
+    t_respond DELETE "$ALERTS_URL/$ID1" "$t_status" '{}'
+    delete_remaining 1 >"$T_CASE_DIR/out"
+    t_expect "$t_label: requests, waits, left" \
+        "$(t_count "$STUB_DIR/http.calls")|$(t_lines "$STUB_DIR/sleeps")|$CLEANUP_LEFT" \
+        "$t_calls|$t_waits|$t_left"
+    case "$t_label" in
+        "one error then 500" | "500 at once") t_expected="INFO cleanup left alert $ID1: status 500" ;;
+        "errors on every attempt") t_expected="INFO cleanup left alert $ID1: transport error ($T_CURL_REFUSED)" ;;
+        *) t_expected="" ;;
+    esac
+    t_expect "$t_label: output" "$(<"$T_CASE_DIR/out")" "$t_expected"
+    if [[ "$t_left" == "0" ]]; then
+        t_expect "$t_label: deleted" "$(t_lines "$RUN_DIR/deleted")" "$ID1"
+    else
+        t_expect "$t_label: deleted" "$(t_lines "$RUN_DIR/deleted")" ""
+    fi
+done
+t_conclude "$check"
+
+check="deleteRemaining_nonCanonicalLines_refusesThemWithoutRequest"
+# Only an edited run directory can hold such lines; none may reach a URL.
+t_new_case
+printf '%s\n' "$ID1" "$T_DASHES" "../../feature-flag-service/v1/flags/$FLAG_ID" \
+    "ABCDEF01-0000-4000-8000-000000000001" "" "$ID2" >"$RUN_DIR/to-delete"
+t_respond DELETE "$ALERTS_URL/$ID1" 204
+t_respond DELETE "$ALERTS_URL/$ID2" 404 '{"error":"not_found"}'
+delete_remaining 6 >"$T_CASE_DIR/out"
+t_expect "requests" "$(<"$STUB_DIR/http.calls")" "DELETE $ALERTS_URL/$ID1
+DELETE $ALERTS_URL/$ID2"
+t_expect "deleted, left, refused" "$(t_lines "$RUN_DIR/deleted")|$CLEANUP_LEFT|$CLEANUP_REFUSED" \
+    "$ID1 $ID2|4|4"
+for t_n in 2 3 4 5; do
+    t_expect_line "line $t_n refused" "$T_CASE_DIR/out" \
+        "INFO cleanup refused line $t_n of $RUN_DIR/to-delete: not a canonical alert id, never sent"
+done
+t_conclude "$check"
+
+check="deleteRemaining_receiptNotRecorded_countsGoneIdAsLeft"
+# The deleted list takes no line, here because it is a directory: an id a 204 or a 404 shows gone
+# still counts as left, so the check fails and a resume sends its DELETE again.
+t_new_case
+rm -f "$RUN_DIR/deleted"
+mkdir "$RUN_DIR/deleted"
+printf '%s\n' "$ID1" "$ID2" >"$RUN_DIR/to-delete"
+t_respond DELETE "$ALERTS_URL/$ID1" 204
+t_respond DELETE "$ALERTS_URL/$ID2" 404 '{"error":"not_found"}'
+delete_remaining 2 >"$T_CASE_DIR/out" 2>"$T_CASE_DIR/err"
+t_expect "requests and left" "$(t_count "$STUB_DIR/http.calls")|$CLEANUP_LEFT|$CLEANUP_REFUSED" "2|2|0"
+t_expect "left lines" "$(<"$T_CASE_DIR/out")" "INFO cleanup left alert $ID1: gone (status 204), but $RUN_DIR/deleted could not record it; a resume DELETEs it again
+INFO cleanup left alert $ID2: gone (status 404), but $RUN_DIR/deleted could not record it; a resume DELETEs it again"
+t_conclude "$check"
+
+check="deleteRemaining_toDeleteNotReadToItsEnd_countsUnreadIdsAsLeft"
+# ROW|REQUESTS|READ: remaining_owned counted 3 ids, but the read of to-delete fails at once, here
+# because it is a directory, or ends after READ lines; every id it never reached counts as left.
+for row in "to-delete unreadable|0|0" "to-delete ends after one id|1|1"; do
+    IFS='|' read -r t_label t_calls t_read <<<"$row"
+    t_new_case
+    case "$t_label" in
+        "to-delete unreadable") mkdir "$RUN_DIR/to-delete" ;;
+        *) printf '%s\n' "$ID1" >"$RUN_DIR/to-delete" ;;
+    esac
+    t_respond DELETE "$ALERTS_URL/$ID1" 204
+    delete_remaining 3 >"$T_CASE_DIR/out" 2>"$T_CASE_DIR/err"
+    t_expect "$t_label: requests and left" "$(t_count "$STUB_DIR/http.calls")|$CLEANUP_LEFT" \
+        "$t_calls|$((3 - t_read))"
+    t_expect_line "$t_label: left line" "$T_CASE_DIR/out" \
+        "INFO cleanup left $((3 - t_read)) owned alerts: $RUN_DIR/to-delete could not be read past line $t_read"
+done
 t_conclude "$check"
 
 check="cleanup_flagOffWithOwnedAlerts_enablesFlagToDeleteThenRestoresIt"
@@ -1620,6 +2169,68 @@ t_expect_line "loadgen not stopped" "$T_CASE_DIR/out" \
     "FAIL cleanup: loadgen not confirmed stopped: compose stop loadgen failed, exit 1 (see $RUN_DIR/compose.log)"
 t_conclude "$check"
 
+check="cleanup_ownedListUnreadable_failsWithoutDeletingAndRestoresFlagAndLoadgen"
+# The owned list is a directory, so which owned alerts are left is unknown: no flag switch and no
+# DELETE, the check fails and prints the resume command, and the flag and loadgen are restored.
+t_new_case
+rm -f "$RUN_DIR/owned"
+mkdir "$RUN_DIR/owned"
+FLAG_TOUCHED=1
+FLAG_INITIAL="false"
+t_respond PUT "$FLAG_URL" 200 '@request'
+LOADGEN_TOUCHED=1
+TABLE_WRITTEN=1
+LOADGEN_WAS_RUNNING=1
+LOADGEN_AT_START="running, PORTFOLIO_INSIGHTS_ALERT_WEIGHT=0"
+echo loadgen >"$STUB_DIR/running"
+t_run_sub t_exit_through_cleanup 0
+t_expect "exit status and requests" "$T_STATUS|$(<"$STUB_DIR/http.calls")" \
+    "1|PUT $FLAG_URL {\"enabled\": false}"
+t_expect_line "verdict" "$T_CASE_DIR/out" \
+    "FAIL cleanup: owned-alert lists of the run dir could not be read or written, owned alerts not deleted"
+t_expect_line "flag restored" "$T_CASE_DIR/out" "INFO cleanup: flag $FLAG_ID restored to enabled=false"
+t_expect "loadgen recreated" "$(t_lines "$STUB_DIR/up.env")" "PORTFOLIO_INSIGHTS_ALERT_WEIGHT=0"
+t_expect_line "loadgen restored" "$T_CASE_DIR/out" \
+    "INFO cleanup: loadgen restored as at start: running, PORTFOLIO_INSIGHTS_ALERT_WEIGHT=0"
+printf -v t_line '%s --resume-cleanup %q' \
+    "INFO cleanup: to delete the owned alerts left, and only those, run: scripts/portfolio-insights/loadgen-check.sh --project et-test --base-url http://stub.invalid --compose-file compose.dev.yaml" \
+    "$RUN_DIR"
+t_expect_line "resume command" "$T_CASE_DIR/out" "$t_line"
+t_expect_line "summary" "$T_CASE_DIR/out" "SUMMARY 0 passed, 1 failed"
+t_conclude "$check"
+
+check="cleanup_receiptNotRecorded_failsWithIdLeftAndRestoresFlag"
+# The DELETE answers 204, but the read-only deleted list cannot record it: the id counts as left,
+# the check fails and prints the resume command, and the flag is still restored.
+t_new_case
+FLAG_INITIAL="false"
+printf '%s\n' "$ID1" >"$RUN_DIR/owned"
+t_respond GET "$FLAG_URL" 200 '{"id":"portfolio-insights-enabled","enabled":false}'
+t_respond PUT "$FLAG_URL" 200 '@request'
+t_respond DELETE "$ALERTS_URL/$ID1" 204
+chmod a-w "$RUN_DIR/deleted"
+# A user who can write a read-only file, as root can, cannot set up this case.
+if [[ -w "$RUN_DIR/deleted" ]]; then
+    t_reasons+=("chmod a-w left $RUN_DIR/deleted writable")
+fi
+t_run_sub t_exit_through_cleanup 0
+chmod u+w "$RUN_DIR/deleted"
+t_expect "exit status and requests" "$T_STATUS|$(<"$STUB_DIR/http.calls")" "1|GET $FLAG_URL
+PUT $FLAG_URL {\"enabled\": true}
+DELETE $ALERTS_URL/$ID1
+PUT $FLAG_URL {\"enabled\": false}"
+t_expect "deleted list" "$(t_count "$RUN_DIR/deleted")" 0
+t_expect_line "id left" "$T_CASE_DIR/out" \
+    "INFO cleanup left alert $ID1: gone (status 204), but $RUN_DIR/deleted could not record it; a resume DELETEs it again"
+t_expect_line "count" "$T_CASE_DIR/out" "INFO cleanup: 0 of 1 owned alerts deleted or already absent"
+t_expect_line "flag restored" "$T_CASE_DIR/out" "INFO cleanup: flag $FLAG_ID restored to enabled=false"
+printf -v t_line '%s --resume-cleanup %q' \
+    "INFO cleanup: to delete the owned alerts left, and only those, run: scripts/portfolio-insights/loadgen-check.sh --project et-test --base-url http://stub.invalid --compose-file compose.dev.yaml" \
+    "$RUN_DIR"
+t_expect_line "resume command" "$T_CASE_DIR/out" "$t_line"
+t_expect_line "verdict" "$T_CASE_DIR/out" "FAIL cleanup: 1 owned alerts left in place"
+t_conclude "$check"
+
 check="cleanup_runStatus_exitsWithRunStatusOrOneAfterAFailedCheck"
 for row in "clean run:0:0:0" "earlier check failed:0:1:1" "aborted run:1:1:1" "interrupt:130:0:130"; do
     IFS=: read -r t_label t_exit t_failed t_expected <<<"$row"
@@ -1631,6 +2242,391 @@ for row in "clean run:0:0:0" "earlier check failed:0:1:1" "aborted run:1:1:1" "i
     t_expect_line "$t_label: cleanup verdict" "$T_CASE_DIR/out" "PASS cleanup"
     t_expect_line "$t_label: summary" "$T_CASE_DIR/out" "SUMMARY 3 passed, $t_failed failed"
 done
+t_conclude "$check"
+
+# ---------------------------------------------------------------------------------------------
+# Recovery record and --resume-cleanup
+
+# t_main_in DIR ARGS...: main ARGS with TMPDIR set to DIR, where main creates its run directory.
+t_main_in() {
+    TMPDIR="$1"
+    shift
+    main "$@"
+}
+
+# t_main_in_without_jq DIR ARGS...: t_main_in DIR ARGS with a jq that fails, as on a full disk.
+# Run it in a subshell, so that only the subshell gets the stub.
+t_main_in_without_jq() {
+    # shellcheck disable=SC2329 # Invoked by write_recovery_record.
+    jq() {
+        echo "jq: error: No space left on device" >&2
+        return 2
+    }
+    t_main_in "$@"
+}
+
+check="main_newRun_writesRecoveryRecordOrExitsTwo"
+t_new_case
+mkdir -p "$T_CASE_DIR/tmp"
+: >"$T_CASE_DIR/compose.yaml"
+t_run_sub t_main_in "$T_CASE_DIR/tmp" --project et-test --base-url http://stub.invalid/ \
+    --compose-file "$T_CASE_DIR/compose.yaml"
+t_run_dirs=("$T_CASE_DIR"/tmp/pi-loadgen.*)
+t_expect "run directories" "${#t_run_dirs[@]}" 1
+t_expect "record" "$(jq -c . "${t_run_dirs[0]}/recovery" 2>&1 | tr -d '\r')" \
+    "{\"project\":\"et-test\",\"baseUrl\":\"http://stub.invalid\",\"composeFiles\":[\"$T_CASE_DIR/compose.yaml\"]}"
+t_expect "owned and deleted lists" \
+    "$(t_count "${t_run_dirs[0]}/owned") $(t_count "${t_run_dirs[0]}/deleted")" "0 0"
+t_new_case
+mkdir -p "$T_CASE_DIR/tmp"
+: >"$T_CASE_DIR/compose.yaml"
+t_run_sub t_main_in_without_jq "$T_CASE_DIR/tmp" --project et-test --base-url http://stub.invalid \
+    --compose-file "$T_CASE_DIR/compose.yaml"
+t_expect "record not written: exit status and requests" "$T_STATUS|$(<"$STUB_DIR/http.calls")" "2|"
+t_expect_match "record not written: message" "$T_CASE_DIR/err" \
+    '^Could not write the recovery record .*/pi-loadgen\.[^/]+/recovery\.$'
+t_conclude "$check"
+
+# The base URL of the resume cases: the reverse proxy of project et-test publishes its port 80
+# there, on every address, as docker compose port prints it.
+T_RESUME_BASE="http://localhost:20480"
+T_RESUME_PUBLISHED="0.0.0.0:20480"
+
+# t_resumable_run_dir [BASE [PUBLISHED]]: the case's run directory as a run of project et-test
+# against BASE (default T_RESUME_BASE) leaves it when its cleanup deleted ID1 of the owned ID1,
+# ID2 and ID3; BASE_URL, FLAG_URL and ALERTS_URL as main derives them from BASE; and the stub
+# answers of that project's stack, whose running reverse-proxy has its port 80 published at
+# PUBLISHED (default T_RESUME_PUBLISHED).
+t_resumable_run_dir() {
+    BASE_URL="${1:-$T_RESUME_BASE}"
+    FLAG_URL="$BASE_URL/feature-flag-service/v1/flags/$FLAG_ID"
+    ALERTS_URL="$BASE_URL/broker-service/v1/alerts"
+    : >"$T_CASE_DIR/compose.yaml"
+    COMPOSE_FILES=("$T_CASE_DIR/compose.yaml")
+    write_recovery_record
+    printf '%s\n' "$ID3" "$ID1" "$ID2" "$ID1" >"$RUN_DIR/owned"
+    printf '%s\n' "$ID1" >"$RUN_DIR/deleted"
+    printf '%s\n' broker-service db db-adapter feature-flag-service reverse-proxy >"$STUB_DIR/running"
+    printf '%s\n' "${2:-$T_RESUME_PUBLISHED}" >"$STUB_DIR/port.reverse-proxy"
+}
+
+# t_resume ARGS...: main ARGS --resume-cleanup RUN_DIR, with the case's compose file.
+t_resume() {
+    main --compose-file "$T_CASE_DIR/compose.yaml" "$@" --resume-cleanup "$RUN_DIR"
+}
+
+check="main_resumeCleanupRefused_exitsTwoBeforeAnyRequest"
+for row in "another project" "another base URL" "no record" "record not JSON" "two records" \
+    "record field mistyped" "owned list missing" "deleted list missing" "deleted list read-only"; do
+    t_new_case
+    t_resumable_run_dir
+    t_project="et-test"
+    t_base="$T_RESUME_BASE"
+    t_reason="its recovery record is not one this script writes"
+    case "$row" in
+        "another project")
+            t_project="et-other"
+            t_reason="its run was against another Compose project than --project"
+            ;;
+        "another base URL")
+            t_base="http://other.invalid"
+            t_reason="its run was against another base URL than --base-url"
+            ;;
+        "no record")
+            rm -f "$RUN_DIR/recovery"
+            t_reason="it holds no readable recovery record"
+            ;;
+        "record not JSON") echo "project=et-test" >"$RUN_DIR/recovery" ;;
+        "two records")
+            cat "$RUN_DIR/recovery" "$RUN_DIR/recovery" >"$RUN_DIR/recovery.twice"
+            mv "$RUN_DIR/recovery.twice" "$RUN_DIR/recovery"
+            ;;
+        "record field mistyped")
+            printf '%s\n' '{"project":"et-test","baseUrl":"http://stub.invalid","composeFiles":[1]}' \
+                >"$RUN_DIR/recovery"
+            ;;
+        "owned list missing")
+            rm -f "$RUN_DIR/owned"
+            t_reason="its owned list is missing or unreadable"
+            ;;
+        "deleted list missing")
+            rm -f "$RUN_DIR/deleted"
+            t_reason="its deleted list is missing or unreadable"
+            ;;
+        "deleted list read-only")
+            chmod a-w "$RUN_DIR/deleted"
+            t_reason="it is not writable, so no deletion could be recorded"
+            # A user who can write a read-only file, as root can, cannot set up this row.
+            if [[ -w "$RUN_DIR/deleted" ]]; then
+                t_reasons+=("$row: chmod a-w left $RUN_DIR/deleted writable")
+            fi
+            ;;
+    esac
+    t_run_sub t_resume --project "$t_project" --base-url "$t_base"
+    t_expect "$row" "$T_STATUS|$(<"$T_CASE_DIR/err")|$(<"$STUB_DIR/http.calls")" \
+        "2|Cannot resume the cleanup of $RUN_DIR: $t_reason.|"
+    if [[ -f "$RUN_DIR/deleted" ]]; then
+        chmod u+w "$RUN_DIR/deleted"
+    fi
+done
+t_conclude "$check"
+
+check="main_resumeCleanup_deletesOnlyOwnedIdsNotDeletedAndRestoresFlag"
+t_new_case
+t_resumable_run_dir
+echo "earlier verdict" >"$RUN_DIR/verdicts"
+t_respond GET "$FLAG_URL" 200 '{"id":"portfolio-insights-enabled","enabled":false,"isModifiable":true}'
+t_respond PUT "$FLAG_URL" 200 '@request'
+t_respond DELETE "$ALERTS_URL/$ID2" 204
+t_respond DELETE "$ALERTS_URL/$ID3" 404 '{"error":"not_found"}'
+# A trailing slash on --base-url is the origin the record holds.
+t_run_sub t_resume --project et-test --base-url "$T_RESUME_BASE/"
+t_expect "exit status" "$T_STATUS" 0
+t_expect "requests" "$(<"$STUB_DIR/http.calls")" "GET $FLAG_URL
+GET $FLAG_URL
+PUT $FLAG_URL {\"enabled\": true}
+DELETE $ALERTS_URL/$ID2
+DELETE $ALERTS_URL/$ID3
+PUT $FLAG_URL {\"enabled\": false}"
+t_expect_line "flag read" "$T_CASE_DIR/out" "PASS resume flag: enabled=false"
+t_expect_line "ids left" "$T_CASE_DIR/out" \
+    "INFO resume: 2 owned alerts of this run directory are not deleted yet"
+t_expect_line "ids deleted" "$T_CASE_DIR/out" "INFO cleanup: 2 of 2 owned alerts deleted or already absent"
+t_expect_line "flag restored" "$T_CASE_DIR/out" "INFO cleanup: flag $FLAG_ID restored to enabled=false"
+t_expect_line "cleanup verdict" "$T_CASE_DIR/out" "PASS cleanup"
+t_expect_line "summary" "$T_CASE_DIR/out" "SUMMARY 2 passed, 0 failed"
+t_expect "deleted list" "$(t_lines "$RUN_DIR/deleted")" "$ID1 $ID2 $ID3"
+# Besides check_tools's docker compose version, the only Docker calls are the two reads that bind
+# --base-url to the project: no loadgen or database call.
+t_calls="$(<"$STUB_DIR/docker.calls")"
+t_expect "docker calls: the origin's two reads alone" "${t_calls#*$'\n'version$'\n'--$'\n'}" "MSYS_NO_PATHCONV=1
+compose
+-p
+et-test
+-f
+$T_CASE_DIR/compose.yaml
+ps
+--status
+running
+--services
+--
+MSYS_NO_PATHCONV=1
+compose
+-p
+et-test
+-f
+$T_CASE_DIR/compose.yaml
+port
+reverse-proxy
+80
+--"
+t_expect_line "origin bound" "$T_CASE_DIR/out" \
+    "INFO resume: --base-url reaches reverse-proxy of project [et-test], port 80 published at $T_RESUME_PUBLISHED"
+t_expect "earlier evidence" \
+    "$(<"$RUN_DIR/verdicts")|$([[ -e "$RUN_DIR/loadgen-families.md" ]] && echo table || echo no table)" \
+    "earlier verdict|no table"
+# A second resume goes on from the deleted list: nothing is left, so it only reads the flag.
+: >"$STUB_DIR/http.calls"
+t_run_sub t_resume --project et-test --base-url "$T_RESUME_BASE"
+t_expect "second resume: exit status and requests" "$T_STATUS|$(<"$STUB_DIR/http.calls")" \
+    "0|GET $FLAG_URL"
+t_expect_line "second resume: ids left" "$T_CASE_DIR/out" \
+    "INFO resume: 0 owned alerts of this run directory are not deleted yet"
+t_expect_line "second resume: cleanup verdict" "$T_CASE_DIR/out" "PASS cleanup"
+t_conclude "$check"
+
+check="main_resumeCleanupFlagUnreadable_exitsOneWithoutDeleting"
+# ROW|ANSWER|REASON: the flag read's status and body, and the reason the check gives.
+for row in "flag service fails|500 {\"error\":\"internal\"}|GET $FLAG_ID gave status 500" \
+    "enabled a string|200 {\"id\":\"$FLAG_ID\",\"enabled\":\"false\"}|GET $FLAG_ID answered without its id and a boolean enabled" \
+    "another flag|200 {\"id\":\"other\",\"enabled\":false}|GET $FLAG_ID answered without its id and a boolean enabled"; do
+    IFS='|' read -r t_label t_answer t_reason <<<"$row"
+    t_new_case
+    t_resumable_run_dir
+    t_respond GET "$FLAG_URL" "${t_answer%% *}" "${t_answer#* }"
+    t_respond DELETE "$ALERTS_URL/$ID2" 204
+    t_run_sub t_resume --project et-test --base-url "$T_RESUME_BASE"
+    t_expect "$t_label: exit status and requests" "$T_STATUS|$(<"$STUB_DIR/http.calls")" "1|GET $FLAG_URL"
+    t_expect_line "$t_label: verdict" "$T_CASE_DIR/out" "FAIL resume flag: $t_reason; nothing was deleted"
+    t_expect_line "$t_label: summary" "$T_CASE_DIR/out" "SUMMARY 0 passed, 1 failed"
+    t_expect "$t_label: deleted list" "$(t_lines "$RUN_DIR/deleted")" "$ID1"
+done
+t_conclude "$check"
+
+check="main_resumeCleanupLedgerUnwritable_printsNoCountAndFailsCleanup"
+# The sorted owned list cannot be written, here because it is a directory, so remaining_owned
+# fails: the resume prints no count of the ids left, and cleanup deletes none, switches no flag
+# and fails on the lists, printing the resume command again.
+t_new_case
+t_resumable_run_dir
+mkdir "$RUN_DIR/owned.sorted"
+t_respond GET "$FLAG_URL" 200 '{"id":"portfolio-insights-enabled","enabled":false}'
+t_respond PUT "$FLAG_URL" 200 '@request'
+t_respond DELETE "$ALERTS_URL/$ID2" 204
+t_respond DELETE "$ALERTS_URL/$ID3" 204
+t_run_sub t_resume --project et-test --base-url "$T_RESUME_BASE"
+t_expect "exit status and requests" "$T_STATUS|$(<"$STUB_DIR/http.calls")" "1|GET $FLAG_URL"
+t_expect_line "flag read" "$T_CASE_DIR/out" "PASS resume flag: enabled=false"
+t_expect_no_match "no count of the ids left" "$T_CASE_DIR/out" '^INFO resume: .*owned alerts'
+t_expect_line "cleanup verdict" "$T_CASE_DIR/out" \
+    "FAIL cleanup: owned-alert lists of the run dir could not be read or written, owned alerts not deleted"
+printf -v t_line 'INFO cleanup: to delete the owned alerts left, and only those, run: %s --project %q --base-url %q --compose-file %q --resume-cleanup %q' \
+    scripts/portfolio-insights/loadgen-check.sh et-test "$T_RESUME_BASE" "$T_CASE_DIR/compose.yaml" \
+    "$RUN_DIR"
+t_expect_line "resume command" "$T_CASE_DIR/out" "$t_line"
+t_expect_line "summary" "$T_CASE_DIR/out" "SUMMARY 1 passed, 1 failed"
+t_expect "deleted list" "$(t_lines "$RUN_DIR/deleted")" "$ID1"
+t_conclude "$check"
+
+check="main_resumeCleanupOriginServedByProject_proceeds"
+# ROW|BASE|PUBLISHED: --base-url, and where the project's reverse-proxy has its port 80 published
+# as docker compose port prints it, IPv6 hosts unbracketed.
+for row in "wildcard binding, localhost|http://localhost:20480|0.0.0.0:20480" \
+    "IPv6 wildcard binding, [::1]|http://[::1]:20480|:::20480" \
+    "IPv4 wildcard binding, [::1]|http://[::1]:20480|0.0.0.0:20480" \
+    "IPv6 wildcard binding, 127.0.0.1|http://127.0.0.1:20480|:::20480" \
+    "loopback binding, localhost|http://localhost:20480|127.0.0.1:20480" \
+    "IPv6 loopback binding, localhost in capitals|http://LOCALHOST:20480|::1:20480" \
+    "binding on the address the base URL names|http://192.0.2.10:20480|192.0.2.10:20480" \
+    "default http port|http://127.0.0.1|0.0.0.0:80" \
+    "default https port|https://localhost|0.0.0.0:443"; do
+    IFS='|' read -r t_label t_base t_published <<<"$row"
+    t_new_case
+    t_resumable_run_dir "$t_base" "$t_published"
+    t_respond GET "$FLAG_URL" 200 '{"id":"portfolio-insights-enabled","enabled":true}'
+    t_respond DELETE "$ALERTS_URL/$ID2" 204
+    t_respond DELETE "$ALERTS_URL/$ID3" 204
+    t_run_sub t_resume --project et-test --base-url "$t_base"
+    t_expect "$t_label: exit status and deleted list" "$T_STATUS|$(t_lines "$RUN_DIR/deleted")" \
+        "0|$ID1 $ID2 $ID3"
+    t_expect_line "$t_label: origin bound" "$T_CASE_DIR/out" \
+        "INFO resume: --base-url reaches reverse-proxy of project [et-test], port 80 published at $t_published"
+done
+t_conclude "$check"
+
+check="main_resumeCleanupOriginNotShownToBeProjects_exitsTwoBeforeAnyRequest"
+for row in "reverse-proxy not running in --project" "running services unreadable" \
+    "port call fails" "port call cut off" "no HOST:PORT printed" "published host not an address" \
+    "published port differs" "default port differs" "non-loopback base URL host, wildcard binding" \
+    "IPv4 loopback base URL, IPv6 loopback binding" "binding on another host address"; do
+    t_new_case
+    t_base="$T_RESUME_BASE"
+    t_published="$T_RESUME_PUBLISHED"
+    t_reason="port 80 of reverse-proxy in --project is published on a host address that --base-url is not shown to reach"
+    case "$row" in
+        "published host not an address") t_published="localhost:20480" ;;
+        "published port differs") t_published="0.0.0.0:20481" ;;
+        "default port differs") t_base="http://localhost" ;;
+        "non-loopback base URL host, wildcard binding") t_base="http://192.0.2.10:20480" ;;
+        "IPv4 loopback base URL, IPv6 loopback binding")
+            t_base="http://127.0.0.1:20480"
+            t_published="::1:20480"
+            ;;
+        "binding on another host address") t_published="192.0.2.10:20480" ;;
+    esac
+    t_resumable_run_dir "$t_base" "$t_published"
+    t_respond GET "$FLAG_URL" 200 '{"id":"portfolio-insights-enabled","enabled":true}'
+    t_respond DELETE "$ALERTS_URL/$ID2" 204
+    t_respond DELETE "$ALERTS_URL/$ID3" 204
+    case "$row" in
+        "reverse-proxy not running in --project")
+            # The origin is another project's: this one runs no reverse proxy.
+            printf '%s\n' broker-service db db-adapter feature-flag-service >"$STUB_DIR/running"
+            t_reason="reverse-proxy is not running in --project, so the stack at --base-url may be another project's"
+            ;;
+        "running services unreadable")
+            STUB_PS_STATUS=1
+            t_reason="listing the running services of --project failed, exit 1 (see $RUN_DIR/compose.log)"
+            ;;
+        "port call fails")
+            STUB_PORT_STATUS=1
+            t_reason="reading where --project publishes port 80 of reverse-proxy failed, exit 1 (see $RUN_DIR/compose.log)"
+            ;;
+        "port call cut off")
+            STUB_PORT_STATUS=124
+            t_reason="reading where --project publishes port 80 of reverse-proxy timed out after $DOCKER_CALL_TIMEOUT_SECONDS s (Docker did not answer)"
+            ;;
+        "no HOST:PORT printed" | "published host not an address")
+            if [[ "$row" == "no HOST:PORT printed" ]]; then
+                : >"$STUB_DIR/port.reverse-proxy"
+            fi
+            t_reason="docker compose port printed no HOST:PORT for port 80 of reverse-proxy in --project"
+            ;;
+        "published port differs" | "default port differs")
+            t_reason="port 80 of reverse-proxy in --project is published on another port than --base-url names"
+            ;;
+    esac
+    t_run_sub t_resume --project et-test --base-url "$t_base"
+    t_expect "$row" "$T_STATUS|$(<"$T_CASE_DIR/err")|$(<"$STUB_DIR/http.calls")|$(t_lines "$RUN_DIR/deleted")" \
+        "2|Cannot resume the cleanup of $RUN_DIR: $t_reason.||$ID1"
+    if [[ "$row" == "port call fails" ]]; then
+        t_expect_line "$row: Docker's error kept in compose.log" "$RUN_DIR/compose.log" \
+            'service "reverse-proxy" is not running'
+    fi
+done
+t_conclude "$check"
+
+check="cleanup_alertsLeft_printsResumeCommandOnlyForIdsLeft"
+# ROW: which owned alerts cleanup leaves, and the Compose files of the run.
+for row in "one left" "one left, compose file with a space" "only a refused line left" "none left"; do
+    t_new_case
+    FLAG_INITIAL="true"
+    t_respond GET "$FLAG_URL" 200 '{"id":"portfolio-insights-enabled","enabled":true}'
+    t_respond DELETE "$ALERTS_URL/$ID1" 500 '{"error":"internal"}'
+    t_respond DELETE "$ALERTS_URL/$ID2" 204
+    t_extra=""
+    case "$row" in
+        "one left") printf '%s\n' "$ID1" "$ID2" >"$RUN_DIR/owned" ;;
+        "one left, compose file with a space")
+            printf '%s\n' "$ID1" "$ID2" >"$RUN_DIR/owned"
+            COMPOSE_FILES=("compose.dev.yaml" "my override.yaml")
+            t_extra=" --compose-file my\\ override.yaml"
+            ;;
+        "only a refused line left") printf '%s\n' "not-an-id" "$ID2" >"$RUN_DIR/owned" ;;
+        "none left") printf '%s\n' "$ID2" >"$RUN_DIR/owned" ;;
+    esac
+    t_run_sub t_exit_through_cleanup 0
+    printf -v t_line '%s%s --resume-cleanup %q' \
+        "INFO cleanup: to delete the owned alerts left, and only those, run: scripts/portfolio-insights/loadgen-check.sh --project et-test --base-url http://stub.invalid --compose-file compose.dev.yaml" \
+        "$t_extra" "$RUN_DIR"
+    case "$row" in
+        "one left"*)
+            t_expect_line "$row: command" "$T_CASE_DIR/out" "$t_line"
+            t_expect_line "$row: verdict" "$T_CASE_DIR/out" "FAIL cleanup: 1 owned alerts left in place"
+            ;;
+        "only a refused line left")
+            t_expect_no_match "$row: command" "$T_CASE_DIR/out" '^INFO cleanup: to delete'
+            t_expect_line "$row: verdict" "$T_CASE_DIR/out" "FAIL cleanup: 1 owned alerts left in place"
+            ;;
+        "none left")
+            t_expect_no_match "$row: command" "$T_CASE_DIR/out" '^INFO cleanup: to delete'
+            t_expect_line "$row: verdict" "$T_CASE_DIR/out" "PASS cleanup"
+            ;;
+    esac
+done
+t_conclude "$check"
+
+check="cleanup_leftThenResumed_resumeDeletesOnlyTheIdLeft"
+# A run's cleanup leaves ID1 while the broker fails; the resume after the broker recovers sends
+# one DELETE, of ID1, and passes.
+t_new_case
+t_resumable_run_dir
+: >"$RUN_DIR/deleted"
+printf '%s\n' "$ID1" "$ID2" >"$RUN_DIR/owned"
+FLAG_INITIAL="true"
+t_respond GET "$FLAG_URL" 200 '{"id":"portfolio-insights-enabled","enabled":true}'
+t_respond DELETE "$ALERTS_URL/$ID2" 204
+t_respond_transient DELETE "$ALERTS_URL/$ID1" 3
+t_respond DELETE "$ALERTS_URL/$ID1" 204
+t_run_sub t_exit_through_cleanup 0
+t_expect "run: exit status and deleted list" "$T_STATUS|$(t_lines "$RUN_DIR/deleted")" "1|$ID2"
+: >"$STUB_DIR/http.calls"
+t_run_sub t_resume --project et-test --base-url "$T_RESUME_BASE"
+t_expect "resume: exit status and requests" "$T_STATUS|$(<"$STUB_DIR/http.calls")" "0|GET $FLAG_URL
+GET $FLAG_URL
+DELETE $ALERTS_URL/$ID1"
+t_expect "resume: deleted list" "$(t_lines "$RUN_DIR/deleted")" "$ID2 $ID1"
+t_expect_line "resume: cleanup verdict" "$T_CASE_DIR/out" "PASS cleanup"
 t_conclude "$check"
 
 echo "SUMMARY ${cases_passed} passed, ${cases_failed} failed"

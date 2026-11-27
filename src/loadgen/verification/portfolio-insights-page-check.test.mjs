@@ -1994,12 +1994,17 @@ test("insightsShapeProblem_body_namesFirstProblemOrNull", async (t) => {
 
 test("formatInPage_values_formatAsFormatterContext", async (t) => {
     const currency = (n, text) => ({
-        values: { currency: [n], percent: [] },
-        expected: { currency: [text], percent: [] },
+        values: { currency: [n], signedCurrency: [], percent: [] },
+        expected: { currency: [text], signedCurrency: [], percent: [] },
+    })
+    // The signed P/L, as InsightsSummary writes it from formatCurrency.
+    const signed = (n, text) => ({
+        values: { currency: [], signedCurrency: [n], percent: [] },
+        expected: { currency: [], signedCurrency: [text], percent: [] },
     })
     const percent = (n, text) => ({
-        values: { currency: [], percent: [n] },
-        expected: { currency: [], percent: [text] },
+        values: { currency: [], signedCurrency: [], percent: [n] },
+        expected: { currency: [], signedCurrency: [], percent: [text] },
     })
     const rows = [
         {
@@ -2018,6 +2023,33 @@ test("formatInPage_values_formatAsFormatterContext", async (t) => {
         { name: "zeroCurrency_smallFormat", ...currency(0, "$0") },
         // FormatterContext gives every value below 0.01 the small format.
         { name: "negativeCurrency_smallFormat", ...currency(-12.3, "-$12.3") },
+        { name: "signedGain_twoDecimals", ...signed(8.04, "$8.04") },
+        {
+            name: "signedLoss_twoDecimalsAfterSign",
+            ...signed(-1.56839895, "-$1.57"),
+        },
+        // Below one cent the magnitude is rounded to whole cents first.
+        {
+            name: "signedLossHalfCent_oneCentAfterSign",
+            ...signed(-0.005, "-$0.01"),
+        },
+        {
+            name: "signedGainBelowOneCent_oneCent",
+            ...signed(0.006, "$0.01"),
+        },
+        {
+            name: "signedLossBelowOneCent_oneCentAfterSign",
+            ...signed(-0.006, "-$0.01"),
+        },
+        {
+            name: "signedGainBelowHalfCent_unsignedZero",
+            ...signed(0.004, "$0"),
+        },
+        {
+            name: "signedLossBelowHalfCent_unsignedZero",
+            ...signed(-0.004, "$0"),
+        },
+        { name: "signedZero_smallFormat", ...signed(0, "$0") },
         { name: "positivePercent_signed", ...percent(12.345, "+12.35%") },
         { name: "negativePercent_signed", ...percent(-5, "-5.00%") },
         { name: "zeroPercent_unsigned", ...percent(0, "0.00%") },

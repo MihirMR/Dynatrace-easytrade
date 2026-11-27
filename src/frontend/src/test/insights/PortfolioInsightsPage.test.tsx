@@ -6,7 +6,11 @@ import {
     QueryClientProvider,
     focusManager,
 } from "@tanstack/react-query"
-import { PortfolioInsights } from "../../pages/protected/PortfolioInsights"
+import {
+    ALLOCATION_ROWS_STORAGE_KEY,
+    MAX_ALLOCATION_ROWS,
+    PortfolioInsights,
+} from "../../pages/protected/PortfolioInsights"
 import { BizEvents } from "../../api/bizEvents"
 import { ApiError } from "../../api/http"
 import type { PortfolioInsights as InsightsResponse } from "../../api/portfolioInsights/types"
@@ -21,11 +25,21 @@ import {
     onPortfolioInsightsDisabled,
     recordFeatureResultContext,
 } from "../../utils/portfolioInsightsFeature"
-import { featureFlagKeys, portfolioKeys } from "../../utils/queryKeys"
+import {
+    alertKeys,
+    featureFlagKeys,
+    instrumentKeys,
+    portfolioKeys,
+} from "../../utils/queryKeys"
 import { FormatterWrapper, ToastWrapper } from "../providers"
 
-// Covers the page's own branches: loading, error, disclaimer, and the view
-// event, sent once per mount for the first result that is current for the
+// Covers the page's own branches: loading, with the allocation rows its
+// placeholder reserves from the tab's record, the cached instruments or, with
+// neither, the instruments once they settle, before which it shows neither
+// the placeholder nor the alerts panel; error, which keeps a reserved
+// footprint hidden under its message; disclaimer, and the view event, sent
+// once per mount for the first
+// result that is current for the
 // request that produced it: after an in-place account change, only for the
 // new account, and after a shutdown and resume while the page stays mounted,
 // for the result loaded afresh. The 403 case checks that the shared shutdown, which the
@@ -351,6 +365,109 @@ async function advance(ms: number): Promise<void> {
     })
 }
 
+/** Every id the loaded summary of `insights` shows, the figures and the table. */
+const SUMMARY_IDS = [
+    "insights-total-value",
+    "insights-total-invested",
+    "insights-unrealized-pnl",
+    "insights-unrealized-pnl-percent",
+    "insights-largest-position",
+    "insights-risk-badge",
+    "insights-allocations-heading",
+    "insights-allocations",
+]
+
+/** What the loading placeholder reserves below its figure cards. */
+type ReservedFootprint = { allocationRows: number; emptyStates: number }
+
+/**
+ * One reserved row: what the page reserves when it remembers no count, has
+ * none of the account's instruments cached, and its instruments request
+ * fails.
+ */
+const DEFAULT_FOOTPRINT: ReservedFootprint = {
+    allocationRows: 1,
+    emptyStates: 0,
+}
+
+/**
+ * One reserved row per holding of the stub's instrument listing, EasyTravel
+ * and EasyHealth: what the page reserves when it remembers no usable count
+ * and has none of the account's instruments cached, once its instruments
+ * query loads that listing.
+ */
+const LISTING_FOOTPRINT: ReservedFootprint = {
+    allocationRows: 2,
+    emptyStates: 0,
+}
+
+/**
+ * An instrument listing of `count` instruments, the first `held` of them
+ * owned; its ids differ from those of the stub's listing.
+ */
+function instrumentListing(count: number, held: number): Instrument[] {
+    return Array.from({ length: count }, (_, index) => ({
+        ...instruments[0],
+        id: `d0000000-0000-4000-8000-${String(index).padStart(12, "0")}`,
+        code: `EINS${index}`,
+        name: `Instrument ${index}`,
+        amount: index < held ? index + 1 : 0,
+    }))
+}
+
+function reservedFootprint(): ReservedFootprint | null {
+    const placeholder = document.querySelector(
+        '.insights-content[aria-hidden="true"]'
+    )
+    if (placeholder === null) {
+        return null
+    }
+    return {
+        allocationRows: placeholder.querySelectorAll(
+            "table.data-table tbody tr"
+        ).length,
+        emptyStates: placeholder.querySelectorAll("p.empty-state").length,
+    }
+}
+
+/** The tab's remembered allocation rows record, parsed; `null` when absent. */
+function rememberedRecord(): unknown {
+    const text = sessionStorage.getItem(ALLOCATION_ROWS_STORAGE_KEY)
+    return text === null ? null : JSON.parse(text)
+}
+
+/**
+ * The summary block's children, each by its id or else its class, the status
+ * region's role and text, the reserved footprint, and whether the alerts
+ * panel below the block is shown.
+ */
+function summaryAndPanel() {
+    const block = document.querySelector(".insights-summary-block")
+    const statusRegion = document.getElementById("insights-status")
+    return {
+        blockChildren: Array.from(
+            block?.children ?? [],
+            (child) => child.id || child.className
+        ),
+        status: {
+            role: statusRegion?.getAttribute("role") ?? null,
+            text: statusRegion?.textContent ?? null,
+        },
+        reserved: reservedFootprint(),
+        panelShown: document.getElementById("alerts-panel") !== null,
+    }
+}
+
+/** What `summaryAndPanel` reads while the placeholder of `reserved` shows. */
+function reservingState(reserved: ReservedFootprint) {
+    return {
+        blockChildren: ["insights-status", "insights-content"],
+        status: { role: "status", text: "Loading portfolio insights\u2026" },
+        reserved,
+        panelShown: true,
+    }
+}
+
 describe("PortfolioInsights page", () => {
     beforeEach(() => {
         // Read by the activation guard every feature request passes through.
@@ -391,6 +508,799 @@ describe("PortfolioInsights page", () => {
         const statusRegion = document.getElementById("insights-status")
         expect(statusRegion).toHaveAttribute("role", "status")
         expect(statusRegion).toContainElement(loading)
+    })
+
+    it("portfolioInsightsPage_loading_reservesSummaryWithHiddenPlaceholder", async () => {
+        stub = stubFetch({
+            [INSIGHTS_KEY]: heldHandler({ status: 200, body: insights }),
+        })
+        renderPage(client)
+        const loading = await screen.findByText(
+            "Loading portfolio insights\u2026"
+        )
+
+        const placeholder = document.querySelector(".insights-content")
+        const statusRegion = document.getElementById("insights-status")
+        expect({
+            hidden: placeholder?.getAttribute("aria-hidden"),
+            labels: Array.from(
+                placeholder?.querySelectorAll(
+                    ".insights-summary > .insights-figure > .form-label"
+                ) ?? [],
+                (label) => label.textContent
+            ),
+            allocationRows: placeholder?.querySelectorAll(
+                "table.data-table tbody tr"
+            ).length,
+            idsInPlaceholder: Array.from(
+                placeholder?.querySelectorAll("[id]") ?? [],
+                (element) => element.id
+            ),
+            summaryIdsShown: SUMMARY_IDS.filter(
+                (id) => document.getElementById(id) !== null
+            ),
+            statusHoldsLoading: statusRegion?.contains(loading),
+            statusInsidePlaceholder: placeholder?.contains(statusRegion),
+        }).toEqual({
+            hidden: "true",
+            labels: [
+                "Total value",
+                "Total invested",
+                "Unrealized P/L",
+                "Unrealized P/L %",
+                "Largest position",
+                "Risk",
+            ],
+            allocationRows: LISTING_FOOTPRINT.allocationRows,
+            idsInPlaceholder: [],
+            summaryIdsShown: [],
+            statusHoldsLoading: true,
+            statusInsidePlaceholder: false,
+        })
+    })
+
+    it("portfolioInsightsPage_loaded_replacesPlaceholderWithFigures", async () => {
+        const { handler, release } = releasableHandler({
+            status: 200,
+            body: insights,
+        })
+        stub = stubFetch({ [INSIGHTS_KEY]: handler })
+        renderPage(client)
+        await screen.findByText("Loading portfolio insights\u2026")
+
+        release()
+
+        expect(await screen.findByText("$400.00")).toHaveAttribute(
+            "id",
+            "insights-total-value"
+        )
+        expect({
+            loadingShown:
+                screen.queryByText("Loading portfolio insights\u2026") !== null,
+            placeholders: document.querySelectorAll(
+                '.insights-content[aria-hidden="true"]'
+            ).length,
+            summaries: document.querySelectorAll(".insights-content").length,
+            summaryIdCounts: SUMMARY_IDS.map(
+                (id) => document.querySelectorAll(`#${id}`).length
+            ),
+        }).toEqual({
+            loadingShown: false,
+            placeholders: 0,
+            summaries: 1,
+            summaryIdCounts: SUMMARY_IDS.map(() => 1),
+        })
+    })
+
+    // The placeholder reserves the row count this tab last showed for the
+    // account, so a reload keeps the alerts panel in place; with none of the
+    // account's instruments cached, anything it cannot use as such a count
+    // reserves one row per holding of the listing its instruments query
+    // loads.
+    it.each<{
+        stored: string
+        record: string | null
+        reserved: ReservedFootprint
+    }>([
+        {
+            stored: "0 rows",
+            record: JSON.stringify({ [ACCOUNT_ID]: 0 }),
+            reserved: { allocationRows: 0, emptyStates: 1 },
+        },
+        {
+            stored: "1 row",
+            record: JSON.stringify({ [ACCOUNT_ID]: 1 }),
+            reserved: { allocationRows: 1, emptyStates: 0 },
+        },
+        {
+            stored: "15 rows beside another account's 3",
+            record: JSON.stringify({ [ACCOUNT_ID]: 15, [OTHER_ACCOUNT_ID]: 3 }),
+            reserved: { allocationRows: 15, emptyStates: 0 },
+        },
+        {
+            stored: "more rows than the cap",
+            record: JSON.stringify({ [ACCOUNT_ID]: 1_000_000 }),
+            reserved: { allocationRows: MAX_ALLOCATION_ROWS, emptyStates: 0 },
+        },
+        { stored: "nothing", record: null, reserved: LISTING_FOOTPRINT },
+        {
+            stored: "only another account's rows",
+            record: JSON.stringify({ [OTHER_ACCOUNT_ID]: 15 }),
+            reserved: LISTING_FOOTPRINT,
+        },
+        {
+            stored: "text that is not JSON",
+            record: "{",
+            reserved: LISTING_FOOTPRINT,
+        },
+        { stored: "a list", record: "[15]", reserved: LISTING_FOOTPRINT },
+        { stored: "null", record: "null", reserved: LISTING_FOOTPRINT },
+        {
+            stored: "a negative count",
+            record: JSON.stringify({ [ACCOUNT_ID]: -1 }),
+            reserved: LISTING_FOOTPRINT,
+        },
+        {
+            stored: "a fractional count",
+            record: JSON.stringify({ [ACCOUNT_ID]: 2.5 }),
+            reserved: LISTING_FOOTPRINT,
+        },
+        {
+            stored: "a count as text",
+            record: JSON.stringify({ [ACCOUNT_ID]: "15" }),
+            reserved: LISTING_FOOTPRINT,
+        },
+    ])(
+        "portfolioInsightsPage_loading_reservesRememberedAllocationRows (stored: $stored)",
+        async ({ record, reserved }) => {
+            // An unusable record is logged; the log itself is not under test.
+            vi.spyOn(console, "error").mockImplementation(() => undefined)
+            if (record !== null) {
+                sessionStorage.setItem(ALLOCATION_ROWS_STORAGE_KEY, record)
+            }
+            stub = stubFetch({
+                [INSIGHTS_KEY]: heldHandler({ status: 200, body: insights }),
+            })
+            renderPage(client)
+            await screen.findByText("Loading portfolio insights\u2026")
+
+            expect(reservedFootprint()).toEqual(reserved)
+        }
+    )
+
+    // Without a usable remembered count, as on a tab's first visit after
+    // /home or /instruments cached the account's instruments, the placeholder
+    // reserves one row per holding they list, up to the cap. A remembered
+    // count still wins, and with neither it reserves once the page's
+    // instruments query loads the stub's listing, two holdings. Otherwise
+    // that query reloads the listing while the figures load, and the
+    // reservation stays as it started.
+    it.each<{
+        known: string
+        record: string | null
+        readFails?: boolean
+        cached?: { accountId: string; listing: Instrument[] }
+        reserved: ReservedFootprint
+    }>([
+        {
+            known: "3 cached instruments, none held",
+            record: null,
+            cached: { accountId: ACCOUNT_ID, listing: instrumentListing(3, 0) },
+            reserved: { allocationRows: 0, emptyStates: 1 },
+        },
+        {
+            known: "4 cached instruments, 2 held",
+            record: null,
+            cached: { accountId: ACCOUNT_ID, listing: instrumentListing(4, 2) },
+            reserved: { allocationRows: 2, emptyStates: 0 },
+        },
+        {
+            known: "16 cached instruments, 15 held",
+            record: null,
+            cached: {
+                accountId: ACCOUNT_ID,
+                listing: instrumentListing(16, 15),
+            },
+            reserved: { allocationRows: 15, emptyStates: 0 },
+        },
+        {
+            known: "more cached holdings than the cap",
+            record: null,
+            cached: {
+                accountId: ACCOUNT_ID,
+                listing: instrumentListing(
+                    MAX_ALLOCATION_ROWS + 1,
+                    MAX_ALLOCATION_ROWS + 1
+                ),
+            },
+            reserved: { allocationRows: MAX_ALLOCATION_ROWS, emptyStates: 0 },
+        },
+        {
+            known: "only another account's rows, 15 cached holdings",
+            record: JSON.stringify({ [OTHER_ACCOUNT_ID]: 3 }),
+            cached: {
+                accountId: ACCOUNT_ID,
+                listing: instrumentListing(16, 15),
+            },
+            reserved: { allocationRows: 15, emptyStates: 0 },
+        },
+        {
+            known: "a negative count, 15 cached holdings",
+            record: JSON.stringify({ [ACCOUNT_ID]: -1 }),
+            cached: {
+                accountId: ACCOUNT_ID,
+                listing: instrumentListing(16, 15),
+            },
+            reserved: { allocationRows: 15, emptyStates: 0 },
+        },
+        {
+            known: "an unreadable record, 15 cached holdings",
+            record: JSON.stringify({ [ACCOUNT_ID]: 3 }),
+            readFails: true,
+            cached: {
+                accountId: ACCOUNT_ID,
+                listing: instrumentListing(16, 15),
+            },
+            reserved: { allocationRows: 15, emptyStates: 0 },
+        },
+        {
+            known: "3 remembered rows, 15 cached holdings",
+            record: JSON.stringify({ [ACCOUNT_ID]: 3 }),
+            cached: {
+                accountId: ACCOUNT_ID,
+                listing: instrumentListing(16, 15),
+            },
+            reserved: { allocationRows: 3, emptyStates: 0 },
+        },
+        {
+            known: "0 remembered rows, 2 cached holdings",
+            record: JSON.stringify({ [ACCOUNT_ID]: 0 }),
+            cached: { accountId: ACCOUNT_ID, listing: instrumentListing(4, 2) },
+            reserved: { allocationRows: 0, emptyStates: 1 },
+        },
+        {
+            known: "only another account's cached holdings",
+            record: null,
+            cached: {
+                accountId: OTHER_ACCOUNT_ID,
+                listing: instrumentListing(16, 15),
+            },
+            reserved: LISTING_FOOTPRINT,
+        },
+        { known: "nothing", record: null, reserved: LISTING_FOOTPRINT },
+    ])(
+        "portfolioInsightsPage_loading_reservesRememberedElseCachedHoldingRows (known: $known)",
+        async ({ record, readFails, cached, reserved }) => {
+            // An unusable record is logged; the log itself is not under test.
+            vi.spyOn(console, "error").mockImplementation(() => undefined)
+            if (record !== null) {
+                sessionStorage.setItem(ALLOCATION_ROWS_STORAGE_KEY, record)
+            }
+            if (readFails === true) {
+                // Bound before the spy replaces it; only the record fails.
+                const readItem = Storage.prototype.getItem.bind(sessionStorage)
+                vi.spyOn(Storage.prototype, "getItem").mockImplementation(
+                    (key) => {
+                        if (key === ALLOCATION_ROWS_STORAGE_KEY) {
+                            throw new DOMException("denied", "SecurityError")
+                        }
+                        return readItem(key)
+                    }
+                )
+            }
+            if (cached !== undefined) {
+                client.setQueryData(
+                    instrumentKeys.byUser(cached.accountId),
+                    cached.listing
+                )
+            }
+            stub = stubFetch({
+                [INSIGHTS_KEY]: heldHandler({ status: 200, body: insights }),
+            })
+            renderPage(client)
+            await screen.findByText("Loading portfolio insights\u2026")
+            const reservedAtStart = reservedFootprint()
+
+            await waitFor(() =>
+                expect(
+                    client.getQueryData(instrumentKeys.byUser(ACCOUNT_ID))
+                ).toEqual(instruments)
+            )
+
+            expect({
+                reservedAtStart,
+                reservedAfterListing: reservedFootprint(),
+            }).toEqual({
+                reservedAtStart: reserved,
+                reservedAfterListing: reserved,
+            })
+        }
+    )
+
+    // With no usable record and none of the account's instruments cached, as
+    // on a document load of /insights in a new tab, the page shows only the
+    // empty status region until its instruments query settles. Then the
+    // placeholder, the loading message and the alerts panel appear together,
+    // so the panel first paints where it stays, and a later listing never
+    // resizes the reservation.
+    it.each<{
+        instruments: string
+        response: StubResponse
+        reserved: ReservedFootprint
+    }>([
+        {
+            instruments: "4 listed, 3 held",
+            response: {
+                status: 200,
+                body: { results: instrumentListing(4, 3) },
+            },
+            reserved: { allocationRows: 3, emptyStates: 0 },
+        },
+        {
+            instruments: "3 listed, none held",
+            response: {
+                status: 200,
+                body: { results: instrumentListing(3, 0) },
+            },
+            reserved: { allocationRows: 0, emptyStates: 1 },
+        },
+        {
+            instruments: "request failed",
+            response: { status: 500 },
+            reserved: DEFAULT_FOOTPRINT,
+        },
+    ])(
+        "portfolioInsightsPage_nothingKnown_reservesOnceInstrumentsSettle (instruments: $instruments)",
+        async ({ response, reserved }) => {
+            const firstListing = releasableHandler(response)
+            const relisting = instrumentListing(16, 15)
+            let listings = 0
+            stub = stubFetch({
+                [INSIGHTS_KEY]: heldHandler({ status: 200, body: insights }),
+                [INSTRUMENTS_KEY]: () => {
+                    listings += 1
+                    return listings === 1
+                        ? firstListing.handler()
+                        : { status: 200, body: { results: relisting } }
+                },
+            })
+            renderPage(client)
+            // The alerts list has loaded, so the page has rendered what it
+            // shows before the instruments settle.
+            await waitFor(() =>
+                expect(
+                    client.getQueryState(alertKeys.list(ACCOUNT_ID))?.status
+                ).toBe("success")
+            )
+            const whileEstimating = summaryAndPanel()
+
+            firstListing.release()
+            await screen.findByText("Loading portfolio insights\u2026")
+            const onceSettled = summaryAndPanel()
+            await act(async () => {
+                await client.refetchQueries({
+                    queryKey: instrumentKeys.byUser(ACCOUNT_ID),
+                })
+            })
+
+            expect({
+                whileEstimating,
+                onceSettled,
+                afterRelisting: summaryAndPanel(),
+                relisted: client.getQueryData(
+                    instrumentKeys.byUser(ACCOUNT_ID)
+                ),
+            }).toEqual({
+                whileEstimating: {
+                    blockChildren: ["insights-status"],
+                    status: { role: "status", text: "" },
+                    reserved: null,
+                    panelShown: false,
+                },
+                onceSettled: reservingState(reserved),
+                afterRelisting: reservingState(reserved),
+                relisted: relisting,
+            })
+        }
+    )
+
+    // Figures that settle before any estimate, loaded or failed, end the
+    // loading period with nothing reserved: the page shows them, or the
+    // error message, with the alerts panel, and the instruments that arrive
+    // later reserve nothing.
+    it.each<{
+        figures: string
+        response: StubResponse
+        shown: string
+        blockChildren: string[]
+    }>([
+        {
+            figures: "loaded",
+            response: { status: 200, body: insights },
+            shown: "$400.00",
+            blockChildren: ["insights-status", "insights-content"],
+        },
+        {
+            figures: "failed",
+            response: { status: 500 },
+            shown: "Could not load portfolio insights. Please try again later.",
+            blockChildren: ["insights-status", "insights-error"],
+        },
+    ])(
+        "portfolioInsightsPage_figuresSettleBeforeInstruments_reservesNothing ($figures)",
+        async ({ response, shown, blockChildren }) => {
+            // The page logs a failure; the log itself is not under test.
+            vi.spyOn(console, "error").mockImplementation(() => undefined)
+            vi.useFakeTimers({ shouldAdvanceTime: true })
+            const listing = releasableHandler({
+                status: 200,
+                body: { results: instruments },
+            })
+            stub = stubFetch({
+                [INSIGHTS_KEY]: () => response,
+                [INSTRUMENTS_KEY]: listing.handler,
+            })
+            renderPage(client)
+            // A failure shows once the back-off before its three retries has
+            // elapsed.
+            for (
+                let elapsed = 0;
+                elapsed <= DEFAULT_RETRY_BACKOFF_MS;
+                elapsed += 1_000
+            ) {
+                await advance(1_000)
+            }
+            await screen.findByText(shown)
+            const beforeListing = summaryAndPanel()
+
+            listing.release()
+            await waitFor(() =>
+                expect(
+                    client.getQueryData(instrumentKeys.byUser(ACCOUNT_ID))
+                ).toEqual(instruments)
+            )
+
+            const settled = {
+                blockChildren,
+                status: { role: "status", text: "" },
+                reserved: null,
+                panelShown: true,
+            }
+            expect({
+                beforeListing,
+                afterListing: summaryAndPanel(),
+            }).toEqual({ beforeListing: settled, afterListing: settled })
+        }
+    )
+
+    // Storage that throws, as with storage disabled or its quota exceeded,
+    // reserves the rows of the loaded listing, as when nothing is remembered,
+    // and leaves the loaded page in place; each failure is logged with the
+    // error itself. A failing read also fails the write, which reads the
+    // record first.
+    it.each<{ failing: "getItem" | "setItem"; logged: string[] }>([
+        {
+            failing: "getItem",
+            logged: [
+                "[PortfolioInsights] could not read the remembered allocation rows",
+                "[PortfolioInsights] could not remember the allocation rows",
+            ],
+        },
+        {
+            failing: "setItem",
+            logged: [
+                "[PortfolioInsights] could not remember the allocation rows",
+            ],
+        },
+    ])(
+        "portfolioInsightsPage_storageThrows_reservesListedRowsAndLogsError ($failing)",
+        async ({ failing, logged }) => {
+            const storageError = new DOMException("denied", "SecurityError")
+            // Bound before the spies replace them; the page uses only
+            // sessionStorage.
+            const readItem = Storage.prototype.getItem.bind(sessionStorage)
+            const storeItem = Storage.prototype.setItem.bind(sessionStorage)
+            vi.spyOn(Storage.prototype, "getItem").mockImplementation((key) => {
+                if (
+                    failing === "getItem" &&
+                    key === ALLOCATION_ROWS_STORAGE_KEY
+                ) {
+                    throw storageError
+                }
+                return readItem(key)
+            })
+            vi.spyOn(Storage.prototype, "setItem").mockImplementation(
+                (key, value) => {
+                    if (
+                        failing === "setItem" &&
+                        key === ALLOCATION_ROWS_STORAGE_KEY
+                    ) {
+                        throw storageError
+                    }
+                    storeItem(key, value)
+                }
+            )
+            const consoleError = vi
+                .spyOn(console, "error")
+                .mockImplementation(() => undefined)
+            const { handler, release } = releasableHandler({
+                status: 200,
+                body: insights,
+            })
+            stub = stubFetch({ [INSIGHTS_KEY]: handler })
+            renderPage(client)
+            await screen.findByText("Loading portfolio insights\u2026")
+            const reservedWhileLoading = reservedFootprint()
+
+            release()
+            await screen.findByText("$400.00")
+
+            await waitFor(() =>
+                expect({
+                    reservedWhileLoading,
+                    totalValue:
+                        document.getElementById("insights-total-value")
+                            ?.textContent ?? null,
+                    logged: consoleError.mock.calls.filter(
+                        ([message]) =>
+                            typeof message === "string" &&
+                            message.includes("allocation rows")
+                    ),
+                }).toEqual({
+                    reservedWhileLoading: LISTING_FOOTPRINT,
+                    totalValue: "$400.00",
+                    logged: logged.map((message) => [message, storageError]),
+                })
+            )
+        }
+    )
+
+    /** An account id that only the corrupt record below names. */
+    const RECORD_ACCOUNT_ID = "e4b7c1d9"
+
+    /**
+     * A record keyed by `RECORD_ACCOUNT_ID` whose entry has no JSON value; it
+     * is short enough for the parser's message to quote it whole.
+     */
+    const CORRUPT_RECORD = `{"${RECORD_ACCOUNT_ID}": x`
+
+    // The parser's error quotes the record it rejects, and so the account ids
+    // keyed in it. The page logs a SyntaxError with a fixed message instead,
+    // carrying the stack frames of the thrown error, or of its own catch when
+    // what was thrown is not an Error, which is never logged; the placeholder
+    // reserves the rows of the loaded listing, as when nothing is remembered.
+    it.each<{ thrown: string; nonError?: unknown; frame: RegExp }>([
+        { thrown: "the parser's SyntaxError", frame: /^\s+at JSON\.parse \(/ },
+        {
+            thrown: "a string holding the record",
+            nonError: CORRUPT_RECORD,
+            frame: /^\s+at parseAllocationRows \(/,
+        },
+    ])(
+        "portfolioInsightsPage_recordNotJson_logsSyntaxErrorWithoutRecord (thrown: $thrown)",
+        async ({ nonError, frame }) => {
+            let parserMessage = ""
+            try {
+                JSON.parse(CORRUPT_RECORD)
+            } catch (error) {
+                parserMessage = error instanceof Error ? error.message : ""
+            }
+            if (nonError !== undefined) {
+                // Bound before the spy replaces it; only the record's parse
+                // throws `nonError`.
+                const parse: typeof JSON.parse = JSON.parse.bind(JSON)
+                vi.spyOn(JSON, "parse").mockImplementation(
+                    (text, reviver): unknown => {
+                        if (text === CORRUPT_RECORD) {
+                            throw nonError
+                        }
+                        return parse(text, reviver)
+                    }
+                )
+            }
+            const consoleError = vi
+                .spyOn(console, "error")
+                .mockImplementation(() => undefined)
+            sessionStorage.setItem(ALLOCATION_ROWS_STORAGE_KEY, CORRUPT_RECORD)
+            stub = stubFetch({
+                [INSIGHTS_KEY]: heldHandler({ status: 200, body: insights }),
+            })
+            renderPage(client)
+            await screen.findByText("Loading portfolio insights\u2026")
+
+            const logged = consoleError.mock.calls
+                .filter(
+                    ([message]) =>
+                        message ===
+                        "[PortfolioInsights] ignoring an allocation rows record that is not valid JSON"
+                )
+                .map(([, error]: unknown[]) => ({
+                    isSyntaxError: error instanceof SyntaxError,
+                    name: error instanceof Error ? error.name : null,
+                    message: error instanceof Error ? error.message : null,
+                    keepsFrame:
+                        error instanceof Error &&
+                        (error.stack ?? "")
+                            .split("\n")
+                            .some((line) => frame.test(line)),
+                }))
+            /** Every console.error argument as text, error stacks included. */
+            const shown = consoleError.mock.calls
+                .flat()
+                .map((argument: unknown) =>
+                    argument instanceof Error
+                        ? `${argument.name}: ${argument.message}\n${argument.stack ?? ""}`
+                        : typeof argument === "string"
+                          ? argument
+                          : (JSON.stringify(argument) ?? String(argument))
+                )
+                .join("\n")
+            const expectedLog = {
+                isSyntaxError: true,
+                name: "SyntaxError",
+                message: "The allocation rows record is not valid JSON",
+                keepsFrame: true,
+            }
+            expect({
+                parserQuotesRecord: parserMessage.includes(CORRUPT_RECORD),
+                reserved: reservedFootprint(),
+                logged,
+                leaked: [RECORD_ACCOUNT_ID, CORRUPT_RECORD].filter((part) =>
+                    shown.includes(part)
+                ),
+            }).toEqual({
+                parserQuotesRecord: true,
+                reserved: LISTING_FOOTPRINT,
+                // The one read of the record while the figures load logs it.
+                logged: [expectedLog],
+                leaked: [],
+            })
+        }
+    )
+
+    // A record the page cannot use is reported where it is read while the
+    // figures load, and only there: once they show, the write replaces it
+    // with the loaded row count without logging it again.
+    it.each<{ stored: string; record: string; logged: string }>([
+        {
+            stored: "text that is not JSON",
+            record: CORRUPT_RECORD,
+            logged: "[PortfolioInsights] ignoring an allocation rows record that is not valid JSON",
+        },
+        {
+            stored: "a list",
+            record: "[1]",
+            logged: "[PortfolioInsights] ignoring an allocation rows record that is not an object",
+        },
+        {
+            stored: "a string",
+            record: '"x"',
+            logged: "[PortfolioInsights] ignoring an allocation rows record that is not an object",
+        },
+    ])(
+        "portfolioInsightsPage_unusableRecordThenLoaded_logsRecordOnceAndReplacesIt (stored: $stored)",
+        async ({ record, logged }) => {
+            const consoleError = vi
+                .spyOn(console, "error")
+                .mockImplementation(() => undefined)
+            sessionStorage.setItem(ALLOCATION_ROWS_STORAGE_KEY, record)
+            const { handler, release } = releasableHandler({
+                status: 200,
+                body: insights,
+            })
+            stub = stubFetch({ [INSIGHTS_KEY]: handler })
+            renderPage(client)
+            await screen.findByText("Loading portfolio insights\u2026")
+
+            release()
+            await screen.findByText("$400.00")
+
+            await waitFor(() =>
+                expect({
+                    record: rememberedRecord(),
+                    totalValue:
+                        document.getElementById("insights-total-value")
+                            ?.textContent ?? null,
+                    // Every log about the record: its storage, its parse and
+                    // its entry for the account.
+                    logged: consoleError.mock.calls
+                        .map(([message]: unknown[]) => message)
+                        .filter(
+                            (message) =>
+                                typeof message === "string" &&
+                                message.includes("allocation row")
+                        ),
+                }).toEqual({
+                    record: { [ACCOUNT_ID]: insights.allocations.length },
+                    totalValue: "$400.00",
+                    logged: [logged],
+                })
+            )
+        }
+    )
+
+    // The loaded summary's row count is stored under the account it shows;
+    // the entries of other accounts stay, and an unusable record is replaced.
+    it.each<{ before: string; record: string | null; after: unknown }>([
+        { before: "nothing", record: null, after: { [ACCOUNT_ID]: 2 } },
+        {
+            before: "another account's rows",
+            record: JSON.stringify({ [OTHER_ACCOUNT_ID]: 7 }),
+            after: { [ACCOUNT_ID]: 2, [OTHER_ACCOUNT_ID]: 7 },
+        },
+        {
+            before: "an older count of this account",
+            record: JSON.stringify({ [ACCOUNT_ID]: 15 }),
+            after: { [ACCOUNT_ID]: 2 },
+        },
+        {
+            before: "text that is not JSON",
+            record: "{",
+            after: { [ACCOUNT_ID]: 2 },
+        },
+    ])(
+        "portfolioInsightsPage_loaded_remembersRowCountForShownAccount (stored before: $before)",
+        async ({ record, after }) => {
+            // An unusable record is logged; the log itself is not under test.
+            vi.spyOn(console, "error").mockImplementation(() => undefined)
+            if (record !== null) {
+                sessionStorage.setItem(ALLOCATION_ROWS_STORAGE_KEY, record)
+            }
+            stub = stubFetch({})
+            renderPage(client)
+            await screen.findByText("$400.00")
+
+            await waitFor(() => expect(rememberedRecord()).toEqual(after))
+        }
+    )
+
+    it("portfolioInsightsPage_accountChangedInPlace_reservesAndRemembersRowsPerAccount", async () => {
+        sessionStorage.setItem(
+            ALLOCATION_ROWS_STORAGE_KEY,
+            JSON.stringify({ [OTHER_ACCOUNT_ID]: 3 })
+        )
+        const otherAccount = releasableHandler({
+            status: 200,
+            body: {
+                ...otherAccountInsights,
+                allocations: [otherTravelAllocation],
+            },
+        })
+        stub = stubFetch({
+            [OTHER_INSIGHTS_KEY]: otherAccount.handler,
+            [OTHER_INSTRUMENTS_KEY]: () => ({
+                status: 200,
+                body: { results: instruments },
+            }),
+            [OTHER_ALERTS_KEY]: () => ({
+                status: 200,
+                body: { results: noAlerts },
+            }),
+            [OTHER_NOTIFICATIONS_KEY]: () => ({
+                status: 200,
+                body: { results: noAlerts },
+            }),
+        })
+        const { switchAccount } = renderPage(client)
+        await screen.findByText("$400.00")
+
+        // The first account's two rows were shown; the other account's
+        // figures load while the page stays mounted.
+        switchAccount(OTHER_ACCOUNT_ID)
+        await screen.findByText("Loading portfolio insights\u2026")
+        const reservedForOther = reservedFootprint()
+        otherAccount.release()
+        await screen.findByText("$200.00")
+
+        await waitFor(() =>
+            expect({
+                reservedForOther,
+                record: rememberedRecord(),
+            }).toEqual({
+                reservedForOther: { allocationRows: 3, emptyStates: 0 },
+                record: { [ACCOUNT_ID]: 2, [OTHER_ACCOUNT_ID]: 1 },
+            })
+        )
     })
 
     it("portfolioInsightsPage_unmountedWhileLoading_abortsInsightsRequest", async () => {
@@ -454,6 +1364,80 @@ describe("PortfolioInsights page", () => {
                 )
             )
             expect(document.getElementById("alerts-panel")).toBeInTheDocument()
+        }
+    )
+
+    // A failure after the placeholder showed keeps its footprint: the error
+    // message sits at the top of the block, in one cell with the same
+    // placeholder kept hidden, so the block keeps its height and the same
+    // alerts panel stays below it.
+    it.each<{ remembered: number; reserved: ReservedFootprint }>([
+        { remembered: 15, reserved: { allocationRows: 15, emptyStates: 0 } },
+        { remembered: 0, reserved: { allocationRows: 0, emptyStates: 1 } },
+    ])(
+        "portfolioInsightsPage_requestFailsWithReservedRows_keepsHiddenFootprintUnderError (remembered: $remembered)",
+        async ({ remembered, reserved }) => {
+            // The page logs the failure; the log itself is not under test.
+            vi.spyOn(console, "error").mockImplementation(() => undefined)
+            vi.useFakeTimers({ shouldAdvanceTime: true })
+            sessionStorage.setItem(
+                ALLOCATION_ROWS_STORAGE_KEY,
+                JSON.stringify({ [ACCOUNT_ID]: remembered })
+            )
+            stub = stubFetch({ [INSIGHTS_KEY]: () => ({ status: 503 }) })
+            renderPage(client)
+            await screen.findByText("Loading portfolio insights\u2026")
+            const whileLoading = summaryAndPanel()
+            const panelWhileLoading = document.getElementById("alerts-panel")
+
+            for (
+                let elapsed = 0;
+                elapsed <= DEFAULT_RETRY_BACKOFF_MS;
+                elapsed += 1_000
+            ) {
+                await advance(1_000)
+            }
+            const message = await screen.findByText(
+                "Could not load portfolio insights. Please try again later."
+            )
+            const footprint = document.querySelector(
+                ".insights-summary-block > .insights-error-footprint"
+            )
+
+            expect({
+                whileLoading,
+                failed: summaryAndPanel(),
+                footprintChildren: Array.from(
+                    footprint?.children ?? [],
+                    (child) => child.id || child.className
+                ),
+                message: {
+                    id: message.id,
+                    className: message.className,
+                    role: message.getAttribute("role"),
+                },
+                samePanel:
+                    document.getElementById("alerts-panel") ===
+                    panelWhileLoading,
+            }).toEqual({
+                whileLoading: reservingState(reserved),
+                failed: {
+                    blockChildren: [
+                        "insights-status",
+                        "insights-error-footprint",
+                    ],
+                    status: { role: "status", text: "" },
+                    reserved,
+                    panelShown: true,
+                },
+                footprintChildren: ["insights-error", "insights-content"],
+                message: {
+                    id: "insights-error",
+                    className: "status-message status-error",
+                    role: "alert",
+                },
+                samePanel: true,
+            })
         }
     )
 
@@ -682,6 +1666,59 @@ describe("PortfolioInsights page", () => {
             holdingCount: 2,
             riskLevel: "HIGH",
         })
+    })
+
+    // The OneAgent call and its `reportError` fallback both throw, so the
+    // event call itself throws: the loaded page must stay and log that throw.
+    it("portfolioInsightsPage_viewEventReportingFails_keepsPageRendered", async () => {
+        const reportingError = new Error("reportError failed")
+        const sendBizEvent = vi.fn((): void => {
+            throw new Error("sendBizEvent failed")
+        })
+        window.dynatrace = { sendBizEvent }
+        window.dtrum = {
+            reportError: () => {
+                throw reportingError
+            },
+        }
+        const consoleError = vi
+            .spyOn(console, "error")
+            .mockImplementation(() => undefined)
+        try {
+            stub = stubFetch({})
+            renderPage(client)
+            await waitFor(() => expect(sendBizEvent).toHaveBeenCalled())
+
+            expect({
+                totalValue:
+                    document.getElementById("insights-total-value")
+                        ?.textContent ?? null,
+                sends: sendBizEvent.mock.calls,
+                loggedFailure: consoleError.mock.calls.some(
+                    ([message, error]) =>
+                        message ===
+                            "[PortfolioInsights] portfolioInsightsView event failed" &&
+                        error === reportingError
+                ),
+            }).toEqual({
+                totalValue: "$400.00",
+                sends: [
+                    [
+                        "com.easytrade.portfolio-insights.view",
+                        {
+                            accountId: ACCOUNT_ID,
+                            holdingCount: 2,
+                            riskLevel: "HIGH",
+                        },
+                    ],
+                ],
+                loggedFailure: true,
+            })
+        } finally {
+            // jsdom defines neither global; no other case expects them.
+            delete window.dynatrace
+            delete window.dtrum
+        }
     })
 
     it("portfolioInsightsPage_windowRefocus_doesNotRefetchInsights", async () => {
