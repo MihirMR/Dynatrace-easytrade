@@ -1,9 +1,15 @@
 import { AsyncLocalStorage } from "node:async_hooks"
 import { IHandleWrapper } from "@demoability/loadgen-core/lib/handles"
 import { createLoggerOptions } from "@demoability/loadgen-core/lib/logger"
-import { IPageActions } from "@demoability/loadgen-core/lib/pageActions"
-import { ISelector } from "@demoability/loadgen-core/lib/selectors"
-import { Page } from "puppeteer"
+import {
+    IPageActions,
+    PageSetup,
+} from "@demoability/loadgen-core/lib/pageActions"
+import {
+    ISelector,
+    XpathSelector,
+} from "@demoability/loadgen-core/lib/selectors"
+import { ClickOptions, ElementHandle, EvaluateFunc, Page } from "puppeteer"
 import { Logger, createLogger } from "winston"
 import { selectors } from "../selectors"
 import { User } from "../user"
@@ -168,7 +174,7 @@ function knownValue(
 }
 
 /** The error's name when it is a known error name, otherwise `unknown`. */
-function errorName(error: unknown): string {
+export function errorName(error: unknown): string {
     return (
         knownValue(readProperty(error, "name"), KNOWN_ERROR_NAMES) ?? "unknown"
     )
@@ -401,54 +407,46 @@ export async function isPortfolioInsightsEnabled(
 }
 
 /**
+ * What BoundedPageActions.enterCredential throws when it writes nothing. It
+ * names no part of either origin: the configured URL can carry a secret, and
+ * the document's origin is untrusted.
+ */
+export const DOCUMENT_ORIGIN_UNVERIFIED =
+    "Browser document not verified at the configured EasyTrade origin; credentials not entered"
+
+/**
  * Assumes starting point on login screen.
  * End point on user Dashboard
  *
- * The steps and selectors of helpers/login.ts, except that the password never
- * passes through a loadgen-core page action: PageActions.inputHandle logs the
- * value it types, and clearInput the value it clears, at debug level. The
- * password field is therefore cleared and typed through its Puppeteer element.
+ * The steps and selectors of helpers/login.ts, except for how the two fields
+ * are filled. Neither credential passes through a loadgen-core page action:
+ * PageActions.inputHandle logs the value it types, and clearInput the value it
+ * clears, at debug level. And the browser follows HTTP and script redirects,
+ * so a credential must reach only a document at the url's origin. Each field
+ * is therefore filled by BoundedPageActions.enterCredential, which checks the
+ * field's document and writes the credential in one synchronous step in the
+ * page, so no navigation or focus change can come between the check and the
+ * write. A field in a document anywhere else gets nothing written, and the
+ * login throws DOCUMENT_ORIGIN_UNVERIFIED before any later step: a refusal at
+ * the username leaves the password field unwritten.
  *
- * @param pageActions
+ * @param pageActions the visit's bounded page actions; their deadline also
+ * bounds the login button's navigation
  * @param user
+ * @param url EasyTrade base url, whose origin the login document must be at
  */
 export async function loginWithoutLoggingPassword(
-    pageActions: IPageActions,
-    user: User
+    pageActions: BoundedPageActions,
+    user: User,
+    url: URL
 ): Promise<void> {
-    await pageActions.input(selectors.loginPage_username, user.username)
+    const username = await pageActions.getHandle(selectors.loginPage_username)
+    await pageActions.enterCredential(username, user.username, url.origin)
     await pageActions.shortDelay()
-    await inputWithoutLogging(
-        pageActions,
-        selectors.loginPage_password,
-        user.password
-    )
+    const password = await pageActions.getHandle(selectors.loginPage_password)
+    await pageActions.enterCredential(password, user.password, url.origin)
     await pageActions.shortDelay()
     await pageActions.navigate(selectors.loginPage_loginButton)
-}
-
-/**
- * Replaces the text of the field with value as PageActions.input does, by
- * focusing it, deleting its current characters and typing value, but without
- * logging the field's old or new text.
- */
-async function inputWithoutLogging(
-    pageActions: IPageActions,
-    selector: ISelector,
-    value: string
-): Promise<void> {
-    const handle = await pageActions.getHandle(selector)
-    await pageActions.scrollIntoView(handle)
-    const element = handle.getHandle()
-    const property = await element.getProperty("value")
-    const current: unknown = await property.jsonValue()
-    await property.dispose()
-    await element.focus()
-    const length = typeof current === "string" ? current.length : 0
-    for (let deleted = 0; deleted < length; deleted++) {
-        await element.press("Backspace")
-    }
-    await element.type(value)
 }
 
 /**
@@ -468,16 +466,30 @@ export async function gotoPortfolioInsightsPage(
 
 /**
  * Whether the Portfolio Insights feature is verifiably gone from the page.
- * The frontend renders the navigation link only while the flag reads true,
- * and its shutdown sends an open /insights page to /home, so a link missing
- * from the DOM means the flag turned off during the visit.
+ * The frontend renders the Portfolio Insights navigation link only while the
+ * flag reads true, beside the home link that the navigation of every
+ * protected page shows, and its shutdown sends an open /insights page to
+ * /home. So only a page whose navigation is shown, its home link present,
+ * without the Portfolio Insights link proves that the flag turned off during
+ * the visit.
  *
- * The link is looked up through navigationLinkPresence, whose DOM query lets
- * browser failures through; the stock check would read any of them, a closed
- * target included, as a missing link. A failed lookup verifies no loss: it is
- * logged at debug, the message naming only the error's name and the entry
- * carrying the error object, and answers false, so the caller rethrows the
- * error of its own page step.
+ * Both facts come from one DOM query, featureLossPresence, whose single XPath
+ * evaluation reads them from one state of the document. Two lookups could
+ * each read a different page, the home link on the protected page and then
+ * no Portfolio Insights link on an error page that replaced it, and combine
+ * into a loss that neither page shows.
+ *
+ * Any other answer proves nothing about the flag: either the link is still
+ * there, or the page shows no navigation, as an error page that replaced the
+ * layout, the login page or a page still loading. It answers false, so the
+ * caller rethrows the error of its own page step. The flag itself is not read
+ * again, because the visit reads it once, at its start.
+ *
+ * The query reads the DOM through DomPresenceSelector, which lets browser
+ * failures through; the stock check would read any of them, a closed target
+ * included, as absence. A failed query verifies no loss either: it is logged
+ * at debug, the message naming only the error's name and the entry carrying
+ * the error object, and answers false.
  *
  * @param pageActions
  * @param logger
@@ -487,7 +499,7 @@ async function isFeatureLost(
     logger: Logger
 ): Promise<boolean> {
     try {
-        return !(await pageActions.isSelectorPresent(navigationLinkPresence))
+        return await pageActions.isSelectorPresent(featureLossPresence)
     } catch (error) {
         logger.debug(
             `Portfolio insights feature check failed, loss not verified: error [${errorName(error)}]`,
@@ -504,8 +516,10 @@ async function isFeatureLost(
  *
  * Opens the page through gotoPortfolioInsightsPage, then runs
  * createAndDeleteOwnedAlert. A navigation that fails while the feature is
- * verifiably lost (see isFeatureLost) ends with nothing submitted; any other
- * navigation error propagates, unchanged also when the loss check fails.
+ * verifiably lost (see isFeatureLost), the navigation still shown without the
+ * Portfolio Insights link, ends with nothing submitted. Any other navigation
+ * error propagates unchanged, also when the page shows no navigation at all
+ * and when the loss check fails.
  *
  * @param pageActions
  * @param url EasyTrade base url
@@ -562,6 +576,529 @@ export function ownedAlertFailure(
 }
 
 /**
+ * Deadline of each element action of BoundedPageActions. It equals the 30 s
+ * default wait of Puppeteer that already bounds getHandle and navigation, so a
+ * healthy action is never cut short.
+ */
+export const PAGE_ACTION_TIMEOUT_MS = 30_000
+
+/** The longest delay setTimeout honours; it fires a longer one at once. */
+const MAX_TIMER_DELAY_MS = 2_147_483_647
+
+/** How often a viewport wait checks intersection, as loadgen-core's does. */
+const VIEWPORT_POLL_MS = 500
+
+/** The stages of one BoundedPageActions element action, under its deadline. */
+type ActionStages = {
+    /**
+     * Waits for one stage of the action; when the deadline passes first, it
+     * rejects with the action's TimeoutError instead.
+     */
+    within<T>(stage: Promise<T>): Promise<T>
+    /** Waits ms within the deadline; its timer ends with the action. */
+    pause(ms: number): Promise<void>
+    /**
+     * Throws the action's TimeoutError once the deadline has passed. It is
+     * synchronous, so a dispatch started right after it, in the same run,
+     * cannot start once the deadline has passed.
+     */
+    gate(): void
+    /** Whether error is the action's TimeoutError. */
+    isTimeout(error: unknown): boolean
+}
+
+/**
+ * Runs in the page, as one synchronous step: sets the value of element
+ * through the value setter of its prototype chain, then dispatches bubbling
+ * input and change events, as typing does. React's controlled inputs see the
+ * change, which an assignment to the element's own value property, tracked by
+ * React, would hide from them. The value is never returned.
+ *
+ * When origin is not null, it first requires element to be connected to the
+ * document of the frame it runs in and that document to be at origin, and
+ * otherwise writes nothing and answers false. The origin is read from the
+ * global document: Window.document, Document.location and every member of
+ * Location are unforgeable, so no script of the page can change the answer,
+ * as it could through a prototype getter such as ownerDocument.
+ *
+ * Puppeteer sends this function's source to the page, so it uses nothing
+ * outside itself but the page's own globals.
+ *
+ * @param element the field
+ * @param text the value the field ends with
+ * @param origin the origin the field's document must be at, or null
+ * @returns whether the value was written
+ */
+function writeValueInPage(
+    element: Element,
+    text: string,
+    origin: string | null
+): boolean {
+    if (
+        origin !== null &&
+        !(
+            element.isConnected &&
+            element.ownerDocument === document &&
+            document.location.origin === origin
+        )
+    ) {
+        return false
+    }
+    let prototype: object | null = Object.getPrototypeOf(element)
+    let setter: ((value: string) => void) | undefined
+    while (prototype !== null && setter === undefined) {
+        setter = Object.getOwnPropertyDescriptor(prototype, "value")?.set
+        prototype = Object.getPrototypeOf(prototype)
+    }
+    if (setter === undefined) {
+        throw new Error("Element has no value to write")
+    }
+    setter.call(element, text)
+    element.dispatchEvent(new Event("input", { bubbles: true }))
+    element.dispatchEvent(new Event("change", { bubbles: true }))
+    return true
+}
+
+/**
+ * Page actions whose element actions end at a deadline and dispatch nothing
+ * after it. Before it clicks, types into, selects in or navigates through an
+ * element, loadgen-core's PageActions polls until the element intersects the
+ * viewport, with no deadline of its own, so a control that is present but
+ * never intersects would hold the visit, and the cleanup after it, forever.
+ * And a Puppeteer action that is merely abandoned still goes on to click,
+ * select or type once its pending step answers, its element disposed or not.
+ *
+ * So each click, input, selectOption and navigate, in its selector and its
+ * handle form, each scrollIntoView and each enterCredential runs its own
+ * stages on the Puppeteer element, under one deadline per action. A selector
+ * form first acquires the handle through the wrapped getHandle, which
+ * Puppeteer's visible wait already bounds. Then comes loadgen-core's viewport
+ * wait, which focuses the element and checks every 500 ms until it intersects
+ * the viewport, and for a click the element's clickable point. Every stage is
+ * raced against the deadline, and the dispatch, the mouse click, the option
+ * selection or the one write of the value, starts in the same synchronous run
+ * as a check of the deadline, so none is dispatched once the deadline has
+ * passed. A navigate starts its navigation wait before its click, as
+ * loadgen-core's does, and waits for the navigation within the same deadline.
+ *
+ * At the deadline the action fails with an error named TimeoutError whose
+ * message names the action and the element, never the value written or
+ * selected, and how the stage it abandoned ends is logged at debug. When an
+ * action fails, at its deadline or otherwise, its element handle is disposed.
+ * Every other member delegates unchanged.
+ */
+export class BoundedPageActions implements IPageActions {
+    private readonly inner: IPageActions
+    private readonly logger: Logger
+    private readonly timeoutMs: number
+
+    /**
+     * @param inner the page actions of the visit's worker
+     * @param logger receives the debug lines of abandoned actions and of
+     * handles that could not be disposed
+     * @param timeoutMs deadline of each element action, in whole milliseconds
+     * from 1 to the longest delay setTimeout honours
+     */
+    constructor(
+        inner: IPageActions,
+        logger: Logger,
+        timeoutMs = PAGE_ACTION_TIMEOUT_MS
+    ) {
+        if (
+            !Number.isInteger(timeoutMs) ||
+            timeoutMs < 1 ||
+            timeoutMs > MAX_TIMER_DELAY_MS
+        ) {
+            throw new RangeError(
+                `Page action deadline must be whole milliseconds from 1 to ${MAX_TIMER_DELAY_MS}, was [${timeoutMs}]`
+            )
+        }
+        this.inner = inner
+        this.logger = logger
+        this.timeoutMs = timeoutMs
+    }
+
+    async click(selector: ISelector): Promise<void> {
+        await this.clickHandle(await this.inner.getHandle(selector))
+    }
+
+    /** Clicks the element at its clickable point, as Puppeteer's click does. */
+    async clickHandle(
+        handle: IHandleWrapper,
+        options?: ClickOptions
+    ): Promise<void> {
+        await this.bounded("click", handle, async (stages, element) => {
+            await this.clickWithin(stages, element, options)
+        })
+    }
+
+    async input(selector: ISelector, value: string): Promise<void> {
+        await this.inputHandle(await this.inner.getHandle(selector), value)
+    }
+
+    /**
+     * Replaces the field's value with value in one write in the page, through
+     * writeValueInPage, instead of clearing and typing it key by key, and
+     * never logs it.
+     */
+    async inputHandle(handle: IHandleWrapper, value: string): Promise<void> {
+        await this.bounded("input", handle, async (stages, element) => {
+            await this.waitInViewport(stages, element, VIEWPORT_POLL_MS)
+            stages.gate()
+            await stages.within(element.evaluate(writeValueInPage, value, null))
+        })
+    }
+
+    /**
+     * Writes a credential into the field, as inputHandle writes a value, but
+     * only while the field is connected to a document at origin. The check and
+     * the write are one synchronous step in the page, through
+     * writeValueInPage, so no navigation or focus change can come between
+     * them, and the credential never reaches the page's keyboard or a log.
+     *
+     * Throws DOCUMENT_ORIGIN_UNVERIFIED, having written nothing, when the
+     * field's document is anywhere else; when origin is the opaque "null",
+     * which every about:blank or data: document shares; and when a stage
+     * fails, as the write does once a navigation destroyed the field's
+     * document. At the deadline it fails with its TimeoutError, like any
+     * action, and the stage it abandoned is logged by its error's name only.
+     *
+     * @param handle the field
+     * @param value the credential
+     * @param origin the origin the field's document must be at, as URL.origin
+     * gives it
+     */
+    async enterCredential(
+        handle: IHandleWrapper,
+        value: string,
+        origin: string
+    ): Promise<void> {
+        const enter = async (
+            stages: ActionStages,
+            element: ElementHandle
+        ): Promise<void> => {
+            if (origin === "null") {
+                throw new Error(DOCUMENT_ORIGIN_UNVERIFIED)
+            }
+            let written: boolean
+            try {
+                await this.waitInViewport(stages, element, VIEWPORT_POLL_MS)
+                stages.gate()
+                written = await stages.within(
+                    element.evaluate(writeValueInPage, value, origin)
+                )
+            } catch (error) {
+                if (stages.isTimeout(error)) {
+                    throw error
+                }
+                // Replaced by the fixed error, not propagated or logged whole
+                // as .claude/rules/typescript.md asks: Puppeteer quotes the
+                // frame's URL in its errors once the frame is detached, and
+                // that URL is the untrusted document's.
+                throw new Error(DOCUMENT_ORIGIN_UNVERIFIED)
+            }
+            if (!written) {
+                throw new Error(DOCUMENT_ORIGIN_UNVERIFIED)
+            }
+        }
+        await this.bounded("enterCredential", handle, enter, true)
+    }
+
+    async selectOption(selector: ISelector, option: string): Promise<void> {
+        await this.selectOptionHandle(
+            await this.inner.getHandle(selector),
+            option
+        )
+    }
+
+    async selectOptionHandle(
+        handle: IHandleWrapper,
+        option: string
+    ): Promise<void> {
+        await this.bounded("selectOption", handle, async (stages, element) => {
+            await this.waitInViewport(stages, element, VIEWPORT_POLL_MS)
+            stages.gate()
+            // Puppeteer selects in its isolated world, into which the viewport
+            // wait's focus already adopted the element, so the selection is
+            // sent in this same run.
+            await stages.within(element.select(option))
+        })
+    }
+
+    async navigate(selector: ISelector): Promise<void> {
+        await this.navigateHandle(await this.inner.getHandle(selector))
+    }
+
+    /**
+     * Clicks the element as clickHandle does and waits, within the same
+     * deadline, for the navigation the click causes.
+     */
+    async navigateHandle(handle: IHandleWrapper): Promise<void> {
+        await this.bounded("navigate", handle, async (stages, element) => {
+            // Started before the click, as loadgen-core starts it, so the
+            // navigation the click causes cannot be missed; Puppeteer's own
+            // navigation timeout ends it. Its rejection reaches the action
+            // through the stage that waits for it; this handler only keeps a
+            // wait the action abandons, after a failed click or at the
+            // deadline, from ending as an unhandled rejection.
+            const navigation = element.frame.waitForNavigation()
+            navigation.catch(() => undefined)
+            await this.clickWithin(stages, element)
+            await stages.within(navigation)
+        })
+    }
+
+    /** The viewport wait alone, checking every waitInterval ms. */
+    async scrollIntoView(
+        handle: IHandleWrapper,
+        waitInterval = VIEWPORT_POLL_MS
+    ): Promise<void> {
+        await this.bounded(
+            "scrollIntoView",
+            handle,
+            async (stages, element) => {
+                await this.waitInViewport(stages, element, waitInterval)
+            }
+        )
+    }
+
+    async setupPage(setup: PageSetup): Promise<void> {
+        await this.inner.setupPage(setup)
+    }
+
+    async isSelectorPresent(selector: ISelector): Promise<boolean> {
+        return await this.inner.isSelectorPresent(selector)
+    }
+
+    async getHandle(selector: ISelector): Promise<IHandleWrapper> {
+        return await this.inner.getHandle(selector)
+    }
+
+    async getAllHandles(selector: ISelector): Promise<IHandleWrapper[]> {
+        return await this.inner.getAllHandles(selector)
+    }
+
+    async clearInput(handle: IHandleWrapper): Promise<void> {
+        await this.inner.clearInput(handle)
+    }
+
+    async sleep(milliseconds: number, noiseProportion?: number): Promise<void> {
+        await this.inner.sleep(milliseconds, noiseProportion)
+    }
+
+    async getProperty<Type = unknown>(
+        selector: ISelector,
+        propertyName: string
+    ): Promise<Type> {
+        return await this.inner.getProperty<Type>(selector, propertyName)
+    }
+
+    async getPropertyHandle<Type = unknown>(
+        handle: IHandleWrapper,
+        propertyName: string
+    ): Promise<Type> {
+        return await this.inner.getPropertyHandle<Type>(handle, propertyName)
+    }
+
+    async endDtSession(): Promise<void> {
+        await this.inner.endDtSession()
+    }
+
+    async evaluate(
+        func: string | EvaluateFunc<unknown[]>,
+        ...args: unknown[]
+    ): Promise<unknown> {
+        return await this.inner.evaluate(func, ...args)
+    }
+
+    async getInnerText(selector: ISelector): Promise<string> {
+        return await this.inner.getInnerText(selector)
+    }
+
+    async gotoPage(url: string): Promise<void> {
+        await this.inner.gotoPage(url)
+    }
+
+    async standardDelay(): Promise<void> {
+        await this.inner.standardDelay()
+    }
+
+    async shortDelay(): Promise<void> {
+        await this.inner.shortDelay()
+    }
+
+    async longDelay(): Promise<void> {
+        await this.inner.longDelay()
+    }
+
+    /**
+     * loadgen-core's viewport wait, within the action's deadline: focuses the
+     * element, then checks every waitInterval ms until it intersects the
+     * viewport.
+     */
+    private async waitInViewport(
+        stages: ActionStages,
+        element: ElementHandle,
+        waitInterval: number
+    ): Promise<void> {
+        await stages.within(element.focus())
+        while (
+            (await stages.within(element.isIntersectingViewport())) === false
+        ) {
+            await stages.pause(waitInterval)
+        }
+    }
+
+    /**
+     * Clicks the element at its clickable point after the viewport wait. The
+     * mouse click starts right after the gate, and Puppeteer sends its mouse
+     * events as the click starts, so none is sent once the deadline has
+     * passed.
+     */
+    private async clickWithin(
+        stages: ActionStages,
+        element: ElementHandle,
+        options?: ClickOptions
+    ): Promise<void> {
+        await this.waitInViewport(stages, element, VIEWPORT_POLL_MS)
+        const point = await stages.within(
+            element.clickablePoint(options?.offset)
+        )
+        stages.gate()
+        await stages.within(
+            element.frame.page().mouse.click(point.x, point.y, options)
+        )
+    }
+
+    /**
+     * Runs the stages of action on the element of handle under one deadline,
+     * and disposes the handle when the action fails, at its deadline or
+     * otherwise.
+     *
+     * @param redacted whether a stage abandoned at the deadline is logged by
+     * its error's name only, without the error object
+     */
+    private async bounded(
+        action: string,
+        handle: IHandleWrapper,
+        run: (stages: ActionStages, element: ElementHandle) => Promise<void>,
+        redacted = false
+    ): Promise<void> {
+        const target = handle.toString()
+        const timeout = new Error(
+            `Page action [${action}] on [${target}] did not finish within [${this.timeoutMs}] ms`
+        )
+        timeout.name = "TimeoutError"
+        let expired = false
+        let expire: (error: Error) => void = () => undefined
+        const expiry = new Promise<never>((_resolve, reject) => {
+            expire = reject
+        })
+        // Handled from the start: the deadline can pass between two stages,
+        // while no stage races it; the next stage or gate then fails.
+        expiry.catch(() => undefined)
+        let inFlight: Promise<unknown> | undefined
+        let pauseTimer: ReturnType<typeof setTimeout> | undefined
+        const stages: ActionStages = {
+            within: async <T>(stage: Promise<T>): Promise<T> => {
+                inFlight = stage
+                return await Promise.race([stage, expiry])
+            },
+            pause: async (ms: number): Promise<void> => {
+                // No browser work runs during a pause, so a deadline that
+                // passes in it abandons no stage.
+                inFlight = undefined
+                const pause = new Promise<void>((resolve) => {
+                    pauseTimer = setTimeout(resolve, ms)
+                })
+                await Promise.race([pause, expiry])
+            },
+            gate: (): void => {
+                if (expired) {
+                    throw timeout
+                }
+            },
+            isTimeout: (error: unknown): boolean => error === timeout,
+        }
+        // Armed before the first stage, through the global setTimeout looked
+        // up at call time, so a mocked clock drives the deadline.
+        const deadline = setTimeout(() => {
+            expired = true
+            expire(timeout)
+        }, this.timeoutMs)
+        try {
+            await run(stages, handle.getHandle())
+        } catch (error) {
+            this.dispose(action, target, handle)
+            if (error === timeout && inFlight !== undefined) {
+                this.logAbandoned(action, target, inFlight, redacted)
+            }
+            throw error
+        } finally {
+            clearTimeout(deadline)
+            if (pauseTimer !== undefined) {
+                clearTimeout(pauseTimer)
+            }
+        }
+    }
+
+    /**
+     * Starts disposing the element handle without waiting for it: Puppeteer
+     * marks the handle disposed as the call starts, and its release of the
+     * remote object must not hold the caller past the deadline. A failure is
+     * logged at debug, never thrown.
+     */
+    private dispose(
+        action: string,
+        target: string,
+        handle: IHandleWrapper
+    ): void {
+        let disposal: Promise<void>
+        try {
+            disposal = Promise.resolve(handle.getHandle().dispose())
+        } catch (error) {
+            disposal = Promise.reject(error)
+        }
+        disposal.catch((error: unknown) => {
+            this.logger.debug(
+                `Page action [${action}] on [${target}] handle not disposed: error [${errorName(error)}]`,
+                { error }
+            )
+        })
+    }
+
+    /**
+     * Logs at debug how the stage an action abandoned at its deadline ends: a
+     * failure by its error's name, and with the error object unless redacted.
+     */
+    private logAbandoned(
+        action: string,
+        target: string,
+        stage: Promise<unknown>,
+        redacted: boolean
+    ): void {
+        stage.then(
+            () => {
+                this.logger.debug(
+                    `Page action [${action}] on [${target}] finished after its deadline`
+                )
+            },
+            (error: unknown) => {
+                const message = `Page action [${action}] on [${target}] failed after its deadline: error [${errorName(error)}]`
+                if (redacted) {
+                    // Without the whole error object .claude/rules/typescript.md
+                    // asks for: a credential field's stage fails with errors
+                    // that quote the untrusted document's URL.
+                    this.logger.debug(message)
+                } else {
+                    this.logger.debug(message, { error })
+                }
+            }
+        )
+    }
+}
+
+/**
  * Assumes starting point Portfolio Insights page.
  * Endpoint Portfolio Insights page.
  *
@@ -571,12 +1108,13 @@ export function ownedAlertFailure(
  * so visits sharing one preset user cannot disturb each other.
  *
  * A page step that fails while the feature is verifiably lost mid-visit (see
- * isFeatureLost) ends with the owned-id outcome reached so far: not_submitted
- * before the submit click, unconfirmed from it until the id is read. Any other
- * page error before the id is read propagates, unchanged also when the loss
- * check fails. Once the id is known, a failing UI deletion is logged and the
- * API fallback decides the outcome, so nothing is thrown after the outcome is
- * decided.
+ * isFeatureLost), the navigation still shown without the Portfolio Insights
+ * link, ends with the owned-id outcome reached so far: not_submitted before
+ * the submit click, unconfirmed from it until the id is read. Any other page
+ * error before the id is read propagates unchanged, also when the page shows
+ * no navigation at all and when the loss check fails. Once the id is known, a
+ * failing UI deletion is logged and the API fallback decides the outcome, so
+ * nothing is thrown after the outcome is decided.
  *
  * @param pageActions
  * @param url EasyTrade base url
@@ -599,7 +1137,7 @@ export async function createAndDeleteOwnedAlert(
 ): Promise<OwnedAlertOutcome> {
     let marker: string
     try {
-        const instrumentId = await waitForInstrumentId(pageActions)
+        const instrumentId = await waitForInstrumentId(pageActions, logger)
         if (instrumentId === undefined) {
             logger.warn(
                 "Alert instrument options did not load, no alert created"
@@ -610,9 +1148,10 @@ export async function createAndDeleteOwnedAlert(
         marker = createMarker(random)
         await fillAlertForm(pageActions, instrumentId, marker)
     } catch (error) {
-        // Nothing is submitted yet: a verified loss of the feature ends the
-        // visit without an alert, and any other error propagates without an
-        // outcome line.
+        // Nothing is submitted yet: a verified loss of the feature, the
+        // navigation shown without its link, ends the visit without an
+        // alert, and any other error, a page without navigation included,
+        // propagates without an outcome line.
         if (!(await isFeatureLost(pageActions, logger))) {
             throw error
         }
@@ -628,8 +1167,10 @@ export async function createAndDeleteOwnedAlert(
         id = await readCreatedAlertId(pageActions, marker, logger)
     } catch (error) {
         // From the submit click on, the alert may exist, so the marker is
-        // logged for an operator to find it. A verified loss of the feature
-        // ends the visit with that outcome; any other error still propagates.
+        // logged for an operator to find it. A verified loss of the feature,
+        // the navigation shown without its link, ends the visit with that
+        // outcome; any other error, a page without navigation included,
+        // still propagates.
         logger.warn(unconfirmedMessage(marker), { error })
         if (!(await isFeatureLost(pageActions, logger))) {
             throw error
@@ -740,9 +1281,19 @@ const instrumentOptionPresence = new DomPresenceSelector(
     selectors.portfolioInsightsPage_alertInstrumentOption
 )
 
-/** The navigation link as isFeatureLost looks it up: in the DOM alone. */
-const navigationLinkPresence = new DomPresenceSelector(
-    selectors.navigation_portfolioInsightsPage
+/**
+ * The home link of the navigation every protected page shows, matched only
+ * while no Portfolio Insights link is anywhere in the document: present only
+ * on a page that has lost the feature, and looked up by isFeatureLost in the
+ * DOM alone. Its XPath is the home link's selector filtered by the absence of
+ * the Portfolio Insights link's selector, both single location paths, so one
+ * evaluation reads both facts from the same document state.
+ */
+export const featureLossPresence = new DomPresenceSelector(
+    new XpathSelector(
+        "nav-without-portfolio-insights",
+        `${selectors.navigation_homePage.baseValue}[not(${selectors.navigation_portfolioInsightsPage.baseValue})]`
+    )
 )
 
 /**
@@ -751,9 +1302,19 @@ const navigationLinkPresence = new DomPresenceSelector(
  * from the DOM because the options of a closed <select> are never visible;
  * once options are present, the first one's value is read, and an empty or
  * non-string value counts as not yet loaded.
+ *
+ * Each check releases the handles it acquired before it answers: the element
+ * handle of every option it found and the handle of the value property it
+ * read, so none is left to the page's close. They are released also when the
+ * read fails, whose error then propagates, and a release that fails is logged
+ * without replacing the check's answer or the read's error.
+ *
+ * @param pageActions
+ * @param logger receives the debug line of a release that fails
  */
 async function waitForInstrumentId(
-    pageActions: IPageActions
+    pageActions: IPageActions,
+    logger: Logger
 ): Promise<string | undefined> {
     return await pollBounded(pageActions, async () => {
         if (!(await pageActions.isSelectorPresent(instrumentOptionPresence))) {
@@ -762,15 +1323,61 @@ async function waitForInstrumentId(
         const options = await pageActions.getAllHandles(
             selectors.portfolioInsightsPage_alertInstrumentOption
         )
-        if (options.length === 0) {
-            return undefined
+        try {
+            if (options.length === 0) {
+                return undefined
+            }
+            const value = await readOptionValue(options[0], logger)
+            return typeof value === "string" && value !== "" ? value : undefined
+        } finally {
+            await releaseHandles(
+                options.map((option) => () => option.getHandle().dispose()),
+                logger
+            )
         }
-        const value = await pageActions.getPropertyHandle<unknown>(
-            options[0],
-            "value"
-        )
-        return typeof value === "string" && value !== "" ? value : undefined
     })
+}
+
+/**
+ * Reads the value property of option through its element, as
+ * PageActions.getPropertyHandle does, but disposes the property's handle,
+ * which getPropertyHandle leaves to the page's close, also when the read
+ * fails.
+ */
+async function readOptionValue(
+    option: IHandleWrapper,
+    logger: Logger
+): Promise<unknown> {
+    const property = await option.getHandle().getProperty("value")
+    try {
+        return await property.jsonValue()
+    } finally {
+        await releaseHandles([() => property.dispose()], logger)
+    }
+}
+
+/**
+ * Runs every disposal, each whether or not another fails, and logs each one
+ * that fails at debug, the message naming only the error's name and the entry
+ * carrying the error object, instead of throwing: a failed release must not
+ * replace the answer or the error of the read the handles served.
+ */
+async function releaseHandles(
+    disposals: readonly (() => Promise<void>)[],
+    logger: Logger
+): Promise<void> {
+    const results = await Promise.allSettled(
+        disposals.map(async (dispose) => await dispose())
+    )
+    for (const result of results) {
+        if (result.status === "rejected") {
+            const error: unknown = result.reason
+            logger.debug(
+                `Instrument option handle not released: error [${errorName(error)}]`,
+                { error }
+            )
+        }
+    }
 }
 
 function randomDigit(random: () => number, lowest: number): number {

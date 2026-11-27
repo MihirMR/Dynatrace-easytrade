@@ -12,11 +12,16 @@
  *
  *     node verification/portfolio-insights-page-check.mjs --base-url URL
  *         --mode flag-off|flag-on --fixture FILE --evidence-dir DIR
+ *     node verification/portfolio-insights-page-check.mjs --help
  *
- * Every option is required, and no environment variable is read. The flag
- * must already be in the state the mode names: `false` for flag-off and
- * `true` for flag-on. flag-on turns it off and on again for its sidebar
- * continuity check and for its last check.
+ * Every option but `--help` is required, and no environment variable is
+ * read. `--help` (`-h`) prints the options, modes, fixture, exit codes and an
+ * example, then exits 0 without reading the fixture or contacting the app,
+ * whatever the other options hold; an unknown option, a positional argument
+ * or an option without its value is still a usage error. The flag must
+ * already be in the state the mode names: `false` for flag-off and `true`
+ * for flag-on. flag-on turns it off and on again for its sidebar continuity
+ * check and for its last check.
  *
  * Fixture, written by scripts/portfolio-insights/e2e.sh:
  *
@@ -27,11 +32,21 @@
  *                     "type": "TARGET_PRICE", "direction": "ABOVE",
  *                     "threshold": "123.45", "armingRevision": 1 } ] }
  *
- * - `evaluationIntervalSeconds`: optional positive integer, 60 by default.
+ * - `evaluationIntervalSeconds`: optional integer from 1 to 4294967, the
+ *   broker's interval range, 60 by default.
+ * - `holder` and `empty`: a non-empty string `username` and `password`, and
+ *   a UUID `accountId`.
  * - flag-off needs `holder`; `empty` is optional and `alerts` is ignored.
- * - flag-on needs `holder`, `empty` and exactly four `alerts`: for each pair,
- *   `target_price` (type `TARGET_PRICE`) and `profit_loss` (`PROFIT_LOSS`),
- *   one `ABOVE` and one `BELOW` member.
+ * - flag-on needs `holder`, `empty` and exactly four `alerts` with distinct
+ *   UUID ids: for each pair, `target_price` (type `TARGET_PRICE`) and
+ *   `profit_loss` (`PROFIT_LOSS`), one `ABOVE` and one `BELOW` member.
+ * - `threshold`: a plain decimal string, `-?(0|[1-9][0-9]*)(\.[0-9]+)?`, of
+ *   at most 10 integer and 8 fractional digits once trailing fractional
+ *   zeros are removed; above 0 for `TARGET_PRICE`, of any sign for
+ *   `PROFIT_LOSS`.
+ * - `armingRevision`: an integer from 1 to 2147483647.
+ * - Any other fixture stops the run with exit code 2 before any browser or
+ *   API action.
  *
  * Passwords are never printed or written. Neither are response bodies, JSON
  * parser messages, response fields the checks do not know, or the text of
@@ -51,8 +66,8 @@
  * is closed, which ends the read at once; that check and every later check
  * on the same page fail.
  *
- * Exit codes: 0 when every check passed; 1 when a check or the setup failed;
- * 2 on a usage or fixture error.
+ * Exit codes: 0 when every check passed, or for `--help`; 1 when a check or
+ * the setup failed; 2 on a usage or fixture error.
  *
  * The check runs only when node starts this file. Importing it runs nothing
  * and exposes the helpers the unit tests exercise, which run from
@@ -60,6 +75,7 @@
  *
  *     node --test "verification/*.test.mjs"
  */
+import { execFile } from "node:child_process"
 import { mkdir, readFile, writeFile } from "node:fs/promises"
 import path from "node:path"
 import process from "node:process"
@@ -68,12 +84,84 @@ import { parseArgs } from "node:util"
 const USAGE =
     "Usage: node verification/portfolio-insights-page-check.mjs --base-url URL --mode flag-off|flag-on --fixture FILE --evidence-dir DIR"
 
+/** What `--help` prints: the options, modes, fixture, exit codes, example. */
+export const HELP = `${USAGE}
+       node verification/portfolio-insights-page-check.mjs --help
+
+Browser check of the Portfolio Insights page against the broker responses
+the page received. Run it from src/loadgen after npm ci. Every input is an
+option or the fixture; no environment variable is read.
+
+Options, all required except --help:
+  --base-url URL      The app's origin: http or https, without a path, query,
+                      fragment or credentials, such as http://localhost.
+  --mode MODE         flag-off or flag-on, as described under Modes.
+  --fixture FILE      The JSON fixture scripts/portfolio-insights/e2e.sh
+                      writes, as described under Fixture.
+  --evidence-dir DIR  The directory, created when missing, that receives
+                      portfolio-insights-page-check-<mode>.json and the
+                      screenshots.
+  -h, --help          Prints this help and exits 0 without reading the
+                      fixture or contacting the app, whatever the other
+                      options hold. An unknown option, a positional argument
+                      or an option without its value is still a usage error.
+
+Modes. The portfolio-insights-enabled flag must already have the state the
+mode names:
+  flag-off  The flag must be false. Checks that the page's navigation link
+            is absent and that a direct visit to /insights lands on /home.
+  flag-on   The flag must be true. Checks the page against the insights
+            response it received, the empty state, one Toast per triggered
+            alert arming, re-arming, acknowledging, the existing sidebar
+            links' layout and the live shutdown. It turns the flag off and
+            on again for the sidebar continuity check and for its last
+            check, and re-arms and acknowledges the fixture's alerts.
+
+Fixture, a JSON object:
+  { "evaluationIntervalSeconds": 60,
+    "holder": { "username": "...", "password": "...", "accountId": "<uuid>" },
+    "empty": { "username": "...", "password": "...", "accountId": "<uuid>" },
+    "alerts": [ { "id": "<uuid>", "pair": "target_price",
+                  "type": "TARGET_PRICE", "direction": "ABOVE",
+                  "threshold": "123.45", "armingRevision": 1 } ] }
+  evaluationIntervalSeconds  Optional integer from 1 to 4294967, the broker's
+                             interval range; 60 by default.
+  holder, empty              Each a non-empty string username and password
+                             and a UUID accountId. flag-off needs holder and
+                             takes an optional empty; flag-on needs both.
+  alerts                     flag-on only; flag-off ignores it. Exactly four
+                             with distinct UUID ids: for each pair,
+                             target_price (type TARGET_PRICE) and profit_loss
+                             (type PROFIT_LOSS), one ABOVE and one BELOW
+                             member.
+  threshold                  A plain decimal string such as "-12.5" or "0.5",
+                             without a plus sign, exponent or extra leading
+                             zero, of at most 10 integer and 8 fractional
+                             digits once trailing fractional zeros are
+                             removed. Above 0 for TARGET_PRICE; of any sign
+                             for PROFIT_LOSS.
+  armingRevision             An integer from 1 to 2147483647.
+
+Output: one "PASS <check>" or "FAIL <check>: <reason>" line per check.
+Passwords are never printed or written.
+
+Exit codes:
+  0  Every check passed, or --help.
+  1  A check or the setup failed.
+  2  A usage or fixture error, found before any browser or API action.
+
+Example, from src/loadgen:
+  node verification/portfolio-insights-page-check.mjs --base-url http://localhost --mode flag-on --fixture run/fixture.json --evidence-dir run/evidence`
+
 const OPTIONS = {
     "base-url": { type: "string" },
     mode: { type: "string" },
     fixture: { type: "string" },
     "evidence-dir": { type: "string" },
+    help: { type: "boolean", short: "h" },
 }
+/** The options a run needs, in the order a missing one is reported. */
+const REQUIRED_OPTIONS = ["base-url", "mode", "fixture", "evidence-dir"]
 
 const MODES = ["flag-off", "flag-on"]
 
@@ -89,6 +177,16 @@ const ALERT_ID_PATH =
 const UUID_PATTERN =
     /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
 const THRESHOLD_PATTERN = /^-?(0|[1-9][0-9]*)(\.[0-9]+)?$/
+/**
+ * A `THRESHOLD_PATTERN` match inside the broker's threshold domain, decided
+ * on the text: at most 10 integer and 8 fractional digits once trailing
+ * fractional zeros are removed, which is what `DECIMAL(18, 8)` stores.
+ */
+const THRESHOLD_DOMAIN_PATTERN = /^-?(0|[1-9][0-9]{0,9})(\.[0-9]{1,8}0*)?$/
+/** The broker uses an evaluation interval only from 1 to this, in seconds. */
+const MAX_EVALUATION_INTERVAL_S = 4294967
+/** Largest arming revision: the int32 of the gRPC contract and `INT` column. */
+const MAX_ARMING_REVISION = 2147483647
 
 /** Fixture pair name → the alert type both of its members carry. */
 const PAIR_TYPES = { target_price: "TARGET_PRICE", profit_loss: "PROFIT_LOSS" }
@@ -142,14 +240,19 @@ const ERROR_CODE_PATTERN = /^[A-Z][A-Z0-9_]{0,63}$/
 
 const VIEWPORT = { width: 1366, height: 900 }
 
-/** The five sidebar links that predate Portfolio Insights, in their order. */
-const LEGACY_NAV_IDS = [
-    "nav-home",
-    "nav-instruments",
-    "nav-deposit",
-    "nav-withdraw",
-    "nav-credit-card",
-]
+/**
+ * The five sidebar links that predate Portfolio Insights, in their order,
+ * each with the route its `NavLink` in Navigation.tsx renders as its href.
+ */
+const LEGACY_NAV_ROUTES = new Map([
+    ["nav-home", "/home"],
+    ["nav-instruments", "/instruments"],
+    ["nav-deposit", "/deposit"],
+    ["nav-withdraw", "/withdraw"],
+    ["nav-credit-card", "/credit-card"],
+])
+/** The ids of `LEGACY_NAV_ROUTES`, in their order. */
+const LEGACY_NAV_IDS = [...LEGACY_NAV_ROUTES.keys()]
 /**
  * Viewport widths of the sidebar continuity check: the mobile row whose
  * labels wrap, the mobile row where the five links fit on one line and a
@@ -173,6 +276,39 @@ const FLAG_REQUEST_TIMEOUT_MS = 10_000
 const FLAG_RESPONSE_TIMEOUT_MS = 15_000
 /** Deadline for the client-side redirect of a direct /insights visit. */
 const REDIRECT_TIMEOUT_MS = 15_000
+/**
+ * How long a flag-off page must stay without the feature once its first flag
+ * response arrived, and once a direct /insights visit landed on /home. The
+ * frontend applies a flag answer in its next render, well within this, and
+ * an element or request the page reports late still arrives within it.
+ */
+const SETTLE_WINDOW_MS = 3_000
+/**
+ * The method and the one status of each page response kind the frontend's
+ * own call gets on success: the flag read (the flag service's `GetByID`), the
+ * insights read, the alert list, the notification poll and the PATCH answer
+ * 200, the acknowledge 204 (`AlertController`). Any other answer is recorded
+ * as evidence and never consumed.
+ */
+const EXPECTED_RESPONSES = {
+    flag: { method: "GET", status: 200 },
+    insights: { method: "GET", status: 200 },
+    alertsList: { method: "GET", status: 200 },
+    notifications: { method: "GET", status: 200 },
+    patch: { method: "PATCH", status: 200 },
+    acknowledge: { method: "POST", status: 204 },
+}
+/** Why a 3xx fails the check's own requests: they never follow one. */
+const REDIRECT_REASON = "a redirect, which the check does not follow"
+/**
+ * The ids of the feature's elements: the sidebar link, the page with its
+ * figures and states, and the alerts panel with its form, list and
+ * notifications. A direct visit the flag sends to /home shows none of them.
+ */
+const FEATURE_ELEMENT_ID_PATTERN =
+    /^(?:nav-portfolio-insights|portfolio-insights|insights-[a-z0-9-]{1,64}|alerts?-[a-z0-9-]{1,64})$/
+/** The only form in which a request method is repeated. */
+const METHOD_PATTERN = /^[A-Z]{1,16}$/
 /** Deadline for the page to render the last insights response it received. */
 const RENDER_TIMEOUT_MS = 10_000
 /** Reads abandoned because a newer insights response arrived meanwhile. */
@@ -187,8 +323,25 @@ const POLLS_AFTER_RELOAD = 2
 const POLLS_AFTER_RELOAD_TIMEOUT_MS = 60_000
 /** Deadline for the Toast of a triggered arming. */
 const TOAST_TIMEOUT_MS = 10_000
-/** Deadline for an alert row, its toggle and the PATCH a click sends. */
+/**
+ * Deadline for an alert row, its toggle, the received state that explains
+ * the toggle's label, and the PATCH a click sends.
+ */
 const ROW_TIMEOUT_MS = 20_000
+/**
+ * The `enabled` value the PATCH of each `button.alert-toggle` label sends
+ * (`AlertList`): "Disable" on an armed row, "Re-arm" on a triggered one and
+ * "Enable" on a disabled one.
+ */
+const TOGGLE_SENDS = { Disable: false, "Re-arm": true, Enable: true }
+const TOGGLE_LABELS = Object.keys(TOGGLE_SENDS)
+/**
+ * Samples of a row's toggle, at most, while its label changes between the
+ * sample and the click, as when the alert triggers just before it.
+ */
+const MAX_TOGGLE_SAMPLES = 3
+/** The response kinds that carry an alert's state to the page. */
+const ALERT_STATE_KINDS = ["alertsList", "notifications", "patch"]
 /** Deadline for a notification item, its acknowledge response and removal. */
 const ACKNOWLEDGE_TIMEOUT_MS = 20_000
 /** Deadline for the first notification poll after the acknowledge click. */
@@ -210,6 +363,14 @@ const POLL_INTERVAL_MS = 250
  * running when its wait times out ends sooner: `probePage` closes its page.
  */
 const PROTOCOL_TIMEOUT_MS = 2 * PAGE_TIMEOUT_MS
+/**
+ * Deadline for the browser to close. Puppeteer bounds the close command by
+ * PROTOCOL_TIMEOUT_MS, then waits for Chrome's process to exit without any
+ * bound; past this deadline that process is killed instead.
+ */
+const BROWSER_CLOSE_TIMEOUT_MS = 15_000
+/** Deadline for the browser process to be killed and seen to exit. */
+const BROWSER_KILL_TIMEOUT_MS = 10_000
 
 /** A bad command line or fixture; the run stops with exit code 2. */
 class UsageError extends Error {
@@ -489,6 +650,11 @@ function parseBaseUrl(text) {
     return url.origin
 }
 
+/**
+ * The run's options, or `{ help: true }` for `--help` or `-h` before any
+ * other option is checked. A command line `parseArgs` rejects stays a usage
+ * error with `--help`.
+ */
 function parseOptions(args) {
     let parsed
     try {
@@ -497,7 +663,10 @@ function parseOptions(args) {
         throw new UsageError(error.message)
     }
     const { values } = parsed
-    for (const name of Object.keys(OPTIONS)) {
+    if (values.help === true) {
+        return { help: true }
+    }
+    for (const name of REQUIRED_OPTIONS) {
         if (values[name] === undefined || values[name] === "") {
             throw new UsageError(`--${name} is required`)
         }
@@ -579,8 +748,26 @@ function parseAlert(fixturePath, alert, index) {
     ) {
         throw invalid("needs a plain decimal string threshold")
     }
-    if (!Number.isInteger(alert.armingRevision) || alert.armingRevision < 1) {
-        throw invalid("needs an integer armingRevision of at least 1")
+    if (!THRESHOLD_DOMAIN_PATTERN.test(alert.threshold)) {
+        throw invalid(
+            "needs a threshold of at most 10 integer and 8 fractional digits, not counting trailing fractional zeros"
+        )
+    }
+    // Above 0, decided on the text: no minus sign and a nonzero digit.
+    if (
+        alert.type === "TARGET_PRICE" &&
+        (alert.threshold.startsWith("-") || !/[1-9]/.test(alert.threshold))
+    ) {
+        throw invalid("of type TARGET_PRICE needs a threshold above 0")
+    }
+    if (
+        !Number.isInteger(alert.armingRevision) ||
+        alert.armingRevision < 1 ||
+        alert.armingRevision > MAX_ARMING_REVISION
+    ) {
+        throw invalid(
+            `needs an integer armingRevision from 1 to ${MAX_ARMING_REVISION}`
+        )
     }
     return {
         id: alert.id.toLowerCase(),
@@ -644,12 +831,15 @@ async function readFixture(fixturePath, mode) {
     }
     const evaluationIntervalSeconds =
         fixture.evaluationIntervalSeconds ?? DEFAULT_EVALUATION_INTERVAL_S
+    // The re-arm wait grows with the interval, so the broker's own range
+    // also keeps that wait bounded.
     if (
         !Number.isInteger(evaluationIntervalSeconds) ||
-        evaluationIntervalSeconds <= 0
+        evaluationIntervalSeconds < 1 ||
+        evaluationIntervalSeconds > MAX_EVALUATION_INTERVAL_S
     ) {
         throw new UsageError(
-            `--fixture ${fixturePath} needs a positive integer evaluationIntervalSeconds`
+            `--fixture ${fixturePath} needs an integer evaluationIntervalSeconds from 1 to ${MAX_EVALUATION_INTERVAL_S}`
         )
     }
     const holder = parseAccount(fixturePath, fixture.holder, "holder")
@@ -928,10 +1118,24 @@ export function transportFailure(error, timeoutMs = FLAG_REQUEST_TIMEOUT_MS) {
 }
 
 /**
+ * Why the status of one of the check's own requests fails it, as a fixed
+ * phrase. Only 200 passes. A 3xx comes back unfollowed, since every such
+ * request is sent with `redirect: "manual"`, and is named as a redirect; its
+ * `Location` is never repeated.
+ */
+function statusFailure(status) {
+    return status >= 300 && status < 400
+        ? `answered HTTP ${status}, ${REDIRECT_REASON}`
+        : `answered HTTP ${status}`
+}
+
+/**
  * Sends one request to the flag service and returns the flag it answers
- * with, as `{ id, enabled }` only. A failure names the method, URL, HTTP
- * status and a fixed reason, never the body: the flag service, or a proxy in
- * front of it, may answer with any text.
+ * with, as `{ id, enabled }` only. Only a 200 answers, and a redirect is
+ * never followed, so neither the request nor its body reaches another
+ * address. A failure names the method, URL, HTTP status and a fixed reason,
+ * never the body: the flag service, or a proxy in front of it, may answer
+ * with any text.
  */
 export async function flagRequest(baseUrl, init) {
     const url = `${baseUrl}${FLAG_PATH}`
@@ -939,7 +1143,7 @@ export async function flagRequest(baseUrl, init) {
     const signal = AbortSignal.timeout(FLAG_REQUEST_TIMEOUT_MS)
     let response
     try {
-        response = await fetch(url, { ...init, signal })
+        response = await fetch(url, { ...init, signal, redirect: "manual" })
     } catch (error) {
         throw new Error(`${method} ${url} failed: ${transportFailure(error)}`, {
             cause: error,
@@ -954,8 +1158,8 @@ export async function flagRequest(baseUrl, init) {
             { cause: error }
         )
     }
-    if (!response.ok) {
-        throw new Error(`${method} ${url} answered HTTP ${response.status}`)
+    if (response.status !== 200) {
+        throw new Error(`${method} ${url} ${statusFailure(response.status)}`)
     }
     const { flag, problem } = parseFlagBody(text)
     if (flag === null) {
@@ -1063,54 +1267,207 @@ function bodyReadFailure(error) {
 }
 
 /**
+ * The query the frontend sends with a call of response kind `kind`
+ * (`api/alerts/index.ts`): `accountId` alone on the alert list, `accountId`
+ * and `unacknowledged=true` on the notification poll, nothing on the others.
+ */
+function expectedQuery(kind, session) {
+    if (kind === "alertsList") {
+        return { accountId: session.account.accountId }
+    }
+    if (kind === "notifications") {
+        return { accountId: session.account.accountId, unacknowledged: "true" }
+    }
+    return {}
+}
+
+/**
+ * Whether a page response answers the frontend's own call, decided once as
+ * it is recorded: `null` when it does, else why not, as a fixed phrase. It
+ * must come from the session's `origin`, the page's own, which the reverse
+ * proxy serves the flag service and the broker from; answer the method of
+ * `EXPECTED_RESPONSES` with its one status; be for the session's account;
+ * and carry exactly `expectedQuery`, each parameter once, an account id in
+ * any case. A redirect is a 3xx, so it is never accepted, and neither is a
+ * response the redirect led to on another origin.
+ */
+function responseRejection(session, classified, url, method, status) {
+    const expected = EXPECTED_RESPONSES[classified.kind]
+    if (url.origin !== session.origin) {
+        return "came from another origin"
+    }
+    if (method !== expected.method) {
+        const sent = METHOD_PATTERN.test(method) ? method : "another"
+        return `answered a ${sent} request, not ${expected.method}`
+    }
+    if (
+        classified.accountId !== null &&
+        classified.accountId !== session.account.accountId
+    ) {
+        return classified.accountId === ""
+            ? "names no account"
+            : "is for another account"
+    }
+    const query = Object.entries(expectedQuery(classified.kind, session))
+    const exactQuery =
+        [...url.searchParams.keys()].length === query.length &&
+        query.every(([name, value]) => {
+            const values = url.searchParams.getAll(name)
+            const sent =
+                name === "accountId" ? values[0]?.toLowerCase() : values[0]
+            return values.length === 1 && sent === value
+        })
+    if (!exactQuery) {
+        return "lacks the exact query the frontend sends"
+    }
+    if (status !== expected.status) {
+        return `answered HTTP ${status}, not ${expected.status}`
+    }
+    return null
+}
+
+/**
  * Records a response in arrival order at once and reads its JSON body in the
- * background; consumers use an entry once `parsed` is set or it is a 204. A
- * body that cannot be read leaves `bodyError`, a fixed phrase.
+ * background. An entry holds the `classifyResponse` fields (`kind`,
+ * `accountId`, `alertId`), the `url`, `path`, `method` and `status`, its
+ * arrival time `at` and sequence number `seq`, and `accepted` with
+ * `rejection`: whether `responseRejection` found it the answer to the
+ * frontend's own call, and else why not. A check counts a call of the page
+ * only on an accepted entry; every other one is kept as evidence of what the
+ * page received. Every body but a 204's is read: `parsed` is set and `body`
+ * holds it once read, and a body that cannot be read leaves `bodyError`, a
+ * fixed phrase. A PATCH entry also gets `sentEnabled`, what its request
+ * sent (`sentEnabledOf`), `undefined` until that is read. Both reads are
+ * pending in `session.pendingBodies` until done.
  */
 export function recordResponse(session, response) {
     const url = new URL(response.url())
-    const method = response.request().method()
+    const request = response.request()
+    const method = request.method()
     const classified = classifyResponse(method, url)
     if (classified === null) {
         return
     }
+    const status = response.status()
+    const rejection = responseRejection(
+        session,
+        classified,
+        url,
+        method,
+        status
+    )
     const entry = {
         ...classified,
         url: response.url(),
         path: url.pathname,
         method,
-        status: response.status(),
+        status,
+        accepted: rejection === null,
+        rejection,
         at: Date.now(),
         seq: nextSequence(),
         body: undefined,
         parsed: false,
     }
     session.responses.push(entry)
-    if (entry.status === 204) {
+    const reads = []
+    if (entry.kind === "patch") {
+        entry.sentEnabled = undefined
+        // `fetchPostData` is the replacement Puppeteer names for the
+        // deprecated `postData`; a request it cannot read sent no known body.
+        reads.push(
+            new Promise((resolve) => resolve(request.fetchPostData())).then(
+                (text) => {
+                    entry.sentEnabled = sentEnabledOf(text)
+                },
+                () => {
+                    entry.sentEnabled = null
+                }
+            )
+        )
+    }
+    if (entry.status !== 204) {
+        reads.push(
+            response.json().then(
+                (body) => {
+                    entry.body = body
+                    entry.parsed = true
+                },
+                (error) => {
+                    entry.bodyError = bodyReadFailure(error)
+                }
+            )
+        )
+    }
+    if (reads.length === 0) {
         return
     }
-    const reading = response
-        .json()
-        .then(
-            (body) => {
-                entry.body = body
-                entry.parsed = true
-            },
-            (error) => {
-                entry.bodyError = bodyReadFailure(error)
-            }
-        )
-        .finally(() => session.pendingBodies.delete(reading))
+    const reading = Promise.all(reads).finally(() =>
+        session.pendingBodies.delete(reading)
+    )
     session.pendingBodies.add(reading)
 }
 
 /**
- * Records when the page asks for notifications, and the trace headers of each
+ * The `enabled` value of a PATCH request body that is the frontend's
+ * `{"enabled": bool}` and nothing else (`updateAlertEnabled`), else `null`:
+ * what was sent is unknown. The body itself is never kept.
+ */
+function sentEnabledOf(text) {
+    if (typeof text !== "string") {
+        return null
+    }
+    let body
+    try {
+        body = JSON.parse(text)
+    } catch {
+        // The parser's message quotes the body, so it is not kept.
+        return null
+    }
+    return isPlainObject(body) &&
+        Object.keys(body).length === 1 &&
+        typeof body.enabled === "boolean"
+        ? body.enabled
+        : null
+}
+
+/**
+ * The route of a feature request, as a template that repeats no id, or
+ * `null` for any other path: the insights read, the alert routes and the
+ * notification poll.
+ */
+function featureRoute(pathname) {
+    if (pathname.startsWith(INSIGHTS_PATH_PREFIX)) {
+        return `${INSIGHTS_PATH_PREFIX}{accountId}`
+    }
+    if (pathname === ALERTS_PATH || pathname === NOTIFICATIONS_PATH) {
+        return pathname
+    }
+    const match = ALERT_ID_PATH.exec(pathname)
+    if (match !== null) {
+        return `${ALERTS_PATH}/{id}${match[2] ?? ""}`
+    }
+    return pathname.startsWith(`${ALERTS_PATH}/`) ? `${ALERTS_PATH}/…` : null
+}
+
+/**
+ * Records every feature request the page sends, by method and route only,
+ * when the page asks for notifications, and the trace headers of each
  * insights request as observed data only. A header value is escaped and cut
  * to `MAX_TRACE_HEADER_CHARS`, which a W3C or Dynatrace value never needs.
  */
 export function recordRequest(session, report, request) {
     const url = new URL(request.url())
+    const route = featureRoute(url.pathname)
+    if (route !== null) {
+        const method = request.method()
+        session.featureRequests.push({
+            seq: nextSequence(),
+            at: Date.now(),
+            method: METHOD_PATTERN.test(method) ? method : null,
+            route,
+        })
+    }
     if (url.pathname === NOTIFICATIONS_PATH) {
         session.notificationRequests.push({
             seq: nextSequence(),
@@ -1184,23 +1541,88 @@ function installToastRecorder() {
 }
 
 /**
+ * In every document of a page, before its own scripts: reports, by its id
+ * only, the first appearance in that document of each element whose id
+ * `idPattern` matches, the feature's. A direct visit the flag redirects may
+ * mount the feature for a moment, which no read after the redirect sees.
+ */
+export function installFeatureRecorder(idPattern) {
+    const pattern = new RegExp(idPattern)
+    const reported = new Set()
+    const report = (element) => {
+        const { id } = element
+        if (typeof id !== "string" || reported.has(id) || !pattern.test(id)) {
+            return
+        }
+        reported.add(id)
+        window
+            .__recordFeatureElement({ id })
+            .catch((error) => console.error(error))
+    }
+    const visit = (node) => {
+        // Only elements carry an id.
+        if (node.nodeType !== 1) {
+            return
+        }
+        report(node)
+        for (const element of node.querySelectorAll("[id]")) {
+            report(element)
+        }
+    }
+    new MutationObserver((mutations) => {
+        for (const mutation of mutations) {
+            if (mutation.type === "attributes") {
+                report(mutation.target)
+            }
+            for (const node of mutation.addedNodes) {
+                visit(node)
+            }
+        }
+    }).observe(document.documentElement ?? document, {
+        childList: true,
+        subtree: true,
+        attributes: true,
+        attributeFilter: ["id"],
+    })
+}
+
+/**
+ * Records a feature element `installFeatureRecorder` reported, by its id
+ * only, and only an id of the feature's form: anything else is page input
+ * the check does not keep.
+ */
+export function recordFeatureElement(session, entry) {
+    const id = isPlainObject(entry) ? entry.id : undefined
+    if (typeof id !== "string" || !FEATURE_ELEMENT_ID_PATTERN.test(id)) {
+        return
+    }
+    session.featureElements.push({ id, seq: nextSequence(), at: Date.now() })
+}
+
+/**
  * Opens a browser context and page of their own for `account`, so session
  * storage, the login and the notification tracker never leak between
  * accounts, and instruments the page before its first navigation. Every
  * Toast is kept in `session.toasts` for the checks; the evidence receives
- * only what `summariseToasts` keeps of them.
+ * only what `summariseToasts` keeps of them. `origin`, the app's, is the only
+ * one whose responses `recordResponse` accepts. `featureElements` and
+ * `featureRequests` keep every feature element the page's documents show
+ * and every feature request the page sends.
  */
-async function openSession(browser, report, label, account) {
+async function openSession(browser, report, label, account, origin) {
     const context = await browser.createBrowserContext()
     const page = await context.newPage()
     const session = {
         label,
         account,
+        origin,
         context,
         page,
         toasts: [],
         responses: [],
         notificationRequests: [],
+        featureElements: [],
+        featureRequests: [],
         pendingBodies: new Set(),
     }
     page.setDefaultTimeout(PAGE_TIMEOUT_MS)
@@ -1221,6 +1643,13 @@ async function openSession(browser, report, label, account) {
         session.toasts.push(toast)
     })
     await page.evaluateOnNewDocument(installToastRecorder)
+    await page.exposeFunction("__recordFeatureElement", (entry) =>
+        recordFeatureElement(session, entry)
+    )
+    await page.evaluateOnNewDocument(
+        installFeatureRecorder,
+        FEATURE_ELEMENT_ID_PATTERN.source
+    )
     page.on("response", (response) => {
         try {
             recordResponse(session, response)
@@ -1261,33 +1690,584 @@ async function launchBrowser(state) {
         // Puppeteer's default leaves a stalled call open for 180 s; this
         // bound stays above every single-call deadline the check sets.
         protocolTimeout: PROTOCOL_TIMEOUT_MS,
+        // Waiting for Chrome's first tab would, on a timeout, close the
+        // browser inside the launch with no bound on its exit. Every session
+        // opens its own page, so only `teardownBrowser` ever closes it.
+        waitForInitialPage: false,
     })
     return state.browser
 }
 
-/** Signs `session`'s account in through the login form, landing on /home. */
-export async function login(session, baseUrl) {
-    const { page, account } = session
-    await page.goto(baseUrl, { waitUntil: "domcontentloaded" })
-    await page.waitForSelector("#login", { timeout: PAGE_TIMEOUT_MS })
-    await page.type("#login", account.username)
-    await page.type("#password", account.password)
-    await page.click("#submitButton")
+/** The fields the login fills in, then the button that sends them. */
+const LOGIN_FIELDS = ["#login", "#password", "#submitButton"]
+const PASSWORD_FIELD = "#password"
+/** Longest address, in characters, a login refusal repeats. */
+const MAX_LOCATION_CHARS = 200
+/**
+ * The only form of resource type a login failure repeats; its method is
+ * repeated only in the form of `METHOD_PATTERN`.
+ */
+const RESOURCE_TYPE_PATTERN = /^[a-z]{1,32}$/
+
+/** Whether `text` is a URL whose origin is `origin`. */
+function isOnOrigin(text, origin) {
     try {
-        await page.waitForSelector("#nav-home", { timeout: PAGE_TIMEOUT_MS })
-    } catch (error) {
-        // Only their number: an error Toast's text is the service's answer.
-        const errorToasts = session.toasts.filter(
-            (toast) => toastVariant(toast.className) === "error"
-        ).length
-        throw new Error(
-            `login as ${account.username} never reached #nav-home: ${errorMessage(error)}` +
-                (errorToasts > 0
-                    ? `; the page showed ${plural(errorToasts, "error Toast")}`
-                    : ""),
-            { cause: error }
+        return new URL(text).origin === origin
+    } catch {
+        return false
+    }
+}
+
+/**
+ * Where `text` points, for a login refusal: a URL's origin and path,
+ * escaped and bounded, never its query or fragment, which can carry tokens.
+ * An opaque origin, or a URL that has one such as a data: URL, is named by
+ * its kind only.
+ */
+export function describeLocation(text) {
+    if (text === "null") {
+        return "an opaque origin"
+    }
+    let url
+    try {
+        url = new URL(text)
+    } catch {
+        return "an address that is not a URL"
+    }
+    if (url.origin === "null") {
+        return `a ${boundText(url.protocol, 32)} URL`
+    }
+    return boundText(
+        escapeControl(`${url.origin}${url.pathname}`),
+        MAX_LOCATION_CHARS
+    )
+}
+
+/**
+ * The first address off `origin` that the navigation `response` passed
+ * through, one of its redirects or its final URL, as `describeLocation`
+ * names it, or `null`. A navigation that answers no response has none.
+ */
+export function offOriginHop(response, origin) {
+    if (response === null || response === undefined) {
+        return null
+    }
+    const hops = response
+        .request()
+        .redirectChain()
+        .map((request) => request.url())
+    const hop = [...hops, response.url()].find(
+        (url) => !isOnOrigin(url, origin)
+    )
+    return hop === undefined ? null : describeLocation(hop)
+}
+
+/**
+ * In the page: the origin of the main frame's document, the one that both
+ * `page.evaluate` and `page.type` address; which of `fields` it lacks;
+ * whether `passwordField` is a password input, which masks what is typed;
+ * every address a form holding one of the fields would submit to; and
+ * every browsing context it would submit into, by target name.
+ */
+export function readLoginForm(fields, passwordField) {
+    const missing = []
+    const actions = []
+    const targets = []
+    // A form without a target of its own submits into the first
+    // base[target]'s; an empty target attribute counts as none.
+    const base = document.querySelector("base[target]")
+    for (const selector of fields) {
+        const element = document.querySelector(selector)
+        if (element === null) {
+            missing.push(selector)
+        } else if (element.form) {
+            actions.push(element.form.action)
+            targets.push(element.form.target || (base?.target ?? ""))
+            // A button's own formaction overrides its form's action, and its
+            // own formtarget its form's target.
+            if (typeof element.formAction === "string") {
+                actions.push(element.formAction)
+            }
+            if (typeof element.formTarget === "string") {
+                targets.push(element.formTarget)
+            }
+        }
+    }
+    const password = document.querySelector(passwordField)
+    return {
+        origin: location.origin,
+        missing,
+        masked:
+            password !== null &&
+            password.tagName === "INPUT" &&
+            password.type === "password",
+        actions,
+        targets,
+    }
+}
+
+/**
+ * The target names that submit into the page's own browsing context: none,
+ * or "_self" in any ASCII case, as the browser matches it. Any other name
+ * can open or reach another context, whose requests the login's
+ * interception of the page does not see; "_top" and "_parent" are refused
+ * too, although in the page's main frame they name the page itself.
+ */
+const SELF_TARGET_PATTERN = /^(_self)?$/i
+
+/**
+ * Why the login page at `url` must not receive credentials, as fixed
+ * reasons naming only origins, paths and login selectors, or none. The
+ * page, its document and every address its login form submits to must be
+ * on `origin`, and the form must submit into the page itself; every login
+ * field must exist, and the password field must mask its text. `form` is
+ * what `readLoginForm` read.
+ */
+export function loginPageProblems(url, form, origin) {
+    const problems = []
+    if (!isOnOrigin(url, origin)) {
+        problems.push(`the page is on ${describeLocation(url)}, not ${origin}`)
+    }
+    if (
+        !isPlainObject(form) ||
+        !Array.isArray(form.missing) ||
+        !Array.isArray(form.actions) ||
+        !Array.isArray(form.targets)
+    ) {
+        problems.push("its login form could not be read")
+        return problems
+    }
+    if (form.origin !== origin) {
+        problems.push(
+            `its document is on ${describeLocation(form.origin)}, not ${origin}`
         )
     }
+    // Only the check's own selectors are repeated, never the page's text.
+    const missing = LOGIN_FIELDS.filter((field) => form.missing.includes(field))
+    if (missing.length > 0) {
+        problems.push(`it has no ${missing.join(", ")}`)
+    }
+    if (!missing.includes(PASSWORD_FIELD) && form.masked !== true) {
+        problems.push(`${PASSWORD_FIELD} is not a password input`)
+    }
+    const action = form.actions.find((address) => !isOnOrigin(address, origin))
+    if (action !== undefined) {
+        problems.push(
+            `its form submits to ${describeLocation(action)}, not ${origin}`
+        )
+    }
+    // A target name is page text, so the reason never repeats it.
+    if (
+        form.targets.some(
+            (target) =>
+                typeof target !== "string" || !SELF_TARGET_PATTERN.test(target)
+        )
+    ) {
+        problems.push(
+            "its form submits into a browsing context other than the page's own"
+        )
+    }
+    return problems
+}
+
+/** A request the login stopped, by its method and resource type only. */
+function describeRequest(request) {
+    const method = request.method()
+    const type = request.resourceType()
+    const methodText =
+        typeof method === "string" && METHOD_PATTERN.test(method)
+            ? method
+            : "non-standard"
+    const typeText =
+        typeof type === "string" && RESOURCE_TYPE_PATTERN.test(type)
+            ? type
+            : "other"
+    return `a ${methodText} ${typeText} request`
+}
+
+/** The only form of target type a login failure repeats. */
+const TARGET_TYPE_PATTERN = /^[a-z_]{1,32}$/
+/**
+ * The targets the login's hold attaches to: all but the browser, its tabs,
+ * which only wrap pages, and its own interface, which no page can open.
+ */
+const HELD_TARGETS = [
+    { type: "browser", exclude: true },
+    { type: "tab", exclude: true },
+    { type: "browser_ui", exclude: true },
+    {},
+]
+
+/** A target beside the login's page, by its type only. */
+function describeTarget(type) {
+    return typeof type === "string" && TARGET_TYPE_PATTERN.test(type)
+        ? `another ${type} target`
+        : "another target"
+}
+
+/**
+ * Whether the paused `request` fetches a service worker's script, which
+ * the browser marks with a Service-Worker header.
+ */
+function isServiceWorkerScript(request) {
+    return Object.keys(request.headers ?? {}).some(
+        (name) => name.toLowerCase() === "service-worker"
+    )
+}
+
+/**
+ * Resumes the paused target that `session` attached as `sessionId`, and
+ * leaves it whether or not it could be resumed.
+ */
+async function leaveTarget(session, sessionId, paused) {
+    try {
+        if (paused) {
+            const attached = session.connection()?.session(sessionId)
+            if (!attached) {
+                throw new Error("a paused target the login left has no session")
+            }
+            await attached.send("Runtime.runIfWaitingForDebugger")
+        }
+    } finally {
+        await session.send("Target.detachFromTarget", { sessionId })
+    }
+}
+
+/**
+ * Until the function it returns resolves, closes every target in `page`'s
+ * browser context other than `page`, such as a window the page opens, and
+ * blocks every service worker's script, passing `violate` a reason that
+ * names `origin` for each. Puppeteer resumes every target it attaches to
+ * before any of its events, so the check attaches at browser level too,
+ * pausing each new target on start: one in the context is closed before it
+ * runs, any other resumed and left. A target already open in the context
+ * when the hold starts is closed as well. A new service worker runs once
+ * any attach resumes it, so it is left too: a browser-level interception,
+ * which continues every other request it pauses, blocks its script, in any
+ * context, so that it is never registered.
+ */
+async function holdOtherTargets(page, origin, violate) {
+    const contextId = page.browserContext().id
+    if (typeof contextId !== "string") {
+        throw new Error("the login's page has no browser context of its own")
+    }
+    const own = await page.createCDPSession()
+    const ownId = await own
+        .send("Target.getTargetInfo")
+        .then(({ targetInfo }) => targetInfo.targetId)
+        .finally(() => own.detach())
+    const session = await page.browser().target().createCDPSession()
+    const pending = []
+    const settle = (promise) =>
+        pending.push(
+            promise.catch((error) => console.error(describeError(error)))
+        )
+    const onAttached = ({ sessionId, targetInfo, waitingForDebugger }) => {
+        try {
+            const other =
+                targetInfo.browserContextId === contextId &&
+                targetInfo.targetId !== ownId
+            // A new service worker runs once Puppeteer resumes it, so it is
+            // its blocked script that stops it and ends the login; ending
+            // it here would stop the interception before the script comes.
+            if (
+                other &&
+                !(targetInfo.type === "service_worker" && waitingForDebugger)
+            ) {
+                violate(
+                    `${describeTarget(targetInfo.type)} opened during the login, outside the page whose requests the login holds to ${origin}`
+                )
+                // Sent at once, so it reaches the browser before the hold ends.
+                settle(
+                    session.send("Target.closeTarget", {
+                        targetId: targetInfo.targetId,
+                    })
+                )
+            } else {
+                settle(leaveTarget(session, sessionId, waitingForDebugger))
+            }
+        } catch (error) {
+            console.error(describeError(error))
+        }
+    }
+    let stopping = false
+    const onPaused = ({ requestId, request }) => {
+        try {
+            if (isServiceWorkerScript(request)) {
+                violate(
+                    `a service worker's script was requested during the login, outside the page whose requests the login holds to ${origin}; it was blocked`
+                )
+                settle(
+                    session.send("Fetch.failRequest", {
+                        requestId,
+                        errorReason: "BlockedByClient",
+                    })
+                )
+            } else if (!stopping) {
+                // Once the hold stops, ending interception continues it.
+                settle(session.send("Fetch.continueRequest", { requestId }))
+            }
+        } catch (error) {
+            console.error(describeError(error))
+        }
+    }
+    const stop = () => {
+        session.off("Target.attachedToTarget", onAttached)
+        session.off("Fetch.requestPaused", onPaused)
+    }
+    session.on("Target.attachedToTarget", onAttached)
+    session.on("Fetch.requestPaused", onPaused)
+    try {
+        await session.send("Target.setAutoAttach", {
+            autoAttach: true,
+            waitForDebuggerOnStart: true,
+            flatten: true,
+            filter: HELD_TARGETS,
+        })
+        await session.send("Fetch.enable", { patterns: [{ urlPattern: "*" }] })
+    } catch (error) {
+        stop()
+        // Leaving the browser ends whatever part of the hold had started.
+        await new Promise((resolve) => resolve(session.detach())).catch(
+            (cleanupError) => console.error(describeError(cleanupError))
+        )
+        throw error
+    }
+    return async () => {
+        try {
+            stopping = true
+            await session.send("Fetch.disable")
+            // A browser-level attach takes only the flat protocol, even to stop.
+            await session.send("Target.setAutoAttach", {
+                autoAttach: false,
+                waitForDebuggerOnStart: false,
+                flatten: true,
+            })
+        } finally {
+            stop()
+            await Promise.all(pending)
+            await session.detach()
+        }
+    }
+}
+
+/**
+ * Holds `page` to `origin` while a login runs, until `release` resolves.
+ * Request interception pauses every request of the page: one for `origin`,
+ * or for a data: URL, which never leaves the browser, continues, and any
+ * other is aborted. Each paused request is continued or aborted exactly
+ * once, unless another handler already resolved it.
+ *
+ * A request off `origin` is a violation, as is a navigation of the main
+ * frame off it, which an aborted request causes too. So is any other
+ * target in the page's browser context, such as a window the page opens,
+ * and any service worker's script, since the page's interception does not
+ * see their requests: `holdOtherTargets` closes the target, a new one
+ * before it runs, and blocks the script. The first violation aborts
+ * `signal`, and `violations` keeps each one. A violation names the
+ * configured origin and the request's method and type or the target's
+ * type, never an address: once the credentials are typed, the page can put
+ * them into any part of an address, its host included.
+ */
+export async function guardLoginOrigin(page, origin) {
+    const violations = []
+    const controller = new AbortController()
+    const violate = (reason) => {
+        violations.push(reason)
+        if (!controller.signal.aborted) {
+            controller.abort(new Error(reason))
+        }
+    }
+    const onRequest = (request) => {
+        try {
+            const url = request.url()
+            const allowed = url.startsWith("data:") || isOnOrigin(url, origin)
+            const { action } = request.interceptResolutionState()
+            const paused = action !== "disabled" && action !== "already-handled"
+            if (paused) {
+                const resolution = allowed
+                    ? request.continue()
+                    : request.abort("blockedbyclient")
+                resolution.catch((error) => console.error(describeError(error)))
+            }
+            if (!allowed) {
+                violate(
+                    `the page sent ${describeRequest(request)} to an origin other than ${origin} during the login; ${paused ? "it was blocked" : "it could not be blocked"}`
+                )
+            }
+        } catch (error) {
+            // An error thrown here would break Puppeteer's event dispatch.
+            console.error(describeError(error))
+        }
+    }
+    const onFrameNavigated = (frame) => {
+        try {
+            if (
+                frame.parentFrame() === null &&
+                !isOnOrigin(frame.url(), origin)
+            ) {
+                violate(`the page's main frame left ${origin} during the login`)
+            }
+        } catch (error) {
+            console.error(describeError(error))
+        }
+    }
+    const stop = () => {
+        page.off("request", onRequest)
+        page.off("framenavigated", onFrameNavigated)
+    }
+    page.on("request", onRequest)
+    page.on("framenavigated", onFrameNavigated)
+    let releaseTargets
+    try {
+        await page.setRequestInterception(true)
+        releaseTargets = await holdOtherTargets(page, origin, violate)
+    } catch (error) {
+        // Interception may have started on part of the page: turning it off
+        // releases what it paused before the listeners that resolve it go.
+        await new Promise((resolve) =>
+            resolve(page.setRequestInterception(false))
+        ).catch((cleanupError) => console.error(describeError(cleanupError)))
+        stop()
+        throw error
+    }
+    return {
+        violations,
+        signal: controller.signal,
+        release: async () => {
+            try {
+                await page.setRequestInterception(false)
+            } finally {
+                stop()
+                await releaseTargets()
+            }
+        },
+    }
+}
+
+/**
+ * Throws the error that ends a login once `guard` has seen a violation,
+ * naming the first and counting the others. `cause` is the error, if any,
+ * of the step the violation interrupted.
+ */
+function throwIfViolated(account, guard, cause) {
+    const [first, ...others] = guard.violations
+    if (first === undefined) {
+        return
+    }
+    throw new Error(
+        `login as ${account.username} refused: ${first}` +
+            (others.length > 0
+                ? `; ${plural(others.length, "further violation")}`
+                : ""),
+        cause === undefined ? undefined : { cause }
+    )
+}
+
+/** The error of a login refused before any credential was typed. */
+function loginRefusal(account, reasons) {
+    return new Error(
+        `login as ${account.username} refused before entering credentials: ${reasons.join("; ")}`
+    )
+}
+
+/**
+ * Fills in and sends the login form of `session`'s page under `guard`,
+ * once the page and its form are found on `baseUrl`. A violation seen
+ * before a step, or while it ran, ends the login instead.
+ */
+async function submitLoginForm(session, baseUrl, guard) {
+    const { page, account } = session
+    const problems = loginPageProblems(
+        page.url(),
+        await page.evaluate(readLoginForm, LOGIN_FIELDS, PASSWORD_FIELD),
+        baseUrl
+    )
+    if (problems.length > 0) {
+        throw loginRefusal(account, problems)
+    }
+    for (const step of [
+        () => page.type("#login", account.username),
+        () => page.type(PASSWORD_FIELD, account.password),
+        () => page.click("#submitButton"),
+    ]) {
+        throwIfViolated(account, guard)
+        try {
+            await step()
+        } catch (error) {
+            throwIfViolated(account, guard, error)
+            throw error
+        }
+    }
+}
+
+/**
+ * Ends `guard`. After a failed login an error ending it is only logged:
+ * the login's own error is the one reported.
+ */
+async function releaseGuard(guard, loginFailed) {
+    try {
+        await guard.release()
+    } catch (error) {
+        if (!loginFailed) {
+            throw error
+        }
+        console.error(describeError(error))
+    }
+}
+
+/**
+ * Signs `session`'s account in through the login form, landing on /home.
+ * The credentials go to `baseUrl` only: the navigation, the page, its
+ * document and its login form must be on that origin, and the form must
+ * submit into the page itself, before anything is typed; `guardLoginOrigin`
+ * blocks and fails any request or main-frame navigation off it, and fails
+ * and closes any other target in the page's browser context, until /home
+ * is reached. A refusal names origins, paths, selectors and target types
+ * only, never what was typed.
+ */
+export async function login(session, baseUrl) {
+    const { page, account } = session
+    const hop = offOriginHop(
+        await page.goto(baseUrl, { waitUntil: "domcontentloaded" }),
+        baseUrl
+    )
+    if (hop !== null) {
+        throw loginRefusal(account, [
+            `the navigation to ${baseUrl} was redirected to ${hop}`,
+        ])
+    }
+    await page.waitForSelector("#login", { timeout: PAGE_TIMEOUT_MS })
+    const guard = await guardLoginOrigin(page, baseUrl)
+    let failed = true
+    try {
+        await submitLoginForm(session, baseUrl, guard)
+        try {
+            await page.waitForSelector("#nav-home", {
+                timeout: PAGE_TIMEOUT_MS,
+                signal: guard.signal,
+            })
+        } catch (error) {
+            throwIfViolated(account, guard, error)
+            // Only their number: an error Toast's text is the service's answer.
+            const errorToasts = session.toasts.filter(
+                (toast) => toastVariant(toast.className) === "error"
+            ).length
+            throw new Error(
+                `login as ${account.username} never reached #nav-home: ${errorMessage(error)}` +
+                    (errorToasts > 0
+                        ? `; the page showed ${plural(errorToasts, "error Toast")}`
+                        : ""),
+                { cause: error }
+            )
+        }
+        throwIfViolated(account, guard)
+        failed = false
+    } finally {
+        await releaseGuard(guard, failed)
+    }
+    // A target the guard closed only as it ended fails the login too.
+    throwIfViolated(account, guard)
 }
 
 function currentPath(page) {
@@ -1481,14 +2461,40 @@ export function describeTimestamp(value) {
     return isTimestamp(value) ? JSON.stringify(value) : describeValue(value)
 }
 
-/** The account's own notification responses whose body was read. */
-function notificationEntries(session) {
-    return session.responses.filter(
-        (entry) =>
-            entry.kind === "notifications" &&
-            entry.parsed &&
-            entry.accountId === session.account.accountId
+/** Why a read notification body is no poll answer; it is never described. */
+const NOT_A_RESULTS_LIST = "the body is not a results list"
+
+/**
+ * Whether a response's body was read as the `{"results": [...]}` list the
+ * notifications endpoint answers with, the only body the frontend applies
+ * (`toAlertsDto`): a JSON object whose `results` is an array.
+ */
+function hasResultsList(entry) {
+    return (
+        entry.parsed &&
+        isPlainObject(entry.body) &&
+        Array.isArray(entry.body.results)
     )
+}
+
+/**
+ * Whether a response counts as a notification poll the page made as the
+ * frontend does: an accepted answer (`responseRejection`), so no reply of
+ * another origin, method, account or filter, or of any status but 200, and
+ * one whose body was read as a results list (`hasResultsList`), so no reply
+ * the frontend would reject either.
+ */
+function isPollAnswer(entry) {
+    return (
+        entry.kind === "notifications" &&
+        entry.accepted &&
+        hasResultsList(entry)
+    )
+}
+
+/** The notification polls of the page, in arrival order (`isPollAnswer`). */
+export function notificationEntries(session) {
+    return session.responses.filter(isPollAnswer)
 }
 
 /**
@@ -2006,7 +3012,9 @@ function insightsEntries(session) {
  * until the page has rendered that response. A read, from the DOM read to
  * the end of the formatting, during which a newer response arrived compared
  * an outdated response; it is discarded and repeated, at most
- * `MAX_UNSTABLE_READS` times.
+ * `MAX_UNSTABLE_READS` times. A last response the recorder did not accept,
+ * or whose body cannot be read, is reported by its fixed reason and never
+ * compared.
  *
  * Only a read the wait accepted is returned: a matching read once the wait
  * resolves with it, and on a timeout the last mismatch that answered by the
@@ -2028,19 +3036,28 @@ export async function compareWithLastInsights(session) {
                     }
                     const entries = insightsEntries(session)
                     const latest = entries[entries.length - 1]
-                    if (
-                        latest === undefined ||
-                        (!latest.parsed && latest.bodyError === undefined)
-                    ) {
+                    if (latest === undefined) {
                         return false
                     }
-                    if (latest.status !== 200 || !latest.parsed) {
+                    // A response that does not answer the frontend's own
+                    // read, a non-200 included, is never compared.
+                    if (!latest.accepted) {
                         publish({
                             problems: [
-                                `the last insights response answered HTTP ${latest.status}` +
-                                    (latest.bodyError === undefined
-                                        ? ""
-                                        : ` with an unreadable body: ${latest.bodyError}`),
+                                `the last insights response ${latest.rejection}`,
+                            ],
+                            pairs: [],
+                            response: null,
+                        })
+                        return false
+                    }
+                    if (!latest.parsed) {
+                        if (latest.bodyError === undefined) {
+                            return false
+                        }
+                        publish({
+                            problems: [
+                                `the last insights response answered HTTP ${latest.status} with an unreadable body: ${latest.bodyError}`,
                             ],
                             pairs: [],
                             response: null,
@@ -2138,7 +3155,13 @@ async function checkEmptyState(
     details,
     { report, state, browser, baseUrl, account, evidenceDir }
 ) {
-    const session = await openSession(browser, report, "empty", account)
+    const session = await openSession(
+        browser,
+        report,
+        "empty",
+        account,
+        baseUrl
+    )
     state.sessions.push(session)
     try {
         const { page } = session
@@ -2229,9 +3252,11 @@ export class NotificationReadError extends Error {
 /**
  * Reads the notifications of `accountId` through the broker API, apart from
  * any page: every alert whose current arming has triggered, acknowledged or
- * not. Resolves with the HTTP status and the `results` list; any other
- * outcome throws a `NotificationReadError`. An invalid `timeoutMs` is not
- * one: `AbortSignal.timeout` throws for it before any request is sent.
+ * not. Resolves with the HTTP status and the `results` list of a 200; any
+ * other outcome, another 2xx or a redirect included, throws a
+ * `NotificationReadError`, and a redirect is never followed. An invalid
+ * `timeoutMs` is not one: `AbortSignal.timeout` throws for it before any
+ * request is sent.
  */
 export async function readNotifications(
     baseUrl,
@@ -2252,6 +3277,7 @@ export async function readNotifications(
     try {
         response = await fetch(`${baseUrl}${target}`, {
             headers: { Accept: "application/json" },
+            redirect: "manual",
             signal,
         })
         text = await response.text()
@@ -2261,9 +3287,9 @@ export async function readNotifications(
             response?.status ?? null
         )
     }
-    if (!response.ok) {
+    if (response.status !== 200) {
         throw new NotificationReadError(
-            `GET ${target} answered HTTP ${response.status}`,
+            `GET ${target} ${statusFailure(response.status)}`,
             response.status
         )
     }
@@ -2505,11 +3531,14 @@ export async function waitForToggle(page, alertId, label) {
     )
 }
 
-/** The revision the page last received for `alert`, else the fixture's. */
-function latestRevision(session, alert) {
+/**
+ * The revision the page last received for `alert` in an accepted response,
+ * else the fixture's.
+ */
+export function latestRevision(session, alert) {
     let revision = alert.armingRevision
     for (const entry of session.responses) {
-        if (!entry.parsed) {
+        if (!entry.accepted || !entry.parsed) {
             continue
         }
         let item
@@ -2517,7 +3546,7 @@ function latestRevision(session, alert) {
             item = resultsOf(entry).find(
                 (candidate) => idOf(candidate) === alert.id
             )
-        } else if (entry.kind === "patch" && entry.status === 200) {
+        } else if (entry.kind === "patch") {
             item = idOf(entry.body) === alert.id ? entry.body : undefined
         }
         if (item !== undefined && Number.isInteger(item.armingRevision)) {
@@ -2527,99 +3556,505 @@ function latestRevision(session, alert) {
     return revision
 }
 
-/** Waits for the PATCH response of `alertId` sent after `afterSeq`. */
+/**
+ * The label `AlertList` gives the `button.alert-toggle` of a row showing
+ * `alert`: "Enable" while it is disabled, "Disable" while it is armed
+ * (`triggeredAt` null) and "Re-arm" once it triggered (`triggeredAt` a
+ * timestamp). `null` for any other state, which explains no label.
+ */
+function toggleLabelOf(alert) {
+    if (alert.enabled === false) {
+        return "Enable"
+    }
+    if (alert.enabled !== true) {
+        return null
+    }
+    if (alert.triggeredAt === null) {
+        return "Disable"
+    }
+    return isTimestamp(alert.triggeredAt) ? "Re-arm" : null
+}
+
+/**
+ * The state the page last received for `alert` in an accepted response,
+ * from the entries `latestRevision` reads. Answers `alert`, the newest item
+ * naming it, else the fixture's alert, which carries no state; `received`,
+ * whether any accepted response named it; `pending`, whether an accepted
+ * response that may name it is still being read, so a newer state may yet
+ * arrive; and `previous`, the toggle label (`toggleLabelOf`) of the state
+ * received before the last change of that label, `null` for none, which a
+ * row rendered from an earlier list may still show.
+ */
+function latestAlertState(session, alert) {
+    let latest = alert
+    let pending = false
+    let previous = null
+    for (const entry of session.responses) {
+        if (!entry.accepted || !ALERT_STATE_KINDS.includes(entry.kind)) {
+            continue
+        }
+        if (!entry.parsed) {
+            // A PATCH of another alert cannot carry this one's state.
+            pending ||=
+                entry.bodyError === undefined &&
+                (entry.kind !== "patch" || entry.alertId === alert.id)
+            continue
+        }
+        const item =
+            entry.kind === "patch"
+                ? idOf(entry.body) === alert.id
+                    ? entry.body
+                    : undefined
+                : resultsOf(entry).find(
+                      (candidate) => idOf(candidate) === alert.id
+                  )
+        if (item === undefined) {
+            continue
+        }
+        if (latest !== alert && toggleLabelOf(latest) !== toggleLabelOf(item)) {
+            previous = toggleLabelOf(latest)
+        }
+        latest = item
+    }
+    return { alert: latest, received: latest !== alert, pending, previous }
+}
+
+/**
+ * Waits for the first PATCH response of `alertId` after `afterSeq`, the one
+ * the click then caused, until what its request sent and, for an accepted
+ * one, its body have been read. It is returned whatever it answered, for
+ * `patchAnswerProblems` to judge.
+ */
 async function waitForPatchResponse(session, alertId, afterSeq) {
-    const entry = await waitFor(
-        () =>
-            session.responses.find(
+    return await waitFor(
+        () => {
+            const entry = session.responses.find(
                 (candidate) =>
                     candidate.kind === "patch" &&
                     candidate.alertId === alertId &&
-                    candidate.seq > afterSeq &&
-                    (candidate.parsed || candidate.bodyError !== undefined)
-            ),
+                    candidate.seq > afterSeq
+            )
+            return entry !== undefined &&
+                entry.sentEnabled !== undefined &&
+                (!entry.accepted ||
+                    entry.parsed ||
+                    entry.bodyError !== undefined)
+                ? entry
+                : false
+        },
         {
             timeoutMs: ROW_TIMEOUT_MS,
             what: `the PATCH response of alert ${alertId}`,
         }
     )
-    if (entry.status !== 200) {
-        throw new Error(`PATCH ${entry.path} answered HTTP ${entry.status}`)
-    }
-    if (!entry.parsed || !isPlainObject(entry.body)) {
-        throw new Error(
-            `PATCH ${entry.path} answered an unreadable body: ${entry.bodyError ?? "not a JSON object"}`
-        )
-    }
-    return entry
-}
-
-/** Clicks the row's toggle and returns the PATCH response it caused. */
-async function clickToggle(session, report, member, label) {
-    const clickSeq = nextSequence()
-    const clickedAt = new Date().toISOString()
-    await clickWhenClear(
-        session.page,
-        `${rowSelector(member.alert.id)} button.alert-toggle`,
-        ROW_TIMEOUT_MS
-    )
-    const entry = await waitForPatchResponse(session, member.alert.id, clickSeq)
-    const snapshot = {
-        alertId: member.alert.id,
-        clicked: label,
-        clickedAt,
-        status: entry.status,
-        enabled: booleanOrNull(entry.body.enabled),
-        armingRevision: integerOrNull(entry.body.armingRevision),
-        triggeredAt: projectTimestamp(entry.body.triggeredAt),
-        acknowledged: booleanOrNull(entry.body.acknowledged),
-    }
-    member.patches.push(snapshot)
-    report.patches.push(snapshot)
-    return { entry, clickSeq }
 }
 
 /**
- * Re-arms one fixture alert through its row: "Re-arm" or "Enable" directly,
- * an armed row through "Disable" and then "Enable". The toggle is clicked by
- * the state it shows, and the PATCH it answers with decides the next step,
- * so a row that changed state just before the click is still handled.
+ * What the answer `entry` to a toggle's PATCH lacks of the action that sends
+ * `enabled`, as the list of what was expected, empty when it lacks nothing.
+ * The request must have sent `enabled`, and an accepted 200 for `alertId`
+ * must answer the state the broker's PATCH sets, as an `AlertDTO`, which
+ * carries every field: `true` re-arms, so `enabled` is true, `triggeredAt`
+ * and `triggerValue` null, `acknowledged` false, and `armingRevision`
+ * exactly `before` + 1, `before` being the revision the page held before the
+ * click; `false` sets only `enabled` false and keeps any trigger data, so
+ * `armingRevision` stays `before`.
  */
-async function rearmMember(session, report, alert) {
+function patchAnswerProblems(entry, alertId, enabled, before) {
+    const expected = []
+    if (entry.sentEnabled !== enabled) {
+        expected.push(`to send enabled ${enabled}`)
+    }
+    if (!entry.accepted) {
+        expected.push("an accepted 200 answer")
+        return expected
+    }
+    if (!entry.parsed || !isPlainObject(entry.body)) {
+        expected.push("a JSON object body")
+        return expected
+    }
+    const { body } = entry
+    if (idOf(body) !== alertId) {
+        expected.push(`the answer for alert ${alertId}`)
+    }
+    if (body.enabled !== enabled) {
+        expected.push(`enabled ${enabled}`)
+    }
+    if (!enabled) {
+        if (body.armingRevision !== before) {
+            expected.push(`armingRevision ${before}`)
+        }
+        return expected
+    }
+    if (body.triggeredAt !== null) {
+        expected.push("triggeredAt null")
+    }
+    if (body.triggerValue !== null) {
+        expected.push("triggerValue null")
+    }
+    if (body.acknowledged !== false) {
+        expected.push("acknowledged false")
+    }
+    if (body.armingRevision !== before + 1) {
+        expected.push(`armingRevision ${before + 1}`)
+    }
+    return expected
+}
+
+/** What a PATCH request sent, from its recorded `sentEnabled`. */
+function describeSent(sentEnabled) {
+    return typeof sentEnabled === "boolean"
+        ? `enabled ${sentEnabled}`
+        : 'no {"enabled": bool} body'
+}
+
+/** How a toggle's PATCH was answered, in defined forms only. */
+function describePatchAnswer(entry) {
+    if (!entry.accepted) {
+        return `its response ${entry.rejection}`
+    }
+    if (!entry.parsed || !isPlainObject(entry.body)) {
+        return `its response body is unreadable: ${entry.bodyError ?? "not a JSON object"}`
+    }
+    const { body } = entry
+    const id = uuidOrNull(body.id) ?? describeValue(body.id)
+    return `was answered for alert ${id} with enabled ${describeValue(body.enabled)}, triggeredAt ${describeTimestamp(body.triggeredAt)}, triggerValue ${describeValue(body.triggerValue)}, acknowledged ${describeValue(body.acknowledged)} and armingRevision ${describeValue(body.armingRevision)}`
+}
+
+/**
+ * In the page: once the `button.alert-toggle` of the row `row` is enabled,
+ * shows `label` and is clear to click, as `isClickable` tells, arms a guard
+ * on the next click; answers `armed` and the label shown, `null` without a
+ * toggle. The guard meets the click before the page's own handlers and
+ * stops it unless it meets that toggle still showing `label`: the row may
+ * have changed state since this check, and a stopped click sends nothing.
+ * It records the label of the row's toggle the click met, `null` for
+ * anything else. Arming removes a guard left from before.
+ */
+function armToggleGuard(row, label) {
+    const earlier = window.__piToggleGuard
+    if (earlier !== undefined) {
+        window.removeEventListener("click", earlier.listener, true)
+        delete window.__piToggleGuard
+    }
+    const button = document.querySelector(`${row} button.alert-toggle`)
+    if (button === null) {
+        return { armed: false, label: null }
+    }
+    const shown = button.textContent.trim()
+    if (shown !== label || button.disabled) {
+        return { armed: false, label: shown }
+    }
+    button.scrollIntoView({ block: "center", inline: "center" })
+    const box = button.getBoundingClientRect()
+    const top = document.elementFromPoint(
+        box.left + box.width / 2,
+        box.top + box.height / 2
+    )
+    if (top === null || !button.contains(top)) {
+        return { armed: false, label: shown }
+    }
+    const guard = { met: undefined, listener: null }
+    guard.listener = (event) => {
+        window.removeEventListener("click", guard.listener, true)
+        const { target } = event
+        const toggle =
+            target instanceof window.Element && target.closest(row) !== null
+                ? target.closest("button.alert-toggle")
+                : null
+        guard.met = toggle === null ? null : toggle.textContent.trim()
+        if (guard.met !== label) {
+            event.stopImmediatePropagation()
+            event.preventDefault()
+        }
+    }
+    window.addEventListener("click", guard.listener, true)
+    window.__piToggleGuard = guard
+    return { armed: true, label: shown }
+}
+
+/**
+ * In the page: removes the guard `armToggleGuard` armed, and answers whether
+ * a click event met it and the label of the row's toggle that click met,
+ * `null` for anything else.
+ */
+function takeToggleGuard() {
+    const guard = window.__piToggleGuard
+    if (guard === undefined) {
+        return { clicked: false, label: null }
+    }
+    window.removeEventListener("click", guard.listener, true)
+    delete window.__piToggleGuard
+    return { clicked: guard.met !== undefined, label: guard.met ?? null }
+}
+
+/** The row's toggle as `readRowToggle` reads it now, by a bounded probe. */
+async function readToggleNow(page, alertId) {
+    const { toggle } = await waitFor(
+        async (signal) => ({
+            toggle: await probePage(page, signal, () =>
+                page.evaluate(readRowToggle, rowSelector(alertId))
+            ),
+        }),
+        {
+            timeoutMs: ROW_TIMEOUT_MS,
+            what: `the toggle of alert ${alertId}`,
+        }
+    )
+    return toggle
+}
+
+/**
+ * Clicks the toggle of alert `alertId`'s row while it shows `label`, behind
+ * the guard of `armToggleGuard`. Resolves with `null` once the click went
+ * through, or with the page text the toggle showed instead: the row changed
+ * state since `label` was sampled, and nothing was sent. A click that
+ * failed, or met no toggle of the row, sent nothing either; it is such a
+ * change only when the toggle now shows another label, and else throws.
+ */
+export async function clickShownToggle(page, alertId, label) {
+    const row = rowSelector(alertId)
+    const found = await waitFor(
+        async (signal) => {
+            const state = await probePage(page, signal, () =>
+                page.evaluate(armToggleGuard, row, label)
+            )
+            return state.armed ||
+                (state.label !== null && state.label !== label)
+                ? state
+                : false
+        },
+        {
+            timeoutMs: ROW_TIMEOUT_MS,
+            what: `the ${label} toggle of alert ${alertId} to be enabled and uncovered`,
+        }
+    )
+    if (!found.armed) {
+        return found.label
+    }
+    let failure = null
+    try {
+        await page.click(`${row} button.alert-toggle`)
+    } catch (error) {
+        failure = error
+    }
+    let click
+    try {
+        // Taken even after a failed click, so no guard is left to stop a
+        // later one.
+        click = await waitFor(
+            (signal) =>
+                probePage(page, signal, () => page.evaluate(takeToggleGuard)),
+            {
+                timeoutMs: ROW_TIMEOUT_MS,
+                what: `the outcome of the click on the ${label} toggle of alert ${alertId}`,
+            }
+        )
+    } catch (error) {
+        if (failure === null) {
+            throw error
+        }
+        // The click's own failure is the one reported.
+        console.error(describeError(error))
+        throw failure
+    }
+    if (click.label !== null) {
+        if (failure !== null) {
+            // The click event was dispatched, so its outcome stands.
+            console.error(describeError(failure))
+        }
+        return click.label === label ? null : click.label
+    }
+    const toggle = await readToggleNow(page, alertId)
+    if (toggle !== null && toggle.label !== label) {
+        if (failure !== null) {
+            console.error(describeError(failure))
+        }
+        return toggle.label
+    }
+    if (failure !== null) {
+        throw failure
+    }
+    throw new Error(
+        click.clicked
+            ? `the click on the ${label} toggle of alert ${alertId} met another element and was stopped`
+            : `no click event followed the click on the ${label} toggle of alert ${alertId}`
+    )
+}
+
+/**
+ * Why the state `latestAlertState` answered, `state`, explains no sampled
+ * toggle label, in defined forms only.
+ */
+function unexplainedReason(state) {
+    if (state.pending) {
+        return "a response that may carry its state is still being read"
+    }
+    if (!state.received) {
+        return "no accepted response named the alert"
+    }
+    const { alert } = state
+    const shows = toggleLabelOf(alert)
+    return `its last state, enabled ${describeValue(alert.enabled)} and triggeredAt ${describeTimestamp(alert.triggeredAt)}, shows ${shows === null ? "no toggle label" : `"${shows}"`}`
+}
+
+/**
+ * Holds `label`, the label the toggle of `alert`'s row was sampled with, to
+ * the state the page received for the alert (`latestAlertState`) before it
+ * is clicked. Answers `label` once no response that may carry that state is
+ * still being read and the last state shows it (`toggleLabelOf`). Answers
+ * the label the toggle shows instead after a genuine transition: the
+ * received state changed from one that shows `label` to one that shows the
+ * toggle's new label, as when a notification shows a trigger before the
+ * list the row renders is read again. Anything else is awaited, since the
+ * page can render a response before its body is read here; once
+ * ROW_TIMEOUT_MS have passed it throws why the label is not explained, and
+ * nothing is clicked.
+ */
+async function waitForExplainedToggle(session, alert, label) {
+    const { page } = session
+    const explains = (state, shown) =>
+        !state.pending && toggleLabelOf(state.alert) === shown
+    try {
+        return await waitFor(
+            async (signal) => {
+                if (explains(latestAlertState(session, alert), label)) {
+                    return label
+                }
+                const toggle = await probePage(page, signal, () =>
+                    page.evaluate(readRowToggle, rowSelector(alert.id))
+                )
+                const state = latestAlertState(session, alert)
+                if (explains(state, label)) {
+                    return label
+                }
+                return toggle !== null &&
+                    !toggle.disabled &&
+                    toggle.label !== label &&
+                    state.previous === label &&
+                    explains(state, toggle.label)
+                    ? toggle.label
+                    : false
+            },
+            {
+                timeoutMs: ROW_TIMEOUT_MS,
+                what: `the received state of alert ${alert.id} to explain its "${label}" toggle`,
+            }
+        )
+    } catch (error) {
+        if (!(error instanceof WaitTimeoutError)) {
+            throw error
+        }
+        throw new Error(
+            `the "${label}" toggle of alert ${alert.id} was not explained within ${ROW_TIMEOUT_MS} ms by the state the page received: ${unexplainedReason(latestAlertState(session, alert))}`,
+            { cause: error }
+        )
+    }
+}
+
+/**
+ * Samples the row's toggle, showing `wanted`, or any label for `null`, holds
+ * the sampled label to the state the page received for the alert
+ * (`waitForExplainedToggle`), and clicks it while it still shows that label
+ * (`clickShownToggle`). A label that changed in between, a genuine change of
+ * the row's state, is sampled again, MAX_TOGGLE_SAMPLES times in all at
+ * most; a label the received state does not explain throws unclicked. The
+ * PATCH the click caused is kept in the evidence and judged by
+ * `patchAnswerProblems` against what the label sends (`TOGGLE_SENDS`); a
+ * mismatch throws and is never retried. Returns the label clicked, the
+ * response and the click's sequence number.
+ */
+async function clickToggle(session, report, member, wanted) {
+    const { page } = session
+    const { id } = member.alert
+    for (let sample = 1; ; sample += 1) {
+        const label = await waitForToggle(page, id, wanted)
+        if (!TOGGLE_LABELS.includes(label)) {
+            // Page text other than a known label is described, not repeated.
+            throw new Error(`the row toggle reads ${describeValue(label)}`)
+        }
+        const shown = await waitForExplainedToggle(session, member.alert, label)
+        const before = latestRevision(session, member.alert)
+        const clickSeq = nextSequence()
+        const clickedAt = new Date().toISOString()
+        // A transition met before the click is sampled again, as one the
+        // click meets is.
+        const changed =
+            shown === label ? await clickShownToggle(page, id, label) : shown
+        if (changed !== null) {
+            if (sample >= MAX_TOGGLE_SAMPLES) {
+                throw new Error(
+                    `the toggle of alert ${id} changed state before each of ${MAX_TOGGLE_SAMPLES} clicks, last from "${label}" to ${describeValue(changed, TOGGLE_LABELS)}`
+                )
+            }
+            continue
+        }
+        const entry = await waitForPatchResponse(session, id, clickSeq)
+        // Only an accepted, readable answer has fields to keep; `rejection`
+        // or `bodyError` tells why another has none.
+        const body =
+            entry.accepted && entry.parsed && isPlainObject(entry.body)
+                ? entry.body
+                : null
+        const snapshot = {
+            alertId: id,
+            clicked: label,
+            clickedAt,
+            sent: entry.sentEnabled,
+            status: entry.status,
+            rejection: entry.rejection,
+            bodyError: entry.bodyError ?? null,
+            answeredId: uuidOrNull(body?.id),
+            enabled: booleanOrNull(body?.enabled),
+            armingRevision: integerOrNull(body?.armingRevision),
+            triggeredAt:
+                body === null ? null : projectTimestamp(body.triggeredAt),
+            acknowledged: booleanOrNull(body?.acknowledged),
+        }
+        member.patches.push(snapshot)
+        report.patches.push(snapshot)
+        const expected = patchAnswerProblems(
+            entry,
+            id,
+            TOGGLE_SENDS[label],
+            before
+        )
+        if (expected.length > 0) {
+            throw new Error(
+                `"${label}" on alert ${id} sent ${describeSent(entry.sentEnabled)} and ${describePatchAnswer(entry)}; expected ${expected.join(", ")}`
+            )
+        }
+        return { label, entry, clickSeq }
+    }
+}
+
+/**
+ * Re-arms one fixture alert through its row, by the label its toggle shows:
+ * "Re-arm" on a triggered row and "Enable" on a disabled one re-arm it at
+ * once; "Disable" on an armed row is followed by "Enable" only once its
+ * PATCH answered the alert disabled. `clickToggle` clicks only a label the
+ * state the page received explains, judges each click by the label it was
+ * made on, and samples again a row that changed state first.
+ */
+export async function rearmMember(session, report, alert) {
     const { page } = session
     await page.waitForSelector(rowSelector(alert.id), {
         timeout: ROW_TIMEOUT_MS,
     })
-    const label = await waitForToggle(page, alert.id, null)
     const member = {
         alert,
         previousRevision: latestRevision(session, alert),
-        initialState: label,
+        initialState: null,
         patches: [],
         newRevision: null,
         enablingSeq: null,
     }
-    if (!["Re-arm", "Enable", "Disable"].includes(label)) {
-        // Page text other than a known label is described, not repeated.
-        throw new Error(`the row toggle reads ${describeValue(label)}`)
-    }
-    let click = await clickToggle(session, report, member, label)
-    if (click.entry.body.enabled === false) {
-        await waitForToggle(page, alert.id, "Enable")
+    let click = await clickToggle(session, report, member, null)
+    member.initialState = click.label
+    if (!TOGGLE_SENDS[click.label]) {
         click = await clickToggle(session, report, member, "Enable")
     }
-    const { body } = click.entry
-    if (
-        body.enabled !== true ||
-        body.triggeredAt !== null ||
-        !Number.isInteger(body.armingRevision) ||
-        body.armingRevision <= member.previousRevision
-    ) {
-        throw new Error(
-            `the enabling PATCH answered enabled ${describeValue(body.enabled)}, triggeredAt ${describeTimestamp(body.triggeredAt)} and armingRevision ${describeValue(body.armingRevision)}, expected true, null and above ${member.previousRevision}`
-        )
-    }
-    member.newRevision = body.armingRevision
+    member.newRevision = click.entry.body.armingRevision
     member.enablingSeq = click.clickSeq
     return member
 }
@@ -2813,9 +4248,12 @@ export async function checkAcknowledge(
         }
     )
     details.acknowledgeStatus = response.status
-    expectEqual(problems, "the acknowledge status", response.status, 204)
-    if (response.status === 204) {
+    // Only the answer to the frontend's own POST, a 204 from the page's
+    // origin, acknowledged the alert.
+    if (response.accepted) {
         report.acknowledged = { id: alertId, armingRevision }
+    } else {
+        problems.push(`the acknowledge response ${response.rejection}`)
     }
     await waitOrReport(problems, () =>
         waitFor(
@@ -2864,8 +4302,21 @@ export async function checkAcknowledge(
  * height, or `null` without a sidebar. A link's position is its offset in
  * the sidebar's scrolled content, so a scrolled row reads the same, and its
  * line count is the number of line boxes its label text occupies.
+ *
+ * What tells whether a link is rendered is read beside its layout: whether
+ * the sidebar contains it, how many layout boxes `getClientRects` gives it,
+ * its computed `display` and `visibility`, and `checkVisibility` with the
+ * opacity and visibility checks, which is `false` when the link has no box,
+ * is hidden or collapsed, or it or an ancestor is fully transparent.
+ *
+ * Where the link leads is read the same way: whether it is an HTML anchor
+ * and, for an anchor with an href, whether the URL the browser resolves
+ * that href to has the page's own origin, and that URL's path, query and
+ * fragment as `route`. Both are `null` for an element that is not an anchor
+ * or has no href, and for an href that resolves to no URL. An opaque page
+ * origin is same-origin with nothing.
  */
-function readLegacySidebar(ids) {
+export function readLegacySidebar(ids) {
     const sidebar = document.querySelector(".sidebar")
     if (sidebar === null) {
         return null
@@ -2888,6 +4339,19 @@ function readLegacySidebar(ids) {
         }
         return lineTops.size
     }
+    const destination = (link) => {
+        if (
+            !(link instanceof window.HTMLAnchorElement) ||
+            !link.hasAttribute("href")
+        ) {
+            return null
+        }
+        try {
+            return new URL(link.href)
+        } catch {
+            return null
+        }
+    }
     return {
         sidebarHeight: sidebarBox.height,
         links: ids.map((id) => {
@@ -2897,9 +4361,28 @@ function readLegacySidebar(ids) {
             }
             const box = link.getBoundingClientRect()
             const style = window.getComputedStyle(link)
+            const target = destination(link)
             return {
                 id,
                 present: true,
+                inSidebar: sidebar.contains(link),
+                anchor: link instanceof window.HTMLAnchorElement,
+                sameOrigin:
+                    target === null
+                        ? null
+                        : location.origin !== "null" &&
+                          target.origin === location.origin,
+                route:
+                    target === null
+                        ? null
+                        : `${target.pathname}${target.search}${target.hash}`,
+                boxes: link.getClientRects().length,
+                display: style.display,
+                visibility: style.visibility,
+                visible: link.checkVisibility({
+                    opacityProperty: true,
+                    visibilityProperty: true,
+                }),
                 left: box.left - sidebarBox.left + sidebar.scrollLeft,
                 top: box.top - sidebarBox.top + sidebar.scrollTop,
                 width: box.width,
@@ -2921,9 +4404,10 @@ function readLegacySidebar(ids) {
 /**
  * A `readLegacySidebar` result with every value in its defined form: finite
  * numbers, booleans and `null` as read, a computed style value only when it
- * matches `CSS_VALUE_PATTERN`, and any other value by its kind and size.
+ * matches `CSS_VALUE_PATTERN`, a link's `route` only when it is that link's
+ * own route in `LEGACY_NAV_ROUTES`, and any other value by its kind and size.
  */
-function projectLegacySidebar(layout) {
+export function projectLegacySidebar(layout) {
     if (!isPlainObject(layout) || !Array.isArray(layout.links)) {
         return null
     }
@@ -2932,6 +4416,10 @@ function projectLegacySidebar(layout) {
         typeof value === "boolean" ||
         isFiniteNumber(value) ||
         (typeof value === "string" && CSS_VALUE_PATTERN.test(value))
+            ? value
+            : describeValue(value)
+    const definedRoute = (id, value) =>
+        value === null || value === LEGACY_NAV_ROUTES.get(id)
             ? value
             : describeValue(value)
     return {
@@ -2944,7 +4432,10 @@ function projectLegacySidebar(layout) {
             const projected = { id }
             for (const [field, value] of Object.entries(link)) {
                 if (field !== "id") {
-                    projected[field] = defined(value)
+                    projected[field] =
+                        field === "route"
+                            ? definedRoute(id, value)
+                            : defined(value)
                 }
             }
             return projected
@@ -2988,18 +4479,95 @@ async function readLegacySidebarLayouts(
 }
 
 /**
- * Adds a problem for every sidebar value read with the feature on that
- * differs from the one read at the same width with the feature off. A
- * computed style value is named in the problem only in its defined form.
+ * What each value of a present link, as `projectLegacySidebar` returns it,
+ * must be for the link with id `id` to count as rendered: inside the
+ * .sidebar, an HTML anchor whose href resolves on the page's own origin to
+ * exactly the link's route in `LEGACY_NAV_ROUTES`, with at least one layout
+ * box, a positive width and height, a computed `display` in its defined form
+ * other than `none`, `visibility` `visible`, and `checkVisibility` true.
  */
-function compareLegacySidebarLayouts(problems, withFeature, withoutFeature) {
+const LEGACY_LINK_RENDERED = {
+    inSidebar: (value) => value === true,
+    anchor: (value) => value === true,
+    sameOrigin: (value) => value === true,
+    route: (value, id) => value === LEGACY_NAV_ROUTES.get(id),
+    boxes: (value) => isFiniteNumber(value) && value > 0,
+    width: (value) => isFiniteNumber(value) && value > 0,
+    height: (value) => isFiniteNumber(value) && value > 0,
+    display: (value) =>
+        typeof value === "string" &&
+        CSS_VALUE_PATTERN.test(value) &&
+        value !== "none",
+    visibility: (value) => value === "visible",
+    visible: (value) => value === true,
+}
+
+/**
+ * Why a present link, as `projectLegacySidebar` returns it, is not rendered:
+ * each `LEGACY_LINK_RENDERED` value it fails, with the value read in its
+ * defined form. A string outside `CSS_VALUE_PATTERN` is already the
+ * projection's description of what was read, so it is named as it stands.
+ * Empty for a rendered link.
+ */
+function legacyLinkRenderGaps(link) {
+    return Object.entries(LEGACY_LINK_RENDERED)
+        .filter(([field, rendered]) => !rendered(link[field], link.id))
+        .map(([field]) => {
+            const value = link[field]
+            if (typeof value === "string" && !CSS_VALUE_PATTERN.test(value)) {
+                return `${field} is ${value}`
+            }
+            const known = typeof value === "string" ? [value] : []
+            return `${field} is ${describeValue(value, known)}`
+        })
+}
+
+/**
+ * Adds a problem for each mode whose page shows no .sidebar at a width, for
+ * each of the five links missing or not rendered by `LEGACY_LINK_RENDERED`
+ * at a width and mode, and for every sidebar value read with the feature on
+ * that differs from the one read at the same width with the feature off. A
+ * link's values are compared only where it is rendered in both modes, so a
+ * link lost in both is reported, not matched. A computed style value is
+ * named in a problem only in its defined form.
+ */
+export function compareLegacySidebarLayouts(
+    problems,
+    withFeature,
+    withoutFeature
+) {
     for (const width of CONTINUITY_WIDTHS) {
         const shown = withFeature[width]
         const reference = withoutFeature[width]
+        const rendered = { on: new Set(), off: new Set() }
+        for (const [mode, layout] of [
+            ["on", shown],
+            ["off", reference],
+        ]) {
+            if (layout === null) {
+                problems.push(
+                    `at ${width} px the page shows no .sidebar with the feature ${mode}`
+                )
+                continue
+            }
+            for (const link of layout.links) {
+                if (link.present !== true) {
+                    problems.push(
+                        `with the feature ${mode} at ${width} px, #${link.id} is missing`
+                    )
+                    continue
+                }
+                const gaps = legacyLinkRenderGaps(link)
+                if (gaps.length === 0) {
+                    rendered[mode].add(link.id)
+                } else {
+                    problems.push(
+                        `with the feature ${mode} at ${width} px, #${link.id} is not rendered in the .sidebar: ${gaps.join(", ")}`
+                    )
+                }
+            }
+        }
         if (shown === null || reference === null) {
-            problems.push(
-                `at ${width} px the page shows no .sidebar with the feature ${shown === null ? "on" : "off"}`
-            )
             continue
         }
         expectEqual(
@@ -3009,6 +4577,9 @@ function compareLegacySidebarLayouts(problems, withFeature, withoutFeature) {
             reference.sidebarHeight
         )
         reference.links.forEach((link, index) => {
+            if (!rendered.on.has(link.id) || !rendered.off.has(link.id)) {
+                return
+            }
             for (const [field, value] of Object.entries(link)) {
                 if (field !== "id") {
                     const actual = shown.links[index][field]
@@ -3143,10 +4714,286 @@ function readShutdownState() {
     }
 }
 
+/** In the page: the ids of the feature's elements it shows, by `idPattern`. */
+export function readFeatureIds(idPattern) {
+    const pattern = new RegExp(idPattern)
+    return Array.from(
+        document.querySelectorAll("[id]"),
+        (element) => element.id
+    ).filter((id) => pattern.test(id))
+}
+
+/**
+ * The page's flag responses sequenced after `afterSeq` whose outcome is
+ * known, in arrival order, as `{ status, accepted, enabled, problem }`. An
+ * accepted response whose body is the flag gives its boolean `enabled` and
+ * no problem; any other gives `enabled: null` and why it is no answer, a
+ * fixed phrase. One whose body is still being read is left out until then.
+ */
+export function pageFlagAnswers(session, afterSeq) {
+    const answers = []
+    for (const entry of session.responses) {
+        if (entry.kind !== "flag" || entry.seq <= afterSeq) {
+            continue
+        }
+        if (
+            !entry.parsed &&
+            entry.bodyError === undefined &&
+            entry.status !== 204
+        ) {
+            continue
+        }
+        let enabled = null
+        let problem = null
+        if (!entry.accepted) {
+            problem = entry.rejection
+        } else if (!entry.parsed) {
+            problem = `has an unreadable body: ${entry.bodyError}`
+        } else if (
+            !isPlainObject(entry.body) ||
+            entry.body.id !== FLAG_ID ||
+            typeof entry.body.enabled !== "boolean"
+        ) {
+            problem = `has a body without "${FLAG_ID}" and a boolean "enabled"`
+        } else {
+            enabled = entry.body.enabled
+        }
+        answers.push({
+            status: entry.status,
+            accepted: entry.accepted,
+            enabled,
+            problem,
+        })
+    }
+    return answers
+}
+
+/**
+ * What is wrong with the flag answers a flag-off page received: each that
+ * is no valid answer or reads `true`, and, once there is one, the lack of
+ * any valid `false`.
+ */
+function flagOffProblems(answers) {
+    const problems = []
+    answers.forEach((answer, index) => {
+        const name = `the page's flag response ${index + 1}`
+        if (answer.problem !== null) {
+            problems.push(`${name} ${answer.problem}`)
+        } else if (answer.enabled) {
+            problems.push(`${name} reads enabled true`)
+        }
+    })
+    if (
+        answers.length > 0 &&
+        !answers.some((answer) => answer.enabled === false)
+    ) {
+        problems.push("no flag response of the page reads enabled false")
+    }
+    return problems
+}
+
+/**
+ * The feature elements the page showed and the feature requests it sent
+ * after `since.seq`, in the order they reached this process. Each is named
+ * by its id, or by its method and route, only, with the milliseconds after
+ * `since.at`, a `Date.now()` time, and a description naming `since.what`.
+ */
+function featureActivity(session, since) {
+    const elements = session.featureElements
+        .filter((element) => element.seq > since.seq)
+        .map((element) => ({
+            seq: element.seq,
+            element: element.id,
+            request: null,
+            afterMs: element.at - since.at,
+        }))
+    const requests = session.featureRequests
+        .filter((request) => request.seq > since.seq)
+        .map((request) => ({
+            seq: request.seq,
+            element: null,
+            request: `${request.method ?? "a request to"} ${request.route}`,
+            afterMs: request.at - since.at,
+        }))
+    return [...elements, ...requests]
+        .sort((a, b) => a.seq - b.seq)
+        .map((item) => ({
+            ...item,
+            text:
+                item.element === null
+                    ? `the page sent ${item.request} ${item.afterMs} ms after ${since.what}`
+                    : `#${item.element} appeared ${item.afterMs} ms after ${since.what}`,
+        }))
+}
+
+/**
+ * flag-off: the sidebar shows no Portfolio Insights link once the page has
+ * its flag answer, and keeps showing none. It waits for the page's first
+ * flag response with a known outcome, then holds the link's absence for
+ * `SETTLE_WINDOW_MS`, so a link the frontend renders a moment after its
+ * answer is seen. Every flag response the page received since `since.seq`
+ * must be an accepted 200 reading `false`, and the page's feature-element
+ * recorder must not have seen the link since then, even for a moment.
+ */
+export async function checkNavLinkAbsent(
+    problems,
+    details,
+    { report, holder, evidenceDir, since }
+) {
+    const { page } = holder
+    try {
+        await waitFor(() => pageFlagAnswers(holder, since.seq).length > 0, {
+            timeoutMs: FLAG_RESPONSE_TIMEOUT_MS,
+            what: "the page's first flag response",
+        })
+        await observeAbsence(
+            async (signal) =>
+                (await probePage(page, signal, () =>
+                    isPresent(page, "#nav-portfolio-insights")
+                ))
+                    ? "#nav-portfolio-insights is shown"
+                    : null,
+            { windowMs: SETTLE_WINDOW_MS }
+        )
+    } finally {
+        const answers = pageFlagAnswers(holder, since.seq)
+        details.flagResponses = answers
+        problems.push(...flagOffProblems(answers))
+        const shown = featureActivity(holder, since).filter(
+            (item) => item.element === "nav-portfolio-insights"
+        )
+        details.linkAppearedAfterMs = shown.map((item) => item.afterMs)
+        problems.push(...shown.map((item) => item.text))
+    }
+    await captureScreenshot(
+        report,
+        page,
+        evidenceDir,
+        "flag-off-home.png",
+        problems
+    )
+}
+
+/**
+ * What is wrong with the flag evidence of a direct visit, as fixed phrases:
+ * no flag read the page sent while still on /insights, where the loader's
+ * entry decision reads the flag; no flag answer with a known outcome; and
+ * what `flagOffProblems` finds in the answers, each that is no valid answer
+ * or reads `true` and the lack of any valid `false`.
+ */
+function directVisitFlagProblems(answers, readsOnInsights) {
+    const problems = []
+    if (readsOnInsights === 0) {
+        problems.push(
+            "the page sent no flag read while on /insights, so no flag answer decided its redirect"
+        )
+    }
+    if (answers.length === 0) {
+        problems.push(
+            "the page received no flag response with a known outcome during the direct visit"
+        )
+    }
+    problems.push(...flagOffProblems(answers))
+    return problems
+}
+
+/**
+ * Visits /insights directly and expects the flag to send the page to /home
+ * without the feature. From the moment the visit starts, through the
+ * redirect and for `SETTLE_WINDOW_MS` after the page lands, no feature
+ * element may appear, even for a moment, no feature request may be sent,
+ * and no feature element may be on the page; the first of these ends the
+ * check, named by its id or route only. The elements and requests recorded
+ * are read once more after the window, so one recorded while its last probe
+ * read the page fails the check too. The redirect must come from the flag:
+ * the page must read it while still on /insights, and the flag responses it
+ * received since the visit started, judged once the window has passed, must
+ * hold an accepted 200 reading `false` and nothing else (`flagOffProblems`).
+ * `details` receives where the page landed, the flag reads it sent from
+ * /insights, its flag answers, and every such element and request.
+ */
+export async function checkDirectVisit(details, session, baseUrl) {
+    const { page } = session
+    const since = {
+        seq: nextSequence(),
+        at: Date.now(),
+        what: "the direct visit started",
+    }
+    let flagReadsOnInsights = 0
+    const onRequest = (request) => {
+        try {
+            // Puppeteer reports a request after every navigation the page
+            // reported before it, so the path is the page's when it was sent.
+            if (
+                request.method() === "GET" &&
+                new URL(request.url()).pathname === FLAG_PATH &&
+                currentPath(page) === "/insights"
+            ) {
+                flagReadsOnInsights += 1
+            }
+        } catch (error) {
+            // An error thrown here would break Puppeteer's event dispatch.
+            console.error(describeError(error))
+        }
+    }
+    page.on("request", onRequest)
+    try {
+        await page.goto(`${baseUrl}/insights`, {
+            waitUntil: "domcontentloaded",
+        })
+        await waitForPath(page, "/home", REDIRECT_TIMEOUT_MS)
+        details.landedOn = currentPath(page)
+        await observeAbsence(
+            async (signal) => {
+                const [first] = featureActivity(session, since)
+                if (first !== undefined) {
+                    return first.text
+                }
+                const ids = await probePage(page, signal, () =>
+                    page.evaluate(
+                        readFeatureIds,
+                        FEATURE_ELEMENT_ID_PATTERN.source
+                    )
+                )
+                // Repeated only in the feature's own id form.
+                const shown = ids.filter(
+                    (id) =>
+                        typeof id === "string" &&
+                        FEATURE_ELEMENT_ID_PATTERN.test(id)
+                )
+                return shown.length === 0
+                    ? null
+                    : `the page shows #${shown[0]} after the redirect`
+            },
+            { windowMs: SETTLE_WINDOW_MS }
+        )
+        // The window's last probe read the ledger before the page answered.
+        const [late] = featureActivity(session, since)
+        if (late !== undefined) {
+            throw new Error(late.text)
+        }
+        const flagProblems = directVisitFlagProblems(
+            pageFlagAnswers(session, since.seq),
+            flagReadsOnInsights
+        )
+        if (flagProblems.length > 0) {
+            throw new Error(flagProblems.join("; "))
+        }
+    } finally {
+        page.off("request", onRequest)
+        details.flagReadsOnInsights = flagReadsOnInsights
+        details.flagResponses = pageFlagAnswers(session, since.seq)
+        details.featureActivity = featureActivity(session, since).map(
+            ({ element, request, afterMs }) => ({ element, request, afterMs })
+        )
+    }
+}
+
 /**
  * Turns the flag off with the page visible and expects the shutdown within
- * `SHUTDOWN_TIMEOUT_MS` of the PUT's start, then a quiet window and a
- * redirected direct visit.
+ * `SHUTDOWN_TIMEOUT_MS` of the PUT's start, then a quiet window and a direct
+ * visit redirected without any feature element or request on the way
+ * (`checkDirectVisit`).
  */
 export async function checkLiveShutdown(
     problems,
@@ -3213,14 +5060,8 @@ export async function checkLiveShutdown(
         { windowMs: ABSENCE_WINDOW_MS }
     )
     details.quietForMs = ABSENCE_WINDOW_MS
-    await page.goto(`${baseUrl}/insights`, { waitUntil: "domcontentloaded" })
-    await waitForPath(page, "/home", REDIRECT_TIMEOUT_MS)
-    expectEqual(
-        problems,
-        "#portfolio-insights shown after the direct visit",
-        await isPresent(page, "#portfolio-insights"),
-        false
-    )
+    details.directVisit = {}
+    await checkDirectVisit(details.directVisit, holder, baseUrl)
     await captureScreenshot(
         report,
         page,
@@ -3240,67 +5081,32 @@ async function runFlagOff(report, state, { baseUrl, evidenceDir }, fixture) {
         return
     }
     const browser = await launchBrowser(state)
-    const holder = await openSession(browser, report, "holder", fixture.holder)
-    state.sessions.push(holder)
-    await login(holder, baseUrl)
-    const { page } = holder
-
-    await runCheck(
+    const holder = await openSession(
+        browser,
         report,
-        "flag-off:nav-link-absent",
-        async (problems, details) => {
-            await waitFor(
-                () =>
-                    holder.responses.some(
-                        (entry) => entry.kind === "flag" && entry.parsed
-                    ),
-                {
-                    timeoutMs: FLAG_RESPONSE_TIMEOUT_MS,
-                    what: "the page's first flag response",
-                }
-            )
-            details.flagResponses = holder.responses
-                .filter((entry) => entry.kind === "flag" && entry.parsed)
-                .map((entry) => ({
-                    status: entry.status,
-                    enabled:
-                        isPlainObject(entry.body) &&
-                        typeof entry.body.enabled === "boolean"
-                            ? entry.body.enabled
-                            : null,
-                }))
-            expectEqual(
-                problems,
-                "#nav-portfolio-insights shown",
-                await isPresent(page, "#nav-portfolio-insights"),
-                false
-            )
-            await captureScreenshot(
-                report,
-                page,
-                evidenceDir,
-                "flag-off-home.png",
-                problems
-            )
-        }
+        "holder",
+        fixture.holder,
+        baseUrl
+    )
+    state.sessions.push(holder)
+    const since = {
+        seq: nextSequence(),
+        at: Date.now(),
+        what: "the login started",
+    }
+    await login(holder, baseUrl)
+
+    await runCheck(report, "flag-off:nav-link-absent", (problems, details) =>
+        checkNavLinkAbsent(problems, details, {
+            report,
+            holder,
+            evidenceDir,
+            since,
+        })
     )
 
-    await runCheck(
-        report,
-        "flag-off:direct-visit-redirects",
-        async (problems, details) => {
-            await page.goto(`${baseUrl}/insights`, {
-                waitUntil: "domcontentloaded",
-            })
-            await waitForPath(page, "/home", REDIRECT_TIMEOUT_MS)
-            details.landedOn = currentPath(page)
-            expectEqual(
-                problems,
-                "#portfolio-insights shown",
-                await isPresent(page, "#portfolio-insights"),
-                false
-            )
-        }
+    await runCheck(report, "flag-off:direct-visit-redirects", (_, details) =>
+        checkDirectVisit(details, holder, baseUrl)
     )
 }
 
@@ -3314,7 +5120,13 @@ async function runFlagOn(report, state, { baseUrl, evidenceDir }, fixture) {
         return
     }
     const browser = await launchBrowser(state)
-    const holder = await openSession(browser, report, "holder", fixture.holder)
+    const holder = await openSession(
+        browser,
+        report,
+        "holder",
+        fixture.holder,
+        baseUrl
+    )
     state.sessions.push(holder)
     await login(holder, baseUrl)
 
@@ -3387,9 +5199,14 @@ async function runFlagOn(report, state, { baseUrl, evidenceDir }, fixture) {
 }
 
 /**
- * What the evidence keeps of every notification response the pages read:
- * per item, the fields the checks judge, each in its defined form, and
- * `null` for an item that is not an object.
+ * What the evidence keeps of every notification response the pages read,
+ * counted as a poll or not. `accepted` and the fixed `rejection` judge its
+ * HTTP answer (`responseRejection`), `counted` tells whether it counts as a
+ * poll (`isPollAnswer`), and `bodyError` is a fixed phrase for a body that
+ * could not be read or is not a results list, whose content is never kept.
+ * Of a results list, per item, the fields the checks judge, each in its
+ * defined form, and `null` for an item that is not an object; without a
+ * results list, `results` is `null`.
  */
 export function summariseNotifications(sessions) {
     return sessions.flatMap((session) =>
@@ -3399,7 +5216,10 @@ export function summariseNotifications(sessions) {
                 account: session.label,
                 at: new Date(entry.at).toISOString(),
                 status: entry.status,
-                results: entry.parsed
+                accepted: entry.accepted,
+                rejection: entry.rejection,
+                counted: isPollAnswer(entry),
+                results: hasResultsList(entry)
                     ? resultsOf(entry).map((item) =>
                           isPlainObject(item)
                               ? {
@@ -3420,7 +5240,10 @@ export function summariseNotifications(sessions) {
                               : null
                       )
                     : null,
-                bodyError: entry.bodyError ?? null,
+                bodyError:
+                    entry.parsed && !hasResultsList(entry)
+                        ? NOT_A_RESULTS_LIST
+                        : (entry.bodyError ?? null),
             }))
     )
 }
@@ -3486,11 +5309,184 @@ function accountSummary(account) {
         : { username: account.username, accountId: account.accountId }
 }
 
+/**
+ * Kills `child`, the browser process this run launched, as Puppeteer's own
+ * launcher does: `taskkill /T /F` on its pid on Windows, which takes its
+ * process tree along, and SIGKILL to its process group elsewhere, where
+ * Puppeteer starts it as the group's leader. When that is refused,
+ * `child.kill("SIGKILL")` stops the process itself. Only that pid is ever
+ * addressed, never a process name. `signal` ends a pending taskkill and
+ * then skips the fallback. Rejects when every way fails. `platform`, `run`
+ * (an `execFile`) and `killGroup` (a `process.kill`) are the test seams.
+ */
+export async function killBrowserProcess(
+    child,
+    signal,
+    {
+        platform = process.platform,
+        run = execFile,
+        killGroup = (pid, name) => process.kill(pid, name),
+    } = {}
+) {
+    try {
+        if (platform === "win32") {
+            await new Promise((resolve, reject) => {
+                run(
+                    "taskkill",
+                    ["/pid", String(child.pid), "/T", "/F"],
+                    { signal, windowsHide: true },
+                    (error) => {
+                        if (error) {
+                            reject(error)
+                        } else {
+                            resolve()
+                        }
+                    }
+                )
+            })
+        } else {
+            killGroup(-child.pid, "SIGKILL")
+        }
+        return
+    } catch (error) {
+        // Either can be refused, for want of permission for instance, while
+        // the process itself can still be stopped.
+        console.error(describeError(error))
+        signal.throwIfAborted()
+    }
+    if (!child.kill("SIGKILL")) {
+        throw new Error(
+            `the browser process [${child.pid}] could not be signalled`
+        )
+    }
+}
+
+/**
+ * Stops `child`, the process of a browser that did not close in time, by
+ * `kill`, and waits at most `killTimeoutMs` for its exit. Answers what
+ * became of it, with the part of the teardown reason that says so: `none`
+ * without a process, `exited` when it was already gone, `killed` once its
+ * exit is seen, `kill-failed` when every kill was refused, and `lingering`
+ * when it was not seen to exit in time.
+ */
+async function stopBrowserProcess(child, kill, killTimeoutMs) {
+    if (child === null) {
+        return { process: "none", note: "it has no process this run can kill" }
+    }
+    if (child.exitCode !== null || child.signalCode !== null) {
+        return { process: "exited", note: "its process had already exited" }
+    }
+    // Listening before the kill, so that an exit it causes at once is seen.
+    const exit = new Promise((resolve) => child.once("exit", resolve))
+    const controller = new AbortController()
+    const killed = await answerBy(
+        async (signal) => {
+            await kill(child, signal)
+            await exit
+        },
+        controller.signal,
+        performance.now() + killTimeoutMs
+    )
+    if (killed.failed) {
+        console.error(describeError(killed.error))
+    }
+    if (killed.late) {
+        // A taskkill still running would keep node alive.
+        controller.abort()
+        return {
+            process: "lingering",
+            note: `its process was not seen to exit within ${killTimeoutMs} ms of the kill`,
+        }
+    }
+    if (killed.failed) {
+        return { process: "kill-failed", note: "killing its process failed" }
+    }
+    return {
+        process: "killed",
+        note: `its process was killed and exited within ${killTimeoutMs} ms`,
+    }
+}
+
+/**
+ * Lets node end while `child`, a browser process not seen to exit, may
+ * still run: the DevTools connection is dropped, and neither the process
+ * handle nor its pipes hold the event loop any longer. The connection's
+ * socket then closes within the close timeout of the WebSocket client
+ * Puppeteer uses.
+ */
+function releaseBrowser(browser, child) {
+    new Promise((resolve) => resolve(browser.disconnect())).catch((error) => {
+        console.error(describeError(error))
+    })
+    if (child !== null) {
+        child.unref()
+        for (const stream of child.stdio) {
+            stream?.destroy()
+        }
+    }
+}
+
+/**
+ * Closes `browser`, the one this run launched, and does nothing when it is
+ * `null`. Puppeteer's close waits for Chrome's process to exit without any
+ * bound, so a wedged process would hold back the report, the exit code and
+ * the caller's cleanup. A close that fails, or has not finished within
+ * `closeTimeoutMs`, is escalated for this browser's own process only: the
+ * one `browser.process()` names, through `kill`. That process gets
+ * `killTimeoutMs` to exit and is released when it is not seen to, and a
+ * `teardown` FAIL names the deadline and the outcome. Answers whether the
+ * browser closed in time; such a close records and prints nothing. Never
+ * throws.
+ */
+export async function teardownBrowser(
+    report,
+    browser,
+    {
+        kill = killBrowserProcess,
+        closeTimeoutMs = BROWSER_CLOSE_TIMEOUT_MS,
+        killTimeoutMs = BROWSER_KILL_TIMEOUT_MS,
+    } = {}
+) {
+    if (browser === null) {
+        return true
+    }
+    const closed = await answerBy(
+        () => browser.close(),
+        undefined,
+        performance.now() + closeTimeoutMs
+    )
+    if (!closed.late && !closed.failed) {
+        return true
+    }
+    if (closed.failed) {
+        console.error(describeError(closed.error))
+    }
+    const child = browser.process()
+    const stopped = await stopBrowserProcess(child, kill, killTimeoutMs)
+    if (stopped.process !== "exited" && stopped.process !== "killed") {
+        releaseBrowser(browser, child)
+    }
+    const reason = closed.late
+        ? `the browser did not close within ${closeTimeoutMs} ms`
+        : `the browser close failed before its ${closeTimeoutMs} ms deadline`
+    recordCheck(report, "teardown", false, `${reason}; ${stopped.note}`, {
+        closeTimeoutMs,
+        killTimeoutMs,
+        process: stopped.process,
+    })
+    return false
+}
+
 async function main() {
     let options
     let fixture
     try {
         options = parseOptions(process.argv.slice(2))
+        if (options.help === true) {
+            console.log(HELP)
+            process.exitCode = 0
+            return
+        }
         fixture = await readFixture(options.fixturePath, options.mode)
     } catch (error) {
         if (!(error instanceof UsageError)) {
@@ -3538,15 +5534,9 @@ async function main() {
         console.error(describeError(error))
         recordCheck(report, "setup", false, errorMessage(error), {})
     } finally {
-        if (state.browser !== null) {
-            try {
-                await state.browser.close()
-            } catch (error) {
-                failed = true
-                console.log(`FAIL teardown: ${errorMessage(error)}`)
-                console.error(describeError(error))
-            }
-        }
+        // Bounded, and recorded in the report as a `teardown` FAIL when the
+        // browser does not close in time.
+        await teardownBrowser(report, state.browser)
         Object.assign(report, summariseToasts(state.sessions, fixture.alerts))
         report.notifications = summariseNotifications(state.sessions)
         report.bodyErrors = summariseBodyErrors(state.sessions)

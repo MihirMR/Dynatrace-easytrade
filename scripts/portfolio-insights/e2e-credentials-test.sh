@@ -3,13 +3,17 @@
 # responses and its failure reasons, without a running stack:
 #   - random_secret takes 16 bytes of /dev/urandom, fails closed without them, and step 3 then
 #     stops at its first check before any request;
+#   - step 3 takes each of the holder's instrument listings only as a 200 with a results array,
+#     and certifies the holdings, writes the fixture and starts the browser check only when both
+#     bought instruments are listed once each with a JSON-number amount of at least 1;
 #   - write_fixture and signup keep the passwords out of every jq command line and still write
 #     the exact fixture file and signup body;
 #   - http keeps the raw responses in the private directory, where expect_forbidden compares
 #     every byte, those after a NUL included;
 #   - body_snippet and jcheck describe a body without any byte of it, and fail redacts both
 #     passwords and keeps each FAIL line to one line of printable ASCII;
-#   - step 4 writes no copy of the insights response to the run directory;
+#   - step 4 writes no copy of the insights response to the run directory, and stops before it
+#     when the flag's PUT answer is not this flag with the JSON boolean true;
 #   - cleanup removes the fixture and the private directory after a pass, a failure and an
 #     interrupt, and fails the run when it cannot; a second interrupt, during cleanup, still
 #     removes them and ends the run with FAIL cleanup, the SUMMARY line and exit status 130;
@@ -154,13 +158,13 @@ load_values() {
     done
 }
 
-load_functions pass fail info abort http jget lower status_text describe_file body_snippet \
-    jcheck expect_forbidden own_alert own_if_created random_secret now_rfc3339 \
+load_functions pass fail info abort http jget jitem jcount lower status_text describe_file \
+    body_snippet jcheck expect_forbidden own_alert own_if_created random_secret now_rfc3339 \
     epoch_to_rfc3339 log_since_now remaining_owned delete_alert write_fixture signup \
     step3_fixture step4_enable delete_remaining remove_private on_cleanup_signal cleanup \
-    on_signal restrict_private_dir
+    on_signal restrict_private_dir flag_enabled media_type
 load_values FLAG_ID HTTP_TIMEOUT_SECONDS LOG_SKEW_MARGIN_SECONDS \
-    MAX_CONSECUTIVE_TRANSPORT_ERRORS PACKAGE_ID FORBIDDEN_BODY UUID_RE
+    MAX_CONSECUTIVE_TRANSPORT_ERRORS PACKAGE_ID FORBIDDEN_BODY UUID_RE DEPOSIT_AMOUNT
 
 # Two passwords in random_secret's format, assembled here so no literal resembles a credential.
 SECRET_A="Pi-$(printf 'a1%.0s' {1..16})"
@@ -168,6 +172,8 @@ SECRET_B="Pi-$(printf 'b2%.0s' {1..16})"
 HOLDER_UUID="0f8e6a52-3b1d-4c7e-9a2f-5d6c7b8a9e01"
 EMPTY_UUID="1a2b3c4d-5e6f-4a7b-8c9d-0e1f2a3b4c5d"
 ALERT_UUID="2b3c4d5e-6f7a-4b8c-9d0e-1f2a3b4c5d6e"
+INSTRUMENT_A_UUID="3c4d5e6f-7a8b-4c9d-8e0f-2a3b4c5d6e7f"
+INSTRUMENT_B_UUID="4d5e6f7a-8b9c-4dae-9f10-3b4c5d6e7f80"
 
 # shellcheck disable=SC2329 # Invoked by the loaded e2e.sh functions.
 # jq: records each command line the loaded functions give jq, then runs the real jq. This file
@@ -182,6 +188,7 @@ jq() {
 fresh_state() {
     RUN_DIR="$(mktemp -d "$T/run.XXXXXX")"
     PRIVATE_DIR="$(mktemp -d "$T/private.XXXXXX")"
+    EVIDENCE_DIR="$RUN_DIR"
     FIXTURE="$PRIVATE_DIR/fixture.json"
     PRIVATE_LEFT=""
     : >"$RUN_DIR/owned"
@@ -379,6 +386,101 @@ if [[ -s "$T/requests" ]]; then
     reasons+=("requests were sent: $(tr '\n' ' ' <"$T/requests")")
 fi
 conclude "$check"
+
+# shellcheck disable=SC2329 # Invoked through run_isolated.
+# scenario_step3_listings: step 3 with every request answered: the holder's instrument listing
+# by STEP3_BEFORE before the buys and by STEP3_AFTER after them, each "STATUS BODY", and the
+# browser check recorded in place of being run.
+scenario_step3_listings() {
+    local listings=0
+    http() {
+        echo "$1 $2" >>"$T/requests"
+        case "$1 $2" in
+            "POST $U/api/auth/signup")
+                if [[ "$3" == *'"lastName":"Holder"'* ]]; then
+                    respond 201 application/json "{\"id\":\"$HOLDER_UUID\"}"
+                else
+                    respond 201 application/json "{\"id\":\"$EMPTY_UUID\"}"
+                fi
+                ;;
+            "GET $B/v1/instrument?accountId=$HOLDER_UUID")
+                listings=$((listings + 1))
+                if [[ $listings -eq 1 ]]; then
+                    respond "${STEP3_BEFORE%% *}" application/json "${STEP3_BEFORE#* }"
+                else
+                    respond "${STEP3_AFTER%% *}" application/json "${STEP3_AFTER#* }"
+                fi
+                ;;
+            *) respond 200 application/json '{}' ;;
+        esac
+    }
+    run_browser_check() {
+        echo "BROWSER $1 $2" >>"$T/requests"
+    }
+    step3_fixture
+}
+
+# with_instrument_ids TEXT: TEXT with every @A and @B replaced by the two instrument ids.
+with_instrument_ids() {
+    local text="${1//@A/$INSTRUMENT_A_UUID}"
+    printf '%s' "${text//@B/$INSTRUMENT_B_UUID}"
+}
+
+STEP3_DEFAULT_BEFORE='200 {"results":[{"id":"@A","amount":0},{"id":"@B","amount":0}]}'
+STEP3_DEFAULT_AFTER='200 {"results":[{"id":"@A","amount":1},{"id":"@B","amount":1}]}'
+# name|buys sent|listing before the buys|listing after them|expected line. A listing is
+# "STATUS BODY", and an empty one is the default above. @A and @B stand for the two instrument
+# ids, and @SIZE for the size of the last response body.
+step3_listing_cases="$(
+    cat <<'EOF'
+numericAmounts_certifiesHoldingsAndStartsBrowserCheck|2||200 {"results":[{"id":"@A","amount":1},{"id":"@B","amount":2.5}]}|PASS step 3 holdings
+amountString_abortsAtHoldingsBeforeFixture|2||200 {"results":[{"id":"@A","amount":"1"},{"id":"@B","amount":1}]}|FAIL step 3 holdings: instrument [@A] shows an amount of JSON type [string], expected a number
+amountObject_abortsAtHoldingsBeforeFixture|2||200 {"results":[{"id":"@A","amount":{}},{"id":"@B","amount":1}]}|FAIL step 3 holdings: instrument [@A] shows an amount of JSON type [object], expected a number
+amountArray_abortsAtHoldingsBeforeFixture|2||200 {"results":[{"id":"@A","amount":[2]},{"id":"@B","amount":1}]}|FAIL step 3 holdings: instrument [@A] shows an amount of JSON type [array], expected a number
+amountZero_abortsAtHoldingsBeforeFixture|2||200 {"results":[{"id":"@A","amount":0},{"id":"@B","amount":1}]}|FAIL step 3 holdings: instrument [@A] shows amount [0], expected at least 1
+secondAmountMissing_abortsAtHoldingsBeforeFixture|2||200 {"results":[{"id":"@A","amount":1},{"id":"@B"}]}|FAIL step 3 holdings: instrument [@B] shows an amount of JSON type [null], expected a number
+listedTwice_abortsAtHoldingsBeforeFixture|2||200 {"results":[{"id":"@A","amount":1},{"id":"@B","amount":1},{"id":"@A","amount":1}]}|FAIL step 3 holdings: instrument [@A] is listed 2 times, expected once
+secondNotListed_abortsAtHoldingsBeforeFixture|2||200 {"results":[{"id":"@A","amount":1}]}|FAIL step 3 holdings: instrument [@B] is listed 0 times, expected once
+afterWithoutResults_abortsAtHoldingsBeforeFixture|2||200 {"items":[]}|FAIL step 3 holdings: the holder's instrument listing has results of JSON type [null], expected an array; body [@SIZE bytes, JSON object with 1 key [items]]
+afterResultsObject_abortsAtHoldingsBeforeFixture|2||200 {"results":{"a":{"id":"@A","amount":1},"b":{"id":"@B","amount":1}}}|FAIL step 3 holdings: the holder's instrument listing has results of JSON type [object], expected an array; body [@SIZE bytes, JSON object with 1 key [results]]
+afterNotJson_abortsAtHoldingsBeforeFixture|2||200 <html></html>|FAIL step 3 holdings: the holder's instrument listing has results of JSON type [unreadable], expected an array; body [@SIZE bytes, not JSON]
+afterListingThenGarbage_abortsAtHoldingsBeforeFixture|2||200 {"results":[{"id":"@A","amount":1},{"id":"@B","amount":1}]}garbage|FAIL step 3 holdings: the holder's instrument listing has results of JSON type [unreadable], expected an array; body [@SIZE bytes, not JSON]
+afterListingTwice_abortsAtHoldingsBeforeFixture|2||200 {"results":[{"id":"@A","amount":1},{"id":"@B","amount":1}]}{"results":[{"id":"@A","amount":1},{"id":"@B","amount":1}]}|FAIL step 3 holdings: the holder's instrument listing has results of JSON type [unreadable], expected an array; body [@SIZE bytes, not JSON]
+afterStatus500_abortsAtHoldingsBeforeFixture|2||500 {}|FAIL step 3 holdings: the holder's instrument listing gave status 500, expected 200
+beforeWithoutResults_abortsBeforeAnyBuy|0|200 {}||FAIL step 3 buy instrument 1: the holder's instrument listing has results of JSON type [null], expected an array; body [@SIZE bytes, JSON object with 0 keys]
+beforeResultsObject_abortsBeforeAnyBuy|0|200 {"results":{"a":{"id":"@A","amount":0},"b":{"id":"@B","amount":0}}}||FAIL step 3 buy instrument 1: the holder's instrument listing has results of JSON type [object], expected an array; body [@SIZE bytes, JSON object with 1 key [results]]
+beforeStatus500_abortsBeforeAnyBuy|0|500 {}||FAIL step 3 buy instrument 1: the holder's instrument listing gave status 500, expected 200
+beforeOneInstrument_abortsBeforeAnyBuy|0|200 {"results":[{"id":"@A","amount":0}]}||FAIL step 3 buy instrument 1: the holder's instrument listing does not begin with two distinct canonical instrument ids
+beforeListingThenGarbage_abortsBeforeAnyBuy|0|200 {"results":[{"id":"@A","amount":0},{"id":"@B","amount":0}]}garbage||FAIL step 3 buy instrument 1: the holder's instrument listing has results of JSON type [unreadable], expected an array; body [@SIZE bytes, not JSON]
+EOF
+)"
+while IFS='|' read -r name buys before after expected <&3; do
+    check="step3Fixture_$name"
+    fresh_state
+    STEP3_BEFORE="$(with_instrument_ids "${before:-$STEP3_DEFAULT_BEFORE}")"
+    STEP3_AFTER="$(with_instrument_ids "${after:-$STEP3_DEFAULT_AFTER}")"
+    run_isolated "$T/step3.out" scenario_step3_listings
+    expected="$(with_instrument_ids "$expected")"
+    expected="${expected//@SIZE/$(file_size "$PRIVATE_DIR/body")}"
+    expect_line "$T/step3.out" "$expected"
+    sent="$(grep -cxF "POST $B/v1/trade/buy" "$T/requests" || true)"
+    if [[ "$sent" -ne "$buys" ]]; then
+        reasons+=("$sent buys sent, expected $buys")
+    fi
+    if [[ "$expected" == PASS* ]]; then
+        expect_rc 0
+        expect_line "$T/requests" "BROWSER flag-off step 3 browser flag-off"
+        if [[ ! -s "$FIXTURE" ]]; then
+            reasons+=("no fixture was written")
+        fi
+    else
+        expect_rc 1
+        expect_no_line "$T/step3.out" "PASS step 3 holdings"
+        expect_no_line "$T/requests" "BROWSER flag-off step 3 browser flag-off"
+        expect_absent "$FIXTURE" "the fixture"
+    fi
+    conclude "$check"
+done 3<<<"$step3_listing_cases"
 
 # ---------------------------------------------------------------------------------------------
 # write_fixture and signup
@@ -731,11 +833,14 @@ conclude "$check"
 # ---------------------------------------------------------------------------------------------
 # Step 4 evidence
 
+# The flag service's answer to step 4's PUT: the flag, as feature-flag-service returns it.
+STEP4_ACK="{\"id\":\"$FLAG_ID\",\"enabled\":true}"
+
 # shellcheck disable=SC2329 # Invoked through run_isolated.
 scenario_step4() {
     http() {
         if [[ "$1" == PUT ]]; then
-            respond 200 application/json '{"enabled":true}'
+            respond 200 application/json "$STEP4_ACK"
         else
             respond 200 application/json "$INSIGHTS_CASE_BODY"
         fi
@@ -764,6 +869,26 @@ while IFS='|' read -r name format <&3; do
     fi
     conclude "$check"
 done 3<<<"$step4_cases"
+
+# name|the PUT's 200 answer, which does not report this flag's JSON boolean true: step 4 stops
+# before its insights request, and the reason describes the body without its text.
+step4_ack_cases='enabledString|{"id":"portfolio-insights-enabled","enabled":"true"}
+otherFlag|{"id":"db_not_responding","enabled":true}
+enabledFalse|{"id":"portfolio-insights-enabled","enabled":false}'
+while IFS='|' read -r name ack <&3; do
+    check="step4Enable_${name}Acknowledgement_abortsBeforeInsightsRequest"
+    fresh_state
+    STEP4_ACK="$ack"
+    INSIGHTS_CASE_BODY='{"totalValue":0,"allocations":[]}'
+    run_isolated "$T/step4.out" scenario_step4
+    expect_rc 1
+    expect_line "$T/step4.out" \
+        "FAIL step 4 enable flag: PUT {\"enabled\": true} gave status 200; body [${#ack} bytes, JSON object with 2 keys [id,enabled]]"
+    expect_no_line "$T/step4.out" "PASS step 4 enable flag"
+    expect_no_line "$T/step4.out" "PASS step 4 first insights request"
+    conclude "$check"
+done 3<<<"$step4_ack_cases"
+STEP4_ACK="{\"id\":\"$FLAG_ID\",\"enabled\":true}"
 
 # ---------------------------------------------------------------------------------------------
 # cleanup

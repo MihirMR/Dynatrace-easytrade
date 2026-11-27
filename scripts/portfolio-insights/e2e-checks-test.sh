@@ -7,10 +7,13 @@
 #   - the exact decimal helpers num_split, magnitude_cmp and num_cmp;
 #   - the step-9 triggerValue verdict, the step-9 instrument choice and step9_trigger with both;
 #   - alert_body, the create body of every alert request;
-#   - the step-1 startup decision: startup_flag_default and step1_ready;
+#   - the step-1 startup decision and flag body: startup_flag_default and step1_ready;
+#   - the flag reads and PUT answers of step2_flag_off, step11_browser and
+#     step13_cleanup_and_disable;
 #   - the step-5 rendered insights log line: insights_line_logged and step5_figures;
 #   - the step-6 empty-account check and the step-8 AlertDTO filters (WANT_JQ, ALERT_JQ);
-#   - the step-7 response checks response_kind and expect_error;
+#   - the step-7 response checks response_kind and expect_error, step 7's unbindable PATCH
+#     bodies and the reserved notifications routes of steps 2 and 7;
 #   - e2e.sh executed: the jq literal-precision probe and a run whose services are down.
 #
 # Usage: scripts/portfolio-insights/e2e-checks-test.sh
@@ -624,15 +627,17 @@ startup_row mixedCaseTrue_unparsableSoFalse tRUE false
 startup_row on_unparsableSoFalse on false
 
 STUB_FLAG_ENABLED="false"
+# The body the flag GET answers; empty for a modifiable flag whose enabled is STUB_FLAG_ENABLED.
+STUB_FLAG_BODY=""
 # shellcheck disable=SC2329 # Invoked through the http stub.
 route_response() {
+    local flag="{\"id\":\"$FLAG_ID\",\"description\":\"Portfolio Insights\",\"enabled\":$STUB_FLAG_ENABLED,\"isModifiable\":true,\"tag\":\"feature\"}"
     case "$1 $2" in
         "GET $BASE_URL/broker-service/readyz" | "GET $BASE_URL/feature-flag-service/readyz")
             last_response 200 "text/plain" "Healthy"
             ;;
         "GET $F")
-            last_response 200 "application/json; charset=utf-8" \
-                "{\"id\":\"$FLAG_ID\",\"description\":\"Portfolio Insights\",\"enabled\":$STUB_FLAG_ENABLED,\"isModifiable\":true,\"tag\":\"feature\"}"
+            last_response 200 "application/json; charset=utf-8" "${STUB_FLAG_BODY:-$flag}"
             ;;
         *) return 1 ;;
     esac
@@ -691,6 +696,201 @@ step1_row startupSettingOne_abortsWithoutWrite false value 1 enabled true
 step1_row containerEnvFails_abortsWithoutWrite false fail "" unread
 step1_row flagEnabledContainerEnvFails_abortsWithoutWrite true fail "" unread
 STUB_ENV_MODE="unset"
+
+# step1_flag_row SCENARIO_RESULT BODY REASON: the flag GET answers BODY with 200, and step 1
+# aborts at "step 1 flag modifiable" with REASON, before it reads the startup setting, sending
+# GET requests only. Feature-flag-service's Flag has a string id and boolean enabled and
+# isModifiable, so a string "true" or "false" is never read as the boolean.
+step1_flag_row() {
+    STUB_FLAG_BODY="$2"
+    : >"$TEST_DIR/requests"
+    capture step1_ready
+    want_rc 1
+    want_line "FAIL step 1 flag modifiable: $3"
+    want_no_text "PASS step 1 flag modifiable"
+    want_no_text "flag default disabled"
+    if grep -qv '^GET ' "$TEST_DIR/requests"; then
+        reasons+=("a request other than GET was sent: $(flat "$(grep -v '^GET ' "$TEST_DIR/requests")")")
+    fi
+    conclude "step1Ready_$1"
+    STUB_FLAG_BODY=""
+}
+
+NOT_MODIFIABLE="a deployment with ENABLE_MODIFY=false cannot be toggled"
+FLAG_EXPECTED="expected id $FLAG_ID and a boolean enabled"
+step1_flag_row isModifiableString_aborts \
+    "{\"id\":\"$FLAG_ID\",\"enabled\":false,\"isModifiable\":\"true\",\"tag\":\"feature\"}" \
+    "isModifiable is [a JSON string]: $NOT_MODIFIABLE"
+step1_flag_row isModifiableFalse_aborts \
+    "{\"id\":\"$FLAG_ID\",\"enabled\":false,\"isModifiable\":false,\"tag\":\"feature\"}" \
+    "isModifiable is [false]: $NOT_MODIFIABLE"
+step1_flag_row isModifiableAbsent_aborts "{\"id\":\"$FLAG_ID\",\"enabled\":false,\"tag\":\"feature\"}" \
+    "isModifiable is [a JSON null]: $NOT_MODIFIABLE"
+step1_flag_row enabledString_aborts \
+    "{\"id\":\"$FLAG_ID\",\"enabled\":\"false\",\"isModifiable\":true,\"tag\":\"feature\"}" \
+    "GET $FLAG_ID answered [id is $FLAG_ID, enabled is a JSON string]; $FLAG_EXPECTED"
+step1_flag_row otherId_aborts \
+    '{"id":"db_not_responding","enabled":false,"isModifiable":true,"tag":"problem_pattern"}' \
+    "GET $FLAG_ID answered [id is another string, enabled is false]; $FLAG_EXPECTED"
+step1_flag_row idNotString_aborts '{"id":1,"enabled":false,"isModifiable":true}' \
+    "GET $FLAG_ID answered [id is a JSON number, enabled is false]; $FLAG_EXPECTED"
+step1_flag_row twoFlagObjects_aborts \
+    "{\"id\":\"$FLAG_ID\",\"enabled\":false,\"isModifiable\":true} {\"id\":\"$FLAG_ID\",\"enabled\":true}" \
+    "GET $FLAG_ID answered [not one JSON object]; $FLAG_EXPECTED"
+step1_flag_row notJson_aborts 'enabled' "GET $FLAG_ID answered [not JSON]; $FLAG_EXPECTED"
+
+# ---------------------------------------------------------------------------------------------
+# step2_flag_off, step11_browser and step13_cleanup_and_disable: a flag read or PUT answer counts
+# only as this flag's JSON boolean, as feature-flag-service's Flag defines it. The other requests
+# of these steps get a transport error unless routed here; only the flag checks are asserted.
+
+STUB_FLAG_ACK=""
+STUB_FLAG_ACK_STATUS=200
+# shellcheck disable=SC2329 # Invoked through the http stub.
+route_response() {
+    case "$1 $2" in
+        "GET $F")
+            last_response 200 "application/json; charset=utf-8" "$STUB_FLAG_BODY"
+            ;;
+        "PUT $F")
+            last_response "$STUB_FLAG_ACK_STATUS" "application/json; charset=utf-8" "$STUB_FLAG_ACK"
+            ;;
+        "GET $BASE_URL/feature-flag-service/v1/flags?tag=problem_pattern" | \
+            "GET $ALERTS_URL?accountId=$HOLDER_ID" | "GET $ALERTS_URL/notifications?accountId=$HOLDER_ID")
+            last_response 200 "application/json; charset=utf-8" '{"results":[]}'
+            ;;
+        *) return 1 ;;
+    esac
+}
+
+# step2_flag_row SCENARIO_RESULT BODY VERDICT: step 2's flag GET answers BODY; VERDICT is its
+# "step 2 flag reads disabled" line. A reason never repeats the id another flag sent.
+step2_flag_row() {
+    STUB_FLAG_BODY="$2"
+    capture step2_flag_off
+    want_line "$3"
+    want_no_text "db_not_responding"
+    conclude "step2FlagOff_$1"
+}
+
+FLAG_OFF_EXPECTED="expected portfolio-insights-enabled, false and feature"
+step2_flag_row thisFlagDisabled_passes \
+    "{\"id\":\"$FLAG_ID\",\"enabled\":false,\"isModifiable\":true,\"tag\":\"feature\"}" \
+    "PASS step 2 flag reads disabled"
+step2_flag_row enabledStringFalse_fails "{\"id\":\"$FLAG_ID\",\"enabled\":\"false\",\"tag\":\"feature\"}" \
+    "FAIL step 2 flag reads disabled: id [$FLAG_ID] enabled [a JSON string] tag [feature], $FLAG_OFF_EXPECTED"
+step2_flag_row enabledTrue_fails "{\"id\":\"$FLAG_ID\",\"enabled\":true,\"tag\":\"feature\"}" \
+    "FAIL step 2 flag reads disabled: id [$FLAG_ID] enabled [true] tag [feature], $FLAG_OFF_EXPECTED"
+step2_flag_row otherFlag_fails '{"id":"db_not_responding","enabled":false,"tag":"feature"}' \
+    "FAIL step 2 flag reads disabled: id [a JSON string] enabled [false] tag [feature], $FLAG_OFF_EXPECTED"
+step2_flag_row idAbsent_fails '{"enabled":false,"tag":"feature"}' \
+    "FAIL step 2 flag reads disabled: id [a JSON null] enabled [false] tag [feature], $FLAG_OFF_EXPECTED"
+step2_flag_row otherTag_fails "{\"id\":\"$FLAG_ID\",\"enabled\":false,\"tag\":\"problem_pattern\"}" \
+    "FAIL step 2 flag reads disabled: id [$FLAG_ID] enabled [false] tag [a JSON string], $FLAG_OFF_EXPECTED"
+
+# flag_step11: step11_browser with no pair alerts, in a run directory of its own, so it lists
+# none, writes the fixture, runs the browser check (node is stubbed to fail) and reads the flag;
+# then prints FLAG_TOUCHED. Run through capture, so nothing it sets outlives it.
+flag_step11() {
+    RUN_DIR="$TEST_DIR/flag-step11"
+    rm -rf "$RUN_DIR"
+    mkdir -p "$RUN_DIR"
+    : >"$RUN_DIR/pairs"
+    PAIRS_READY=1
+    FLAG_TOUCHED=0
+    step11_browser
+    echo "FLAG_TOUCHED=$FLAG_TOUCHED"
+}
+
+# step11_flag_row SCENARIO_RESULT BODY ACK_STATUS ACK VERDICT: the flag GET after the browser
+# check answers BODY, and a PUT answers ACK with ACK_STATUS. VERDICT is step 11's one "flag on
+# for step 12" line: PASS only for a 200 with this flag's JSON boolean true, otherwise a FAIL
+# naming the status or the answer's JSON types, never a value another flag sent. An empty
+# VERDICT means the flag reads on, so step 11 sends no PUT and prints no such line.
+step11_flag_row() {
+    local put switches=1
+    if [[ -z "$5" ]]; then
+        switches=0
+    fi
+    STUB_FLAG_BODY="$2"
+    STUB_FLAG_ACK_STATUS="$3"
+    STUB_FLAG_ACK="$4"
+    : >"$TEST_DIR/requests"
+    capture flag_step11
+    put="$(grep -cxF "PUT $F" "$TEST_DIR/requests" || true)"
+    if [[ "$put" != "$switches" ]]; then
+        reasons+=("PUT sent $put times, expected $switches")
+    fi
+    want_line "FLAG_TOUCHED=$switches"
+    if [[ $switches -eq 1 ]]; then
+        want_line "INFO flag $FLAG_ID is not on after the browser check (status 200); switching it on for step 12"
+        want_line "$5"
+        if [[ "$(grep -c 'step 11 flag on for step 12' <<<"$OUT" || true)" != "1" ]]; then
+            reasons+=("not exactly one step 11 flag on for step 12 line")
+        fi
+    else
+        want_no_text "switching it on"
+        want_no_text "step 11 flag on for step 12"
+    fi
+    want_no_text "db_not_responding"
+    conclude "step11Browser_$1"
+    STUB_FLAG_ACK_STATUS=200
+}
+
+STEP11_OFF="{\"id\":\"$FLAG_ID\",\"enabled\":false,\"tag\":\"feature\"}"
+STEP11_ACK_ON="{\"id\":\"$FLAG_ID\",\"enabled\":true}"
+STEP11_ON="PASS step 11 flag on for step 12"
+STEP11_UNCONFIRMED="FAIL step 11 flag on for step 12: PUT {\"enabled\": true}"
+STEP11_EXPECTED="expected id $FLAG_ID and enabled true"
+step11_flag_row thisFlagOn_keepsFlag "{\"id\":\"$FLAG_ID\",\"enabled\":true,\"tag\":\"feature\"}" \
+    200 "$STEP11_ACK_ON" ""
+step11_flag_row enabledStringTrue_switchesOn "{\"id\":\"$FLAG_ID\",\"enabled\":\"true\",\"tag\":\"feature\"}" \
+    200 "$STEP11_ACK_ON" "$STEP11_ON"
+step11_flag_row otherFlagOn_switchesOn '{"id":"db_not_responding","enabled":true,"tag":"problem_pattern"}' \
+    200 "$STEP11_ACK_ON" "$STEP11_ON"
+step11_flag_row thisFlagOff_switchesOn "$STEP11_OFF" 200 "$STEP11_ACK_ON" "$STEP11_ON"
+step11_flag_row ackOtherFlag_failsSwitchOn "$STEP11_OFF" 200 '{"id":"db_not_responding","enabled":true}' \
+    "$STEP11_UNCONFIRMED answered [id is another string, enabled is true]; $STEP11_EXPECTED"
+step11_flag_row ackEnabledString_failsSwitchOn "$STEP11_OFF" 200 "{\"id\":\"$FLAG_ID\",\"enabled\":\"true\"}" \
+    "$STEP11_UNCONFIRMED answered [id is $FLAG_ID, enabled is a JSON string]; $STEP11_EXPECTED"
+step11_flag_row ackFlagOff_failsSwitchOn "$STEP11_OFF" 200 "{\"id\":\"$FLAG_ID\",\"enabled\":false}" \
+    "$STEP11_UNCONFIRMED answered [false]; $STEP11_EXPECTED"
+step11_flag_row ackNotJson_failsSwitchOn "$STEP11_OFF" 200 'ok' \
+    "$STEP11_UNCONFIRMED answered [not JSON]; $STEP11_EXPECTED"
+step11_flag_row ackStatus500_failsSwitchOn "$STEP11_OFF" 500 "$STEP11_ACK_ON" \
+    "$STEP11_UNCONFIRMED gave status 500"
+step11_flag_row ackTransportError_failsSwitchOn "$STEP11_OFF" 000 "" \
+    "$STEP11_UNCONFIRMED gave transport error (stubbed transport error)"
+
+# flag_step13: step13_cleanup_and_disable with no owned alerts, in a run directory of its own.
+flag_step13() {
+    RUN_DIR="$TEST_DIR/flag-step13"
+    rm -rf "$RUN_DIR"
+    mkdir -p "$RUN_DIR"
+    : >"$RUN_DIR/owned"
+    : >"$RUN_DIR/deleted"
+    step13_cleanup_and_disable
+}
+
+# step13_flag_row SCENARIO_RESULT ACK OUTCOME: the PUT {"enabled": false} answers ACK with 200;
+# OUTCOME is pass or fail, the failure naming the status and the body's shape only.
+step13_flag_row() {
+    STUB_FLAG_ACK="$2"
+    capture flag_step13
+    if [[ "$3" == pass ]]; then
+        want_line "PASS step 13 disable flag"
+    else
+        want_line "FAIL step 13 disable flag: PUT {\"enabled\": false} gave status 200; body [${#2} bytes, JSON object with 2 keys [id,enabled]]"
+    fi
+    conclude "step13CleanupAndDisable_$1"
+}
+
+step13_flag_row thisFlagOff_passes "{\"id\":\"$FLAG_ID\",\"enabled\":false}" pass
+step13_flag_row enabledStringFalse_fails "{\"id\":\"$FLAG_ID\",\"enabled\":\"false\"}" fail
+step13_flag_row otherFlagOff_fails '{"id":"db_not_responding","enabled":false}' fail
+step13_flag_row thisFlagOn_fails "{\"id\":\"$FLAG_ID\",\"enabled\":true}" fail
+STUB_FLAG_BODY=""
+STUB_FLAG_ACK=""
 
 # ---------------------------------------------------------------------------------------------
 # insights_line_logged and step5_figures: the full rendered insights event of the holder.
@@ -776,6 +976,121 @@ step5_row responseWithStringTotalValue_failsUnmatchable \
 step5_row responseWithoutAllocations_failsUnmatchable "$(jq -c 'del(.allocations)' <<<"$LIVE_INSIGHTS" | tr -d '\r')" \
     "$GOOD_LINE" "$UNMATCHABLE"
 
+# Signed values netting to a totalValue of exactly 0, as PortfolioInsightsCalculator answers
+# them: every percent 0, the lowest id the largest although its value is the lower, risk LOW.
+ZERO_INSIGHTS='{"totalValue":0.00,"totalInvested":10.00,"unrealizedPnl":-10.00,"unrealizedPnlPercent":-100,"allocations":[{"instrumentId":"c0000000-0000-4000-8000-000000000002","name":"EasyPlanes","quantity":1,"value":5.00,"percent":0},{"instrumentId":"c0000000-0000-4000-8000-000000000001","name":"EasyTravel","quantity":1,"value":-5.00,"percent":0}],"largestPosition":{"instrumentId":"c0000000-0000-4000-8000-000000000001","name":"EasyTravel","quantity":1,"value":-5.00,"percent":0},"riskLevel":"LOW"}'
+ZERO_LINE="${GOOD_LINE/value \[222.38948395\] risk \[HIGH\]/value [0.00] risk [LOW]}"
+mutate_zero() {
+    jq -c "$1" <<<"$ZERO_INSIGHTS" | tr -d '\r'
+}
+STEP5_NONZERO_PASS=("PASS step 5 two allocations" "PASS step 5 percents sum to 100"
+    "PASS step 5 totalValue is the sum of the values" "PASS step 5 largest position"
+    "PASS step 5 risk level" "PASS step 5 insights log line")
+STEP5_ZERO_PASS=("PASS step 5 two allocations" "PASS step 5 percents are 0 at a zero total"
+    "PASS step 5 totalValue is the sum of the values" "PASS step 5 largest position"
+    "PASS step 5 risk level" "PASS step 5 insights log line")
+# The start of the largest-position verdict when largestPosition is not its allocation entry.
+ZERO_LARGEST="FAIL step 5 largest position: largestPosition differs from the lowest-id allocation, as totalValue is 0"
+NONZERO_LARGEST="FAIL step 5 largest position: largestPosition differs from the highest-value allocation with the lowest id"
+
+# step5_checks_row SCENARIO_RESULT INSIGHTS LOG LINE...: step5_figures prints exactly the LINEs,
+# one per check and in order; a LINE ending in "..." is matched as the start of its line.
+step5_checks_row() {
+    local check="step5Figures_$1" i
+    local -a want got
+    HOLDER_INSIGHTS="$2"
+    STUB_LOG="$3"
+    shift 3
+    want=("$@")
+    capture step5_figures
+    mapfile -t got <<<"$OUT"
+    want_rc 0
+    if [[ ${#got[@]} -ne ${#want[@]} ]]; then
+        reasons+=("${#got[@]} lines, expected ${#want[@]}")
+    fi
+    for i in "${!want[@]}"; do
+        if [[ "${got[i]:-}" != "${want[i]}" && ! ("${want[i]}" == *... && "${got[i]:-}" == "${want[i]%...}"*) ]]; then
+            reasons+=("line $((i + 1)) [${got[i]:-}], expected [${want[i]}]")
+        fi
+    done
+    conclude "$check"
+}
+
+step5_checks_row liveBody_passesNonzeroChecks "$LIVE_INSIGHTS" "$GOOD_LINE" "${STEP5_NONZERO_PASS[@]}"
+# The rows that change only the allocations' percents leave largestPosition with its own, so it
+# is no longer its allocation entry either.
+step5_checks_row nonzeroTotalZeroPercents_failsSum "$(jq -c '.allocations |= map(.percent = 0)' <<<"$LIVE_INSIGHTS" | tr -d '\r')" \
+    "$GOOD_LINE" "${STEP5_NONZERO_PASS[0]}" "FAIL step 5 percents sum to 100: allocation percents sum to 0" \
+    "${STEP5_NONZERO_PASS[2]}" "$NONZERO_LARGEST: percent 67.707108877438446882101324290, expected 0" \
+    "${STEP5_NONZERO_PASS[@]:4}"
+step5_checks_row zeroTotalSignedValues_passesZeroTotalChecks "$ZERO_INSIGHTS" "$ZERO_LINE" "${STEP5_ZERO_PASS[@]}"
+step5_checks_row zeroTotalIntegerForm_passesZeroTotalChecks "${ZERO_INSIGHTS/\"totalValue\":0.00/\"totalValue\":0}" \
+    "$ZERO_LINE" "${STEP5_ZERO_PASS[@]}"
+step5_checks_row zeroTotalPercentsSumTo100_failsPercents "$(mutate_zero '.allocations |= map(.percent = 50)')" \
+    "$ZERO_LINE" "${STEP5_ZERO_PASS[0]}" \
+    "FAIL step 5 percents are 0 at a zero total: allocation percents [50,50], expected the number 0 each at a totalValue of 0" \
+    "${STEP5_ZERO_PASS[2]}" "$ZERO_LARGEST: percent 0, expected 50" "${STEP5_ZERO_PASS[@]:4}"
+step5_checks_row zeroTotalStringPercent_failsPercents "$(mutate_zero '.allocations[1].percent = "0"')" \
+    "$ZERO_LINE" "${STEP5_ZERO_PASS[0]}" \
+    "FAIL step 5 percents are 0 at a zero total: allocation percents [0,\"0\"], expected the number 0 each at a totalValue of 0" \
+    "${STEP5_ZERO_PASS[2]}" "$ZERO_LARGEST: percent differs" "${STEP5_ZERO_PASS[@]:4}"
+step5_checks_row zeroTotalHighestValueLargest_failsLargest "$(mutate_zero '.largestPosition = .allocations[0]')" \
+    "$ZERO_LINE" "${STEP5_ZERO_PASS[@]:0:3}" \
+    "FAIL step 5 largest position: largestPosition [c0000000-0000-4000-8000-000000000002], expected [c0000000-0000-4000-8000-000000000001], the lowest id, as totalValue is 0" \
+    "${STEP5_ZERO_PASS[@]:4}"
+step5_checks_row zeroTotalRiskHigh_failsRisk "$(mutate_zero '.riskLevel = "HIGH"')" "${ZERO_LINE/risk \[LOW\]/risk [HIGH]}" \
+    "${STEP5_ZERO_PASS[@]:0:4}" "FAIL step 5 risk level: riskLevel [HIGH], a totalValue of 0 gives LOW" \
+    "${STEP5_ZERO_PASS[5]}"
+step5_checks_row zeroTotalRiskMedium_failsRisk "$(mutate_zero '.riskLevel = "MEDIUM"')" \
+    "${ZERO_LINE/risk \[LOW\]/risk [MEDIUM]}" \
+    "${STEP5_ZERO_PASS[@]:0:4}" "FAIL step 5 risk level: riskLevel [MEDIUM], a totalValue of 0 gives LOW" \
+    "${STEP5_ZERO_PASS[5]}"
+# Only a JSON number equal to 0 is a zero total, so a string "0" keeps the nonzero checks.
+step5_checks_row zeroTotalAsString_failsNonzeroChecks "${ZERO_INSIGHTS/\"totalValue\":0.00/\"totalValue\":\"0\"}" \
+    "$ZERO_LINE" "${STEP5_NONZERO_PASS[0]}" "FAIL step 5 percents sum to 100: allocation percents sum to 0" \
+    "FAIL step 5 totalValue is the sum of the values: unreadable JSON [..." \
+    "FAIL step 5 largest position: largestPosition value -5.00, highest value 5.00" \
+    "${STEP5_NONZERO_PASS[4]}" "$UNMATCHABLE"
+
+# step5_largest_row SCENARIO_RESULT BRANCH MUTATION LARGEST: the zero or nonzero BRANCH's body,
+# changed by the jq MUTATION, passes every step-5 check but the largest position, whose line is
+# LARGEST. largestPosition must be the selected allocation entry itself, in every field.
+step5_largest_row() {
+    local body line
+    local -a lines
+    if [[ "$2" == "zero" ]]; then
+        body="$(mutate_zero "$3")"
+        line="$ZERO_LINE"
+        lines=("${STEP5_ZERO_PASS[@]}")
+    else
+        body="$(jq -c "$3" <<<"$LIVE_INSIGHTS" | tr -d '\r')"
+        line="$GOOD_LINE"
+        lines=("${STEP5_NONZERO_PASS[@]}")
+    fi
+    lines[3]="$4"
+    step5_checks_row "$1" "$body" "$line" "${lines[@]}"
+}
+
+step5_largest_row zeroTotalLowestIdOtherPercentAndValue_failsLargest zero \
+    '.largestPosition.percent = 80 | .largestPosition.value = 700' "$ZERO_LARGEST: value 700, expected -5.00; percent 80, expected 0"
+step5_largest_row zeroTotalLowestIdOtherName_failsLargest zero '.largestPosition.name = "EasyPlanes"' "$ZERO_LARGEST: name differs"
+step5_largest_row nonzeroSelectedIdOtherPercent_failsLargest nonzero '.largestPosition.percent = 67.7' \
+    "$NONZERO_LARGEST: percent 67.7, expected 67.707108877438446882101324290"
+step5_largest_row nonzeroSelectedIdOtherName_failsLargest nonzero '.largestPosition.name = "EasyPlanes"' \
+    "$NONZERO_LARGEST: name differs"
+step5_largest_row nonzeroSelectedIdWithoutQuantity_failsLargest nonzero 'del(.largestPosition.quantity)' \
+    "$NONZERO_LARGEST: quantity differs"
+step5_largest_row nonzeroSelectedIdExtraField_failsLargest nonzero '.largestPosition.extra = true' \
+    "$NONZERO_LARGEST: other fields differ"
+step5_largest_row nonzeroSelectedIdUpperCase_failsLargest nonzero \
+    '.largestPosition.instrumentId |= ascii_upcase' "$NONZERO_LARGEST: instrumentId differs"
+# Equal values, listed with the higher id first: the entry with the lowest id is the largest.
+step5_checks_row nonzeroTiedValuesLowestIdEntry_passesNonzeroChecks \
+    "$(jq -c '.totalValue = 200 | .allocations = [.allocations[1], .allocations[0]]
+        | .allocations |= map(.value = 100 | .percent = 50)
+        | .largestPosition = .allocations[1] | .riskLevel = "MEDIUM"' <<<"$LIVE_INSIGHTS" | tr -d '\r')" \
+    "${GOOD_LINE/value \[222.38948395\] risk \[HIGH\]/value [200] risk [MEDIUM]}" "${STEP5_NONZERO_PASS[@]}"
+
 # ---------------------------------------------------------------------------------------------
 # step6_empty: WANT_JQ's verdict, where an absent property never passes as null.
 
@@ -783,6 +1098,7 @@ EMPTY_ID="b0000000-0000-4000-8000-000000000001"
 EMPTY_OK='{"totalValue":0,"totalInvested":0,"unrealizedPnl":0,"unrealizedPnlPercent":0,"allocations":[],"largestPosition":null,"riskLevel":null}'
 STUB_STATUS=200
 STUB_BODY=""
+# shellcheck disable=SC2329 # Invoked through the http stub.
 route_response() {
     if [[ "$1 $2" == "GET $INSIGHTS_URL/$EMPTY_ID" ]]; then
         last_response "$STUB_STATUS" "application/json; charset=utf-8" "$STUB_BODY"
@@ -847,12 +1163,13 @@ CREATED_BODY="$(mutate_alert '.enabled = true | .triggeredAt = null | .triggerVa
 NEVER_TRIGGERED="$(mutate_alert '.triggeredAt = null | .triggerValue = null')"
 REARMED_BODY="$(mutate_alert '.enabled = true | .armingRevision = 2 | .triggeredAt = null | .triggerValue = null')"
 
-# alert_row FILTER SCENARIO_RESULT BODY EXPECTED: FILTER is create (CREATED_FILTER), disable
-# (alert(false; 1; true)) or rearm (alert(true; 2; false)); EXPECTED is "ok" or the verdict.
+# alert_row FILTER SCENARIO_RESULT BODY EXPECTED: FILTER is create (alert(true; 1; false)),
+# disable (alert(false; 1; true)) or rearm (alert(true; 2; false)); EXPECTED is "ok" or the
+# verdict.
 alert_row() {
     local filter
     case "$1" in
-        create) filter="$CREATED_FILTER" ;;
+        create) filter="$ALERT_JQ"'alert(true; 1; false)' ;;
         disable) filter="$ALERT_JQ"'alert(false; 1; true)' ;;
         *) filter="$ALERT_JQ"'alert(true; 2; false)' ;;
     esac
@@ -902,6 +1219,263 @@ alert_row rearm rearmRevisionOne_fails "$(jq -c '.armingRevision = 1' <<<"$REARM
     "armingRevision [1], expected 2"
 
 # ---------------------------------------------------------------------------------------------
+# alert_verdict: a step-8 response tied to its request, the holder's TARGET_PRICE alert ABOVE
+# MAX_THRESHOLD on H1, with ids in any letter case and the threshold compared exactly.
+
+HOLDER_ID="210e9235-10d0-4f73-b88d-5aad621a1972"
+H1="08d4d015-82fa-400b-9867-fef2ebabfad9"
+ALERT_ID="6f1c2b9e-3d4a-4b5c-8d6e-7f8091a2b3c4"
+OTHER_GUID="00000000-0000-4000-8000-000000000000"
+
+# alert_verdict_row FILTER SCENARIO_RESULT BODY EXPECTED: FILTER is create (CREATED_FILTER, its
+# request without an id), disable (DISABLED_FILTER) or rearm (REARMED_FILTER), the PATCHes of
+# ALERT_ID; EXPECTED is "ok" or the verdict.
+alert_verdict_row() {
+    local filter="$DISABLED_FILTER" id="$ALERT_ID"
+    case "$1" in
+        create)
+            filter="$CREATED_FILTER"
+            id=""
+            ;;
+        rearm) filter="$REARMED_FILTER" ;;
+    esac
+    last_response 200 "application/json; charset=utf-8" "$3"
+    assert_eq "alertVerdict_$2" "$4" \
+        "$(alert_verdict "$filter" "$(alert_want "$id" "$HOLDER_ID" "$H1" TARGET_PRICE ABOVE)" "$MAX_THRESHOLD")"
+}
+
+alert_verdict_row create createAsRequested_ok "$CREATED_BODY" ok
+alert_verdict_row create createUpperCaseGuids_ok \
+    "$(jq -c '.id |= ascii_upcase | .accountId |= ascii_upcase | .instrumentId |= ascii_upcase' <<<"$CREATED_BODY" | tr -d '\r')" ok
+alert_verdict_row create createThresholdTrailingZero_ok "${CREATED_BODY/9999999999.99999999/9999999999.999999990}" ok
+alert_verdict_row create createThresholdExponentOfSameValue_ok \
+    "${CREATED_BODY/9999999999.99999999/9.99999999999999999E+9}" ok
+alert_verdict_row create createOtherAccount_fails "$(jq -c --arg g "$OTHER_GUID" '.accountId = $g' <<<"$CREATED_BODY" | tr -d '\r')" \
+    "accountId [\"$OTHER_GUID\"], expected $HOLDER_ID"
+alert_verdict_row create createAccountNotGuid_failsOnce "$(jq -c '.accountId = "x"' <<<"$CREATED_BODY" | tr -d '\r')" \
+    "accountId [\"x\"], expected $HOLDER_ID"
+alert_verdict_row create createOtherInstrument_fails "$(jq -c --arg g "$OTHER_GUID" '.instrumentId = $g' <<<"$CREATED_BODY" | tr -d '\r')" \
+    "instrumentId [\"$OTHER_GUID\"], expected $H1"
+alert_verdict_row create createOtherType_fails "$(jq -c '.type = "PROFIT_LOSS"' <<<"$CREATED_BODY" | tr -d '\r')" \
+    'type ["PROFIT_LOSS"], expected TARGET_PRICE'
+alert_verdict_row create createLowerCaseType_failsOnce "$(jq -c '.type = "target_price"' <<<"$CREATED_BODY" | tr -d '\r')" \
+    'type ["target_price"], expected TARGET_PRICE'
+alert_verdict_row create createOtherDirection_fails "$(jq -c '.direction = "BELOW"' <<<"$CREATED_BODY" | tr -d '\r')" \
+    'direction ["BELOW"], expected ABOVE'
+alert_verdict_row create createRoundedThreshold_fails "${CREATED_BODY/9999999999.99999999/10000000000}" \
+    "threshold [10000000000], expected $MAX_THRESHOLD"
+alert_verdict_row create createThresholdLastDigitDropped_fails "${CREATED_BODY/9999999999.99999999/9999999999.9999999}" \
+    "threshold [9999999999.9999999], expected $MAX_THRESHOLD"
+alert_verdict_row create createThresholdExponentOfOtherValue_fails "${CREATED_BODY/9999999999.99999999/1E+10}" \
+    "threshold [1E+10], expected $MAX_THRESHOLD"
+alert_verdict_row create createThresholdString_failsOnce "${CREATED_BODY/9999999999.99999999/\"9999999999.99999999\"}" \
+    'threshold ["9999999999.99999999"], expected a number'
+alert_verdict_row create createOtherAccountAndRoundedThreshold_failsWithBoth \
+    "$(jq -c --arg g "$OTHER_GUID" '.accountId = $g' <<<"${CREATED_BODY/9999999999.99999999/10000000000}" | tr -d '\r')" \
+    "accountId [\"$OTHER_GUID\"], expected $HOLDER_ID; threshold [10000000000], expected $MAX_THRESHOLD"
+alert_verdict_row create createBodyNotJson_failsUnreadable 'not json' "unreadable JSON [8 bytes, not JSON]"
+alert_verdict_row create createBodyThenGarbage_failsUnreadable "${CREATED_BODY}garbage" \
+    "unreadable JSON [$((${#CREATED_BODY} + 7)) bytes, not JSON]"
+alert_verdict_row create createBodyTwice_failsUnreadable "$CREATED_BODY$CREATED_BODY" \
+    "unreadable JSON [$((2 * ${#CREATED_BODY})) bytes, not JSON]"
+alert_verdict_row create createBodyEmpty_failsUnreadable '' "unreadable JSON [empty]"
+alert_verdict_row disable disableAsPatched_ok "$TRIGGERED_ALERT" ok
+alert_verdict_row disable disableOtherId_fails "$(mutate_alert ".id = \"$OTHER_GUID\"")" \
+    "id [\"$OTHER_GUID\"], expected $ALERT_ID"
+alert_verdict_row disable disableOtherInstrument_fails "$(mutate_alert ".instrumentId = \"$OTHER_GUID\"")" \
+    "instrumentId [\"$OTHER_GUID\"], expected $H1"
+alert_verdict_row disable disableRoundedThreshold_fails "${TRIGGERED_ALERT/9999999999.99999999/10000000000}" \
+    "threshold [10000000000], expected $MAX_THRESHOLD"
+alert_verdict_row rearm rearmAsPatched_ok "$REARMED_BODY" ok
+alert_verdict_row rearm rearmOtherId_fails "$(jq -c --arg g "$OTHER_GUID" '.id = $g' <<<"$REARMED_BODY" | tr -d '\r')" \
+    "id [\"$OTHER_GUID\"], expected $ALERT_ID"
+alert_verdict_row rearm rearmOtherAccount_fails "$(jq -c --arg g "$OTHER_GUID" '.accountId = $g' <<<"$REARMED_BODY" | tr -d '\r')" \
+    "accountId [\"$OTHER_GUID\"], expected $HOLDER_ID"
+alert_verdict_row rearm rearmOtherDirection_fails "$(jq -c '.direction = "BELOW"' <<<"$REARMED_BODY" | tr -d '\r')" \
+    'direction ["BELOW"], expected ABOVE'
+
+# ---------------------------------------------------------------------------------------------
+# step8_crud against a fake broker: every response tied to its request, and each listing's
+# {"results": [...]} envelope and entries, each an alert with a GUID id, checked before an id is
+# looked for in it. The fake keeps the holder's alerts newest first, one "ID TYPE ENABLED
+# REVISION" line each, in STEP8_ALERTS.
+# STEP8_WHERE names the one response that STEP8_MUTATION, a jq filter, rewrites and that
+# STEP8_STATUS, when set, answers with: create, disable or rearm of the TARGET_PRICE alert,
+# list (the read after both creates) or absent (the read after the TARGET_PRICE delete).
+
+STEP8_PREFIX="cccccccc-0000-4000-8000-00000000000"
+STEP8_TP="${STEP8_PREFIX}1"
+STEP8_ALERTS=""
+STEP8_POSTS=0
+STEP8_GETS=0
+STEP8_WHERE=""
+STEP8_MUTATION="."
+STEP8_STATUS=""
+
+# step8_alert ID TYPE ENABLED REVISION: the fake's AlertDTO of an untriggered holder alert.
+step8_alert() {
+    printf '{"id":"%s","accountId":"%s","instrumentId":"%s","type":"%s","direction":"ABOVE","threshold":%s,"enabled":%s,"armingRevision":%s,"triggeredAt":null,"triggerValue":null,"acknowledged":false,"createdAt":"2026-11-26T01:00:00.123456+00:00"}' \
+        "$1" "$HOLDER_ID" "$H1" "$2" "$MAX_THRESHOLD" "$3" "$4"
+}
+
+# shellcheck disable=SC2329 # Invoked through the http stub.
+route_response() {
+    local id="" type enabled revision line kind status body="" sep=""
+    case "$1 $2" in
+        "POST $ALERTS_URL")
+            STEP8_POSTS=$((STEP8_POSTS + 1))
+            id="$STEP8_PREFIX$STEP8_POSTS"
+            type="TARGET_PRICE"
+            if [[ "$3" == *'"type":"PROFIT_LOSS"'* ]]; then
+                type="PROFIT_LOSS"
+            fi
+            STEP8_ALERTS="$id $type true 1${STEP8_ALERTS:+$'\n'$STEP8_ALERTS}"
+            kind="create"
+            status=201
+            body="$(step8_alert "$id" "$type" true 1)"
+            ;;
+        "PATCH $ALERTS_URL/"*)
+            id="${2##*/}"
+            kind="patch"
+            status=404
+            body='{"statusCode":404,"message":"Alert not found"}'
+            line="$(grep "^$id " <<<"$STEP8_ALERTS" || true)"
+            if [[ -n "$line" ]]; then
+                read -r _ type enabled revision <<<"$line"
+                if [[ "$3" == '{"enabled":true}' ]]; then
+                    kind="rearm"
+                    enabled=true
+                    revision=$((revision + 1))
+                else
+                    kind="disable"
+                    enabled=false
+                fi
+                STEP8_ALERTS="${STEP8_ALERTS/"$line"/"$id $type $enabled $revision"}"
+                status=200
+                body="$(step8_alert "$id" "$type" "$enabled" "$revision")"
+            fi
+            ;;
+        "DELETE $ALERTS_URL/"*)
+            id="${2##*/}"
+            kind="delete"
+            status=404
+            body='{"statusCode":404,"message":"Alert not found"}'
+            if grep -q "^$id " <<<"$STEP8_ALERTS"; then
+                STEP8_ALERTS="$(grep -v "^$id " <<<"$STEP8_ALERTS" || true)"
+                status=204
+                body=""
+            fi
+            ;;
+        "GET $ALERTS_URL?accountId=$HOLDER_ID")
+            STEP8_GETS=$((STEP8_GETS + 1))
+            kind="read"
+            if [[ $STEP8_GETS -eq 1 ]]; then
+                kind="list"
+            elif [[ $STEP8_GETS -eq 2 ]]; then
+                kind="absent"
+            fi
+            body='{"results":['
+            while read -r id type enabled revision; do
+                if [[ -n "$id" ]]; then
+                    body="$body$sep$(step8_alert "$id" "$type" "$enabled" "$revision")"
+                    sep=","
+                fi
+            done <<<"$STEP8_ALERTS"
+            body="$body]}"
+            id=""
+            status=200
+            ;;
+        *) return 1 ;;
+    esac
+    if [[ "$kind" == "$STEP8_WHERE" && (-z "$id" || "$id" == "$STEP8_TP") ]]; then
+        body="$(jq -c "$STEP8_MUTATION" <<<"$body" | tr -d '\r')"
+        status="${STEP8_STATUS:-$status}"
+    fi
+    last_response "$status" "application/json; charset=utf-8" "$body"
+}
+
+# step8_row SCENARIO_RESULT WHERE MUTATION STATUS EXPECTED: EXPECTED is PASS, every one of the
+# 13 step-8 checks passing, or the one FAIL line, its start followed by "..." where a body
+# description ends it, with the other 12 checks passing.
+step8_row() {
+    local fails passes expected_passes=12
+    STEP8_WHERE="$2"
+    STEP8_MUTATION="$3"
+    STEP8_STATUS="$4"
+    STEP8_ALERTS=""
+    STEP8_POSTS=0
+    STEP8_GETS=0
+    reset_alert_files
+    capture step8_crud
+    fails="$(grep '^FAIL ' <<<"$OUT" || true)"
+    passes="$(grep -c '^PASS ' <<<"$OUT" || true)"
+    if [[ "$5" == "PASS" ]]; then
+        expected_passes=13
+        if [[ -n "$fails" ]]; then
+            reasons+=("unexpected FAIL lines [$(flat "$fails")]")
+        fi
+    elif [[ "$fails" != "$5" && ("$5" != *... || "$fails" == *$'\n'* || "$fails" != "${5%...}"*) ]]; then
+        reasons+=("FAIL lines [$(flat "$fails")], expected [$5]")
+    fi
+    if [[ "$passes" != "$expected_passes" ]]; then
+        reasons+=("$passes PASS lines, expected $expected_passes")
+    fi
+    want_rc 0
+    conclude "step8Crud_$1"
+}
+
+step8_row asRequested_passesEveryCheck "" . "" PASS
+step8_row createOtherAccount_failsCreate create ".accountId = \"$OTHER_GUID\"" "" \
+    "FAIL step 8 create TARGET_PRICE: accountId [\"$OTHER_GUID\"], expected $HOLDER_ID"
+step8_row createRoundedThreshold_failsCreate create '.threshold = 10000000000' "" \
+    "FAIL step 8 create TARGET_PRICE: threshold [10000000000], expected $MAX_THRESHOLD"
+step8_row disableOtherId_failsDisable disable ".id = \"$OTHER_GUID\"" "" \
+    "FAIL step 8 TARGET_PRICE disable: id [\"$OTHER_GUID\"], expected $STEP8_TP"
+step8_row rearmOtherType_failsRearm rearm '.type = "PROFIT_LOSS"' "" \
+    'FAIL step 8 TARGET_PRICE re-arm: type ["PROFIT_LOSS"], expected TARGET_PRICE'
+step8_row listWithoutResults_failsList list 'del(.results)' "" \
+    "FAIL step 8 list newest first: results missing, expected an array"
+step8_row absentWithoutResults_failsAbsent absent 'del(.results)' "" \
+    "FAIL step 8 TARGET_PRICE absent after delete: results missing, expected an array"
+step8_row absentResultsNull_failsAbsent absent '.results = null' "" \
+    "FAIL step 8 TARGET_PRICE absent after delete: results [null], expected an array"
+step8_row absentResultsEmpty_passes absent '.results = []' "" PASS
+step8_row absentStillListedUpperCase_failsAbsent absent ".results += [{\"id\": \"${STEP8_TP^^}\"}]" "" \
+    "FAIL step 8 TARGET_PRICE absent after delete: alert $STEP8_TP listed 1 times, expected 0"
+step8_row absentStatus503_failsAbsent absent '{statusCode: 503, message: "Database unavailable"}' 503 \
+    "FAIL step 8 TARGET_PRICE absent after delete: status 503, expected 200; body [..."
+# Every listed entry must be an alert object with a GUID id, named by position when it is not;
+# only then are the ids looked at.
+STEP8_ENTRY_FAIL="is not an alert with a GUID id"
+step8_row listMalformedBesideBoth_failsList list '.results += [{"id": 42}]' "" \
+    "FAIL step 8 list newest first: results entry 3 of 3 $STEP8_ENTRY_FAIL"
+step8_row listNullFirst_failsList list '.results = [null] + .results' "" \
+    "FAIL step 8 list newest first: results entry 1 of 3 $STEP8_ENTRY_FAIL"
+step8_row listUpperCaseIds_passes list '.results |= map(.id |= ascii_upcase)' "" PASS
+step8_row listOneMissing_failsList list '.results |= .[0:1]' "" \
+    "FAIL step 8 list newest first: listed ids [\"${STEP8_PREFIX}2\"], expected both ${STEP8_PREFIX}2 and $STEP8_TP"
+step8_row listOldestFirst_failsList list '.results |= reverse' "" \
+    "FAIL step 8 list newest first: PROFIT_LOSS ${STEP8_PREFIX}2 is listed after TARGET_PRICE $STEP8_TP"
+step8_row absentNumericId_failsAbsent absent '.results = [{"id": 42}]' "" \
+    "FAIL step 8 TARGET_PRICE absent after delete: results entry 1 of 1 $STEP8_ENTRY_FAIL"
+step8_row absentNullEntry_failsAbsent absent '.results = [null]' "" \
+    "FAIL step 8 TARGET_PRICE absent after delete: results entry 1 of 1 $STEP8_ENTRY_FAIL"
+step8_row absentStringEntry_failsAbsent absent '.results = ["x"]' "" \
+    "FAIL step 8 TARGET_PRICE absent after delete: results entry 1 of 1 $STEP8_ENTRY_FAIL"
+step8_row absentNonGuidId_failsAbsent absent '.results = [{"id": "not-a-guid"}]' "" \
+    "FAIL step 8 TARGET_PRICE absent after delete: results entry 1 of 1 $STEP8_ENTRY_FAIL"
+step8_row absentBracedDeletedId_failsAbsent absent ".results += [{\"id\": \"{$STEP8_TP}\"}]" "" \
+    "FAIL step 8 TARGET_PRICE absent after delete: results entry 2 of 2 $STEP8_ENTRY_FAIL"
+step8_row absentMissingId_failsAbsent absent '.results += [{}]' "" \
+    "FAIL step 8 TARGET_PRICE absent after delete: results entry 2 of 2 $STEP8_ENTRY_FAIL"
+step8_row absentTwoMalformed_failsAbsent absent '.results += [42, {"id": null}]' "" \
+    "FAIL step 8 TARGET_PRICE absent after delete: results entries 2, 3 of 3 are not alerts with a GUID id"
+step8_row absentSevenMalformed_failsAbsent absent '.results = [range(7) | {id: 42}]' "" \
+    "FAIL step 8 TARGET_PRICE absent after delete: results entries 1, 2, 3, 4, 5 and 2 more of 7 are not alerts with a GUID id"
+step8_row absentOtherAlert_passes absent ".results += [{\"id\": \"$OTHER_GUID\"}]" "" PASS
+reset_alert_files
+
+# ---------------------------------------------------------------------------------------------
 # response_kind and expect_error: the step-7 status and response-kind checks.
 
 ERROR_400='{"statusCode":400,"message":"Invalid alert threshold."}'
@@ -946,7 +1520,19 @@ NR="no route, so neither an ErrorResponse nor a validation problem"
 expect_error_row errorResponseAsJson_passes error_response 400 400 "application/json; charset=utf-8" "$ERROR_400" PASS
 expect_error_row errorResponseAsProblemJson_failsContentType error_response 400 400 \
     "application/problem+json; charset=utf-8" "$ERROR_400" \
-    "status 400, body kind [error_response], content type [application/problem+json; charset=utf-8]; expected 400: $ER_400"
+    "status 400, body kind [error_response], content type [application/problem+json]; expected 400: $ER_400"
+# The media type is compared whole, in any case and without its parameters, so a type that only
+# begins with the expected one is another type.
+expect_error_row errorResponseAsJsonp_failsContentType error_response 400 400 "application/jsonp" "$ERROR_400" \
+    "status 400, body kind [error_response], content type [application/jsonp]; expected 400: $ER_400"
+expect_error_row errorResponseAsJsonSeq_failsContentType error_response 400 400 \
+    "application/json-seq; charset=utf-8" "$ERROR_400" \
+    "status 400, body kind [error_response], content type [application/json-seq]; expected 400: $ER_400"
+expect_error_row errorResponseMixedCaseJsonWithBlanks_passes error_response 400 400 \
+    $' Application/JSON\t; charset=utf-8' "$ERROR_400" PASS
+expect_error_row problemAsProblemJsonLonger_failsContentType problem 400 400 "application/problem+jsonx" \
+    "$PROBLEM_400" "status 400, body kind [problem], content type [application/problem+jsonx]; expected 400: $PR_400"
+expect_error_row problemUpperCaseProblemJson_passes problem 400 400 "APPLICATION/PROBLEM+JSON" "$PROBLEM_400" PASS
 expect_error_row errorResponseOtherStatusCode_fails error_response 404 404 "application/json" "$ERROR_400" \
     "status 404, body kind [error_response with another statusCode], content type [application/json]; expected 404: an ErrorResponse with statusCode 404 as application/json"
 expect_error_row problemAsProblemJson_passes problem 400 400 "application/problem+json; charset=utf-8" "$PROBLEM_400" PASS
@@ -967,6 +1553,147 @@ expect_error_row transportError_fails no_route 404 000 "" "" \
     "transport error (stubbed transport error), body kind [empty], content type [none]; expected 404: $NR"
 expect_error_row unknownKind_fails other 400 400 "application/json" "$ERROR_400" \
     "unknown expected response kind [other]"
+
+# check_reserved_notifications_routes, as steps 2 and 7 call it, and step 7's PATCH bodies on
+# its temporary alert.
+
+H1="c0000000-0000-4000-8000-000000000001"
+TEMP_ID="aaaaaaaa-0000-4000-8000-0000000000a7"
+STUB_RESERVED_STATUS=404
+STUB_RESERVED_CTYPE=""
+STUB_RESERVED_BODY=""
+STUB_RESERVED_ALLOW=""
+STUB_TEMP_CREATED=1
+STUB_BINDING_KIND="problem"
+# The notifications literal answers PATCH with the valid body, and DELETE without one, with the
+# STUB_RESERVED_* values: an Allow header STUB_RESERVED_ALLOW unless it is empty. Only the
+# temporary alert's create is answered, 201 with STUB_TEMP_CREATED 1 and a 400 ErrorResponse
+# otherwise. Its missing and null enabled get the ErrorResponse 400, its two unbindable bodies
+# the 400 of STUB_BINDING_KIND (problem or error_response). Every other request gets a transport
+# error.
+# shellcheck disable=SC2329 # Invoked through the http stub.
+route_response() {
+    case "$1 $2" in
+        "PATCH $ALERTS_URL/notifications" | "DELETE $ALERTS_URL/notifications")
+            if [[ ("$1" == "PATCH" && ($# -ne 3 || "${3-}" != '{"enabled":true}')) ||
+                ("$1" == "DELETE" && $# -ne 2) ]]; then
+                return 1
+            fi
+            last_response "$STUB_RESERVED_STATUS" "$STUB_RESERVED_CTYPE" "$STUB_RESERVED_BODY"
+            if [[ -n "$STUB_RESERVED_ALLOW" ]]; then
+                printf 'HTTP/1.1 %s\r\nAllow: %s\r\n\r\n' "$STUB_RESERVED_STATUS" "$STUB_RESERVED_ALLOW" \
+                    >"$PRIVATE_DIR/headers"
+            fi
+            ;;
+        "POST $ALERTS_URL")
+            if [[ $# -ne 3 || "${3-}" != "$(alert_body "$HOLDER_ID" TARGET_PRICE "$H1" ABOVE "$MAX_THRESHOLD")" ]]; then
+                return 1
+            fi
+            if [[ "$STUB_TEMP_CREATED" -eq 1 ]]; then
+                last_response 201 "application/json; charset=utf-8" "{\"id\":\"$TEMP_ID\"}"
+            else
+                last_response 400 "application/json; charset=utf-8" "$ERROR_400"
+            fi
+            ;;
+        "PATCH $ALERTS_URL/$TEMP_ID")
+            case "${3-}" in
+                '{}' | '{"enabled":null}')
+                    last_response 400 "application/json; charset=utf-8" "$ERROR_400"
+                    ;;
+                '{"enabled":true' | '{"enabled":"true"}')
+                    if [[ "$STUB_BINDING_KIND" == "problem" ]]; then
+                        last_response 400 "application/problem+json; charset=utf-8" "$PROBLEM_400"
+                    else
+                        last_response 400 "application/json; charset=utf-8" "$ERROR_400"
+                    fi
+                    ;;
+                *) return 1 ;;
+            esac
+            ;;
+        "DELETE $ALERTS_URL/$TEMP_ID") last_response 204 "" "" ;;
+        *) return 1 ;;
+    esac
+}
+
+# want_check CHECK EXPECTED: collects a reason unless the captured OUT reports CHECK on exactly
+# one line: "PASS CHECK" when EXPECTED is PASS, otherwise a FAIL whose reason contains EXPECTED.
+want_check() {
+    local line verdict="" found=0
+    while IFS= read -r line; do
+        if [[ "$line" == "PASS $1" || "$line" == "FAIL $1: "* ]]; then
+            found=$((found + 1))
+            verdict="$line"
+        fi
+    done <<<"$OUT"
+    if [[ $found -ne 1 ]]; then
+        reasons+=("[$1] reported on $found lines, expected one")
+    elif [[ "$2" == "PASS" && "$verdict" != "PASS $1" ]]; then
+        reasons+=("[$1] reported [$verdict], expected PASS")
+    elif [[ "$2" != "PASS" && "$verdict" != "FAIL $1: "*"$2"* ]]; then
+        reasons+=("[$1] reported [$verdict], expected a FAIL naming [$2]")
+    fi
+}
+
+# reserved_row SCENARIO_RESULT STATUS CONTENT_TYPE BODY ALLOW EXPECTED: both requests answered
+# with STATUS, CONTENT_TYPE and BODY, and an Allow header ALLOW unless it is empty. EXPECTED is
+# "PASS", or text both checks' FAIL reasons must contain.
+reserved_row() {
+    local method
+    STUB_RESERVED_STATUS="$2"
+    STUB_RESERVED_CTYPE="$3"
+    STUB_RESERVED_BODY="$4"
+    STUB_RESERVED_ALLOW="$5"
+    : >"$TEST_DIR/requests"
+    capture check_reserved_notifications_routes "step 7"
+    want_rc 0
+    for method in PATCH DELETE; do
+        want_check "step 7 $method notifications path 404" "$6"
+    done
+    if [[ "$(grep -c '' <<<"$OUT")" != 2 ]]; then
+        reasons+=("expected exactly one line per check")
+    fi
+    if [[ "$(cat "$TEST_DIR/requests")" != "PATCH $ALERTS_URL/notifications"$'\n'"DELETE $ALERTS_URL/notifications" ]]; then
+        reasons+=("requests [$(flat "$(cat "$TEST_DIR/requests")")], expected a PATCH and then a DELETE on the notifications path")
+    fi
+    conclude "checkReservedNotificationsRoutes_$1"
+}
+
+reserved_row plain404_passes 404 "" "" "" PASS
+reserved_row featureDisabled403_fails 403 "application/json" "$FORBIDDEN_BODY" "" "status 403, body kind [json]"
+reserved_row methodNotAllowed405WithAllow_fails 405 "" "" GET \
+    "status 405 with an Allow header; expected 404 with no route and no Allow header"
+STUB_RESERVED_STATUS=404
+STUB_RESERVED_CTYPE=""
+STUB_RESERVED_BODY=""
+STUB_RESERVED_ALLOW=""
+
+: >"$TEST_DIR/requests"
+capture step2_flag_off
+want_check "step 2 PATCH notifications path 404" PASS
+want_check "step 2 DELETE notifications path 404" PASS
+conclude step2FlagOff_reservedNotificationsPath_checksBothMethods
+
+# step7_row SCENARIO_RESULT CREATED KIND EXPECTED: step7_errors with the temporary alert created
+# (CREATED 1) or refused (0) and its two unbindable PATCH bodies answered as KIND. EXPECTED is
+# "PASS", or text both binding checks' FAIL reasons must contain. The notifications literal
+# answers with routing's plain 404 throughout.
+step7_row() {
+    STUB_TEMP_CREATED="$2"
+    STUB_BINDING_KIND="$3"
+    reset_alert_files
+    capture step7_errors
+    want_check "step 7 PATCH malformed JSON 400" "$4"
+    want_check 'step 7 PATCH quoted enabled "true" 400' "$4"
+    want_check "step 7 PATCH notifications path 404" PASS
+    want_check "step 7 DELETE notifications path 404" PASS
+    conclude "step7Errors_$1"
+}
+
+step7_row unbindablePatchAnsweredProblem_passes 1 problem PASS
+step7_row unbindablePatchAnsweredErrorResponse_fails 1 error_response "status 400, body kind [error_response]"
+step7_row temporaryAlertRefused_failsBothBindingChecks 0 problem \
+    "creating the temporary alert gave status 400, body kind [error_response]; expected 201 with an id"
+reset_alert_files
 
 # ---------------------------------------------------------------------------------------------
 # e2e.sh executed: the main guard, the jq literal-precision probe and the step-1 abort. PATH

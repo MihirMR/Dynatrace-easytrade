@@ -10,7 +10,7 @@
 #   --base-url URL       Reverse-proxy origin of that stack (default: http://localhost)
 #   --compose-file FILE  Compose file of that project, relative to the current directory
 #                        (default: compose.dev.yaml)
-#   --help               Show this help and exit
+#   -h, --help           Show this help and exit
 #
 # One project per invocation. Never run it alongside e2e.sh or loadgen-check.sh: all three
 # toggle the same flag and work on the same preset accounts.
@@ -22,8 +22,9 @@
 # only if loadgen was running at start.
 #
 # Prints one PASS or FAIL line per check, a REPORT block and a final SUMMARY line. Exits 0
-# when every check passes, 1 when any check fails, and 2 on a usage error or a missing tool.
-# Working files stay in the run directory printed at start and end.
+# when every check passes, 1 when any check fails, 2 on a usage error, a missing tool or a run
+# directory it cannot make, and 130 on an interrupt. Working files stay in the run directory
+# printed at start and end.
 
 set -euo pipefail
 
@@ -43,9 +44,11 @@ LOG_STEP_SECONDS=5
 # line; the earlier lines it also reads carry other trace ids and are left out.
 LOG_SKEW_MARGIN_SECONDS=30
 # Every broker-service log read runs under timeout(1), so a Docker call that never answers
-# cannot hold the run. Inside wait_cycle_line it may take the time left to that wait's deadline;
-# a read outside it may take this fixed bound. Either is a hard limit on the whole read, its
-# termination included: TERM comes LOG_PROBE_KILL_SECONDS before the limit and KILL at it.
+# cannot hold the run. Inside a cycle wait (wait_cycle_line, or the first read of
+# open_verified_window) it may take the time left to that wait's deadline; a read outside one
+# may take this fixed bound. Either is a hard limit on the Docker call, its termination
+# included: TERM comes LOG_PROBE_KILL_SECONDS before the limit and KILL at it. A cycle-wait read
+# that still ends at or after its deadline, output filters included, is discarded (read_window).
 LOG_PROBE_TIMEOUT_SECONDS=60
 LOG_PROBE_KILL_SECONDS=5
 # The hard limit of cleanup's compose start of loadgen, termination included as for log reads,
@@ -97,8 +100,15 @@ Usage: scripts/portfolio-insights/perf.sh --project NAME [--base-url URL] [--com
   --base-url URL       Reverse-proxy origin of that stack (default: http://localhost)
   --compose-file FILE  Compose file of that project, relative to the current directory
                        (default: compose.dev.yaml)
-  --help               Show this help and exit
+  -h, --help           Show this help and exit
 Run one project at a time, never alongside e2e.sh or loadgen-check.sh.
+
+Examples:
+  scripts/portfolio-insights/perf.sh --project pi-dev-postgres
+  scripts/portfolio-insights/perf.sh --project pi-dev-mssql --base-url http://localhost \
+      --compose-file compose.dev.yaml
+
+Exit: 0 all passed, 1 a check failed, 2 bad usage, missing tool or no run dir, 130 interrupted.
 EOF
 }
 
@@ -203,75 +213,87 @@ is_base_origin() {
     [[ -z "$port" ]] || { [[ "$port" == :* ]] && is_port_number "${port#:}"; }
 }
 
-BASE_URL="http://localhost"
-COMPOSE_FILE="compose.dev.yaml"
-PROJECT=""
-while [[ $# -gt 0 ]]; do
-    case "$1" in
-        --base-url | --compose-file | --project)
-            if [[ $# -lt 2 || -z "$2" || "$2" == -* ]]; then
-                usage_error "Option $1 requires a value."
-            fi
-            case "$1" in
-                --base-url) BASE_URL="$2" ;;
-                --compose-file) COMPOSE_FILE="$2" ;;
-                --project) PROJECT="$2" ;;
-            esac
-            shift 2
-            ;;
-        --help)
-            usage
-            exit 0
-            ;;
-        *)
-            # Only a bare option name is echoed: a stray value or a --name=value argument can be
-            # a URL that holds credentials.
-            if [[ "$1" =~ ^--?[A-Za-z][A-Za-z0-9-]*$ ]]; then
-                usage_error "Unknown option: $1"
-            fi
-            usage_error "Unknown argument (not shown): each option takes its value as the next argument."
-            ;;
-    esac
-done
+# parse_options ARGS...: sets BASE_URL, COMPOSE_FILE and PROJECT from the command line. A usage
+# error prints its reason and the usage on stderr and exits 2; -h or --help prints the usage on
+# stdout and exits 0.
+parse_options() {
+    BASE_URL="http://localhost"
+    COMPOSE_FILE="compose.dev.yaml"
+    PROJECT=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --base-url | --compose-file | --project)
+                if [[ $# -lt 2 || -z "$2" || "$2" == -* ]]; then
+                    usage_error "Option $1 requires a value."
+                fi
+                case "$1" in
+                    --base-url) BASE_URL="$2" ;;
+                    --compose-file) COMPOSE_FILE="$2" ;;
+                    --project) PROJECT="$2" ;;
+                esac
+                shift 2
+                ;;
+            -h | --help)
+                usage
+                exit 0
+                ;;
+            *)
+                # Only a bare option name is echoed: a stray value or a --name=value argument can
+                # be a URL that holds credentials.
+                if [[ "$1" =~ ^--?[A-Za-z][A-Za-z0-9-]*$ ]]; then
+                    usage_error "Unknown option: $1"
+                fi
+                usage_error "Unknown argument (not shown): each option takes its value as the next argument."
+                ;;
+        esac
+    done
 
-if [[ -z "$PROJECT" ]]; then
-    usage_error "Option --project is required."
-fi
-# The refused value is never echoed, since it can hold credentials.
-if ! is_base_origin "$BASE_URL"; then
-    usage_error "Option --base-url needs an http:// or https:// origin: a host and optional port, without credentials, path, query or fragment."
-fi
-BASE_URL="${BASE_URL%/}"
-if [[ ! -f "$COMPOSE_FILE" ]]; then
-    usage_error "Compose file not found: $COMPOSE_FILE (resolved from $(pwd); the repository root is $REPO_ROOT)"
-fi
-
-missing_tools=""
-for tool in bash curl jq docker timeout; do
-    if ! command -v "$tool" >/dev/null 2>&1; then
-        missing_tools="$missing_tools $tool"
+    if [[ -z "$PROJECT" ]]; then
+        usage_error "Option --project is required."
     fi
-done
-if [[ -n "$missing_tools" ]]; then
-    echo "Missing required tools:$missing_tools" >&2
-    exit 2
-fi
-if ! docker compose version >/dev/null 2>&1 </dev/null; then
-    echo "The docker compose plugin is required (docker compose version failed)." >&2
-    exit 2
-fi
+    # The refused value is never echoed, since it can hold credentials.
+    if ! is_base_origin "$BASE_URL"; then
+        usage_error "Option --base-url needs an http:// or https:// origin: a host and optional port, without credentials, path, query or fragment."
+    fi
+    BASE_URL="${BASE_URL%/}"
+    if [[ ! -f "$COMPOSE_FILE" ]]; then
+        usage_error "Compose file not found: $COMPOSE_FILE (resolved from $(pwd); the repository root is $REPO_ROOT)"
+    fi
+}
 
-if ! RUN_DIR="$(mktemp -d "${TMPDIR:-/tmp}/pi-perf.XXXXXX")"; then
-    echo "Could not create a run directory under ${TMPDIR:-/tmp}." >&2
-    exit 2
-fi
-: >"$RUN_DIR/owned"
-: >"$RUN_DIR/expected"
-: >"$RUN_DIR/deleted"
+# check_tools: exits 2 with the reason on stderr unless every program the run calls is on PATH
+# and docker has its compose plugin.
+check_tools() {
+    local tool missing=""
+    for tool in bash curl jq docker timeout; do
+        if ! command -v "$tool" >/dev/null 2>&1; then
+            missing="$missing $tool"
+        fi
+    done
+    if [[ -n "$missing" ]]; then
+        echo "Missing required tools:$missing" >&2
+        exit 2
+    fi
+    if ! docker compose version >/dev/null 2>&1 </dev/null; then
+        echo "The docker compose plugin is required (docker compose version failed)." >&2
+        exit 2
+    fi
+}
 
-FLAG_URL="$BASE_URL/feature-flag-service/v1/flags/$FLAG_ID"
-ALERTS_URL="$BASE_URL/broker-service/v1/alerts"
-INSIGHTS_URL="$BASE_URL/broker-service/v1/portfolio/insights"
+# prepare_run: makes the run directory under TMPDIR, with empty owned, expected and deleted
+# files, and sets the request URLs from BASE_URL. Exits 2 when the directory cannot be made.
+prepare_run() {
+    if ! RUN_DIR="$(mktemp -d "${TMPDIR:-/tmp}/pi-perf.XXXXXX")"; then
+        echo "Could not create a run directory under ${TMPDIR:-/tmp}." >&2
+        exit 2
+    fi
+    : >"$RUN_DIR/owned"
+    : >"$RUN_DIR/expected"
+    : >"$RUN_DIR/deleted"
+    FLAG_URL="$BASE_URL/feature-flag-service/v1/flags/$FLAG_ID"
+    ALERTS_URL="$BASE_URL/broker-service/v1/alerts"
+    INSIGHTS_URL="$BASE_URL/broker-service/v1/portfolio/insights"
+}
 
 passed=0
 failed=0
@@ -287,10 +309,13 @@ LOADGEN_STOPPED=0
 DIALECT=""
 EVAL_INTERVAL=""
 STARTED_AT=""
-# The deadline (on the $SECONDS clock) of the wait_cycle_line running now, empty outside it,
-# and why the last log read failed.
+# The deadline (on the $SECONDS clock) of the cycle wait running now (wait_cycle_line, or the
+# first read of open_verified_window), empty outside one, and why the last log read failed.
 PROBE_DEADLINE=""
 LOG_PROBE_DETAIL=""
+# 1 while $RUN_DIR/broker.log holds the read open_verified_window made of the window it opened,
+# which ended before that window's deadline; the next wait_cycle_line parses it first and sets 0.
+WINDOW_READ_HELD=0
 
 # Report values; "n/a" until measured.
 R_INSIGHTS_ACCOUNT="n/a"
@@ -328,15 +353,26 @@ abort() {
 # ---------------------------------------------------------------------------------------------
 # HTTP and JSON
 
-# http METHOD URL [BODY]: sets HTTP_STATUS (000 on a transport error), HTTP_CTYPE, HTTP_BODY
-# and HTTP_ERROR (curl's message on a transport error). Never trips set -e.
-http() {
-    local method="$1" url="$2" out rc=0
-    local args=(-sS --max-time "$HTTP_TIMEOUT_SECONDS" -X "$method"
+# http_within MAX_TIME METHOD URL [BODY]: one request that curl ends after MAX_TIME seconds.
+# Every caller passes MAX_TIME itself, so no variable of the caller's scope or environment sets
+# a request's limit. A MAX_TIME that is not a whole number above 0 is refused unsent: curl takes
+# 0 as no limit at all. Sets HTTP_STATUS (000 on a transport error or a refused limit),
+# HTTP_CTYPE, HTTP_BODY and HTTP_ERROR (curl's message on a transport error, or why the request
+# was not sent). Never trips set -e.
+http_within() {
+    local max_time="$1" method="$2" url="$3" out rc=0
+    if [[ ! "$max_time" =~ ^[1-9][0-9]*$ ]]; then
+        HTTP_STATUS="000"
+        HTTP_CTYPE=""
+        HTTP_ERROR="not sent: time limit [$max_time] is not a whole number of seconds above 0"
+        HTTP_BODY=""
+        return 0
+    fi
+    local args=(-sS --max-time "$max_time" -X "$method"
         -o "$RUN_DIR/body" -D "$RUN_DIR/headers" -w '%{http_code} %{content_type}'
         -H 'Accept: application/json')
-    if [[ $# -ge 3 ]]; then
-        args+=(-H 'Content-Type: application/json' --data-binary "$3")
+    if [[ $# -ge 4 ]]; then
+        args+=(-H 'Content-Type: application/json' --data-binary "$4")
     fi
     : >"$RUN_DIR/body"
     out="$(curl "${args[@]}" "$url" 2>"$RUN_DIR/curl-error")" || rc=$?
@@ -350,6 +386,12 @@ http() {
         HTTP_ERROR=""
     fi
     HTTP_BODY="$(cat "$RUN_DIR/body")"
+}
+
+# http METHOD URL [BODY]: http_within with the HTTP_TIMEOUT_SECONDS limit, which every request
+# but readyz's takes.
+http() {
+    http_within "$HTTP_TIMEOUT_SECONDS" "$@"
 }
 
 # jget FILTER JSON: prints jq's raw output, or nothing when the JSON does not parse.
@@ -543,14 +585,17 @@ epoch_to_rfc3339() {
 
 # broker_logs SINCE: broker-service output since SINCE, without colour codes or carriage
 # returns. The custom console logger pads each line and ends it with " | <CallerName>", so
-# callers match substrings only. The read has ended, killed if need be, probe_limit seconds
-# after it started (hard_timeout), and is never started once the wait's deadline has passed. On
-# failure LOG_PROBE_DETAIL tells a read Docker did not answer in time from one that failed.
+# callers match substrings only. The Docker call has ended, killed if need be, probe_limit
+# seconds after it started (hard_timeout), and is never started once the wait's deadline has
+# passed. The colour and carriage-return filters after it are outside that limit, so a read can
+# still end after the deadline; the cycle waits read through read_window, which discards such a
+# read. On failure LOG_PROBE_DETAIL tells a read Docker did not answer in time from one that
+# failed.
 broker_logs() {
     local limit rc=0
     if ! limit="$(probe_limit)"; then
-        # Only wait_cycle_line sets a deadline, and its last attempt can start just as the
-        # deadline passes. That attempt fails at once and leaves LOG_PROBE_DETAIL to the read
+        # Only the cycle waits set a deadline, and an attempt of wait_cycle_line can start just
+        # as it passes. That attempt fails at once and leaves LOG_PROBE_DETAIL to the read
         # before it, the one that tells why the wait found no line.
         return 1
     fi
@@ -567,8 +612,10 @@ broker_logs() {
     return 1
 }
 
-# probe_limit: the seconds a log read may take now, the time left to PROBE_DEADLINE inside
-# wait_cycle_line and LOG_PROBE_TIMEOUT_SECONDS outside it. Fails when the deadline has passed.
+# probe_limit: the seconds the Docker call of a log read may take now, the time left to
+# PROBE_DEADLINE inside a cycle wait (wait_cycle_line, or the first read of
+# open_verified_window) and LOG_PROBE_TIMEOUT_SECONDS outside it. Fails when the deadline has
+# passed, so no read starts then; read_window checks the deadline again once a read has ended.
 probe_limit() {
     local left
     if [[ -z "$PROBE_DEADLINE" ]]; then
@@ -580,6 +627,22 @@ probe_limit() {
         return 1
     fi
     echo "$left"
+}
+
+# read_window: one read of the cycle-log window, the broker-service output since LOG_SINCE, into
+# $RUN_DIR/broker.log, by PROBE_DEADLINE, the deadline of the cycle wait that reads it. A read
+# counts only when it has ended before that deadline: one that ends at or after it, whatever
+# Docker answered, returns 1 like an unreadable one, with LOG_PROBE_DETAIL saying it ended late,
+# so no line in it is used. A failed read, or one never started, returns 1 with
+# LOG_PROBE_DETAIL as broker_logs left it.
+read_window() {
+    if ! broker_logs "$LOG_SINCE" >"$RUN_DIR/broker.log"; then
+        return 1
+    fi
+    if [[ $SECONDS -ge $PROBE_DEADLINE ]]; then
+        LOG_PROBE_DETAIL="broker-service logs read ended after the wait deadline and was discarded"
+        return 1
+    fi
 }
 
 # parse_cycle_line LINE: sets C_ALERTS, C_TRIGGERED, C_FAILED, C_SKIPPED, C_OUTCOME and
@@ -606,17 +669,23 @@ cycle_summary_text() {
     echo "alerts [$C_ALERTS] triggered [$C_TRIGGERED] failed [$C_FAILED] skipped [$C_SKIPPED] outcome [$C_OUTCOME] duration [$C_DURATION] ms"
 }
 
-# wait_cycle_line AFTER TIMEOUT [ALERTS]: bounded poll, every LOG_STEP_SECONDS for at most
-# TIMEOUT seconds, for the first cycle line of the current window after the AFTER-th one. With
-# ALERTS, lines rendering another alert count are cycles that began during setup and are
-# skipped. Sets CYCLE_INDEX and CYCLE_LINE. Its log reads see the deadline as PROBE_DEADLINE,
-# local to this call, so it ends with the wait; on expiry LOG_PROBE_DETAIL holds why the last
-# read failed, or nothing when it succeeded.
+# wait_cycle_line AFTER DEADLINE [ALERTS]: bounded poll, every LOG_STEP_SECONDS until DEADLINE
+# (on the $SECONDS clock), for the first cycle line of the current window after the AFTER-th
+# one. The caller sets DEADLINE at its own boundary, so time it spent since counts against the
+# wait. With ALERTS, lines rendering another alert count are cycles that began during setup and
+# are skipped. Sets CYCLE_INDEX and CYCLE_LINE. When open_verified_window holds its read of the
+# window (WINDOW_READ_HELD), made by the CYCLE_DEADLINE its caller then passes as DEADLINE, the
+# first attempt parses that read, even once DEADLINE has passed, and the hold is used up either
+# way; every other attempt reads the window anew through read_window, which uses a read only
+# when it ended before DEADLINE. Its log reads see the deadline as PROBE_DEADLINE, local to this
+# call, so it ends with the wait; on expiry LOG_PROBE_DETAIL holds why the last read failed or
+# was discarded, or nothing when it succeeded.
 wait_cycle_line() {
-    local after="$1" deadline=$((SECONDS + $2)) wanted="${3:-}" reported="$1" index line
+    local after="$1" deadline="$2" wanted="${3:-}" reported="$1" held="$WINDOW_READ_HELD" index line
     local PROBE_DEADLINE="$deadline"
+    WINDOW_READ_HELD=0
     while :; do
-        if broker_logs "$LOG_SINCE" >"$RUN_DIR/broker.log"; then
+        if [[ $held -eq 1 ]] || read_window; then
             index=0
             while IFS= read -r line; do
                 index=$((index + 1))
@@ -635,6 +704,7 @@ wait_cycle_line() {
                 return 0
             done < <(grep -F "$CYCLE_MARKER" "$RUN_DIR/broker.log" || true)
         fi
+        held=0
         if [[ $((SECONDS + LOG_STEP_SECONDS)) -gt $deadline ]]; then
             return 1
         fi
@@ -927,6 +997,21 @@ on_exit() {
 # ---------------------------------------------------------------------------------------------
 # Setup
 
+# readyz SERVICE DEADLINE: one GET of SERVICE's readyz through the reverse proxy, sent only while
+# DEADLINE (on the $SECONDS clock) is ahead, through http_within with a limit of the seconds
+# left to it, at most HTTP_TIMEOUT_SECONDS. Sets READY_ANSWER to the answer's status text, or to
+# why none was sent.
+readyz() {
+    local left=$(($2 - SECONDS)) limit
+    if [[ $left -le 0 ]]; then
+        READY_ANSWER="no answer (not probed: no time left before the deadline)"
+        return 0
+    fi
+    limit=$((left < HTTP_TIMEOUT_SECONDS ? left : HTTP_TIMEOUT_SECONDS))
+    http_within "$limit" GET "$BASE_URL/$1/readyz"
+    READY_ANSWER="$(status_text)"
+}
+
 setup() {
     local running missing="" service deadline broker_ready flag_ready raw_interval flag_id modifiable enabled
 
@@ -942,16 +1027,22 @@ setup() {
     if grep -qxF "loadgen" <<<"$running"; then
         LOADGEN_WAS_RUNNING=1
     fi
+    # Both answers must come by the deadline: no probe starts once it has passed, each may take
+    # only the time left to it, and a pair answered after it is no pass.
     deadline=$((SECONDS + READY_TIMEOUT_SECONDS))
     while :; do
-        http GET "$BASE_URL/broker-service/readyz"
-        broker_ready="$(status_text)"
-        http GET "$BASE_URL/feature-flag-service/readyz"
-        flag_ready="$(status_text)"
+        readyz broker-service "$deadline"
+        broker_ready="$READY_ANSWER"
+        readyz feature-flag-service "$deadline"
+        flag_ready="$READY_ANSWER"
         if [[ "$broker_ready" == "status 200" && "$flag_ready" == "status 200" ]]; then
-            break
+            if [[ $SECONDS -le $deadline ]]; then
+                break
+            fi
+            abort "readiness" "broker-service and feature-flag-service readyz gave status 200 only $((SECONDS - deadline))s after the ${READY_TIMEOUT_SECONDS}s deadline"
         fi
-        if [[ $((SECONDS + READY_STEP_SECONDS)) -gt $deadline ]]; then
+        # A sleep that reaches the deadline would leave no time to probe again.
+        if [[ $((SECONDS + READY_STEP_SECONDS)) -ge $deadline ]]; then
             abort "readiness" "after ${READY_TIMEOUT_SECONDS}s broker-service readyz gave $broker_ready, feature-flag-service readyz gave $flag_ready"
         fi
         sleep "$READY_STEP_SECONDS"
@@ -1071,9 +1162,14 @@ read_id_list() {
     fi
 }
 
-# fetch_presets: the first PRESET_COUNT preset account ids, in the service's order, into
-# $RUN_DIR/presets. They must be exactly PRESET_COUNT distinct canonical UUIDs; otherwise
-# PRESETS_ERROR names the counts and $RUN_DIR/presets stays empty, so no id is used.
+# fetch_presets: the preset account ids of GET presets?limit=PRESET_COUNT, in the service's
+# order, into $RUN_DIR/presets: each canonical UUID once, at its first occurrence, and at most
+# PRESET_COUNT of them, so the presets verify_cycle_inputs requests stay bounded whatever the
+# body holds.
+# An id that is not a canonical UUID is never written. These ids are the candidates for the p95
+# account even when they fall short of the cycle workload. PRESETS_ERROR names the counts
+# unless the body held exactly PRESET_COUNT distinct canonical ids and nothing else; a status
+# other than 200 or an unreadable body leaves no id at all.
 fetch_presets() {
     PRESETS_ERROR=""
     : >"$RUN_DIR/presets"
@@ -1082,26 +1178,31 @@ fetch_presets() {
         PRESETS_ERROR="GET presets gave $(status_text); exactly $PRESET_COUNT distinct canonical account ids are needed"
         return 0
     fi
-    if ! read_id_list "$HTTP_BODY" "$RUN_DIR/presets"; then
+    if ! read_id_list "$HTTP_BODY" "$RUN_DIR/presets-read"; then
         PRESETS_ERROR="GET presets gave status 200 with $IDS_ERROR; exactly $PRESET_COUNT distinct canonical account ids are needed"
         return 0
     fi
+    awk -v limit="$PRESET_COUNT" '!seen[$0]++ && ++kept <= limit' "$RUN_DIR/presets-read" \
+        >"$RUN_DIR/presets"
     if [[ $IDS_TOTAL -ne $PRESET_COUNT || $IDS_INVALID -ne 0 || $IDS_DUPLICATE -ne 0 ]]; then
-        : >"$RUN_DIR/presets"
         PRESETS_ERROR="GET presets gave $IDS_TOTAL accounts, $IDS_INVALID without a canonical UUID id and $IDS_DUPLICATE duplicate ids; exactly $PRESET_COUNT distinct canonical account ids are needed"
     fi
 }
 
-# insights_profile ACCOUNT: GETs the account's insights. Sets PROFILE_STATUS and
-# PROFILE_COUNTS (empty when there are none to name), and writes the distinct held instrument
-# ids, sorted, to $RUN_DIR/held-ACCOUNT. Succeeds when the account has exactly
-# HOLDINGS_EXPECTED allocations and every one is held, each on another instrument. An ACCOUNT
-# that is not a canonical UUID is refused before it reaches a file name or a URL. The body
-# must be exactly one JSON value, and the held file exactly the canonical ids counted;
-# otherwise the file is left empty.
+# insights_profile ACCOUNT: GETs the account's insights. Sets PROFILE_STATUS, PROFILE_COUNTS
+# (empty when there are none to name) and PROFILE_QUALIFIES, and writes the distinct held
+# instrument ids, sorted, to $RUN_DIR/held-ACCOUNT. PROFILE_QUALIFIES is 1, the p95 account's
+# condition, when the body has exactly HOLDINGS_EXPECTED allocations and each is an object
+# with a numeric quantity > 0; it comes from those counts alone, so neither the instrument ids
+# nor the held file bear on it, and it is 0 otherwise. It succeeds, the cycle workload's
+# condition, when the account qualifies and each of its allocations is held on a distinct
+# canonical instrumentId. An ACCOUNT that is not a canonical UUID is refused before it reaches
+# a file name or a URL. The body must be exactly one JSON value, and the held file exactly the
+# canonical ids counted; otherwise the file is left empty.
 insights_profile() {
     local lines allocations positive invalid held distinct
     PROFILE_COUNTS=""
+    PROFILE_QUALIFIES=0
     if [[ ! "$1" =~ $UUID_RE ]]; then
         PROFILE_STATUS="refused: the account id is not a canonical UUID"
         return 1
@@ -1134,6 +1235,9 @@ insights_profile() {
     held="${BASH_REMATCH[4]}"
     distinct="${BASH_REMATCH[5]}"
     PROFILE_COUNTS="$allocations allocations, $positive with a numeric quantity > 0, $invalid without a canonical instrumentId, $held held on $distinct distinct instruments"
+    if [[ $allocations -eq $HOLDINGS_EXPECTED && $positive -eq $HOLDINGS_EXPECTED ]]; then
+        PROFILE_QUALIFIES=1
+    fi
     if [[ "$lines" == *$'\n'* ]]; then
         printf '%s\n' "${lines#*$'\n'}" | LC_ALL=C sort -u >"$RUN_DIR/held-$1"
     fi
@@ -1148,71 +1252,63 @@ insights_profile() {
 }
 
 # select_insights_account: the p95 account, from what preflight_inputs recorded before any
-# timing: the first preset whose insights passed insights_profile, as SELECTED_ACCOUNT. That
-# preset is timed only when its instrument listing matched its holdings too, so the timed
-# account is fully verified. Sets SELECT_ERROR, naming the counts found, when no preset
-# qualifies or the first one that does failed its listing.
+# timing: the first preset, in the service's order, whose PROFILE_QUALIFIES was 1, as
+# SELECTED_ACCOUNT. The cycle inputs verdict does not bear on it: a preset list short of
+# PRESET_COUNT, or a qualifying preset whose instrument ids or listing fall short, still gives
+# the p95 its account. Sets SELECT_ERROR when preflight_inputs has not run, with PRESETS_ERROR
+# when no preset id was read, and naming every preset's insights counts when none qualifies.
 select_insights_account() {
     local k seen=""
     SELECTED_ACCOUNT=""
     SELECT_ERROR=""
-    if [[ -n "$PRESETS_ERROR" ]]; then
-        SELECT_ERROR="$PRESETS_ERROR"
-        return 1
-    fi
     if [[ -z "${INPUTS_VERIFIED:-}" ]]; then
         SELECT_ERROR="the preset inputs were not verified before the account was selected"
         return 1
     fi
+    if [[ ${#INPUT_IDS[@]} -eq 0 ]]; then
+        SELECT_ERROR="${PRESETS_ERROR:-no preset account id was read}"
+        return 1
+    fi
     for ((k = 0; k < ${#INPUT_IDS[@]}; k++)); do
-        if [[ "${INPUT_HELD[k]}" == "1" ]]; then
-            if [[ -n "${INPUT_LISTING[k]}" ]]; then
-                SELECT_ERROR="the first preset with exactly $HOLDINGS_EXPECTED allocations, each with a numeric quantity > 0 on a distinct canonical instrumentId, [${INPUT_IDS[k]}], is not timed because its instrument listing does not match its holdings: ${INPUT_LISTING[k]}${seen:+; presets before it:$seen}"
-                return 1
-            fi
+        if [[ "${INPUT_QUALIFIES[k]}" == "1" ]]; then
             SELECTED_ACCOUNT="${INPUT_IDS[k]}"
             return 0
         fi
         seen="$seen [${INPUT_IDS[k]}] ${INPUT_INSIGHTS[k]};"
     done
-    SELECT_ERROR="no preset account has exactly $HOLDINGS_EXPECTED allocations, each with a numeric quantity > 0 on a distinct canonical instrumentId:$seen"
+    SELECT_ERROR="no preset account has exactly $HOLDINGS_EXPECTED allocations, each with a numeric quantity > 0:$seen"
     return 1
 }
 
-# verify_cycle_inputs: every preset holds HOLDINGS_EXPECTED instruments (insights_profile), and
-# its instrument listing returns exactly those: HOLDINGS_EXPECTED distinct canonical ids, the
-# same set as the held one. An id that is not a canonical UUID is refused before any URL or
-# file name is built from it. Records, per preset in order, INPUT_IDS, INPUT_HELD (1 when its
-# insights passed insights_profile), INPUT_INSIGHTS (that insights status and its counts) and
-# INPUT_LISTING (the listing shortfall, empty when the listing matched). Sets INPUTS_ERROR,
-# naming the counts of each account that falls short.
+# verify_cycle_inputs: the cycle workload's inputs. Every preset holds HOLDINGS_EXPECTED
+# instruments (insights_profile succeeds), and its instrument listing returns exactly those:
+# HOLDINGS_EXPECTED distinct canonical ids, the same set as the held one. Every id of
+# $RUN_DIR/presets is profiled, also when PRESETS_ERROR is set, so a short preset list still
+# yields the p95 account. An id that is not a canonical UUID is refused before any URL or file
+# name is built from it. Records, per preset in order, INPUT_IDS, INPUT_QUALIFIES (its
+# PROFILE_QUALIFIES, 0 for a refused id) and INPUT_INSIGHTS (its insights status and counts).
+# Succeeds only when PRESETS_ERROR is empty, which fetch_presets leaves only for exactly
+# PRESET_COUNT distinct canonical ids, and no preset falls short. Otherwise sets INPUTS_ERROR
+# to PRESETS_ERROR and the counts of each account that falls short.
 verify_cycle_inputs() {
     local id problem shortfalls="" listing unlisted unheld
     INPUTS_ERROR=""
     INPUT_IDS=()
-    INPUT_HELD=()
+    INPUT_QUALIFIES=()
     INPUT_INSIGHTS=()
-    INPUT_LISTING=()
-    if [[ -n "$PRESETS_ERROR" ]]; then
-        INPUTS_ERROR="$PRESETS_ERROR"
-        return 1
-    fi
     while IFS= read -r id; do
         INPUT_IDS+=("$id")
         if [[ ! "$id" =~ $UUID_RE ]]; then
-            INPUT_HELD+=(0)
+            INPUT_QUALIFIES+=(0)
             INPUT_INSIGHTS+=("refused: the account id is not a canonical UUID")
-            INPUT_LISTING+=("not requested")
             shortfalls="$shortfalls [$id] refused: the account id is not a canonical UUID, so neither its insights nor its instrument listing is requested;"
             continue
         fi
         problem=""
-        if insights_profile "$id"; then
-            INPUT_HELD+=(1)
-        else
-            INPUT_HELD+=(0)
+        if ! insights_profile "$id"; then
             problem="insights $PROFILE_STATUS${PROFILE_COUNTS:+, $PROFILE_COUNTS}"
         fi
+        INPUT_QUALIFIES+=("$PROFILE_QUALIFIES")
         INPUT_INSIGHTS+=("$PROFILE_STATUS${PROFILE_COUNTS:+, $PROFILE_COUNTS}")
         listing=""
         http GET "$BASE_URL/broker-service/v1/instrument?accountId=$id"
@@ -1229,7 +1325,6 @@ verify_cycle_inputs() {
                 listing="$IDS_TOTAL results, $IDS_INVALID without a canonical UUID id, $IDS_DUPLICATE duplicate ids, $unlisted held instruments not listed, $unheld listed instruments not held"
             fi
         fi
-        INPUT_LISTING+=("$listing")
         if [[ -n "$listing" ]]; then
             problem="${problem:+$problem, }instrument listing $listing"
         fi
@@ -1239,14 +1334,21 @@ verify_cycle_inputs() {
     done <"$RUN_DIR/presets"
     if [[ -n "$shortfalls" ]]; then
         INPUTS_ERROR="every preset must hold and list the same $HOLDINGS_EXPECTED instruments:$shortfalls"
+    fi
+    if [[ -n "$PRESETS_ERROR" ]]; then
+        INPUTS_ERROR="$PRESETS_ERROR${INPUTS_ERROR:+; $INPUTS_ERROR}"
+    fi
+    if [[ -n "$INPUTS_ERROR" ]]; then
         return 1
     fi
     return 0
 }
 
 # preflight_inputs: runs verify_cycle_inputs once, after fetch_presets and before anything is
-# timed or created, and prints its "cycle inputs" line. select_insights_account chooses the
-# p95 account from what it recorded, and measure_cycle measures only when INPUTS_VERIFIED is 1.
+# timed or created, and prints its "cycle inputs" line. INPUTS_VERIFIED becomes 1 only when it
+# passed: exactly PRESET_COUNT distinct canonical presets, each holding and listing the same
+# HOLDINGS_EXPECTED instruments. measure_cycle creates alerts only then, while
+# select_insights_account chooses the p95 account from the same record whatever the verdict.
 preflight_inputs() {
     INPUTS_VERIFIED=0
     if verify_cycle_inputs; then
@@ -1476,35 +1578,54 @@ verify_owned_set() {
 # owned set is verified first, and T (CYCLE_T) is the database's own time of the armed-set
 # query that verified it. The window is `compose logs --since T` (LOG_SINCE), so every cycle
 # line in it was logged after T and none is skipped (LOG_BASE is 0). The db container runs on
-# the Docker engine whose clock stamps the log lines, so no host-clock margin applies. One read
-# of the window checks that the logs are readable. Returns 2 with OWNED_ERROR set when the armed
-# set differs from the owned id,revision set, and 1 when the broker-service logs are unreadable.
+# the Docker engine whose clock stamps the log lines, so no host-clock margin applies. The first
+# line after T is due within two intervals plus the margin: CYCLE_DEADLINE, on the $SECONDS
+# clock, counts that allowance from just before the query, so it never ends later than T plus
+# the allowance, and the caller's wait for that line ends at it. One read of the window
+# (read_window), by the same deadline, checks that the logs are readable, and it is the first
+# read of that wait: it stays in $RUN_DIR/broker.log with WINDOW_READ_HELD set, so the wait
+# parses it before reading again and a line already in it is never lost to a later read.
+# Returns 2 with OWNED_ERROR set when the armed set differs from the owned id,revision set, and
+# 1 when no time is left to read the logs, when they are unreadable, or when the read ended at
+# or after the deadline, LOG_PROBE_DETAIL saying which; WINDOW_READ_HELD is then 0.
 open_verified_window() {
+    local allowance=$((2 * EVAL_INTERVAL + CYCLE_WAIT_MARGIN_SECONDS)) PROBE_DEADLINE
+    WINDOW_READ_HELD=0
+    CYCLE_DEADLINE=$((SECONDS + allowance))
     if ! verify_owned_set; then
         return 2
     fi
     CYCLE_T="$ARMED_AT"
     LOG_SINCE="$CYCLE_T"
     LOG_BASE=0
-    if ! broker_logs "$LOG_SINCE" >"$RUN_DIR/broker.log"; then
+    if [[ $SECONDS -ge $CYCLE_DEADLINE ]]; then
+        LOG_PROBE_DETAIL="broker-service logs probe not started: no time left of the ${allowance}s allowance after $CYCLE_T"
         return 1
     fi
+    PROBE_DEADLINE="$CYCLE_DEADLINE"
+    if ! read_window; then
+        return 1
+    fi
+    WINDOW_READ_HELD=1
 }
 
 # select_cycle_sample: establishes T over the owned set and reads the accepted sample. The
-# first line of the verified window over ALERTS_EXPECTED alerts is the sample, read within two
-# intervals plus the margin; lines over another count are cycles that began during setup and
-# are skipped. A sample is rejected when its line shows a trigger, skip, failure or another
-# outcome, or when the armed set differs from the owned set after it. Owned alerts missing from
-# the armed set are then re-armed. When any was, a new verified window opens at a new T and its
-# first line over ALERTS_EXPECTED alerts is read. When none was, the owned set is verified
+# first line of the verified window over ALERTS_EXPECTED alerts is the sample, read by
+# open_verified_window's deadline, two intervals plus the margin after T. The window's first
+# read, which open_verified_window makes and the wait parses before reading again, counts
+# against it, and a read that ends at or after it is discarded with its lines; lines over
+# another count are cycles that began during setup and are skipped. A sample is rejected when
+# its line shows a trigger, skip, failure or another outcome, or when the armed set differs from
+# the owned set after it. Owned alerts missing from the armed set are then re-armed. When any
+# was, a new verified window opens at a new T and its first line over ALERTS_EXPECTED alerts is
+# read by that window's deadline, in the same way. When none was, the owned set is verified
 # again and reading goes on in the same window after the rejected line, so a cycle already
-# logged there is the next one read. Either read waits up to two intervals plus the margin. The
-# workload itself never changes. Returns 0 with the accepted line in CYCLE_INDEX, CYCLE_LINE
+# logged there is the next one read, for up to two intervals plus the margin after that check.
+# The workload itself never changes. Returns 0 with the accepted line in CYCLE_INDEX, CYCLE_LINE
 # and the C_* values; otherwise prints the failing check and returns 1, at the latest after
 # MAX_REJECTED_SAMPLES rejected samples.
 select_cycle_sample() {
-    local revisions rc rejected=0 reasons="" reason after
+    local revisions rc rejected=0 reasons="" reason after deadline
     local timeout=$((2 * EVAL_INTERVAL + CYCLE_WAIT_MARGIN_SECONDS))
 
     revisions="$(cut -d, -f2 "$RUN_DIR/expected" | LC_ALL=C sort -u | tr '\n' ' ')"
@@ -1525,10 +1646,11 @@ select_cycle_sample() {
     fi
     pass "cycle owned set"
     after="$LOG_BASE"
-    info "owned set verified at $CYCLE_T; waiting up to ${timeout}s for a cycle over $ALERTS_EXPECTED alerts"
+    deadline="$CYCLE_DEADLINE"
+    info "owned set verified at $CYCLE_T; waiting up to $((deadline > SECONDS ? deadline - SECONDS : 0))s, ${timeout}s after T in all, for a cycle over $ALERTS_EXPECTED alerts"
 
     while :; do
-        if ! wait_cycle_line "$after" "$timeout" "$ALERTS_EXPECTED"; then
+        if ! wait_cycle_line "$after" "$deadline" "$ALERTS_EXPECTED"; then
             R_CYCLE_VERDICT="FAIL"
             fail "cycle < 10 s" "no cycle line rendered alerts [$ALERTS_EXPECTED] within ${timeout}s after $CYCLE_T${LOG_PROBE_DETAIL:+; last read: $LOG_PROBE_DETAIL}${reasons:+; rejected: $reasons}"
             return 1
@@ -1570,6 +1692,7 @@ select_cycle_sample() {
                 return 1
             fi
             after="$CYCLE_INDEX"
+            deadline=$((SECONDS + timeout))
             info "nothing re-armed and the owned set verified again; waiting up to ${timeout}s for the next cycle over $ALERTS_EXPECTED alerts after line $after of the window since $CYCLE_T"
             continue
         fi
@@ -1586,7 +1709,8 @@ select_cycle_sample() {
             return 1
         fi
         after="$LOG_BASE"
-        info "owned set verified at $CYCLE_T; waiting up to ${timeout}s for a cycle over $ALERTS_EXPECTED alerts"
+        deadline="$CYCLE_DEADLINE"
+        info "owned set verified at $CYCLE_T; waiting up to $((deadline > SECONDS ? deadline - SECONDS : 0))s, ${timeout}s after T in all, for a cycle over $ALERTS_EXPECTED alerts"
     done
 }
 
@@ -1596,20 +1720,27 @@ select_cycle_sample() {
 # margin per line. A follow-up is clean when its line is clean and the armed set still equals
 # the owned id,revision set after it, and only a clean one fills a slot. After an unclean one,
 # owned alerts missing from the armed set are re-armed. When any was, a new verified window
-# opens at a new T and its first line over ALERTS_EXPECTED alerts is read within two intervals
-# plus the margin. When none was, the owned set is verified again and reading goes on in the
-# same window after the unclean line, so cycles already logged there are the next follow-ups,
-# each read within one interval plus the margin. Recording stops when FOLLOW_UP_CYCLES clean
-# follow-ups are recorded, after MAX_REJECTED_SAMPLES unclean ones, or when a wait times out or
-# the logs, the database or a re-arm fail; the check then fails with the shortfall and its
-# reasons. Sets R_FOLLOW_UPS to the recorded durations and any shortfall.
+# opens at a new T and its first line over ALERTS_EXPECTED alerts is read by that window's
+# deadline, two intervals plus the margin after T, starting with the window's first read, which
+# open_verified_window made. When none was, the owned set is verified again and reading goes on
+# in the same window after the unclean line, so cycles already logged there are the next
+# follow-ups, each read within one interval plus the margin. Every wait discards a read that
+# ends at or after its deadline. Recording stops when FOLLOW_UP_CYCLES clean follow-ups are
+# recorded, after MAX_REJECTED_SAMPLES unclean ones, or when a wait times out or the logs, the
+# database or a re-arm fail; the check then fails with the shortfall and its reasons. Sets
+# R_FOLLOW_UPS to the recorded durations and any shortfall.
 record_follow_ups() {
     local after="$CYCLE_INDEX" wanted="" attempt=0 clean=0 unclean=0 durations="" problems=""
-    local problem rc timeout=$((EVAL_INTERVAL + CYCLE_WAIT_MARGIN_SECONDS))
+    local problem rc deadline="" timeout=$((EVAL_INTERVAL + CYCLE_WAIT_MARGIN_SECONDS))
 
     while [[ $clean -lt $FOLLOW_UP_CYCLES ]]; do
         attempt=$((attempt + 1))
-        if ! wait_cycle_line "$after" "$timeout" "$wanted"; then
+        # A re-armed window set its deadline at its T; any other read counts from now, straight
+        # after the previous line or the check after it.
+        if [[ -z "$deadline" ]]; then
+            deadline=$((SECONDS + timeout))
+        fi
+        if ! wait_cycle_line "$after" "$deadline" "$wanted"; then
             if [[ -n "$wanted" ]]; then
                 problem="no cycle line rendered alerts [$wanted] within ${timeout}s after $CYCLE_T${LOG_PROBE_DETAIL:+; last read: $LOG_PROBE_DETAIL}"
             else
@@ -1621,6 +1752,7 @@ record_follow_ups() {
         fi
         after="$CYCLE_INDEX"
         wanted=""
+        deadline=""
         timeout=$((EVAL_INTERVAL + CYCLE_WAIT_MARGIN_SECONDS))
         parse_cycle_line "$CYCLE_LINE"
         problem=""
@@ -1672,7 +1804,8 @@ record_follow_ups() {
         after="$LOG_BASE"
         wanted="$ALERTS_EXPECTED"
         timeout=$((2 * EVAL_INTERVAL + CYCLE_WAIT_MARGIN_SECONDS))
-        info "owned set verified again at $CYCLE_T; waiting up to ${timeout}s for a cycle over $ALERTS_EXPECTED alerts"
+        deadline="$CYCLE_DEADLINE"
+        info "owned set verified again at $CYCLE_T; waiting up to $((deadline > SECONDS ? deadline - SECONDS : 0))s, ${timeout}s after T in all, for a cycle over $ALERTS_EXPECTED alerts"
     done
 
     if [[ $clean -ge $FOLLOW_UP_CYCLES ]]; then
@@ -1773,9 +1906,12 @@ on_signal() {
     exit 130
 }
 
-# Runs the checks in order. The options, the tool checks and the run directory are handled
-# above, when the file is read.
+# main ARGS...: reads the options, checks the tools and makes the run directory, then installs
+# the traps, whose cleanup needs that directory, and runs the checks in order.
 main() {
+    parse_options "$@"
+    check_tools
+    prepare_run
     trap on_exit EXIT
     trap on_signal INT TERM
 
@@ -1790,7 +1926,8 @@ main() {
     finish
 }
 
-# Sourcing the file defines its functions without running it.
+# Sourcing the file defines its functions and constants without running it: it reads no option,
+# checks no tool, makes no run directory and sets no trap.
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
-    main
+    main "$@"
 fi

@@ -8,6 +8,8 @@ import { User } from "../user"
 import { pageSetup } from "../helpers/common"
 import { logout } from "../helpers/logout"
 import {
+    BoundedPageActions,
+    errorName,
     isPortfolioInsightsEnabled,
     loginWithoutLoggingPassword,
     openPageAndRunOwnedAlert,
@@ -85,11 +87,21 @@ export class PortfolioInsightsAlertVisit implements IVisit {
             return
         }
 
-        logger.info(`Going to EasyTrade frontend at [${this.url.origin}]`)
-        await pageActions.gotoPage(this.url.toString())
+        // Every element action from here on ends at its deadline and
+        // dispatches no click, selection or write after it, so a control that
+        // never scrolls into view cannot hold the visit or the cleanup and
+        // logout after it, and an abandoned action cannot run late.
+        const boundedActions = new BoundedPageActions(pageActions, logger)
 
+        logger.info(`Going to EasyTrade frontend at [${this.url.origin}]`)
+        await boundedActions.gotoPage(this.url.toString())
+
+        // The login writes each credential only into a field whose document
+        // is at this origin, checked in the same step in the page as the
+        // write, so a redirect elsewhere fails the visit with nothing written,
+        // before there is a session to close.
         logger.info(`Logging in as user [${this.user.username}]`)
-        await loginWithoutLoggingPassword(pageActions, this.user)
+        await loginWithoutLoggingPassword(boundedActions, this.user, this.url)
 
         // Logged in from here on, so the session is closed whatever happens.
         // The visit then fails with the first error, or when its own alert
@@ -98,7 +110,7 @@ export class PortfolioInsightsAlertVisit implements IVisit {
         try {
             logger.info("Opening portfolio insights page")
             const outcome = await openPageAndRunOwnedAlert(
-                pageActions,
+                boundedActions,
                 this.url,
                 logger,
                 { fetchFn: this.fetchFn, random: this.random }
@@ -112,7 +124,7 @@ export class PortfolioInsightsAlertVisit implements IVisit {
         }
 
         try {
-            await this.closeSession(pageActions, logger)
+            await this.closeSession(boundedActions, logger)
         } catch (error) {
             if (failure === undefined) {
                 throw error
@@ -126,17 +138,39 @@ export class PortfolioInsightsAlertVisit implements IVisit {
         }
     }
 
-    /** Logs out, and ends the Dynatrace session even when logging out fails. */
+    /**
+     * Logs out, then ends the Dynatrace session, also when logging out failed,
+     * and fails with the first error: the logout's, otherwise the session
+     * end's. A session end that fails after a failed logout is logged at warn,
+     * the message naming only the error's name and the entry carrying the
+     * error object, so neither failure is lost.
+     */
     private async closeSession(
         pageActions: IPageActions,
         logger: Logger
     ): Promise<void> {
         logger.info(`Logging out user [${this.user.username}]`)
+        let logoutFailure: { error: unknown } | undefined
         try {
             await logout(pageActions)
-        } finally {
-            logger.info("Attempting to end dynatrace session")
+        } catch (error) {
+            logoutFailure = { error }
+        }
+
+        logger.info("Attempting to end dynatrace session")
+        try {
             await pageActions.endDtSession()
+        } catch (error) {
+            if (logoutFailure === undefined) {
+                throw error
+            }
+            logger.warn(
+                `Ending the dynatrace session failed after the logout failed: error [${errorName(error)}]`,
+                { error }
+            )
+        }
+        if (logoutFailure !== undefined) {
+            throw logoutFailure.error
         }
     }
 }

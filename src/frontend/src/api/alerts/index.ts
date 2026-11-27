@@ -3,7 +3,7 @@ import {
     getJsonWithSignal,
     InvalidResponseError,
     patchJson,
-    post,
+    postExactStatus,
     postJsonText,
     services,
 } from "../http"
@@ -29,6 +29,14 @@ function isNonEmptyText(value: unknown): value is string {
     return typeof value === "string" && value !== ""
 }
 
+const GUID_PATTERN =
+    /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
+
+/** True for a canonical 8-4-4-4-12 hex GUID string, in either case. */
+function isGuid(value: unknown): value is string {
+    return typeof value === "string" && GUID_PATTERN.test(value)
+}
+
 function isFiniteNumber(value: unknown): value is number {
     return typeof value === "number" && Number.isFinite(value)
 }
@@ -36,7 +44,9 @@ function isFiniteNumber(value: unknown): value is number {
 /**
  * The entry at `path` as an `Alert`, its values unchanged, or an
  * `InvalidResponseError` naming the first field, in contract order, that
- * breaks the broker's `AlertDTO` shape.
+ * breaks the broker's `AlertDTO` shape. The `id` must be the canonical GUID
+ * string the broker writes, so every decoded alert can address the
+ * `{id:guid}` update, delete and acknowledge routes.
  */
 function toAlert(value: unknown, path: string): Alert {
     if (!isJsonObject(value)) throw new InvalidResponseError(path)
@@ -55,7 +65,7 @@ function toAlert(value: unknown, path: string): Alert {
         acknowledged,
         createdAt,
     } = value
-    if (!isNonEmptyText(id)) throw invalid("id")
+    if (!isGuid(id)) throw invalid("id")
     if (!isNonEmptyText(accountId)) throw invalid("accountId")
     if (!isNonEmptyText(instrumentId)) throw invalid("instrumentId")
     if (!isAlertType(type)) throw invalid("type")
@@ -180,11 +190,15 @@ export async function listAlertNotifications(
  * rejects with its message otherwise. Only the token it returns is spliced, so
  * the body is always valid JSON. Resolves with the created alert and that
  * token, the threshold exactly as the body carried it. Only the broker's 201
- * resolves; any other status, 2xx included, rejects with `ApiError`, so
- * nothing reports a create the broker did not confirm.
+ * with an `AlertDTO` body resolves; any other status, 2xx included, rejects
+ * with `ApiError`, a body that is not valid JSON with `MalformedJsonError`,
+ * and one that breaks the alert contract with `InvalidResponseError`, so
+ * nothing reports a create the broker did not confirm. Aborting `signal`
+ * cancels the HTTP request and its body read, as for each alert write below.
  */
 export async function createAlert(
-    req: CreateAlertRequest
+    req: CreateAlertRequest,
+    signal?: AbortSignal
 ): Promise<CreatedAlert> {
     const threshold = validateThreshold(req.type, req.threshold)
     if (!threshold.ok) {
@@ -198,33 +212,59 @@ export async function createAlert(
         direction: req.direction,
     })
     const bodyText = `${head.slice(0, -1)},"threshold":${token}}`
-    const alert = await postJsonText<Alert>(
+    const body = await postJsonText<unknown>(
         `${services.broker()}/alerts`,
         bodyText,
-        201
+        201,
+        signal
     )
-    return { alert, threshold: token }
+    return { alert: toAlert(body, "body"), threshold: token }
 }
 
-/** Enables (re-arming it) or disables an alert; returns this update's state. */
+/**
+ * Enables (re-arming it) or disables an alert; returns this update's state.
+ * Only the broker's 200 with an `AlertDTO` body resolves; any other status,
+ * 2xx included, rejects with `ApiError` before the body is read, a body that
+ * is not valid JSON with `MalformedJsonError`, and one that breaks the alert
+ * contract with `InvalidResponseError`.
+ */
 export async function updateAlertEnabled(
     id: string,
-    enabled: boolean
+    enabled: boolean,
+    signal?: AbortSignal
 ): Promise<Alert> {
-    return await patchJson<Alert>(`${services.broker()}/alerts/${id}`, {
-        enabled,
-    })
+    const body = await patchJson<unknown>(
+        `${services.broker()}/alerts/${id}`,
+        { enabled },
+        200,
+        signal
+    )
+    return toAlert(body, "body")
 }
 
 /**
  * Deletes an alert together with its notification. Only the broker's 204
  * resolves; any other status, 2xx included, rejects with `ApiError`.
  */
-export async function deleteAlert(id: string): Promise<void> {
-    await delExactStatus(`${services.broker()}/alerts/${id}`, 204)
+export async function deleteAlert(
+    id: string,
+    signal?: AbortSignal
+): Promise<void> {
+    await delExactStatus(`${services.broker()}/alerts/${id}`, 204, signal)
 }
 
-/** Acknowledges the notification of the alert's current arming, if any. */
-export async function acknowledgeAlert(id: string): Promise<void> {
-    await post(`${services.broker()}/alerts/${id}/acknowledge`, {})
+/**
+ * Acknowledges the notification of the alert's current arming, if any. The
+ * request is id-only, with no body. Only the broker's 204 resolves; any other
+ * status, 2xx included, rejects with `ApiError`.
+ */
+export async function acknowledgeAlert(
+    id: string,
+    signal?: AbortSignal
+): Promise<void> {
+    await postExactStatus(
+        `${services.broker()}/alerts/${id}/acknowledge`,
+        204,
+        signal
+    )
 }

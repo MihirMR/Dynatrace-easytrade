@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
-# Unit tests for the helpers of scripts/portfolio-insights/perf.sh. perf.sh runs its checks in
-# main(), which it calls only when it is executed. Sourced, it parses its options, checks its
-# tools and makes its run directory, and runs nothing else: no trap, no step. These cases source
-# it and call its functions, and every outside effect is a stub:
+# Unit tests for the helpers of scripts/portfolio-insights/perf.sh. perf.sh does all of its work
+# in main(), which it calls only when it is executed: sourced, it only defines its functions and
+# constants. These cases source it, set its options, tool check and run directory up through its
+# own parse_options, check_tools and prepare_run, as main does before its traps, and call its
+# functions, and every outside effect is a stub:
 #   - docker and curl are shell functions that record each call and answer with canned output,
 #     and timeout is one that records the hard limit perf.sh's hard_timeout gives a Docker call
 #     and runs that call through the docker function, so no container, stack, database or
@@ -14,15 +15,18 @@
 #     client's output, an answer without exactly one readable time row, and the propagation of
 #     the client's exit status;
 #   - sleep advances SECONDS instead of waiting, and date prints one fixed time.
-# Covered: the command line, direct execution running main, exact decimals, the nearest-rank
-# percentile, cycle-line parsing, sample eligibility and bounded log polling, the armed-set
-# query on both dialects including client failures and unexpected answers, the owned-set
-# comparison, re-arming after a rejected sample, alert creation outcomes, and every cleanup and
-# exit path, the bounded start of loadgen included. Covered elsewhere: sourcing that runs
-# nothing and the recording of a created alert by perf-inputs-test.sh; each time-row format
-# read into ARMED_AT and the sample and follow-up selection built on the armed set by
-# perf-cycle-test.sh; the insights p95 measurement by perf-insights-test.sh; hard_timeout and
-# broker_logs themselves by harness-test.sh.
+# Covered: the command line, direct execution running main, sourcing that runs nothing, exact
+# decimals, the nearest-rank percentile, cycle-line parsing, sample eligibility, bounded log
+# polling and the held window read it parses first, the armed-set query on both dialects
+# including client failures and unexpected
+# answers, the owned-set comparison, re-arming after a rejected sample, alert creation outcomes,
+# setup's readiness wait against its deadline, the time limit of every request, which no
+# exported variable changes, and every cleanup and exit path, the bounded start of loadgen
+# included. Covered elsewhere: the recording of a created alert by
+# perf-inputs-test.sh; each time-row format read into ARMED_AT and the sample and follow-up
+# selection built on the armed set by perf-cycle-test.sh; the insights p95 measurement by
+# perf-insights-test.sh; hard_timeout and broker_logs themselves by harness-test.sh; a log read
+# that ends after its wait's deadline by harness-test.sh and perf-cycle-test.sh.
 #
 # Usage: scripts/portfolio-insights/perf-test.sh
 #   --help  Show this help and exit
@@ -87,8 +91,8 @@ COMPOSE_PREFIX="${COMPOSE_ARGS[*]}"
 CONNECT_ERROR="curl: (7) Failed to connect to localhost port 80"
 
 # ---------------------------------------------------------------------------------------------
-# Stubs. docker, curl and timeout are defined before perf.sh is sourced, because its tool check
-# runs then. Like the helpers below they use builtins only: every fork is slow under Git Bash.
+# Stubs. docker, curl and timeout are defined before load_perf runs perf.sh's tool check, which
+# looks for them. Like the helpers below they use builtins only: every fork is slow under Git Bash.
 
 STUB_EXEC_OUT=""
 STUB_EXEC_ERR=""
@@ -98,11 +102,12 @@ STUB_LOG_POLLS=0
 STUB_START_RC=0
 STUB_SIGNAL_PID=""
 STUB_TIMEOUT_RC=""
+STUB_RUNNING_SERVICES=""
 
 # reset_stubs: empty call records and default answers.
 reset_stubs() {
     local file
-    for file in docker.calls logs.calls requests responses sleeps exec.args timeouts; do
+    for file in docker.calls logs.calls requests responses sleeps exec.args timeouts max-times; do
         : >"$STUB/$file"
     done
     STUB_EXEC_OUT=""
@@ -113,6 +118,7 @@ reset_stubs() {
     STUB_START_RC=0
     STUB_SIGNAL_PID=""
     STUB_TIMEOUT_RC=""
+    STUB_RUNNING_SERVICES=""
 }
 
 # The program files docker and curl, ahead of the real ones on PATH, record each call in
@@ -136,9 +142,10 @@ export PATH="$TEST_TMP/bin:$PATH"
 # must be `compose -p P -f F <command> ...`: exec writes the MSYS_NO_PATHCONV value it ran with
 # and its arguments, one per line, to exec.args and answers STUB_EXEC_OUT, STUB_EXEC_ERR and
 # STUB_EXEC_RC; the Nth logs call prints logs.N, capped at STUB_LOG_POLLS, and exits
-# STUB_LOGS_RC; start and stop exit STUB_START_RC.
+# STUB_LOGS_RC; start and stop exit STUB_START_RC; `ps --status running --services` lists the
+# words of STUB_RUNNING_SERVICES, one per line, none when it is empty or unset.
 docker() {
-    local calls=() n line
+    local calls=() n line services=()
     if [[ "$*" == "compose version" ]]; then
         return 0
     fi
@@ -176,6 +183,16 @@ docker() {
         start | stop)
             return "$STUB_START_RC"
             ;;
+        ps)
+            if [[ "${*:7}" != "--status running --services" ]]; then
+                echo "docker stub: unexpected compose command: $*" >&2
+                return 97
+            fi
+            read -ra services <<<"${STUB_RUNNING_SERVICES:-}"
+            if [[ ${#services[@]} -gt 0 ]]; then
+                printf '%s\n' "${services[@]}"
+            fi
+            ;;
         *)
             echo "docker stub: unexpected compose command: $*" >&2
             return 97
@@ -210,9 +227,11 @@ timeout() {
 # responses, "RC<TAB>STATUS<TAB>PAYLOAD". RC 0 writes PAYLOAD as the body and prints what
 # -w '%{http_code} %{content_type}' prints; any other RC prints PAYLOAD as curl's error and
 # fails with RC. A request without a queued answer fails as a transport error. With
-# STUB_SIGNAL_PID set, that process gets SIGTERM while the request is in flight.
+# STUB_SIGNAL_PID set, that process gets SIGTERM while the request is in flight. Each request's
+# --max-time value goes, one per line, to max-times.
 curl() {
     local method="GET" body_file="" data="" url="" sent=() answers=() response rc status payload
+    local max_time=""
     while [[ $# -gt 0 ]]; do
         case "$1" in
             -X)
@@ -227,7 +246,11 @@ curl() {
                 data="$2"
                 shift 2
                 ;;
-            -D | -H | -w | --max-time)
+            --max-time)
+                max_time="$2"
+                shift 2
+                ;;
+            -D | -H | -w)
                 shift 2
                 ;;
             -*)
@@ -240,6 +263,7 @@ curl() {
         esac
     done
     printf '%s %s%s\n' "$method" "$url" "${data:+ $data}" >>"$STUB/requests"
+    echo "$max_time" >>"$STUB/max-times"
     if [[ -n "$STUB_SIGNAL_PID" ]]; then
         kill -TERM "$STUB_SIGNAL_PID"
     fi
@@ -278,13 +302,17 @@ slurp() {
     done
 }
 
-# Loads perf.sh: its options are parsed, its tools checked and a run directory made. Sourced,
-# perf.sh does not call main, so it sets no trap and runs no step. Every assignment perf.sh
-# makes at its top level is global, so sourcing it from a function defines the same state as
-# sourcing it here.
+# Loads perf.sh and sets up the state main sets before its traps: perf.sh's own parse_options,
+# check_tools and prepare_run read the fixture's options, check the stubbed tools and make a run
+# directory under TMPDIR. Sourced, perf.sh does not call main, so it sets no trap and runs no
+# step. Every assignment perf.sh makes at its top level or in those functions is global, so
+# loading it from a function defines the same state as loading it here.
 load_perf() {
     # shellcheck source-path=SCRIPTDIR source=perf.sh
-    source "$PERF_SH" --project unit-test --compose-file compose.dev.yaml
+    source "$PERF_SH"
+    parse_options --project unit-test --compose-file compose.dev.yaml
+    check_tools
+    prepare_run
 }
 
 reset_stubs
@@ -344,6 +372,7 @@ fresh_state() {
     REARM_ERROR=""
     CREATE_ERROR=""
     LOG_SINCE="2026-01-01T00:00:00Z"
+    WINDOW_READ_HELD=0
     CYCLE_INDEX=""
     CYCLE_LINE=""
     SECONDS=0
@@ -446,6 +475,11 @@ command_row() {
 
 command_line_case() {
     command_row "--help" 0 out "Usage: scripts/portfolio-insights/perf.sh --project NAME" --help
+    command_row "-h" 0 out "  -h, --help           Show this help and exit" -h
+    command_row "--help examples" 0 out \
+        $'Examples:\n  scripts/portfolio-insights/perf.sh --project pi-dev-postgres\n' --help
+    command_row "--help exit statuses" 0 out \
+        "Exit: 0 all passed, 1 a check failed, 2 bad usage, missing tool or no run dir, 130 interrupted." --help
     command_row "no arguments" 2 err "Option --project is required."
     command_row "unknown option" 2 err "Unknown option: --bogus" --project unit-test --bogus
     command_row "--project without a value" 2 err "Option --project requires a value." --project
@@ -457,7 +491,7 @@ command_line_case() {
 }
 
 # Run directly, perf.sh calls main, whose first step, setup's readiness check, asks docker for
-# the running services. The stub knows no such call, so readiness fails, cleanup runs and the
+# the running services. The stub lists none there, so readiness fails, cleanup runs and the
 # run ends with its SUMMARY and status 1, with nothing reached outside the stubs.
 executed_case() {
     local status=0 calls=() out=()
@@ -473,6 +507,152 @@ executed_case() {
     expect "first docker call" "$COMPOSE_PREFIX ps --status running --services" "${calls[0]:-}"
     if [[ "${out[${#out[@]} - 1]:-}" != "SUMMARY "* ]]; then
         case_reasons+=("last line [${out[${#out[@]} - 1]:-}] is not a SUMMARY")
+    fi
+}
+
+# sourced_row ROW CALLER_ARGS SOURCE_ARGS: sources perf.sh with the words of SOURCE_ARGS in a
+# subshell whose positional parameters are the words of CALLER_ARGS. That subshell has no trap,
+# none of perf.sh's option and URL variables, a TMPDIR of its own, and docker and curl functions
+# that only record their calls. Sourcing must return 0 and print nothing, and leave the
+# positional parameters, the traps, those variables, RUN_DIR and TMPDIR as they were, with no
+# docker or curl call.
+sourced_row() {
+    local row="$1" caller=() sourced=() status=0
+    local source_tmp="$RUN_DIR/sourced-tmp" call_log="$RUN_DIR/sourced.calls"
+    local report="$RUN_DIR/sourced.report"
+    read -ra caller <<<"$2"
+    read -ra sourced <<<"$3"
+    rm -rf "$source_tmp" "$report"
+    mkdir "$source_tmp"
+    : >"$call_log"
+    (
+        trap - EXIT INT TERM
+        unset BASE_URL COMPOSE_FILE PROJECT FLAG_URL ALERTS_URL INSIGHTS_URL
+        # shellcheck disable=SC2329 # Called only when sourcing perf.sh runs its code.
+        docker() {
+            echo "docker $*" >>"$call_log"
+            return 1
+        }
+        # shellcheck disable=SC2329 # Called only when sourcing perf.sh runs its code.
+        curl() {
+            echo "curl $*" >>"$call_log"
+            return 7
+        }
+        export TMPDIR="$source_tmp"
+        set -- "${caller[@]}"
+        sourced_status=0
+        # shellcheck source=/dev/null # The linter reads perf.sh through load_perf.
+        source "$PERF_SH" "${sourced[@]}" || sourced_status=$?
+        set_names=""
+        for name in BASE_URL COMPOSE_FILE PROJECT FLAG_URL ALERTS_URL INSIGHTS_URL; do
+            if [[ -v "$name" ]]; then
+                set_names="$set_names $name"
+            fi
+        done
+        {
+            echo "status $sourced_status"
+            echo "positional parameters [$*]"
+            echo "traps [$(trap -p EXIT INT TERM)]"
+            echo "variables set [${set_names# }]"
+            echo "run dir [$RUN_DIR]"
+        } >"$report"
+    ) >"$RUN_DIR/child.out" 2>"$RUN_DIR/child.err" </dev/null || status=$?
+    expect "$row: subshell status" 0 "$status"
+    expect_file "$row: state after sourcing" "$report" "status 0" "positional parameters [$2]" \
+        "traps []" "variables set []" "run dir [$RUN_DIR]"
+    slurp "$RUN_DIR/child.out"
+    expect "$row: stdout" "" "$REPLY"
+    slurp "$RUN_DIR/child.err"
+    expect "$row: stderr" "" "$REPLY"
+    slurp "$call_log"
+    expect "$row: docker and curl calls" "" "$REPLY"
+    expect "$row: entries made under TMPDIR" "" "$(compgen -G "$source_tmp/*" || true)"
+}
+
+# Sourced, perf.sh only defines its functions and constants: it reads neither the arguments
+# given to source nor the caller's own positional parameters, and consumes neither.
+sourced_case() {
+    sourced_row "arguments to source" "caller-1 caller-2" "--project x --bogus"
+    sourced_row "the caller's arguments" "--project x --bogus" ""
+}
+
+# capture_exit COMMAND...: runs COMMAND in a subshell, since it may exit, with its output in
+# child.out and child.err, and sets OUTCOME to "rc=STATUS" followed by its stderr, if any.
+capture_exit() {
+    local rc=0
+    ("$@") >"$RUN_DIR/child.out" 2>"$RUN_DIR/child.err" </dev/null || rc=$?
+    slurp "$RUN_DIR/child.err"
+    OUTCOME="rc=$rc${REPLY:+ $REPLY}"
+}
+
+# without_programs COMMAND...: runs COMMAND with a PATH that names no directory, so of the
+# tools check_tools looks for only the docker, curl and timeout functions are found.
+without_programs() {
+    local PATH="$TEST_TMP/no-such-directory"
+    "$@"
+}
+
+# compose_plugin_failing COMMAND...: runs COMMAND with a docker that fails every call, as
+# docker compose version fails without the plugin. Call it only through capture_exit, whose
+# subshell keeps the stub docker of every other case.
+compose_plugin_failing() {
+    # shellcheck disable=SC2329 # Called by check_tools, which COMMAND runs.
+    docker() {
+        return 1
+    }
+    "$@"
+}
+
+check_tools_case() {
+    capture_exit check_tools
+    expect "every tool found" "rc=0" "$OUTCOME"
+    capture_exit without_programs check_tools
+    expect "bash and jq not on PATH" "rc=2 Missing required tools: bash jq" "$OUTCOME"
+    capture_exit compose_plugin_failing check_tools
+    expect "compose plugin failing" \
+        "rc=2 The docker compose plugin is required (docker compose version failed)." "$OUTCOME"
+}
+
+# with_tmpdir DIR COMMAND...: runs COMMAND with TMPDIR set to DIR.
+with_tmpdir() {
+    local TMPDIR="$1"
+    shift
+    "$@"
+}
+
+# prepared_run: prepare_run, then prints the run directory, the three request URLs and one
+# "NAME empty" or "NAME not empty" line per entry of the run directory.
+prepared_run() {
+    local entry
+    prepare_run
+    printf '%s\n' "$RUN_DIR" "$FLAG_URL" "$ALERTS_URL" "$INSIGHTS_URL"
+    for entry in "$RUN_DIR"/*; do
+        if [[ -s "$entry" ]]; then
+            echo "${entry##*/} not empty"
+        else
+            echo "${entry##*/} empty"
+        fi
+    done
+}
+
+prepare_run_case() {
+    local tmp="$RUN_DIR/prepare-tmp" missing="$RUN_DIR/no-such-tmp" lines=() got
+    rm -rf "$tmp"
+    mkdir "$tmp"
+    capture_exit with_tmpdir "$tmp" prepared_run
+    expect "TMPDIR that exists: status and stderr" "rc=0" "$OUTCOME"
+    mapfile -t lines <"$RUN_DIR/child.out"
+    if [[ ! "${lines[0]:-}" =~ ^"$tmp"/pi-perf\.[[:alnum:]]{6}$ ]]; then
+        case_reasons+=("TMPDIR that exists: run directory [${lines[0]:-}] is not $tmp/pi-perf.XXXXXX")
+    fi
+    joined "${lines[@]:1}"
+    got="$REPLY"
+    joined "$FLAG_ENDPOINT" "$ALERTS_ENDPOINT" "http://localhost/broker-service/v1/portfolio/insights" \
+        "deleted empty" "expected empty" "owned empty"
+    expect "TMPDIR that exists: URLs and run directory entries" "$REPLY" "$got"
+    capture_exit with_tmpdir "$missing" prepare_run
+    if [[ "$OUTCOME" != "rc=2 "* || "$OUTCOME" != *"Could not create a run directory under $missing." ]]; then
+        case_reasons+=("TMPDIR that does not exist: expected status 2 naming it, got [$OUTCOME]")
     fi
 }
 
@@ -663,7 +843,7 @@ wait_after_case() {
     cycle_text 1000 0 0 0 completed 900
     c900="$REPLY"
     log_poll 1 "$INSIGHTS_TEXT" "$c700" "$CANCELLED_TEXT" "$c800" "$INSIGHTS_TEXT" "$c812" "$c900"
-    wait_cycle_line 2 60 >"$TEST_OUT" || rc=$?
+    wait_cycle_line 2 "$((SECONDS + 60))" >"$TEST_OUT" || rc=$?
     expect "status" 0 "$rc"
     expect "index" 3 "$CYCLE_INDEX"
     expect "line" "$c812" "$CYCLE_LINE"
@@ -681,7 +861,7 @@ wait_other_count_case() {
     log_poll 1 "$c40"
     log_poll 2 "$c40" "$c960"
     log_poll 3 "$c40" "$c960" "$c1000"
-    wait_cycle_line 0 60 1000 >"$TEST_OUT" || rc=$?
+    wait_cycle_line 0 "$((SECONDS + 60))" 1000 >"$TEST_OUT" || rc=$?
     expect "status" 0 "$rc"
     expect "index" 3 "$CYCLE_INDEX"
     expect_file "reports" "$TEST_OUT" \
@@ -699,7 +879,7 @@ deadline_row() {
     STUB_LOGS_RC="$4"
     shift 4
     log_poll 1 "$@"
-    wait_cycle_line "$after" 10 "$wanted" >"$TEST_OUT" || rc=$?
+    wait_cycle_line "$after" "$((SECONDS + 10))" "$wanted" >"$TEST_OUT" || rc=$?
     count_lines "$STUB/logs.calls"
     polls="$REPLY"
     mapfile -t steps <"$STUB/sleeps"
@@ -716,6 +896,34 @@ wait_deadline_case() {
     deadline_row "only another alert count" 0 1000 0 "$REPLY"
     deadline_row "no cycle line" 0 "" 0 "$INSIGHTS_TEXT" "$CANCELLED_TEXT"
     deadline_row "logs unreadable" 0 1000 1
+}
+
+# held_row ROW HELD EXPECTED: a 10 s wait over 1000 alerts while broker.log holds the window read
+# open_verified_window made (WINDOW_READ_HELD 1), the cleaned line HELD, and the first logs call
+# would print a clean 900 ms cycle. EXPECTED is the status, the line found, the logs calls, the
+# seconds slept and the hold left: the held read is parsed before any logs call, and is used up.
+held_row() {
+    local rc=0 polls c900
+    fresh_state
+    cycle_text 1000 0 0 0 completed 900
+    c900="$REPLY"
+    log_poll 1 "$c900"
+    printf '%s\n' "$2" >"$RUN_DIR/broker.log"
+    WINDOW_READ_HELD=1
+    wait_cycle_line 0 "$((SECONDS + 10))" 1000 >"$TEST_OUT" || rc=$?
+    count_lines "$STUB/logs.calls"
+    polls="$REPLY"
+    expect "$1" "$3" "rc=$rc line=$CYCLE_LINE polls=$polls elapsed=$SECONDS held=$WINDOW_READ_HELD"
+}
+
+wait_held_read_case() {
+    local c812 c900
+    cycle_text 1000 0 0 0 completed 812
+    c812="$REPLY"
+    cycle_text 1000 0 0 0 completed 900
+    c900="$REPLY"
+    held_row "qualifying line in the held read" "$c812" "rc=0 line=$c812 polls=0 elapsed=0 held=0"
+    held_row "no cycle line in the held read" "$INSIGHTS_TEXT" "rc=0 line=$c900 polls=1 elapsed=5 held=0"
 }
 
 # ---------------------------------------------------------------------------------------------
@@ -1467,10 +1675,176 @@ resolve_interval_case() {
 }
 
 # ---------------------------------------------------------------------------------------------
+# Setup readiness
+
+# readiness_row ROW TIMES STATUSES EXPECTED: runs setup in a subshell with every required
+# service running. The Nth readyz request answers status word N of STATUSES and takes word N of
+# TIMES in seconds, 0 past its last word, whatever its --max-time. curl runs inside
+# http_within's command substitution, where a change to SECONDS never reaches setup, so
+# http_within itself, which readyz and http both call, is wrapped to move the clock on.
+# EXPECTED is "LINE|max-times L...|sleeps S...|requests N|elapsed E": the readiness check line,
+# each request's --max-time, each sleep, the request count and SECONDS when the subshell exits.
+# setup ends through abort at the runtime facts check at the latest, since the stub knows no
+# container id.
+readiness_row() {
+    local row="$1" times=() statuses=() status limits=() steps=() line readiness="" requests
+    fresh_state
+    : >"$STUB/elapsed"
+    read -ra times <<<"$2"
+    read -ra statuses <<<"$3"
+    for status in "${statuses[@]}"; do
+        respond 0 "$status" '{"status":"Healthy"}'
+    done
+    STUB_RUNNING_SERVICES="$REQUIRED_SERVICES"
+    (
+        trap 'echo "$SECONDS" >"$STUB/elapsed"' EXIT
+        eval "perf_$(declare -f http_within)"
+        request=0
+        http_within() {
+            perf_http_within "$@"
+            SECONDS=$((SECONDS + ${times[request]:-0}))
+            request=$((request + 1))
+        }
+        setup
+    ) >"$TEST_OUT" 2>&1 || true
+    while IFS= read -r line; do
+        if [[ "$line" == "PASS readiness" || "$line" == "FAIL readiness: "* ]]; then
+            readiness="$line"
+        fi
+    done <"$TEST_OUT"
+    mapfile -t limits <"$STUB/max-times"
+    mapfile -t steps <"$STUB/sleeps"
+    count_lines "$STUB/requests"
+    requests="$REPLY"
+    slurp "$STUB/elapsed"
+    expect "$row" "$4" \
+        "$readiness|max-times ${limits[*]}|sleeps ${steps[*]}|requests $requests|elapsed $REPLY"
+}
+
+# With READY_TIMEOUT_SECONDS 300, READY_STEP_SECONDS 5 and HTTP_TIMEOUT_SECONDS 15: a pair that
+# answers 200 by the deadline passes; one answered after it fails; a probe gets only the time
+# left; no probe starts, and no sleep ends, at or after the deadline.
+readiness_case() {
+    readiness_row "both 200 at once" "" "200 200" \
+        "PASS readiness|max-times 15 15|sleeps |requests 2|elapsed 0"
+    readiness_row "both 200, the second after the deadline" "0 0 285 20" "503 503 200 200" \
+        "FAIL readiness: broker-service and feature-flag-service readyz gave status 200 only 10s after the 300s deadline|max-times 15 15 15 10|sleeps 5|requests 4|elapsed 310"
+    readiness_row "deadline reached by the first probe of a pair" "0 0 295" "503 503 200" \
+        "FAIL readiness: after 300s broker-service readyz gave status 200, feature-flag-service readyz gave no answer (not probed: no time left before the deadline)|max-times 15 15 15|sleeps 5|requests 3|elapsed 300"
+    readiness_row "503 until the deadline" "0 0 280" "503 503 503 503 503 503 503 503" \
+        "FAIL readiness: after 300s broker-service readyz gave status 503, feature-flag-service readyz gave status 503|max-times 15 15 15 15 10 10 5 5|sleeps 5 5 5|requests 8|elapsed 295"
+}
+
+# ---------------------------------------------------------------------------------------------
+# Request time limits
+
+# Names a caller's environment could hold for a request's limit: the override perf.sh's http
+# once read from its caller's scope, and http_within's own local. None of them may reach a
+# request; executed, perf.sh's own HTTP_TIMEOUT_SECONDS must not be replaced either.
+LIMIT_VARIABLES=(HTTP_MAX_TIME max_time)
+HEALTHY='{"status":"Healthy"}'
+
+# Sourced: with every name of LIMIT_VARIABLES exported as 0, an owned alert's DELETE and
+# cleanup_all's flag restore keep HTTP_TIMEOUT_SECONDS, and each readyz probe takes the lesser
+# of that and the time left to its deadline: 40 and 7 seconds. Executed: perf.sh as its own
+# process, with HTTP_TIMEOUT_SECONDS also exported as 0 and every required service running,
+# probes both readyz with its own 15 seconds; setup then ends at the runtime facts check, since
+# the stub knows no container id.
+limit_variables_case() {
+    local name id status=0 out=() line readiness=""
+    alert_id 1
+    id="$REPLY"
+    own 1
+    FLAG_TOUCHED=1
+    FLAG_INITIAL=false
+    : >"$RUN_DIR/ready-answers"
+    respond 0 204
+    respond 0 200 "$FLAG_OFF"
+    respond 0 200 "$HEALTHY"
+    respond 0 200 "$HEALTHY"
+    (
+        for name in "${LIMIT_VARIABLES[@]}"; do
+            export "$name=0"
+        done
+        delete_owned_alerts
+        cleanup_all
+        # fresh_state set SECONDS to 0, and no stub here advances it.
+        readyz broker-service 40
+        echo "$READY_ANSWER" >>"$RUN_DIR/ready-answers"
+        readyz feature-flag-service 7
+        echo "$READY_ANSWER" >>"$RUN_DIR/ready-answers"
+    ) >"$TEST_OUT" 2>&1 || status=$?
+    expect "sourced: subshell status" 0 "$status"
+    expect_file "sourced: requests" "$STUB/requests" "DELETE $ALERTS_ENDPOINT/$id" \
+        "PUT $FLAG_ENDPOINT {\"enabled\": false}" "GET http://localhost/broker-service/readyz" \
+        "GET http://localhost/feature-flag-service/readyz"
+    expect_file "sourced: limits" "$STUB/max-times" 15 15 15 7
+    expect_file "sourced: readyz answers" "$RUN_DIR/ready-answers" "status 200" "status 200"
+
+    fresh_state
+    respond 0 200 "$HEALTHY"
+    respond 0 200 "$HEALTHY"
+    status=0
+    (
+        for name in "${LIMIT_VARIABLES[@]}" HTTP_TIMEOUT_SECONDS; do
+            export "$name=0"
+        done
+        export STUB_EXEC_OUT STUB_EXEC_ERR STUB_EXEC_RC STUB_LOGS_RC STUB_LOG_POLLS \
+            STUB_START_RC STUB_TIMEOUT_RC
+        export -f docker curl timeout
+        STUB_SIGNAL_PID="" STUB_RUNNING_SERVICES="$REQUIRED_SERVICES" \
+            "$BASH" "$PERF_SH" --project unit-test --compose-file compose.dev.yaml
+    ) >"$RUN_DIR/child.out" 2>"$RUN_DIR/child.err" </dev/null || status=$?
+    expect "executed: exit status" 1 "$status"
+    mapfile -t out <"$RUN_DIR/child.out"
+    for line in "${out[@]}"; do
+        if [[ "$line" == "PASS readiness" || "$line" == "FAIL readiness: "* ]]; then
+            readiness="$line"
+        fi
+    done
+    expect "executed: readiness" "PASS readiness" "$readiness"
+    expect_file "executed: requests" "$STUB/requests" "GET http://localhost/broker-service/readyz" \
+        "GET http://localhost/feature-flag-service/readyz"
+    expect_file "executed: limits" "$STUB/max-times" 15 15
+}
+
+# refused_limit_row LIMIT: http_within with LIMIT, after an earlier answer, sends nothing and
+# reports why as a transport error, replacing every field of that answer.
+refused_limit_row() {
+    HTTP_STATUS="200"
+    HTTP_CTYPE="application/json"
+    HTTP_BODY="earlier body"
+    HTTP_ERROR=""
+    : >"$STUB/requests"
+    http_within "$1" DELETE "$ALERTS_ENDPOINT/$ALERT_ID"
+    count_lines "$STUB/requests"
+    expect "limit [$1]" \
+        "requests=0 status=000 ctype=[] body=[] transport error (not sent: time limit [$1] is not a whole number of seconds above 0)" \
+        "requests=$REPLY status=$HTTP_STATUS ctype=[$HTTP_CTYPE] body=[$HTTP_BODY] $(status_text)"
+}
+
+# A limit that is not a whole number above 0, 0 above all, which curl takes as no limit, is
+# refused; a whole number above 0 goes to curl as given.
+refused_limit_case() {
+    local limit
+    for limit in 0 00 -5 "" 1.5 15s " 15"; do
+        refused_limit_row "$limit"
+    done
+    : >"$STUB/requests"
+    respond 0 204
+    http_within 1 DELETE "$ALERTS_ENDPOINT/$ALERT_ID"
+    expect "limit [1]: status" 204 "$HTTP_STATUS"
+    expect_file "limit [1]: limits" "$STUB/max-times" 1
+}
+
+# ---------------------------------------------------------------------------------------------
 # Main
 
 run_case "perfSh_commandLine_exitsWithUsageStatus" command_line_case
 run_case "perfSh_executedDirectly_runsMainFlow" executed_case
+run_case "perfSh_sourcedWithArguments_runsNothing" sourced_case
+run_case "checkTools_toolsAndComposePlugin_exitsTwoWhenOneIsMissing" check_tools_case
+run_case "prepareRun_tmpdir_makesRunDirectoryOrExitsTwo" prepare_run_case
 run_case "decToUnits_plainDecimal_roundsHalfAwayFromZero" dec_to_units_case
 run_case "decToUnits_outsideDomain_returnsOne" dec_to_units_rejects_case
 run_case "unitsToDec_integerUnits_printsNormalisedDecimal" units_to_dec_case
@@ -1484,6 +1858,7 @@ run_case "cycleIsClean_cycleFields_cleanOnlyForExpectedCompletedCycle" cycle_is_
 run_case "waitCycleLine_linesAfterBase_returnsFirstLaterCycleAndIndex" wait_after_case
 run_case "waitCycleLine_otherAlertCount_skipsAndReportsEachOnce" wait_other_count_case
 run_case "waitCycleLine_noQualifyingLine_returnsOneAtDeadline" wait_deadline_case
+run_case "waitCycleLine_heldWindowRead_parsedBeforeAnyLogsCall" wait_held_read_case
 run_case "armedSql_dialect_rendersExactQuery" armed_sql_case
 run_case "dbQuery_dialect_sendsContainerClientInvocation" db_query_case
 run_case "readArmedSet_emptyResult_writesEmptySet" read_armed_empty_case
@@ -1513,6 +1888,9 @@ run_case "finish_cleanupOutcome_reportsCleanupAndExitStatus" finish_case
 run_case "abort_failedCheck_failsCheckThenFinishes" abort_case
 run_case "onExit_runEndsEarly_cleansUpOnceAndKeepsFailureStatus" on_exit_case
 run_case "resolveInterval_rawSetting_appliesBrokerRule" resolve_interval_case
+run_case "setup_readyzAnswerTimes_passesOnlyBothAnswersWithinDeadline" readiness_case
+run_case "httpWithin_limitVariablesExported_sendsFixedLimitAndReadyzTimeLeft" limit_variables_case
+run_case "httpWithin_limitNotWholeSecondsAboveZero_returns000WithoutRequest" refused_limit_case
 
 echo "SUMMARY ${t_passed} passed, ${t_failed} failed"
 if [[ $t_failed -ne 0 ]]; then

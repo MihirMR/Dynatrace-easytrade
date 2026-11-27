@@ -1,7 +1,9 @@
 import "@testing-library/jest-dom/vitest"
 import {
+    type MutateOptions,
     QueryClient,
     QueryClientProvider,
+    onlineManager,
     skipToken,
     useQuery,
 } from "@tanstack/react-query"
@@ -19,14 +21,26 @@ import type { PropsWithChildren } from "react"
 import type { MockInstance } from "vitest"
 import type { Alert, CreateAlertRequest } from "../../api/alerts/types"
 import { BizEvents } from "../../api/bizEvents"
+import { ApiError } from "../../api/http"
 import type { Instrument } from "../../api/instrument/types"
 import { AlertsPanel } from "../../components/insights/AlertsPanel"
 import { SESSION_KEY } from "../../contexts/AuthContext/storage"
-import { useCreateAlertMutation } from "../../hooks/useAlerts"
+import {
+    useAcknowledgeAlertMutation,
+    useCreateAlertMutation,
+    useDeleteAlertMutation,
+    useUpdateAlertEnabledMutation,
+} from "../../hooks/useAlerts"
 import { portfolioInsightsQuery } from "../../hooks/usePortfolioInsights"
+import {
+    type FeatureContext,
+    captureFeatureContext,
+    onPortfolioInsightsDisabled,
+} from "../../utils/portfolioInsightsFeature"
 import {
     alertKeys,
     featureFlagKeys,
+    invalidateOnLogout,
     portfolioKeys,
 } from "../../utils/queryKeys"
 import {
@@ -113,8 +127,9 @@ const UPDATE = `PATCH ${BROKER}/alerts/${armedAlert.id}`
 const DELETE = `DELETE ${BROKER}/alerts/${armedAlert.id}`
 const ACKNOWLEDGE = `POST ${BROKER}/alerts/${triggeredAlert.id}/acknowledge`
 
-type StubResponse = { status: number; body?: unknown }
-type Handler = () => StubResponse | Promise<StubResponse>
+/** `text`, when given, is the exact body; otherwise `body` as JSON, if any. */
+type StubResponse = { status: number; body?: unknown; text?: string }
+type Handler = (init?: RequestInit) => StubResponse | Promise<StubResponse>
 type User = ReturnType<typeof userEvent.setup>
 
 /** One mutation as a user starts it, and where the panel shows its state. */
@@ -139,11 +154,14 @@ let createBodies: unknown[] = []
 let releases: (() => void)[] = []
 let createSpy: MockInstance<(typeof BizEvents)["alertCreate"]>
 
-function respond({ status, body }: StubResponse): Response {
-    return new Response(body === undefined ? null : JSON.stringify(body), {
-        status,
-        headers: { "Content-Type": "application/json" },
-    })
+function respond({ status, body, text }: StubResponse): Response {
+    return new Response(
+        text ?? (body === undefined ? null : JSON.stringify(body)),
+        {
+            status,
+            headers: { "Content-Type": "application/json" },
+        }
+    )
 }
 
 function countOf(request: string): number {
@@ -193,7 +211,7 @@ function stubFetch(handlers: Partial<Record<string, Handler>> = {}): void {
             if (handler === undefined) {
                 throw new Error(`Unexpected request ${key}`)
             }
-            return respond(await handler())
+            return respond(await handler(init))
         }
     )
 }
@@ -215,6 +233,38 @@ function hold(response: StubResponse): {
         },
         release,
     }
+}
+
+/**
+ * A request that is never answered: it rejects as `fetch` does once its
+ * signal aborts, and records that signal in `signals`.
+ */
+function heldUntilAborted(signals: (AbortSignal | undefined)[]): Handler {
+    return (init) => {
+        const signal = init?.signal ?? undefined
+        signals.push(signal)
+        return new Promise<StubResponse>((_, reject) => {
+            const abort = (): void =>
+                reject(new DOMException("Aborted", "AbortError"))
+            if (signal?.aborted) {
+                abort()
+                return
+            }
+            signal?.addEventListener("abort", abort, { once: true })
+        })
+    }
+}
+
+function pausedMutationCount(): number {
+    return client
+        .getMutationCache()
+        .getAll()
+        .filter((mutation) => mutation.state.isPaused).length
+}
+
+/** The text of every alert message the page shows. */
+function shownMessages(): (string | null)[] {
+    return screen.queryAllByRole("alert").map((message) => message.textContent)
 }
 
 function elementBySelector(selector: string): HTMLElement {
@@ -387,6 +437,284 @@ const acknowledgeAction: MutationAction = {
     errorRegion: notificationItem,
 }
 
+const mutationActions: [string, MutationAction][] = [
+    ["create", createAction],
+    ["update-enabled", updateAction],
+    ["delete", deleteAction],
+    ["acknowledge", acknowledgeAction],
+]
+
+/** The ways the context a mutation was started in can end. */
+const contextEnds: { boundary: string; end: () => void }[] = [
+    {
+        boundary: "logout",
+        end: () => {
+            sessionStorage.removeItem(SESSION_KEY)
+            invalidateOnLogout(client)
+        },
+    },
+    {
+        boundary: "account switch",
+        end: () => sessionStorage.setItem(SESSION_KEY, "2"),
+    },
+    { boundary: "shutdown", end: () => onPortfolioInsightsDisabled(client) },
+]
+
+/** One alert hook called on its own, and what it shows. */
+type HookCall = {
+    settled: () => boolean
+    messages: () => readonly string[]
+}
+
+const hookCalls: { hook: string; request: string; call: () => HookCall }[] = [
+    {
+        hook: "useCreateAlertMutation",
+        request: CREATE,
+        call: () => {
+            const { result } = renderHook(
+                () => useCreateAlertMutation(ACCOUNT_ID),
+                { wrapper: ClientWrapper }
+            )
+            act(() =>
+                result.current.mutate({
+                    accountId: ACCOUNT_ID,
+                    type: "TARGET_PRICE",
+                    instrumentId: INSTRUMENT_ID,
+                    direction: "ABOVE",
+                    threshold: THRESHOLD_TEXT,
+                })
+            )
+            return {
+                settled: () => result.current.isError,
+                messages: () =>
+                    result.current.errorMessage === null
+                        ? []
+                        : [result.current.errorMessage],
+            }
+        },
+    },
+    {
+        hook: "useUpdateAlertEnabledMutation",
+        request: UPDATE,
+        call: () => {
+            const { result } = renderHook(
+                () => useUpdateAlertEnabledMutation(ACCOUNT_ID),
+                { wrapper: ClientWrapper }
+            )
+            act(() =>
+                result.current.mutate({ id: armedAlert.id, enabled: false })
+            )
+            return {
+                settled: () => result.current.isError,
+                messages: () => Array.from(result.current.rowErrors.values()),
+            }
+        },
+    },
+    {
+        hook: "useDeleteAlertMutation",
+        request: DELETE,
+        call: () => {
+            const { result } = renderHook(
+                () => useDeleteAlertMutation(ACCOUNT_ID),
+                { wrapper: ClientWrapper }
+            )
+            act(() => result.current.mutate(armedAlert.id))
+            return {
+                settled: () => result.current.isError,
+                messages: () => Array.from(result.current.rowErrors.values()),
+            }
+        },
+    },
+    {
+        hook: "useAcknowledgeAlertMutation",
+        request: ACKNOWLEDGE,
+        call: () => {
+            const { result } = renderHook(
+                () => useAcknowledgeAlertMutation(ACCOUNT_ID),
+                { wrapper: ClientWrapper }
+            )
+            act(() => result.current.mutate(triggeredAlert.id))
+            return {
+                settled: () => result.current.isError,
+                messages: () => Array.from(result.current.rowErrors.values()),
+            }
+        },
+    },
+]
+
+/** One per-call callback, with the arguments its caller received. */
+type CallbackRecord = {
+    callback: "onSuccess" | "onError" | "onSettled"
+    data: unknown
+    /** The failure's HTTP status; `null` without a failure. */
+    status: number | null
+    variables: unknown
+    onMutateResult: FeatureContext | undefined
+    /** Whether the last argument names the case's client. */
+    ownClient: boolean
+}
+
+function statusOf(error: Error | null): number | null {
+    return error instanceof ApiError ? error.status : null
+}
+
+/** Per-call options that record every callback into `log`, in order. */
+function recordingOptions<TData, TInput>(
+    log: CallbackRecord[]
+): MutateOptions<TData, Error, TInput, FeatureContext> {
+    return {
+        onSuccess: (data, variables, onMutateResult, context) => {
+            log.push({
+                callback: "onSuccess",
+                data,
+                status: null,
+                variables,
+                onMutateResult,
+                ownClient: context.client === client,
+            })
+        },
+        onError: (error, variables, onMutateResult, context) => {
+            log.push({
+                callback: "onError",
+                data: undefined,
+                status: statusOf(error),
+                variables,
+                onMutateResult,
+                ownClient: context.client === client,
+            })
+        },
+        onSettled: (data, error, variables, onMutateResult, context) => {
+            log.push({
+                callback: "onSettled",
+                data,
+                status: statusOf(error),
+                variables,
+                onMutateResult,
+                ownClient: context.client === client,
+            })
+        },
+    }
+}
+
+const createRequest: CreateAlertRequest = {
+    accountId: ACCOUNT_ID,
+    type: "TARGET_PRICE",
+    instrumentId: INSTRUMENT_ID,
+    direction: "ABOVE",
+    threshold: THRESHOLD_TEXT,
+}
+
+const disableRequest = { id: armedAlert.id, enabled: false }
+
+/** The hook function a call goes through. */
+type CallVia = "mutate" | "mutateAsync"
+
+/** The two call functions of an alert mutation hook, in the caller's terms. */
+type CallFunctions<TData, TInput> = {
+    mutate: (
+        input: TInput,
+        options?: MutateOptions<TData, Error, TInput, FeatureContext>
+    ) => void
+    mutateAsync: (
+        input: TInput,
+        options?: MutateOptions<TData, Error, TInput, FeatureContext>
+    ) => Promise<TData>
+}
+
+/**
+ * Calls `input` through `via` with options recording into `log`. A rejected
+ * `mutateAsync` is left to the log, which records its failure.
+ */
+function callWithRecording<TData, TInput>(
+    hook: CallFunctions<TData, TInput>,
+    via: CallVia,
+    input: TInput,
+    log: CallbackRecord[]
+): void {
+    const options = recordingOptions<TData, TInput>(log)
+    if (via === "mutate") {
+        hook.mutate(input, options)
+        return
+    }
+    hook.mutateAsync(input, options).catch(() => undefined)
+}
+
+/**
+ * One alert hook called through `via` with per-call options recording into
+ * the log, its caller's input, and the data its call resolves with on
+ * success.
+ */
+type PerCallHook = {
+    hook: string
+    request: string
+    input: unknown
+    data: unknown
+    call: (log: CallbackRecord[], via: CallVia) => void
+}
+
+const perCallHooks: PerCallHook[] = [
+    {
+        hook: "useCreateAlertMutation",
+        request: CREATE,
+        input: createRequest,
+        data: { alert: createdAlert, threshold: THRESHOLD_TEXT },
+        call: (log, via) => {
+            const { result } = renderHook(
+                () => useCreateAlertMutation(ACCOUNT_ID),
+                { wrapper: ClientWrapper }
+            )
+            act(() =>
+                callWithRecording(result.current, via, createRequest, log)
+            )
+        },
+    },
+    {
+        hook: "useUpdateAlertEnabledMutation",
+        request: UPDATE,
+        input: disableRequest,
+        data: updateAction.success.body,
+        call: (log, via) => {
+            const { result } = renderHook(
+                () => useUpdateAlertEnabledMutation(ACCOUNT_ID),
+                { wrapper: ClientWrapper }
+            )
+            act(() =>
+                callWithRecording(result.current, via, disableRequest, log)
+            )
+        },
+    },
+    {
+        hook: "useDeleteAlertMutation",
+        request: DELETE,
+        input: armedAlert.id,
+        data: undefined,
+        call: (log, via) => {
+            const { result } = renderHook(
+                () => useDeleteAlertMutation(ACCOUNT_ID),
+                { wrapper: ClientWrapper }
+            )
+            act(() =>
+                callWithRecording(result.current, via, armedAlert.id, log)
+            )
+        },
+    },
+    {
+        hook: "useAcknowledgeAlertMutation",
+        request: ACKNOWLEDGE,
+        input: triggeredAlert.id,
+        data: undefined,
+        call: (log, via) => {
+            const { result } = renderHook(
+                () => useAcknowledgeAlertMutation(ACCOUNT_ID),
+                { wrapper: ClientWrapper }
+            )
+            act(() =>
+                callWithRecording(result.current, via, triggeredAlert.id, log)
+            )
+        },
+    },
+]
+
 describe("Alert mutations", () => {
     beforeEach(() => {
         sessionStorage.setItem(SESSION_KEY, ACCOUNT_ID)
@@ -397,11 +725,16 @@ describe("Alert mutations", () => {
         createSpy = vi
             .spyOn(BizEvents, "alertCreate")
             .mockImplementation(() => undefined)
-        // Every failed mutation logs its full error by design.
+        // Every failed mutation logs its full error by design, and every
+        // discarded one at debug level.
         vi.spyOn(console, "error").mockImplementation(() => undefined)
+        vi.spyOn(console, "debug").mockImplementation(() => undefined)
     })
 
     afterEach(async () => {
+        // Back online while still mounted, so a mutation a failed case left
+        // paused resumes and settles below.
+        act(() => onlineManager.setOnline(true))
         // Unmount first, so a released response refetches nothing.
         cleanup()
         releases.forEach((release) => release())
@@ -499,6 +832,84 @@ describe("Alert mutations", () => {
                 recorded: result.current.created?.thresholdText,
                 sentBodies: createBodies,
             }).toEqual({ recorded: sent, sentBodies: [createBodyWith(sent)] })
+        }
+    )
+
+    // The hook's own `mutateAsync` and `variables` speak the caller's input,
+    // not the context-carrying shape the mutation runs on.
+    it("useCreateAlertMutation_mutateAsync_resolvesCreateWithCallerInput", async () => {
+        stubFetch()
+        const { result } = renderHook(
+            () => useCreateAlertMutation(ACCOUNT_ID),
+            { wrapper: ClientWrapper }
+        )
+        const request: CreateAlertRequest = {
+            accountId: ACCOUNT_ID,
+            type: "TARGET_PRICE",
+            instrumentId: INSTRUMENT_ID,
+            direction: "ABOVE",
+            threshold: THRESHOLD_TEXT,
+        }
+
+        let created: unknown
+        await act(async () => {
+            created = await result.current.mutateAsync(request)
+        })
+
+        expect({ created, variables: result.current.variables }).toEqual({
+            created: { alert: createdAlert, threshold: THRESHOLD_TEXT },
+            variables: request,
+        })
+    })
+
+    // A call's own callbacks receive the caller's input, not the write the
+    // mutation runs on, the context captured at that call as its
+    // `onMutateResult`, and their other arguments unchanged.
+    it.each(
+        perCallHooks.flatMap((hookCall) =>
+            (["mutate", "mutateAsync"] as const).flatMap((via) => [
+                { ...hookCall, via, outcome: "success", status: null },
+                { ...hookCall, via, outcome: "failure", status: 500 },
+            ])
+        )
+    )(
+        "alertMutation_perCallCallbacks_receiveCallerInputAndCallContext ($hook, $via, $outcome)",
+        async ({ request, input, data, call, via, status }) => {
+            stubFetch(status === null ? {} : { [request]: () => ({ status }) })
+            const log: CallbackRecord[] = []
+            const ctx = captureFeatureContext()
+
+            call(log, via)
+            await waitFor(() =>
+                expect(log[log.length - 1]?.callback).toBe("onSettled")
+            )
+
+            const received = {
+                variables: input,
+                onMutateResult: ctx,
+                ownClient: true,
+            }
+            expect(log).toEqual(
+                status === null
+                    ? [
+                          { callback: "onSuccess", data, status, ...received },
+                          { callback: "onSettled", data, status, ...received },
+                      ]
+                    : [
+                          {
+                              callback: "onError",
+                              data: undefined,
+                              status,
+                              ...received,
+                          },
+                          {
+                              callback: "onSettled",
+                              data: undefined,
+                              status,
+                              ...received,
+                          },
+                      ]
+            )
         }
     )
 
@@ -698,9 +1109,10 @@ describe("Alert mutations", () => {
         }
     )
 
-    // A 2xx other than the specified 201 or 204 confirms nothing, even with
-    // an alert-shaped body.
-    it.each<[string, MutationAction, StubResponse, string]>([
+    // A 2xx other than the specified 201, 200 or 204 confirms nothing, even
+    // with an alert-shaped body, and neither does the specified status with
+    // a body that is not a valid alert.
+    it.each<[string, MutationAction, StubResponse, string | null]>([
         [
             "create 200",
             createAction,
@@ -714,6 +1126,37 @@ describe("Alert mutations", () => {
             "output#alert-created-id",
         ],
         [
+            "create 201 without id",
+            createAction,
+            { status: 201, body: { ...createdAlert, id: undefined } },
+            "output#alert-created-id",
+        ],
+        [
+            "create 201 malformed JSON",
+            createAction,
+            { status: 201, text: `<${createdAlert.id}` },
+            "output#alert-created-id",
+        ],
+        [
+            "update-enabled 202",
+            updateAction,
+            { status: 202, body: { ...armedAlert, enabled: false } },
+            null,
+        ],
+        ["update-enabled 204", updateAction, { status: 204 }, null],
+        [
+            "update-enabled 200 without id",
+            updateAction,
+            { status: 200, body: { ...armedAlert, id: undefined } },
+            null,
+        ],
+        [
+            "update-enabled 200 malformed JSON",
+            updateAction,
+            { status: 200, text: "<not json>" },
+            null,
+        ],
+        [
             "delete 200",
             deleteAction,
             { status: 200, body: armedAlert },
@@ -725,21 +1168,28 @@ describe("Alert mutations", () => {
             { status: 202, body: armedAlert },
             "output#alert-deleted-id",
         ],
+        ["acknowledge 200", acknowledgeAction, { status: 200, body: {} }, null],
+        ["acknowledge 202", acknowledgeAction, { status: 202 }, null],
     ])(
-        "alertMutation_unexpectedSuccessStatus_showsGenericMessageWithoutConfirmation (%s)",
+        "alertMutation_unconfirmedReply_showsGenericMessageWithoutConfirmation (%s)",
         async (_label, action, response, outputSelector) => {
             stubFetch({ [action.request]: () => response })
             const user = userEvent.setup({ delay: null })
             const { container } = renderPanel(client)
             await waitForInitialLoad()
+            const readsBefore = countOf(LIST) + countOf(NOTIFICATIONS)
 
             await action.start(user)
             await within(action.errorRegion()).findByText(GENERIC_MESSAGE)
 
             expect({
-                output: container.querySelector(outputSelector),
+                output:
+                    outputSelector === null
+                        ? null
+                        : container.querySelector(outputSelector),
                 events: createSpy.mock.calls.length,
-            }).toEqual({ output: null, events: 0 })
+                refetches: countOf(LIST) + countOf(NOTIFICATIONS) - readsBefore,
+            }).toEqual({ output: null, events: 0, refetches: 0 })
         }
     )
 
@@ -821,4 +1271,213 @@ describe("Alert mutations", () => {
             })
         }
     )
+
+    // The logged error names its endpoint by template, while the original,
+    // whose URL names the alert, still decides the message shown.
+    it.each<[string, MutationAction, number, string, string, string]>([
+        [
+            "create 500",
+            createAction,
+            500,
+            GENERIC_MESSAGE,
+            "[useCreateAlertMutation] failed",
+            "/broker-service/v1/alerts",
+        ],
+        [
+            "update-enabled 404",
+            updateAction,
+            404,
+            ROW_NOT_FOUND_MESSAGE,
+            "[useUpdateAlertEnabledMutation] failed",
+            "/broker-service/v1/alerts/{id}",
+        ],
+        [
+            "delete 404",
+            deleteAction,
+            404,
+            ROW_NOT_FOUND_MESSAGE,
+            "[useDeleteAlertMutation] failed",
+            "/broker-service/v1/alerts/{id}",
+        ],
+        [
+            "acknowledge 404",
+            acknowledgeAction,
+            404,
+            ROW_NOT_FOUND_MESSAGE,
+            "[useAcknowledgeAlertMutation] failed",
+            "/broker-service/v1/alerts/{id}/acknowledge",
+        ],
+    ])(
+        "alertMutation_failure_logsEndpointTemplateWithoutAlertId (%s)",
+        async (_label, action, status, shown, logLine, endpoint) => {
+            stubFetch({ [action.request]: () => ({ status }) })
+            const user = userEvent.setup({ delay: null })
+            renderPanel(client)
+            await waitForInitialLoad()
+
+            await action.start(user)
+            await within(action.errorRegion()).findByText(shown)
+
+            const logged = vi
+                .mocked(console.error)
+                .mock.calls.find(([line]) => line === logLine)?.[1] as Error & {
+                status?: number
+                endpoint?: string
+            }
+            const text = `${logged.name}\n${logged.message}\n${logged.stack ?? ""}`
+            expect({
+                name: logged.name,
+                status: logged.status,
+                endpoint: logged.endpoint,
+                message: logged.message,
+                leaked: [armedAlert.id, triggeredAlert.id, BROKER].filter(
+                    (part) => text.includes(part)
+                ),
+            }).toEqual({
+                name: "ApiError",
+                status,
+                endpoint,
+                message: `HTTP ${status} for ${endpoint}`,
+                leaked: [],
+            })
+        }
+    )
+
+    // A mutation started offline waits, paused, before its request. Once its
+    // context has ended, reconnecting must not send it.
+    it.each(
+        mutationActions.flatMap(([label, action]) =>
+            contextEnds.map(({ boundary, end }) => ({
+                label,
+                action,
+                boundary,
+                end,
+            }))
+        )
+    )(
+        "alertMutation_queuedOfflineThenContextEnds_sendsNothingOnReconnect ($label, $boundary)",
+        async ({ action, end }) => {
+            stubFetch()
+            const user = userEvent.setup({ delay: null })
+            renderPanel(client)
+            await waitForInitialLoad()
+            onlineManager.setOnline(false)
+            await action.start(user)
+            await waitFor(() => expect(pausedMutationCount()).toBe(1))
+
+            act(() => end())
+            act(() => onlineManager.setOnline(true))
+            await waitFor(() => expect(client.isMutating()).toBe(0))
+
+            expect({
+                writes: countOf(action.request),
+                messages: shownMessages(),
+            }).toEqual({ writes: 0, messages: [] })
+        }
+    )
+
+    it.each(mutationActions)(
+        "alertMutation_queuedOfflineStillCurrent_sendsOnReconnect (%s)",
+        async (_label, action) => {
+            stubFetch()
+            const user = userEvent.setup({ delay: null })
+            renderPanel(client)
+            await waitForInitialLoad()
+            onlineManager.setOnline(false)
+            await action.start(user)
+            await waitFor(() => expect(pausedMutationCount()).toBe(1))
+
+            act(() => onlineManager.setOnline(true))
+            await waitFor(() => expect(client.isMutating()).toBe(0))
+
+            expect(countOf(action.request)).toBe(1)
+        }
+    )
+
+    // The request is held until its signal aborts, so only an abort ends it.
+    it.each(
+        mutationActions.flatMap(([label, action]) =>
+            contextEnds
+                .filter(({ boundary }) => boundary !== "account switch")
+                .map(({ boundary, end }) => ({ label, action, boundary, end }))
+        )
+    )(
+        "alertMutation_inFlightWhenContextEnds_abortsRequestAndShowsNothing ($label, $boundary)",
+        async ({ action, end }) => {
+            const signals: (AbortSignal | undefined)[] = []
+            stubFetch({ [action.request]: heldUntilAborted(signals) })
+            const user = userEvent.setup({ delay: null })
+            renderPanel(client)
+            await waitForInitialLoad()
+            await action.start(user)
+            await waitFor(() => expect(countOf(action.request)).toBe(1))
+
+            act(() => end())
+            await waitFor(() => expect(client.isMutating()).toBe(0))
+
+            expect({
+                aborted: signals.map((signal) => signal?.aborted),
+                messages: shownMessages(),
+                loggedAbort: vi
+                    .mocked(console.debug)
+                    .mock.calls.some(
+                        ([, logged]) =>
+                            logged instanceof DOMException &&
+                            logged.name === "AbortError"
+                    ),
+            }).toEqual({ aborted: [true], messages: [], loggedAbort: true })
+        }
+    )
+
+    // A write for an account other than the tab's is refused before any
+    // request, and shows no message: not even the generic one.
+    it.each(hookCalls)(
+        "alertMutation_otherAccountSignedIn_sendsNothingAndShowsNoMessage ($hook)",
+        async ({ request, call }) => {
+            stubFetch()
+            sessionStorage.setItem(SESSION_KEY, "2")
+
+            const hook = call()
+            await waitFor(() => expect(hook.settled()).toBe(true))
+
+            expect({
+                writes: countOf(request),
+                messages: hook.messages(),
+            }).toEqual({ writes: 0, messages: [] })
+        }
+    )
+
+    // The body names the input's account, while the tab and the hook are
+    // signed in to another: the create is refused before any request, as a
+    // discarded write that shows, sends and refreshes nothing.
+    it("useCreateAlertMutation_inputForOtherAccount_sendsNothingAndShowsNoMessage", async () => {
+        stubFetch()
+        const { result } = renderHook(
+            () => useCreateAlertMutation(ACCOUNT_ID),
+            { wrapper: ClientWrapper }
+        )
+
+        act(() =>
+            result.current.mutate({
+                accountId: "2",
+                type: "TARGET_PRICE",
+                instrumentId: INSTRUMENT_ID,
+                direction: "ABOVE",
+                threshold: THRESHOLD_TEXT,
+            })
+        )
+        await waitFor(() => expect(result.current.isError).toBe(true))
+
+        expect({
+            requests,
+            created: result.current.created,
+            errorMessage: result.current.errorMessage,
+            events: createSpy.mock.calls.length,
+        }).toEqual({
+            requests: [],
+            created: null,
+            errorMessage: null,
+            events: 0,
+        })
+    })
 })

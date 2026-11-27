@@ -95,10 +95,35 @@ export function currentLogoutCount(): number {
     return logoutCount
 }
 
+const logoutListeners = new Set<() => void>()
+
+/**
+ * Runs `listener` on every later `invalidateOnLogout`, once the logout is
+ * counted and before any query is removed, so work that belongs to the ended
+ * session can be stopped where no query reaches it. Returns the function that
+ * stops listening.
+ */
+export function onLogout(listener: () => void): () => void {
+    logoutListeners.add(listener)
+    return () => {
+        logoutListeners.delete(listener)
+    }
+}
+
 export function invalidateOnLogout(client: QueryClient) {
     // Counted before the removals, so any result checked from here on already
     // belongs to an ended session.
     logoutCount += 1
+    // A failing listener is logged whole rather than propagated (an exception
+    // to the propagate-errors convention): a throw here would stop the
+    // existing logout flow before it removes the ended session's queries.
+    for (const listener of logoutListeners) {
+        try {
+            listener()
+        } catch (error) {
+            console.error("[invalidateOnLogout] logout listener failed", error)
+        }
+    }
     client.removeQueries({ queryKey: transactionKeys.all })
     client.removeQueries({ queryKey: instrumentKeys.all })
     client.removeQueries({ queryKey: userKeys.current })

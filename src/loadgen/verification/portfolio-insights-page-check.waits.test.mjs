@@ -6,7 +6,8 @@
 // together one millisecond at a time. `lag` moves only the clock, as a busy
 // event loop does when it runs a timer late. The live-shutdown cases move the
 // clock from a loopback flag-service stub and a page stand-in instead, and
-// no outcome waits on a real timer.
+// no outcome waits on a real timer; those that run on to the direct visit
+// also move the mock timers with the clock once the stub has answered.
 //
 // Run from src/loadgen, with the other verification suites, as
 //
@@ -23,6 +24,8 @@ import {
     clickWhenClear,
     observeAbsence,
     probePage,
+    readFeatureIds,
+    recordResponse,
     waitFor,
     waitForToggle,
     WaitTimeoutError,
@@ -1105,6 +1108,8 @@ test("checkAcknowledge_itemRemovalReadStalls_closesPageAndReportsTimeout", async
             alertId: ALERT_ID,
             seq: Number.MAX_SAFE_INTEGER,
             status: 204,
+            accepted: true,
+            rejection: null,
         })
     }
     holder.page = page
@@ -1320,29 +1325,90 @@ async function slowFlagService(t, clock, putMs, perReadMs) {
 }
 
 /**
- * The holder's page on /insights. Each read of the shutdown state answers
- * `observedAfterMs` after the PUT started, by `clock`, and finds the
- * shutdown done, unless it `stalls`: then it moves the clock there and never
- * answers until the page is closed, which rejects it as Puppeteer does. A
- * notification request planted after any sequence number ends the quiet
- * window at once.
+ * The holder's page on /insights of `origin`. Each read of the shutdown
+ * state answers `observedAfterMs` after the PUT started, by `clock`, and
+ * finds the shutdown done, on /home, unless it `stalls`: then it moves the
+ * clock there and never answers until the page is closed, which rejects it
+ * as Puppeteer does. A notification request planted after any sequence
+ * number ends the quiet window at once, unless the page stays `quiet`. A
+ * direct visit then loads /insights, where the loader's entry decision
+ * sends a flag read to the page's request listeners and receives a 200
+ * holding `loaderFlag`, as the real page does, or sends none when it is
+ * `null`, and lands on /home without any feature element.
  */
-function shutdownHolder(clock, observedAfterMs, stalls) {
+function shutdownHolder(
+    clock,
+    observedAfterMs,
+    stalls,
+    {
+        origin = "http://127.0.0.1",
+        quiet = false,
+        loaderFlag = { id: FLAG_ID, enabled: false },
+    } = {}
+) {
+    const listeners = new Set()
     const holder = {
+        label: "holder",
+        account: {
+            username: "pi-holder",
+            accountId: "6f1d3c2a-8b4e-4d5f-9a7c-1e2b3c4d5e6f",
+        },
+        origin,
         shutdownProbes: 0,
-        notificationRequests: [{ seq: Number.MAX_SAFE_INTEGER, at: 0 }],
+        notificationRequests: quiet
+            ? []
+            : [{ seq: Number.MAX_SAFE_INTEGER, at: 0 }],
         toasts: [],
+        responses: [],
+        featureElements: [],
+        featureRequests: [],
+        pendingBodies: new Set(),
+        requestListeners: listeners,
     }
+    let path = "/insights"
     let rejectStalled = null
     holder.page = {
         closes: 0,
         bringToFront: async () => {},
-        url: () => "http://127.0.0.1/insights",
+        url: () => `${origin}${path}`,
+        on: (event, listener) => {
+            if (event === "request") {
+                listeners.add(listener)
+            }
+        },
+        off: (event, listener) => {
+            if (event === "request") {
+                listeners.delete(listener)
+            }
+        },
+        goto: async () => {
+            path = "/insights"
+            if (loaderFlag !== null) {
+                const url = `${origin}${FLAG_PATH}`
+                const request = {
+                    url: () => url,
+                    method: () => "GET",
+                    headers: () => ({}),
+                }
+                listeners.forEach((listener) => listener(request))
+                recordResponse(holder, {
+                    url: () => url,
+                    request: () => request,
+                    status: () => 200,
+                    json: async () => loaderFlag,
+                })
+            }
+            path = "/home"
+        },
+        screenshot: async () => {},
         close: async () => {
             holder.page.closes += 1
             rejectStalled?.(new Error("Target closed"))
         },
-        evaluate: async (_, selector) => {
+        evaluate: async (fn, selector) => {
+            if (fn === readFeatureIds) {
+                return []
+            }
             if (selector !== undefined) {
                 return selector === "#portfolio-insights"
             }
@@ -1353,11 +1419,112 @@ function shutdownHolder(clock, observedAfterMs, stalls) {
                     rejectStalled = reject
                 })
             }
+            path = "/home"
             return SHUTDOWN_STATE
         },
     }
     return holder
 }
+
+test("checkLiveShutdown_directVisitAfterQuietWindow_needsLoaderFalseRead", async (t) => {
+    const rows = [
+        {
+            name: "loaderReadsFalse_passes",
+            loaderFlag: { id: FLAG_ID, enabled: false },
+            state: "fulfilled",
+            error: undefined,
+            directVisit: {
+                landedOn: "/home",
+                flagReadsOnInsights: 1,
+                flagResponses: [
+                    {
+                        status: 200,
+                        accepted: true,
+                        enabled: false,
+                        problem: null,
+                    },
+                ],
+                featureActivity: [],
+            },
+            screenshots: ["post-shutdown-home.png"],
+        },
+        {
+            name: "redirectWithoutLoaderRead_fails",
+            loaderFlag: null,
+            state: "rejected",
+            error:
+                "the page sent no flag read while on /insights, so no flag answer decided its redirect; " +
+                "the page received no flag response with a known outcome during the direct visit",
+            directVisit: {
+                landedOn: "/home",
+                flagReadsOnInsights: 0,
+                flagResponses: [],
+                featureActivity: [],
+            },
+            screenshots: [],
+        },
+    ]
+    for (const { name, loaderFlag, ...expected } of rows) {
+        await t.test(name, async (t) => {
+            const clock = { now: PUT_STARTS_AT, perReadMs: 0 }
+            t.mock.method(performance, "now", () => clock.now)
+            t.mock.timers.enable({ apis: ["setTimeout"] })
+            const { baseUrl, requests } = await slowFlagService(t, clock, 0, 0)
+            const holder = shutdownHolder(clock, 15_000, false, {
+                origin: baseUrl,
+                quiet: true,
+                loaderFlag,
+            })
+            const report = { screenshots: [] }
+            const details = {}
+
+            const outcome = track(
+                checkLiveShutdown([], details, {
+                    report,
+                    holder,
+                    baseUrl,
+                    evidenceDir: "",
+                })
+            )
+            // The PUT runs on real sockets, so time moves only once it has
+            // answered; then the clock and the mock timers move together
+            // through the quiet window and the direct visit's settle window.
+            while (
+                outcome.state === "pending" &&
+                details.flagOff === undefined
+            ) {
+                await settle()
+            }
+            for (
+                let elapsed = 0;
+                outcome.state === "pending" && elapsed < 60_000;
+                elapsed += 10
+            ) {
+                clock.now += 10
+                t.mock.timers.tick(10)
+                await settle()
+            }
+
+            assert.deepEqual(
+                {
+                    state: outcome.state,
+                    error: outcome.error?.message,
+                    requests,
+                    quietForMs: details.quietForMs,
+                    directVisit: details.directVisit,
+                    screenshots: report.screenshots,
+                    listening: holder.requestListeners.size,
+                },
+                {
+                    ...expected,
+                    requests: [`PUT ${FLAG_PATH} {"enabled":false}`],
+                    quietForMs: 20_000,
+                    listening: 0,
+                }
+            )
+        })
+    }
+})
 
 test("checkLiveShutdown_slowFlagPut_countsPutTimeAgainstWindow", async (t) => {
     // The wait passes; the planted request then ends the quiet window.

@@ -13,7 +13,8 @@
 #   --base-url URL       Reverse-proxy origin of that stack (default: http://localhost)
 #   --compose-file FILE  Compose file of that project, relative to the current directory
 #                        (default: compose.dev.yaml)
-#   --evidence-dir DIR   Directory the browser check writes its evidence to
+#   --evidence-dir DIR   Directory in which each run creates its own evidence directory,
+#                        pi-e2e-evidence.XXXXXX, printed at start, for the browser check
 #                        (default: the run directory)
 #   --help               Show this help and exit
 #
@@ -35,8 +36,10 @@
 # directory outside the run directory that only the current user can open (an ACL set with
 # icacls on Windows, mode 700 elsewhere). On exit, normal, failed or interrupted, both are
 # removed, and a removal that fails fails the cleanup check. The run directory, printed at start
-# and end, keeps the browser evidence (unless --evidence-dir names another directory) and
-# working files the run derives, never a copy of a response body.
+# and end, keeps the working files the run derives, never a copy of a response body, and the
+# browser evidence unless --evidence-dir is given. Each run's evidence directory is new and its
+# own, so no run reads, overwrites or removes another run's evidence; it is printed at start,
+# and at end too when it is not the run directory.
 
 # shellcheck disable=SC2016 # jq filters are single-quoted on purpose: their $names are jq's own.
 set -euo pipefail
@@ -87,6 +90,9 @@ DEFAULT_INTERVAL_SECONDS=60
 MAX_INTERVAL_SECONDS=4294967
 
 CYCLE_MARKER="Alert evaluation cycle finished"
+# "Alert evaluation cycle finished: alerts [n] triggered [n] failed [n] skipped [n] outcome
+# [completed|failed] duration [n] ms", as AlertEvaluationService renders it.
+CYCLE_RE='Alert evaluation cycle finished: alerts \[[0-9]+\] triggered \[[0-9]+\] failed \[[0-9]+\] skipped \[[0-9]+\] outcome \[(completed|failed)\] duration \[[0-9]+\] ms'
 TRIGGER_MARKER="] triggered for account ["
 # "Alert [<id>] triggered for account [<account>] type [..] direction [..] threshold [..]
 # value [..] revision [<n>]", as AlertEvaluationService renders it.
@@ -103,7 +109,8 @@ Usage: scripts/portfolio-insights/e2e.sh --project NAME [--base-url URL]
   --base-url URL       Reverse-proxy origin of that stack (default: http://localhost)
   --compose-file FILE  Compose file of that project, relative to the current directory
                        (default: compose.dev.yaml)
-  --evidence-dir DIR   Directory the browser check writes its evidence to
+  --evidence-dir DIR   Directory in which each run creates its own evidence directory,
+                       pi-e2e-evidence.XXXXXX, printed at start, for the browser check
                        (default: the run directory)
   --help               Show this help and exit
 Run one project at a time, never alongside perf.sh or loadgen-check.sh.
@@ -368,12 +375,16 @@ if ! restrict_private_dir; then
     rmdir "$RUN_DIR" "$PRIVATE_DIR" || true
     exit 2
 fi
-# The browser check runs from src/loadgen, so every path handed to it is absolute.
-if [[ -z "$EVIDENCE_DIR" ]]; then
+# The browser check runs from src/loadgen, so every path handed to it is absolute. Its reports
+# have fixed names, so each run gets an evidence directory no other run writes to: the run
+# directory, or a new pi-e2e-evidence.XXXXXX directory inside the --evidence-dir one. A report
+# step 12 reads can then only be this run's, and no earlier run's evidence is replaced.
+evidence_parent="$EVIDENCE_DIR"
+if [[ -z "$evidence_parent" ]]; then
     EVIDENCE_DIR="$RUN_DIR"
-fi
-if ! mkdir -p "$EVIDENCE_DIR" || ! EVIDENCE_DIR="$(cd "$EVIDENCE_DIR" && pwd)"; then
-    echo "Could not create the evidence directory: $EVIDENCE_DIR" >&2
+elif ! mkdir -p "$evidence_parent" || ! EVIDENCE_DIR="$(cd "$evidence_parent" && pwd)" ||
+    ! EVIDENCE_DIR="$(mktemp -d "$EVIDENCE_DIR/pi-e2e-evidence.XXXXXX")"; then
+    echo "Could not create the evidence directory: $evidence_parent/pi-e2e-evidence.XXXXXX" >&2
     rmdir "$RUN_DIR" "$PRIVATE_DIR"
     exit 2
 fi
@@ -383,6 +394,7 @@ PRIVATE_LEFT=""
 : >"$RUN_DIR/deleted"
 : >"$RUN_DIR/pairs"
 : >"$RUN_DIR/triggered"
+: >"$RUN_DIR/trigger-lines"
 
 B="$BASE_URL/broker-service"
 F="$BASE_URL/feature-flag-service/v1/flags/$FLAG_ID"
@@ -409,7 +421,6 @@ H1=""
 LOG4_SINCE=""
 LOG9_SINCE=""
 BASE9=0
-LAST_TRIGGER_INDEX=""
 PAIRS_READY=0
 SKIP_REASON=""
 POLL_DETAIL=""
@@ -489,23 +500,58 @@ http() {
     HTTP_BODY="$(tr -d '\000' <"$PRIVATE_DIR/body")"
 }
 
-# jget FILTER JSON: prints jq's raw output, or nothing when the JSON does not parse.
+# jget FILTER JSON [JQ-OPTION...]: jq's raw output for FILTER, run on JSON with the options, or
+# nothing unless JSON is exactly one complete JSON document and jq succeeds. Reading a document
+# at a time, jq prints FILTER's output for a valid first document before it fails on the bytes
+# after it, and runs FILTER again on a second document, so a valid body followed by anything
+# would pass as that body. Slurped, FILTER runs only once all of JSON parses, and only on a lone
+# document. FILTER keeps lines of its own, so it may begin with def and end with a comment.
+# Carriage returns and NUL bytes, which no shell variable holds, are dropped from the output.
 jget() {
-    jq -r "$1" 2>/dev/null <<<"$2" | tr -d '\r' || true
+    local out nl=$'\n'
+    local program="if length == 1 then .[0] | ($nl$1$nl) else empty end"
+    out="$(
+        set -o pipefail
+        MSYS_NO_PATHCONV=1 jq -r -s "${@:3}" "$program" 2>/dev/null <<<"$2" | tr -d '\r\000' &&
+            printf x
+    )" || return 0
+    printf '%s' "${out%x}"
 }
 
 # jitem ID JSON [FILTER]: FILTER (default: the item itself, keys sorted, compact) applied to the
-# first .results item whose id is ID. Prints nothing when there is none.
+# first .results item whose id is ID. Prints nothing when there is none, or when JSON is not
+# exactly one JSON document, as jget.
 jitem() {
-    jq -S -c -r --arg id "$1" \
-        "first(.results[]? | select((.id // \"\" | ascii_downcase) == \$id)) | ${3:-.}" \
-        2>/dev/null <<<"$2" | tr -d '\r' || true
+    jget "first(.results[]? | select((.id // \"\" | ascii_downcase) == \$id)) | ${3:-.}" "$2" \
+        -S -c --arg id "$1"
 }
 
-# jcount ID JSON: how many .results items carry the id ID.
+# jcount ID JSON: how many .results items carry the id ID; nothing when JSON is not exactly one
+# JSON document, as jget.
 jcount() {
-    jq -r --arg id "$1" '[.results[]? | select((.id // "" | ascii_downcase) == $id)] | length' \
-        2>/dev/null <<<"$2" | tr -d '\r' || true
+    jget '[.results[]? | select((.id // "" | ascii_downcase) == $id)] | length' "$2" --arg id "$1"
+}
+
+# flag_enabled JSON: the enabled state of a flag response, as feature-flag-service's Flag
+# defines one (id a string, enabled a boolean): true or false only when JSON is one object whose
+# id is exactly $FLAG_ID and whose enabled is a JSON boolean, never from jq -r's text, which
+# reads a string "true" as true. Anything else prints what JSON holds instead, such as "id is
+# portfolio-insights-enabled, enabled is a JSON string": the id only when it is $FLAG_ID and
+# otherwise each field's JSON type, so no server text reaches a failure reason and no comparison
+# with true or false passes on it.
+flag_enabled() {
+    local state
+    state="$(jq -r -s --arg id "$FLAG_ID" '
+        def kind: "a JSON \(type)";
+        if length != 1 or (.[0] | type) != "object" then "not one JSON object"
+        else .[0]
+          | if .id == $id and (.enabled | type) == "boolean" then .enabled | tostring
+            else "id is \(if .id == $id then $id elif (.id | type) == "string" then "another string"
+                          else .id | kind end), enabled is \(if (.enabled | type) == "boolean"
+                          then .enabled | tostring else .enabled | kind end)"
+            end
+        end' 2>/dev/null <<<"$1" | tr -d '\r')" || state=""
+    echo "${state:-not JSON}"
 }
 
 lower() {
@@ -519,6 +565,17 @@ status_text() {
     else
         echo "status $HTTP_STATUS"
     fi
+}
+
+# media_type: the media type of the last response, compared as RFC 9110 compares one: its
+# Content-Type up to the first ";", without the spaces and tabs around it, in lower case. So
+# parameters such as "; charset=utf-8" are not part of it, while application/jsonp and
+# application/json-seq stay types of their own, never application/json.
+media_type() {
+    local type="${HTTP_CTYPE%%;*}"
+    type="${type#"${type%%[![:blank:]]*}"}"
+    type="${type%"${type##*[![:blank:]]}"}"
+    printf '%s' "$type" | lower
 }
 
 # describe_file FILE: what FILE holds, for failure reasons, without any of its bytes: "empty",
@@ -604,20 +661,22 @@ expect_json() {
 }
 
 # expect_forbidden CHECK METHOD URL [BODY]: PASS only for a 403 whose body bytes are exactly
-# {"error":"feature_disabled"} and whose content type is application/json. read stops at the
-# first NUL, so the body's size must also be the expected body's (ASCII, one byte a character).
+# {"error":"feature_disabled"} and whose media type is exactly application/json, with or without
+# parameters. read stops at the first NUL, so the body's size must also be the expected body's
+# (ASCII, one byte a character).
 expect_forbidden() {
-    local check="$1" content="" size
+    local check="$1" content="" size media
     shift
     http "$@"
     own_if_created
     IFS= read -r -d '' content <"$PRIVATE_DIR/body" || true
     size="$(wc -c <"$PRIVATE_DIR/body" | tr -d ' \r')" || size=""
+    media="$(media_type)"
     if [[ "$HTTP_STATUS" == "403" && "$size" == "${#FORBIDDEN_BODY}" && "$content" == "$FORBIDDEN_BODY" &&
-        "$HTTP_CTYPE" == application/json* ]]; then
+        "$media" == "application/json" ]]; then
         pass "$check"
     else
-        fail "$check" "$(status_text), content type [$HTTP_CTYPE], body [$(body_snippet)]; expected 403 application/json $FORBIDDEN_BODY"
+        fail "$check" "$(status_text), content type [$media], body [$(body_snippet)]; expected 403 application/json $FORBIDDEN_BODY"
     fi
 }
 
@@ -1013,14 +1072,21 @@ probe_limit() {
 }
 
 # read_window SINCE: the broker's cycle summary and trigger lines since SINCE, in log order,
-# into $RUN_DIR/window.events as "C" for a cycle line or "T <alert id> <revision>".
+# into $RUN_DIR/window.events as "C <outcome>" for a cycle line or "T <alert id> <revision>".
+# The outcome is completed or failed as CYCLE_RE reads it, and unknown for a cycle line that
+# does not render the whole summary, so a line whose outcome cannot be read never counts as
+# completed.
 read_window() {
     local line id
     broker_logs "$1" >"$RUN_DIR/window.log" || return 1
     : >"$RUN_DIR/window.events"
     while IFS= read -r line; do
         if [[ "$line" == *"$CYCLE_MARKER"* ]]; then
-            echo "C" >>"$RUN_DIR/window.events"
+            if [[ "$line" =~ $CYCLE_RE ]]; then
+                echo "C ${BASH_REMATCH[1]}" >>"$RUN_DIR/window.events"
+            else
+                echo "C unknown" >>"$RUN_DIR/window.events"
+            fi
         elif [[ "$line" =~ $TRIGGER_RE ]]; then
             id="$(lower <<<"${BASH_REMATCH[1]}")"
             echo "T $id ${BASH_REMATCH[2]}" >>"$RUN_DIR/window.events"
@@ -1028,15 +1094,15 @@ read_window() {
     done < <(grep -F -e "$CYCLE_MARKER" -e "$TRIGGER_MARKER" "$RUN_DIR/window.log" || true)
 }
 
-# window_cycles: the cycle lines in the current window.
+# window_cycles: the cycle lines in the current window, whatever their outcome.
 window_cycles() {
-    grep -c '^C$' "$RUN_DIR/window.events" || true
+    grep -c '^C ' "$RUN_DIR/window.events" || true
 }
 
-# shellcheck disable=SC2329 # Invoked by trigger_logged, a poll command.
+# shellcheck disable=SC2329 # Invoked by trigger_logged and later_cycles_seen, poll commands.
 # trigger_position ID REVISION: sets TRIGGER_INDEX, the event number of the trigger line of
-# that alert arming in the current window, and TRIGGER_CYCLES, the cycle lines before it.
-# Fails when the window holds no such line.
+# that alert arming in the current window, and TRIGGER_CYCLES, the cycle lines before it,
+# whatever their outcome. Fails when the window holds no such line.
 trigger_position() {
     local kind id revision index=0 cycles=0
     while read -r kind id revision; do
@@ -1067,17 +1133,55 @@ trigger_logged() {
 }
 
 # shellcheck disable=SC2329 # Invoked through poll.
-# later_cycles_seen: poll command; true once two cycle lines follow the last step-9 trigger
-# line, the triggering cycle's own summary and the next cycle's.
+# later_cycles_seen: poll command; true once, in a fresh read of the step-9 window, a cycle line
+# with outcome completed follows the last of the trigger lines step 9 found, listed in
+# $RUN_DIR/trigger-lines, beyond the first cycle line after it, the triggering cycle's own
+# summary. A failed cycle evaluates no alert and an unknown one may not have, so neither counts.
+# Every read locates each trigger line by its alert id and revision, never by its place in an
+# earlier read, and the attempt fails when one of them is no longer in the window.
 later_cycles_seen() {
-    local after
+    local id revision kind outcome last=0 index=0 own=0 failed=0 unknown=0
     if ! read_window "$LOG9_SINCE"; then
         POLL_DETAIL="$LOG_PROBE_DETAIL"
         return 1
     fi
-    after="$(tail -n "+$((LAST_TRIGGER_INDEX + 1))" "$RUN_DIR/window.events" | grep -c '^C$' || true)"
-    POLL_DETAIL="$after cycle lines after the last trigger line, 2 needed (the triggering cycle's own and the next)"
-    [[ $after -ge 2 ]]
+    if [[ ! -s "$RUN_DIR/trigger-lines" ]]; then
+        POLL_DETAIL="no step-9 trigger line was recorded to count cycles from"
+        return 1
+    fi
+    while read -r id revision; do
+        if ! trigger_position "$id" "$revision"; then
+            POLL_DETAIL="the step-9 trigger line of alert [$id] revision [$revision] is no longer in the log window since $LOG9_SINCE"
+            return 1
+        fi
+        if [[ $TRIGGER_INDEX -gt $last ]]; then
+            last=$TRIGGER_INDEX
+        fi
+    done <"$RUN_DIR/trigger-lines"
+    while read -r kind outcome _; do
+        index=$((index + 1))
+        if [[ $index -le $last || "$kind" != "C" ]]; then
+            continue
+        fi
+        if [[ $own -eq 0 ]]; then
+            own=1
+        elif [[ "$outcome" == "completed" ]]; then
+            POLL_DETAIL=""
+            return 0
+        elif [[ "$outcome" == "failed" ]]; then
+            failed=$((failed + 1))
+        else
+            unknown=$((unknown + 1))
+        fi
+    done <"$RUN_DIR/window.events"
+    if [[ $own -eq 0 ]]; then
+        POLL_DETAIL="no cycle line after the last trigger line; the triggering cycle's own summary and a completed follow-up cycle are needed"
+    elif [[ $((failed + unknown)) -eq 0 ]]; then
+        POLL_DETAIL="only the triggering cycle's own summary after the last trigger line; a completed follow-up cycle is needed"
+    else
+        POLL_DETAIL="no follow-up cycle after the last trigger line completed: $failed failed, $unknown without a rendered outcome; a completed one is needed"
+    fi
+    return 1
 }
 
 # ---------------------------------------------------------------------------------------------
@@ -1188,6 +1292,28 @@ check_forbidden_endpoints() {
     expect_forbidden "$step POST acknowledge forbidden" POST "$ALERTS_URL/$alert/acknowledge"
 }
 
+# check_reserved_notifications_routes STEP: PATCH, with a valid body, and DELETE on
+# /v1/alerts/notifications, where the notifications literal stands in an alert id's place.
+# Routing answers both with its plain 404 and no Allow header before the feature gate runs, so
+# the answer is the same whether the flag is on or off: never the gate's 403, nor the 405 with
+# Allow: GET that the literal's GET route would draw.
+check_reserved_notifications_routes() {
+    local step="$1" method check
+    for method in PATCH DELETE; do
+        check="$step $method notifications path 404"
+        if [[ "$method" == "PATCH" ]]; then
+            http PATCH "$ALERTS_URL/notifications" '{"enabled":true}'
+        else
+            http DELETE "$ALERTS_URL/notifications"
+        fi
+        if grep -qi '^allow:' "$PRIVATE_DIR/headers"; then
+            fail "$check" "$(status_text) with an Allow header; expected 404 with no route and no Allow header"
+        else
+            expect_error "$check" 404 no_route
+        fi
+    done
+}
+
 # ---------------------------------------------------------------------------------------------
 # Fixture and browser check
 
@@ -1229,6 +1355,8 @@ prefix_lines() {
 }
 
 # run_browser_check MODE CHECK: runs the browser check with the fixture; PASS on exit code 0.
+# It writes to this run's own evidence directory, which held no report when the run began, so a
+# report found there later can only be this invocation's, and nothing is removed first.
 run_browser_check() {
     local mode="$1" check="$2" rc=0
     if [[ ! -d "$REPO_ROOT/src/loadgen/node_modules/puppeteer" ]]; then
@@ -1310,13 +1438,16 @@ on_cleanup_signal() {
     remove_private
     fail "cleanup" "interrupted before it finished: owned alerts may be left in place and flag $FLAG_ID may not be restored${PRIVATE_LEFT:+; $PRIVATE_LEFT not removed}"
     info "run dir $RUN_DIR"
+    if [[ "$EVIDENCE_DIR" != "$RUN_DIR" ]]; then
+        info "evidence dir $EVIDENCE_DIR"
+    fi
     echo "SUMMARY $passed passed, $failed failed"
     exit 130
 }
 
 # shellcheck disable=SC2329 # Invoked by the EXIT trap below.
 cleanup() {
-    local rc=$? remaining problems=""
+    local rc=$? remaining problems="" switched
     trap - EXIT
     # A second interrupt abandons the remaining requests, but never leaves the passwords behind
     # and still ends the run with a cleanup verdict and the SUMMARY line.
@@ -1324,22 +1455,31 @@ cleanup() {
     set +e
     remaining="$(remaining_owned)"
     if [[ "$remaining" -gt 0 ]]; then
-        # DELETE answers 403 while the flag is off, so the flag is switched on to delete.
+        # DELETE answers 403 while the flag is off, so the flag is switched on to delete. Only a
+        # 200 with this flag's JSON boolean true confirms it; otherwise the deletes still run,
+        # each answer deciding its id, and the switch-on is a cleanup problem of its own.
         http GET "$F"
-        if [[ "$HTTP_STATUS" == "200" && "$(jget '.enabled' "$HTTP_BODY")" == "false" ]]; then
+        if [[ "$HTTP_STATUS" == "200" && "$(flag_enabled "$HTTP_BODY")" == "false" ]]; then
             FLAG_TOUCHED=1
             http PUT "$F" '{"enabled": true}'
-            info "cleanup: flag $FLAG_ID switched on to delete $remaining owned alerts ($(status_text))"
+            switched="$(flag_enabled "$HTTP_BODY")"
+            if [[ "$HTTP_STATUS" != "200" ]]; then
+                problems="flag $FLAG_ID could not be switched on to delete $remaining owned alerts: $(status_text)"
+            elif [[ "$switched" != "true" ]]; then
+                problems="flag $FLAG_ID could not be switched on to delete $remaining owned alerts: answered [$switched]"
+            else
+                info "cleanup: flag $FLAG_ID switched on to delete $remaining owned alerts"
+            fi
         fi
         delete_remaining
         info "cleanup: $((remaining - CLEANUP_LEFT)) of $remaining remaining owned alerts deleted or already absent"
         if [[ $CLEANUP_LEFT -gt 0 ]]; then
-            problems="$CLEANUP_LEFT owned alerts left in place"
+            problems="${problems:+$problems; }$CLEANUP_LEFT owned alerts left in place"
         fi
     fi
     if [[ $FLAG_TOUCHED -eq 1 && -n "$FLAG_INITIAL" ]]; then
         http PUT "$F" "{\"enabled\": $FLAG_INITIAL}"
-        if [[ "$HTTP_STATUS" == "200" && "$(jget '.enabled' "$HTTP_BODY")" == "$FLAG_INITIAL" ]]; then
+        if [[ "$HTTP_STATUS" == "200" && "$(flag_enabled "$HTTP_BODY")" == "$FLAG_INITIAL" ]]; then
             info "cleanup: flag $FLAG_ID restored to enabled=$FLAG_INITIAL"
         else
             problems="${problems:+$problems; }flag $FLAG_ID not restored to enabled=$FLAG_INITIAL: $(status_text)"
@@ -1365,6 +1505,9 @@ cleanup() {
         fail "cleanup" "$problems"
     fi
     info "run dir $RUN_DIR"
+    if [[ "$EVIDENCE_DIR" != "$RUN_DIR" ]]; then
+        info "evidence dir $EVIDENCE_DIR"
+    fi
     echo "SUMMARY $passed passed, $failed failed"
     if [[ $rc -eq 0 && $failed -gt 0 ]]; then
         rc=1
@@ -1407,7 +1550,7 @@ startup_flag_default() {
 }
 
 step1_ready() {
-    local running missing="" service flag_id modifiable enabled raw_default startup_default raw_interval
+    local running missing="" service modifiable enabled raw_default startup_default raw_interval
     running="$(running_services)" || running=""
     for service in $REQUIRED_SERVICES; do
         if ! grep -qxF "$service" <<<"$running"; then
@@ -1428,12 +1571,13 @@ step1_ready() {
     if [[ "$HTTP_STATUS" != "200" ]]; then
         abort "step 1 flag modifiable" "GET $FLAG_ID gave $(status_text); body [$(body_snippet)]"
     fi
-    flag_id="$(jget '.id' "$HTTP_BODY")"
-    modifiable="$(jget '.isModifiable' "$HTTP_BODY")"
-    enabled="$(jget '.enabled' "$HTTP_BODY")"
-    if [[ "$flag_id" != "$FLAG_ID" || ("$enabled" != "true" && "$enabled" != "false") ]]; then
-        abort "step 1 flag modifiable" "GET $FLAG_ID answered id [$flag_id] enabled [$enabled]"
+    enabled="$(flag_enabled "$HTTP_BODY")"
+    if [[ "$enabled" != "true" && "$enabled" != "false" ]]; then
+        abort "step 1 flag modifiable" "GET $FLAG_ID answered [$enabled]; expected id $FLAG_ID and a boolean enabled"
     fi
+    # The body is one JSON object now. Only the JSON boolean true is modifiable: a string "true"
+    # shows as its type.
+    modifiable="$(jget '.isModifiable | if type == "boolean" then tostring else "a JSON \(type)" end' "$HTTP_BODY")"
     if [[ "$modifiable" != "true" ]]; then
         abort "step 1 flag modifiable" "isModifiable is [$modifiable]: a deployment with ENABLE_MODIFY=false cannot be toggled"
     fi
@@ -1474,9 +1618,12 @@ step1_ready() {
 
 step2_flag_off() {
     http GET "$F"
+    # jq's == compares types too, so a string "false" is not false. A field that differs shows as
+    # its JSON type, or as a boolean's value, never as the server's text.
     expect_json "step 2 flag reads disabled" 200 \
-        'if .enabled == false and .tag == "feature" then "ok"
-         else "enabled [\(.enabled)] tag [\(.tag)], expected false and feature" end'
+        'def seen($want): if . == $want or type == "boolean" then tostring else "a JSON \(type)" end;
+         if .id == "portfolio-insights-enabled" and .enabled == false and .tag == "feature" then "ok"
+         else "id [\(.id | seen("portfolio-insights-enabled"))] enabled [\(.enabled | seen(false))] tag [\(.tag | seen("feature"))], expected portfolio-insights-enabled, false and feature" end'
 
     http GET "$BASE_URL/feature-flag-service/v1/flags?tag=problem_pattern"
     expect_json "step 2 flag not listed as a problem pattern" 200 \
@@ -1485,6 +1632,7 @@ step2_flag_off() {
          else "ok" end'
 
     check_forbidden_endpoints "step 2" "$(random_guid)" "$(random_guid)" "$(random_guid)"
+    check_reserved_notifications_routes "step 2"
 }
 
 # ---------------------------------------------------------------------------------------------
@@ -1510,7 +1658,7 @@ signup() {
 }
 
 step3_fixture() {
-    local epoch body ids id n=0
+    local epoch body ids id results_type count amount_type n=0
     epoch="$(date -u +%s)"
     HOLDER_USER="pi-e2e-$epoch-holder"
     EMPTY_USER="pi-e2e-$epoch-empty"
@@ -1533,11 +1681,17 @@ step3_fixture() {
     pass "step 3 deposit"
 
     http GET "$B/v1/instrument?accountId=$HOLDER_ID"
-    ids="$(jget '[.results[]?.id] | .[0:2] | join(" ")' "$HTTP_BODY" | lower)"
+    if [[ "$HTTP_STATUS" != "200" ]]; then
+        abort "step 3 buy instrument 1" "the holder's instrument listing gave $(status_text), expected 200"
+    fi
+    results_type="$(jget '.results | type' "$HTTP_BODY")"
+    if [[ "$results_type" != "array" ]]; then
+        abort "step 3 buy instrument 1" "the holder's instrument listing has results of JSON type [${results_type:-unreadable}], expected an array; body [$(body_snippet)]"
+    fi
+    ids="$(jget '[.results[].id] | .[0:2] | join(" ")' "$HTTP_BODY" | lower)"
     # Both ids go into request bodies and run files, so each must be a distinct canonical id.
-    if [[ "$HTTP_STATUS" != "200" || ! "${ids%% *}" =~ $UUID_RE || ! "${ids#* }" =~ $UUID_RE ||
-        "${ids%% *}" == "${ids#* }" ]]; then
-        abort "step 3 buy instrument 1" "the holder's instrument listing gave $(status_text) without two distinct canonical instrument ids"
+    if [[ ! "${ids%% *}" =~ $UUID_RE || ! "${ids#* }" =~ $UUID_RE || "${ids%% *}" == "${ids#* }" ]]; then
+        abort "step 3 buy instrument 1" "the holder's instrument listing does not begin with two distinct canonical instrument ids"
     fi
     for id in $ids; do
         n=$((n + 1))
@@ -1551,9 +1705,23 @@ step3_fixture() {
 
     http GET "$B/v1/instrument?accountId=$HOLDER_ID"
     if [[ "$HTTP_STATUS" != "200" ]]; then
-        abort "step 3 holdings" "the holder's instrument listing gave $(status_text)"
+        abort "step 3 holdings" "the holder's instrument listing gave $(status_text), expected 200"
     fi
+    results_type="$(jget '.results | type' "$HTTP_BODY")"
+    if [[ "$results_type" != "array" ]]; then
+        abort "step 3 holdings" "the holder's instrument listing has results of JSON type [${results_type:-unreadable}], expected an array; body [$(body_snippet)]"
+    fi
+    # An amount is a decimal, so a JSON number. jq orders strings, arrays and objects above
+    # every number, so its type is checked before its value.
     for id in $ids; do
+        count="$(jcount "$id" "$HTTP_BODY")"
+        if [[ "$count" != "1" ]]; then
+            abort "step 3 holdings" "instrument [$id] is listed ${count:-an unreadable number of} times, expected once"
+        fi
+        amount_type="$(jitem "$id" "$HTTP_BODY" '.amount | type')"
+        if [[ "$amount_type" != "number" ]]; then
+            abort "step 3 holdings" "instrument [$id] shows an amount of JSON type [${amount_type:-unreadable}], expected a number"
+        fi
         if [[ "$(jitem "$id" "$HTTP_BODY" '.amount >= 1')" != "true" ]]; then
             abort "step 3 holdings" "instrument [$id] shows amount [$(jitem "$id" "$HTTP_BODY" '.amount')], expected at least 1"
         fi
@@ -1576,7 +1744,7 @@ step4_enable() {
     LOG4_SINCE="$(log_since_now)"
     FLAG_TOUCHED=1
     http PUT "$F" '{"enabled": true}'
-    if [[ "$HTTP_STATUS" != "200" || "$(jget '.enabled' "$HTTP_BODY")" != "true" ]]; then
+    if [[ "$HTTP_STATUS" != "200" || "$(flag_enabled "$HTTP_BODY")" != "true" ]]; then
         abort "step 4 enable flag" "PUT {\"enabled\": true} gave $(status_text); body [$(body_snippet)]"
     fi
     pass "step 4 enable flag"
@@ -1647,33 +1815,75 @@ insights_line_logged() {
 }
 
 step5_figures() {
-    local j="$HOLDER_INSIGHTS" holdings total risk
+    local j="$HOLDER_INSIGHTS" holdings total risk zero_total entry_jq
+    # Prices are signed, so two holdings' values can net to a totalValue of exactly 0. The
+    # calculator then makes every percent 0 and the allocation with the ordinally lowest
+    # lowercase id the largest, whatever its value, so the risk is LOW. The response's own
+    # totalValue, a JSON number equal to 0, selects those checks.
+    # largestPosition is the very allocation entry the calculator selects, so it must equal
+    # that entry in every field. same_entry($entry; $which) prints "ok" when it does, otherwise
+    # which fields differ, with both values of a number, and never either whole object.
+    entry_jq='def same_entry($entry; $which):
+        . as $got
+        | if $got == $entry then "ok"
+          else [("instrumentId", "name", "quantity", "value", "percent") as $key
+                | select(($got | has($key)) != ($entry | has($key)) or $got[$key] != $entry[$key])
+                | if ($got[$key] | type) == "number" and ($entry[$key] | type) == "number"
+                  then "\($key) \($got[$key]), expected \($entry[$key])"
+                  else "\($key) differs" end]
+              + (if ($got | del(.instrumentId, .name, .quantity, .value, .percent))
+                    != ($entry | del(.instrumentId, .name, .quantity, .value, .percent))
+                 then ["other fields differ"] else [] end)
+            | "largestPosition differs from \($which): \(join("; "))" end;
+    '
+    zero_total="$(jget '.totalValue | if type == "number" and . == 0 then "yes" else "no" end' "$j")"
     jcheck "step 5 two allocations" \
         'if (.allocations | length) == 2 then "ok" else "\(.allocations | length) allocations, expected 2" end' "$j"
-    jcheck "step 5 percents sum to 100" \
-        '([.allocations[].percent] | add) as $sum
-         | if $sum != null and (($sum - 100) | fabs) <= 1e-6 then "ok"
-           else "allocation percents sum to \($sum)" end' "$j"
+    if [[ "$zero_total" == "yes" ]]; then
+        jcheck "step 5 percents are 0 at a zero total" \
+            '[.allocations[].percent] as $percents
+             | if all($percents[]; type == "number" and . == 0) then "ok"
+               else "allocation percents \($percents), expected the number 0 each at a totalValue of 0" end' "$j"
+    else
+        jcheck "step 5 percents sum to 100" \
+            '([.allocations[].percent] | add) as $sum
+             | if $sum != null and (($sum - 100) | fabs) <= 1e-6 then "ok"
+               else "allocation percents sum to \($sum)" end' "$j"
+    fi
     jcheck "step 5 totalValue is the sum of the values" \
         '([.allocations[].value] | add) as $sum
          | if $sum != null and ((.totalValue - $sum) | fabs) <= 1e-6 then "ok"
            else "totalValue \(.totalValue), values sum to \($sum)" end' "$j"
-    jcheck "step 5 largest position" \
-        '([.allocations[].value] | max) as $max
-         | ([.allocations[] | select(.value == $max) | .instrumentId | ascii_downcase] | min) as $lowest
-         | if .largestPosition == null then "largestPosition is null"
-           elif .largestPosition.value != $max then
-             "largestPosition value \(.largestPosition.value), highest value \($max)"
-           elif (.largestPosition.instrumentId | ascii_downcase) != $lowest then
-             "largestPosition [\(.largestPosition.instrumentId)], expected [\($lowest)], the lowest id among the highest values"
-           else "ok" end' "$j"
-    jcheck "step 5 risk level" \
-        '.largestPosition.percent as $share
-         | (if $share == null then null elif $share < 25 then "LOW"
-            elif $share <= 50 then "MEDIUM" else "HIGH" end) as $expected
-         | if $expected == null then "largestPosition has no percent"
-           elif .riskLevel == $expected then "ok"
-           else "riskLevel [\(.riskLevel)], a largest share of \($share) % gives \($expected)" end' "$j"
+    if [[ "$zero_total" == "yes" ]]; then
+        jcheck "step 5 largest position" "$entry_jq"'
+            ([.allocations[].instrumentId | ascii_downcase] | min) as $lowest
+             | ([.allocations[]] | min_by(.instrumentId | ascii_downcase)) as $entry
+             | if .largestPosition == null then "largestPosition is null"
+               elif (.largestPosition.instrumentId | ascii_downcase) != $lowest then
+                 "largestPosition [\(.largestPosition.instrumentId)], expected [\($lowest)], the lowest id, as totalValue is 0"
+               else .largestPosition | same_entry($entry; "the lowest-id allocation, as totalValue is 0") end' "$j"
+        jcheck "step 5 risk level" \
+            'if .riskLevel == "LOW" then "ok"
+             else "riskLevel [\(.riskLevel)], a totalValue of 0 gives LOW" end' "$j"
+    else
+        jcheck "step 5 largest position" "$entry_jq"'
+            ([.allocations[].value] | max) as $max
+             | ([.allocations[] | select(.value == $max) | .instrumentId | ascii_downcase] | min) as $lowest
+             | ([.allocations[] | select(.value == $max)] | min_by(.instrumentId | ascii_downcase)) as $entry
+             | if .largestPosition == null then "largestPosition is null"
+               elif .largestPosition.value != $max then
+                 "largestPosition value \(.largestPosition.value), highest value \($max)"
+               elif (.largestPosition.instrumentId | ascii_downcase) != $lowest then
+                 "largestPosition [\(.largestPosition.instrumentId)], expected [\($lowest)], the lowest id among the highest values"
+               else .largestPosition | same_entry($entry; "the highest-value allocation with the lowest id") end' "$j"
+        jcheck "step 5 risk level" \
+            '.largestPosition.percent as $share
+             | (if $share == null then null elif $share < 25 then "LOW"
+                elif $share <= 50 then "MEDIUM" else "HIGH" end) as $expected
+             | if $expected == null then "largestPosition has no percent"
+               elif .riskLevel == $expected then "ok"
+               else "riskLevel [\(.riskLevel)], a largest share of \($share) % gives \($expected)" end' "$j"
+    fi
     # The line must carry this response's own figures, so they are read from it first.
     holdings="$(jget '.allocations | if type == "array" then length else empty end' "$j")"
     total="$(jget '.totalValue | if type == "number" then . else empty end' "$j")"
@@ -1742,20 +1952,22 @@ response_kind() {
 #   error_response  a rule violation, through BrokerExceptionFilter, as application/json
 #   problem         a body or query that cannot bind, as application/problem+json
 #   no_route        a non-GUID path segment, which matches no route: neither of the two above
-# The failure reason names the status, the body's kind and the content type, never the body.
+# Each media type must be exactly the one named, with or without parameters. The failure reason
+# names the status, the body's kind and the media type, never the body.
 expect_error() {
-    local check="$1" status="$2" want="$3" kind ok=0 expected
+    local check="$1" status="$2" want="$3" kind ok=0 expected media
     kind="$(response_kind)"
+    media="$(media_type)"
     case "$want" in
         error_response)
             expected="an ErrorResponse with statusCode $status as application/json"
-            if [[ "$kind" == "error_response" && "$HTTP_CTYPE" == application/json* ]]; then
+            if [[ "$kind" == "error_response" && "$media" == "application/json" ]]; then
                 ok=1
             fi
             ;;
         problem)
             expected="a validation problem with status $status as application/problem+json"
-            if [[ "$kind" == "problem" && "$HTTP_CTYPE" == application/problem+json* ]]; then
+            if [[ "$kind" == "problem" && "$media" == "application/problem+json" ]]; then
                 ok=1
             fi
             ;;
@@ -1773,7 +1985,7 @@ expect_error() {
     if [[ "$HTTP_STATUS" == "$status" && $ok -eq 1 ]]; then
         pass "$check"
     else
-        fail "$check" "$(status_text), body kind [$kind], content type [${HTTP_CTYPE:-none}]; expected $status: $expected"
+        fail "$check" "$(status_text), body kind [$kind], content type [${media:-none}]; expected $status: $expected"
     fi
 }
 
@@ -1877,12 +2089,16 @@ step7_errors() {
     expect_error "step 7 POST acknowledge unknown alert 404" 404 error_response
     http POST "$ALERTS_URL/not-a-guid/acknowledge"
     expect_error "step 7 POST acknowledge non-GUID alert 404" 404 no_route
+    check_reserved_notifications_routes "step 7"
 
-    # A missing and a null enabled need a real alert, since an unknown id answers 404 first.
+    # Each PATCH body case targets a real alert, so only the body is wrong: a missing or null
+    # enabled breaks the service's rule, while malformed JSON and a quoted enabled cannot bind.
     if ! create_alert "$HOLDER_ID" TARGET_PRICE "$H1" ABOVE "$MAX_THRESHOLD"; then
         reason="creating the temporary alert gave $(status_text), body kind [$(response_kind)]; expected 201 with an id"
         fail "step 7 PATCH {} 400" "$reason"
         fail "step 7 PATCH enabled null 400" "$reason"
+        fail "step 7 PATCH malformed JSON 400" "$reason"
+        fail "step 7 PATCH quoted enabled \"true\" 400" "$reason"
         fail "step 7 DELETE temporary alert 204" "not attempted: $reason"
         return 0
     fi
@@ -1891,6 +2107,12 @@ step7_errors() {
     expect_error "step 7 PATCH {} 400" 400 error_response
     http PATCH "$ALERTS_URL/$temp" '{"enabled":null}'
     expect_error "step 7 PATCH enabled null 400" 400 error_response
+    # The valid body without its closing brace.
+    http PATCH "$ALERTS_URL/$temp" '{"enabled":true'
+    expect_error "step 7 PATCH malformed JSON 400" 400 problem
+    # A JSON string, not a boolean.
+    http PATCH "$ALERTS_URL/$temp" '{"enabled":"true"}'
+    expect_error "step 7 PATCH quoted enabled \"true\" 400" 400 problem
     delete_alert "$temp"
     if [[ "$HTTP_STATUS" == "204" ]]; then
         pass "step 7 DELETE temporary alert 204"
@@ -1907,6 +2129,10 @@ step7_errors() {
 # triggerValue must both be null, as a create or a re-arm answers. With KEPT true, a trigger of
 # the current arming passes as well, since a disable keeps it: an ISO-8601 triggeredAt with a
 # numeric triggerValue, never one without the other.
+# alert_as(WANT; ENABLED; REVISION; KEPT): alert(ENABLED; REVISION; KEPT) for the alert a request
+# named. Each of id, accountId, instrumentId, type and direction that the object WANT carries
+# must hold that value, not only a value of its kind; GUIDs match in any letter case. jq
+# compares numbers as doubles, so the exact threshold is alert_verdict's to compare.
 ALERT_JQ="$WANT_JQ"'def guid: type == "string"
         and test("^[0-9a-fA-F]{8}-([0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12}$");
     def stamp: type == "string" and test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}");
@@ -1918,30 +2144,99 @@ ALERT_JQ="$WANT_JQ"'def guid: type == "string"
             (("triggeredAt", "triggerValue") as $key
                 | want($key; . == null; if $kept then "null or a kept trigger" else "null" end))
         end;
-    def alert($enabled; $revision; $kept): verdict(
-        (("id", "accountId", "instrumentId") as $key | want($key; guid; "a GUID string")),
-        want("type"; . == "TARGET_PRICE" or . == "PROFIT_LOSS"; "TARGET_PRICE or PROFIT_LOSS"),
-        want("direction"; . == "ABOVE" or . == "BELOW"; "ABOVE or BELOW"),
+    def alert_as($want; $enabled; $revision; $kept): verdict(
+        (("id", "accountId", "instrumentId") as $key
+            | if $want | has($key) then
+                want($key; guid and ascii_downcase == ($want[$key] | ascii_downcase); $want[$key])
+              else want($key; guid; "a GUID string") end),
+        (if $want | has("type") then want("type"; . == $want.type; $want.type)
+         else want("type"; . == "TARGET_PRICE" or . == "PROFIT_LOSS"; "TARGET_PRICE or PROFIT_LOSS")
+         end),
+        (if $want | has("direction") then want("direction"; . == $want.direction; $want.direction)
+         else want("direction"; . == "ABOVE" or . == "BELOW"; "ABOVE or BELOW") end),
         want("threshold"; type == "number"; "a number"),
         want("enabled"; . == $enabled; $enabled),
         want("armingRevision"; . == $revision; $revision),
         trigger($kept),
         want("acknowledged"; . == false; false),
         want("createdAt"; stamp; "an ISO-8601 string"));
+    def alert($enabled; $revision; $kept): alert_as({}; $enabled; $revision; $kept);
 '
-CREATED_FILTER="$ALERT_JQ"'alert(true; 1; false)'
+# The checks of a 201 and of the disable and re-arm answers, $want being the alert the request
+# named. A trigger value can exceed the domain-maximum threshold, so the evaluator may trigger
+# revision 1 before the disable, which keeps that trigger. The re-arm clears it.
+CREATED_FILTER="$ALERT_JQ"'alert_as($want; true; 1; false)'
+DISABLED_FILTER="$ALERT_JQ"'alert_as($want; false; 1; true)'
+REARMED_FILTER="$ALERT_JQ"'alert_as($want; true; 2; false)'
 
-# create_checked CHECK TYPE: creates TYPE ABOVE the domain maximum on H1 and checks the 201.
-# Leaves the id in CREATED_ID, empty when the create failed.
+# alert_want ID ACCOUNT INSTRUMENT TYPE DIRECTION: the WANT object of alert_as for the alert a
+# request named, every value encoded by jq. An empty ID is left out, since a create's id is new.
+alert_want() {
+    MSYS_NO_PATHCONV=1 jq -cn --arg id "$1" --arg accountId "$2" --arg instrumentId "$3" \
+        --arg type "$4" --arg direction "$5" \
+        '{accountId: $accountId, instrumentId: $instrumentId, type: $type, direction: $direction}
+         + (if $id == "" then {} else {id: $id} end)' | tr -d '\r'
+}
+
+# alert_verdict FILTER WANT THRESHOLD: FILTER, an ALERT_JQ program ending in an alert_as($want;
+# ...) call, run on the last response body with $want bound to WANT, and the body's threshold
+# held to THRESHOLD, the token the create sent. jq compares numbers as doubles, which would pass
+# a rounded threshold, so the threshold is read as jq prints it, its literal kept, and num_cmp
+# compares it exactly; a threshold that is no number is alert_as's to report. Prints "ok" or
+# every reason, each naming a field, the value it holds and the value expected, or "unreadable
+# JSON" when the body is not exactly one JSON document, which jget requires.
+alert_verdict() {
+    local verdict threshold order reason
+    verdict="$(jget "$1" "$HTTP_BODY" --argjson want "$2")"
+    if [[ -z "$verdict" ]]; then
+        echo "unreadable JSON [$(body_snippet)]"
+        return 0
+    fi
+    threshold="$(jget 'select(type == "object") | .threshold | numbers' "$HTTP_BODY")"
+    if [[ -n "$threshold" ]]; then
+        if ! order="$(num_cmp "$threshold" "$3")" || [[ "$order" != "0" ]]; then
+            if [[ ${#threshold} -gt 60 ]]; then
+                threshold="${threshold:0:60}..."
+            fi
+            reason="threshold [$threshold], expected $3"
+            if [[ "$verdict" == "ok" ]]; then
+                verdict="$reason"
+            else
+                verdict="$verdict; $reason"
+            fi
+        fi
+    fi
+    echo "$verdict"
+}
+
+# expect_alert CHECK STATUS FILTER WANT THRESHOLD: the last response has STATUS and
+# alert_verdict FILTER WANT THRESHOLD prints "ok".
+expect_alert() {
+    local verdict
+    if [[ "$HTTP_STATUS" != "$2" ]]; then
+        fail "$1" "$(status_text), expected $2; body [$(body_snippet)]"
+        return 0
+    fi
+    verdict="$(alert_verdict "$3" "$4" "$5")"
+    if [[ "$verdict" == "ok" ]]; then
+        pass "$1"
+    else
+        fail "$1" "$verdict"
+    fi
+}
+
+# create_checked CHECK TYPE: creates TYPE ABOVE the domain maximum on H1 and checks that the 201
+# is that alert as created. Leaves the id in CREATED_ID, empty when the create failed.
 create_checked() {
     local reason="" verdict
     if ! create_alert "$HOLDER_ID" "$2" "$H1" ABOVE "$MAX_THRESHOLD"; then
         fail "$1" "$CREATE_ERROR"
         return 0
     fi
-    verdict="$(jget "$CREATED_FILTER" "$HTTP_BODY")"
+    verdict="$(alert_verdict "$CREATED_FILTER" "$(alert_want "" "$HOLDER_ID" "$H1" "$2" ABOVE)" \
+        "$MAX_THRESHOLD")"
     if [[ "$verdict" != "ok" ]]; then
-        reason="${verdict:-unreadable body}"
+        reason="$verdict"
     fi
     if grep -qi '^location:' "$PRIVATE_DIR/headers"; then
         reason="${reason:+$reason; }a Location header was sent"
@@ -1953,23 +2248,43 @@ create_checked() {
     fi
 }
 
+# listing(F), the check of each step-8 listing: F run on the listed ids, lowercased, once the
+# body is the {"results": [...]} envelope and every entry is an alert object whose id is a GUID
+# string; otherwise why not. A malformed entry is named by its position from 1, never its value.
+LISTING_JQ="$ALERT_JQ"'def listing(f):
+    verdict(want("results"; type == "array"; "an array")) as $envelope
+    | if $envelope != "ok" then $envelope
+      else [.results | range(length) as $i
+              | select(.[$i] | type == "object" and (.id | guid) | not) | $i + 1 | tostring]
+          as $bad
+        | ($bad | length) as $n
+        | if $n == 0 then .results | map(.id | ascii_downcase) | f
+          elif $n == 1 then
+              "results entry \($bad[0]) of \(.results | length) is not an alert with a GUID id"
+          else "results entries \($bad[0:5] | join(", "))"
+              + (if $n > 5 then " and \($n - 5) more" else "" end)
+              + " of \(.results | length) are not alerts with a GUID id" end
+      end;
+'
+
 step8_crud() {
-    local tp="" pl="" id type list
+    local tp="" pl="" id type want
     create_checked "step 8 create TARGET_PRICE" TARGET_PRICE
     tp="$CREATED_ID"
     create_checked "step 8 create PROFIT_LOSS" PROFIT_LOSS
     pl="$CREATED_ID"
 
+    # Each listing must be the {"results": [...]} envelope of alerts with GUID ids before any id
+    # is looked for in it.
     http GET "$ALERTS_URL?accountId=$HOLDER_ID"
     if [[ -z "$tp" || -z "$pl" ]]; then
         fail "step 8 list newest first" "both alerts are needed and at least one create failed"
     else
-        expect_json "step 8 list newest first" 200 \
-            "(.results | map(.id | ascii_downcase)) as \$ids
-             | (\$ids | index(\"$pl\")) as \$p | (\$ids | index(\"$tp\")) as \$t
-             | if \$p == null or \$t == null then \"listed ids \(\$ids), expected both $pl and $tp\"
-               elif \$p < \$t then \"ok\"
-               else \"PROFIT_LOSS $pl is listed after TARGET_PRICE $tp\" end"
+        expect_json "step 8 list newest first" 200 "$LISTING_JQ
+            listing(index(\"$pl\") as \$p | index(\"$tp\") as \$t
+                | if \$p == null or \$t == null then \"listed ids \(.), expected both $pl and $tp\"
+                  elif \$p < \$t then \"ok\"
+                  else \"PROFIT_LOSS $pl is listed after TARGET_PRICE $tp\" end)"
     fi
 
     for id in "$tp" "$pl"; do
@@ -1981,21 +2296,18 @@ step8_crud() {
         else
             type="PROFIT_LOSS"
         fi
-        # A trigger value can exceed the domain-maximum threshold, so the evaluator may trigger
-        # revision 1 before the disable, which keeps that trigger. The re-arm clears it.
+        # Each PATCH answers the snapshot of this alert's update, so it must be this alert.
+        want="$(alert_want "$id" "$HOLDER_ID" "$H1" "$type" ABOVE)"
         http PATCH "$ALERTS_URL/$id" '{"enabled":false}'
-        expect_json "step 8 $type disable" 200 "$ALERT_JQ"'alert(false; 1; true)'
+        expect_alert "step 8 $type disable" 200 "$DISABLED_FILTER" "$want" "$MAX_THRESHOLD"
         http PATCH "$ALERTS_URL/$id" '{"enabled":true}'
-        expect_json "step 8 $type re-arm" 200 "$ALERT_JQ"'alert(true; 2; false)'
+        expect_alert "step 8 $type re-arm" 200 "$REARMED_FILTER" "$want" "$MAX_THRESHOLD"
         delete_alert "$id"
         expect_status "step 8 $type delete" 204
         http GET "$ALERTS_URL?accountId=$HOLDER_ID"
-        list="$HTTP_BODY"
-        if [[ "$HTTP_STATUS" == "200" && "$(jcount "$id" "$list")" == "0" ]]; then
-            pass "step 8 $type absent after delete"
-        else
-            fail "step 8 $type absent after delete" "$(status_text), alert listed $(jcount "$id" "$list") times"
-        fi
+        expect_json "step 8 $type absent after delete" 200 "$LISTING_JQ
+            listing(map(select(. == \"$id\")) | length
+                | if . == 0 then \"ok\" else \"alert $id listed \(.) times, expected 0\" end)"
         http DELETE "$ALERTS_URL/$id"
         expect_status "step 8 $type second delete 404" 404
     done
@@ -2174,9 +2486,9 @@ step9_trigger() {
         if poll "step 9 $pair $direction trigger log line" "$LOG_LINE_TIMEOUT_SECONDS" \
             "$LOG_STEP_SECONDS" trigger_logged "$id" "$revision"; then
             cycles=$((TRIGGER_CYCLES - BASE9))
-            if [[ -z "$LAST_TRIGGER_INDEX" || $TRIGGER_INDEX -gt $LAST_TRIGGER_INDEX ]]; then
-                LAST_TRIGGER_INDEX=$TRIGGER_INDEX
-            fi
+            # Step 10 finds this line again by its id and revision on each of its own reads,
+            # since a place in this read can point at another line once the log is reread.
+            echo "$id $revision" >>"$RUN_DIR/trigger-lines"
             if [[ $cycles -le 2 ]]; then
                 pass "step 9 $pair $direction trigger log line"
             else
@@ -2198,7 +2510,7 @@ step10_no_repeat() {
         fail "step 10 no second notification" "no alert triggered in step 9"
         return 0
     fi
-    if [[ -z "$LAST_TRIGGER_INDEX" ]]; then
+    if [[ ! -s "$RUN_DIR/trigger-lines" ]]; then
         fail "step 10 a later cycle completed" "no trigger line was found in step 9 to count cycles from"
     elif poll "step 10 a later cycle completed" $((INTERVAL + 30)) "$LOG_STEP_SECONDS" later_cycles_seen; then
         pass "step 10 a later cycle completed"
@@ -2229,7 +2541,7 @@ step10_no_repeat() {
 # Step 11: browser check with the flag on
 
 step11_browser() {
-    local id pair type direction threshold revision list missing="" alerts
+    local id pair type direction threshold revision list missing="" alerts ack
     if [[ $PAIRS_READY -ne 1 ]]; then
         return 0
     fi
@@ -2262,13 +2574,21 @@ step11_browser() {
     fi
     run_browser_check flag-on "step 11 browser flag-on"
 
-    # The check's live shutdown turns the flag off and on again; step 12 needs it on.
+    # The check's live shutdown turns the flag off and on again; step 12 needs it on. Switching it
+    # on is a check of its own, confirmed only by a 200 with this flag's JSON boolean true.
     http GET "$F"
-    if [[ "$HTTP_STATUS" != "200" || "$(jget '.enabled' "$HTTP_BODY")" != "true" ]]; then
+    if [[ "$HTTP_STATUS" != "200" || "$(flag_enabled "$HTTP_BODY")" != "true" ]]; then
         info "flag $FLAG_ID is not on after the browser check ($(status_text)); switching it on for step 12"
         FLAG_TOUCHED=1
         http PUT "$F" '{"enabled": true}'
-        info "PUT {\"enabled\": true} gave $(status_text)"
+        ack="$(flag_enabled "$HTTP_BODY")"
+        if [[ "$HTTP_STATUS" != "200" ]]; then
+            fail "step 11 flag on for step 12" "PUT {\"enabled\": true} gave $(status_text)"
+        elif [[ "$ack" != "true" ]]; then
+            fail "step 11 flag on for step 12" "PUT {\"enabled\": true} answered [$ack]; expected id $FLAG_ID and enabled true"
+        else
+            pass "step 11 flag on for step 12"
+        fi
     fi
 }
 
@@ -2276,7 +2596,31 @@ step11_browser() {
 # Step 12: acknowledging an untriggered alert changes nothing
 
 step12_untriggered_ack() {
-    local id before after evidence fields ack_id ack_revision
+    local id before="" after unready="" changed evidence fields ack_id ack_revision
+    # A listing's verdict on alert $id, from jq -S -c -r -s over its body: the listed row, keys
+    # sorted and compact, or why the listing cannot serve, a text that never starts with "{".
+    # Each field of the object $want must be present in the row with exactly that JSON value:
+    # the string "false" is not false, and an absent triggeredAt is not null. A reason names
+    # fields, JSON kinds and numbers, never another value it was sent.
+    local listed_jq='
+        def kind: if type == "boolean" or type == "null" or type == "number" then tojson
+            elif type == "object" or type == "array" then "an \(type)" else "a \(type)" end;
+        if length != 1 or (.[0] | type) != "object" then "the listing is not one JSON object"
+        elif (.[0].results | type) != "array" then "the listing has no results array"
+        else [.[0].results[] | select(type == "object" and (.id | type) == "string"
+                and (.id | ascii_downcase) == $id)]
+            | if length == 0 then "the listing does not list the alert"
+              else .[0] as $row
+                | [$want | to_entries[] | .key as $name | .value as $value
+                    | if ($row | has($name) | not) then "\($name) is absent, expected \($value | tojson)"
+                      elif $row[$name] != $value then
+                          "\($name) is \($row[$name] | kind), expected \($value | tojson)"
+                      else empty end]
+                | if length == 0 then $row else join("; ") end
+              end
+        end'
+    # The state a disabled alert that never triggered shows (AlertDTO).
+    local untriggered='{"enabled":false,"triggeredAt":null,"triggerValue":null,"acknowledged":false}'
     if [[ $PAIRS_READY -ne 1 ]]; then
         return 0
     fi
@@ -2287,48 +2631,113 @@ step12_untriggered_ack() {
         id="$CREATED_ID"
         http PATCH "$ALERTS_URL/$id" '{"enabled":false}'
         if [[ "$HTTP_STATUS" != "200" ]]; then
-            fail "step 12 disabled untriggered alert" "PATCH {\"enabled\":false} gave $(status_text); body [$(body_snippet)]"
+            unready="PATCH {\"enabled\":false} gave $(status_text)"
+            fail "step 12 disabled untriggered alert" "$unready; body [$(body_snippet)]"
         else
             http GET "$ALERTS_URL?accountId=$HOLDER_ID"
-            before="$(jitem "$id" "$HTTP_BODY")"
-            if [[ "$HTTP_STATUS" == "200" && "$(jitem "$id" "$HTTP_BODY" '"\(.enabled) \(.triggeredAt)"')" == "false null" ]]; then
+            if [[ "$HTTP_STATUS" != "200" ]]; then
+                unready="the listing gave $(status_text), expected 200"
+            else
+                before="$(jq -S -c -r -s --arg id "$id" --argjson want "$untriggered" "$listed_jq" \
+                    2>/dev/null <<<"$HTTP_BODY" | tr -d '\r' || true)"
+                if [[ "$before" != "{"* ]]; then
+                    unready="${before:-the listing is not JSON}"
+                    before=""
+                fi
+            fi
+            if [[ -z "$unready" ]]; then
                 pass "step 12 disabled untriggered alert"
             else
-                fail "step 12 disabled untriggered alert" "$(status_text), list row [$before], expected enabled false and triggeredAt null"
+                fail "step 12 disabled untriggered alert" "$unready"
             fi
         fi
         http POST "$ALERTS_URL/$id/acknowledge"
         if [[ "$HTTP_STATUS" != "204" ]]; then
             fail "step 12 acknowledge leaves an untriggered alert unchanged" "$(status_text), expected 204; body [$(body_snippet)]"
+        elif [[ -n "$unready" ]]; then
+            # Only a row shown disabled and untriggered can prove that acknowledging changed nothing.
+            fail "step 12 acknowledge leaves an untriggered alert unchanged" "no disabled, untriggered row to compare: $unready"
         else
             http GET "$ALERTS_URL?accountId=$HOLDER_ID"
-            after="$(jitem "$id" "$HTTP_BODY")"
-            if [[ -n "${before:-}" && "$after" == "$before" ]]; then
-                pass "step 12 acknowledge leaves an untriggered alert unchanged"
+            if [[ "$HTTP_STATUS" != "200" ]]; then
+                fail "step 12 acknowledge leaves an untriggered alert unchanged" "the listing after acknowledging gave $(status_text), expected 200"
             else
-                fail "step 12 acknowledge leaves an untriggered alert unchanged" "row before [${before:-}], after [$after]"
+                after="$(jq -S -c -r -s --arg id "$id" --argjson want '{}' "$listed_jq" \
+                    2>/dev/null <<<"$HTTP_BODY" | tr -d '\r' || true)"
+                if [[ "$after" != "{"* ]]; then
+                    fail "step 12 acknowledge leaves an untriggered alert unchanged" "after acknowledging, ${after:-the listing is not JSON}"
+                elif [[ "$after" == "$before" ]]; then
+                    pass "step 12 acknowledge leaves an untriggered alert unchanged"
+                else
+                    # Named: the AlertDTO fields that differ; any other key is only counted. Both
+                    # rows reach jq on stdin, never as arguments, so no process list shows them.
+                    changed="$(printf '%s\n%s\n' "$before" "$after" | jq -n -r '
+                        input as $before | input as $after
+                        | ["id", "accountId", "type", "instrumentId", "direction", "threshold",
+                            "enabled", "armingRevision", "triggeredAt", "triggerValue",
+                            "acknowledged", "createdAt"] as $known
+                        | [[$before, $after | keys[]] | unique[] | . as $k
+                            | select(($before | has($k)) != ($after | has($k))
+                                or $before[$k] != $after[$k])] as $diff
+                        | [$diff[] | select(IN($known[]))] as $named
+                        | (($diff | length) - ($named | length)) as $other
+                        | if ($diff | length) == 0 then "a number is written differently"
+                          else ($named + (if $other == 0 then []
+                                else ["\($other) other key\(if $other == 1 then "" else "s" end)"] end))
+                            | join(", ") end' 2>/dev/null | tr -d '\r' || true)"
+                    fail "step 12 acknowledge leaves an untriggered alert unchanged" "acknowledging changed the row: ${changed:-its fields differ}"
+                fi
             fi
         fi
     fi
 
+    # Only this run's report counts: the flag-on mode, this run's fresh holder, and an
+    # acknowledgement of one of the pair alerts in the fixture this run handed the check. A
+    # reason names the fact that does not match, never a value the report holds.
     evidence="$EVIDENCE_DIR/portfolio-insights-page-check-flag-on.json"
     if [[ ! -f "$evidence" ]]; then
         fail "step 12 browser acknowledgement persisted" "evidence file $evidence is missing"
         return 0
     fi
-    fields="$(jq -r '.acknowledged | if type == "object" then "\(.id) \(.armingRevision)" else empty end' \
-        "$evidence" 2>/dev/null | tr -d '\r' | lower || true)"
-    read -r ack_id ack_revision <<<"$fields"
-    if [[ ! "${ack_id:-}" =~ $UUID_RE || ! "${ack_revision:-}" =~ ^[0-9]+$ ]]; then
-        fail "step 12 browser acknowledgement persisted" "$evidence has no acknowledged {id, armingRevision}"
+    fields="$(jq -r -s --rawfile pairs "$RUN_DIR/pairs" --arg holderUser "$HOLDER_USER" \
+        --arg holderId "$HOLDER_ID" '
+        ($pairs | [splits("\r?\n") | select(length > 0) | split(" ")[0] | ascii_downcase]) as $ids
+        | if length != 1 or (.[0] | type) != "object" then "it is not one JSON object"
+          else .[0]
+            | if .mode != "flag-on" then "its mode is not flag-on"
+              elif (.holder | type) != "object" or (.holder.accountId | type) != "string"
+                  or (.holder.accountId | ascii_downcase) != ($holderId | ascii_downcase) then
+                  "its holder.accountId is not the holder of this run"
+              elif .holder.username != $holderUser then
+                  "its holder.username is not the holder of this run"
+              elif (.acknowledged | type) != "object" then
+                  "its acknowledged is not an object: the check acknowledged no alert"
+              elif (.acknowledged.id | type) != "string"
+                  or (.acknowledged.id | ascii_downcase | IN($ids[]) | not) then
+                  "its acknowledged.id is not one of the pair alerts of this run"
+              elif (.acknowledged.armingRevision | type) != "number"
+                  or (.acknowledged.armingRevision | . != floor or . < 1 or . > 2147483647) then
+                  "its acknowledged.armingRevision is not an integer from 1 to 2147483647"
+              else "ok \(.acknowledged.id | ascii_downcase) \(.acknowledged.armingRevision | floor)"
+              end
+          end' "$evidence" 2>/dev/null | tr -d '\r' || true)"
+    read -r _ ack_id ack_revision <<<"$fields"
+    if [[ "$fields" != "ok "* || ! "${ack_id:-}" =~ $UUID_RE || ! "${ack_revision:-}" =~ ^[1-9][0-9]*$ ]]; then
+        fail "step 12 browser acknowledgement persisted" "evidence file $evidence: ${fields:-it is not JSON}"
         return 0
     fi
     http GET "$ALERTS_URL?accountId=$HOLDER_ID"
-    fields="$(jitem "$ack_id" "$HTTP_BODY" '"\(.acknowledged) \(.armingRevision)"')"
-    if [[ "$HTTP_STATUS" == "200" && "$fields" == "true $ack_revision" ]]; then
+    if [[ "$HTTP_STATUS" != "200" ]]; then
+        fail "step 12 browser acknowledgement persisted" "the listing gave $(status_text), expected 200"
+        return 0
+    fi
+    fields="$(jq -S -c -r -s --arg id "$ack_id" \
+        --argjson want "{\"acknowledged\":true,\"armingRevision\":$ack_revision}" "$listed_jq" \
+        2>/dev/null <<<"$HTTP_BODY" | tr -d '\r' || true)"
+    if [[ "$fields" == "{"* ]]; then
         pass "step 12 browser acknowledgement persisted"
     else
-        fail "step 12 browser acknowledgement persisted" "$(status_text); alert [$ack_id] shows acknowledged and revision [$fields], expected [true $ack_revision]"
+        fail "step 12 browser acknowledgement persisted" "alert [$ack_id]: ${fields:-the listing is not JSON}"
     fi
 }
 
@@ -2360,7 +2769,7 @@ step13_cleanup_and_disable() {
 
     FLAG_TOUCHED=1
     http PUT "$F" '{"enabled": false}'
-    if [[ "$HTTP_STATUS" == "200" && "$(jget '.enabled' "$HTTP_BODY")" == "false" ]]; then
+    if [[ "$HTTP_STATUS" == "200" && "$(flag_enabled "$HTTP_BODY")" == "false" ]]; then
         pass "step 13 disable flag"
     else
         fail "step 13 disable flag" "PUT {\"enabled\": false} gave $(status_text); body [$(body_snippet)]"

@@ -144,6 +144,8 @@ function insightsEntry(body) {
         kind: "insights",
         accountId: ACCOUNT_ID,
         status: 200,
+        accepted: true,
+        rejection: null,
         parsed: true,
         body,
     }

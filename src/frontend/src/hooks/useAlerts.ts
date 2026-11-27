@@ -1,7 +1,9 @@
 import {
+    type MutateOptions,
     type Mutation,
     type MutationKey,
     type QueryClient,
+    type UseMutationResult,
     queryOptions,
     useMutation,
     useMutationState,
@@ -19,12 +21,15 @@ import {
 } from "../api/alerts"
 import type { Alert, CreateAlertRequest } from "../api/alerts/types"
 import { BizEvents } from "../api/bizEvents"
-import { ApiError } from "../api/http"
+import { ApiError, loggableError } from "../api/http"
 import {
     type FeatureContext,
+    StaleFeatureWriteError,
     captureFeatureContext,
+    dispatchFeatureWrite,
     featureQueryRetry,
     isCurrentFeatureContext,
+    isDiscardedFeatureWrite,
     isFeatureDisabledError,
     onPortfolioInsightsDisabled,
     shareFeatureResult,
@@ -153,11 +158,98 @@ export type AlertRowErrors = ReadonlyMap<string, string>
 
 export type UpdateAlertEnabledVariables = { id: string; enabled: boolean }
 
-/** `onMutate` can throw before it returns, which leaves no context. */
-function isCurrentContext(
-    ctx: FeatureContext | undefined
-): ctx is FeatureContext {
-    return ctx !== undefined && isCurrentFeatureContext(ctx)
+/**
+ * A feature write as its mutation runs it: the caller's `input` and the
+ * context captured when the caller started it. The capture travels in the
+ * variables, so the dispatch, which can run long after the call (a mutation
+ * paused while offline runs on reconnect), judges the write by the account,
+ * session and activation it was made in.
+ */
+type FeatureWrite<TInput> = { input: TInput; ctx: FeatureContext }
+
+/**
+ * A call's own options as the mutation takes them. Each callback the caller
+ * gave receives the caller's input as its `variables`, in place of the write
+ * the mutation runs on, and its other arguments unchanged; `onMutateResult`
+ * is the context captured at that call. A callback the caller left out stays
+ * out.
+ */
+function toWriteOptions<TData, TInput>(
+    options: MutateOptions<TData, Error, TInput, FeatureContext> | undefined
+):
+    | MutateOptions<TData, Error, FeatureWrite<TInput>, FeatureContext>
+    | undefined {
+    if (options === undefined) return undefined
+    const { onSuccess, onError, onSettled } = options
+    const writeOptions: MutateOptions<
+        TData,
+        Error,
+        FeatureWrite<TInput>,
+        FeatureContext
+    > = {}
+    if (onSuccess !== undefined) {
+        writeOptions.onSuccess = (data, write, onMutateResult, context) =>
+            onSuccess(data, write.input, onMutateResult, context)
+    }
+    if (onError !== undefined) {
+        writeOptions.onError = (error, write, onMutateResult, context) =>
+            onError(error, write.input, onMutateResult, context)
+    }
+    if (onSettled !== undefined) {
+        writeOptions.onSettled = (
+            data,
+            error,
+            write,
+            onMutateResult,
+            context
+        ) => onSettled(data, error, write.input, onMutateResult, context)
+    }
+    return writeOptions
+}
+
+/**
+ * `mutation` as its callers use it: `mutate` and `mutateAsync` take the
+ * caller's input and add the context captured at that call, their per-call
+ * options speak the caller's input too, and `variables` is the latest call's
+ * input.
+ */
+function useCallContextMutation<TData, TInput>(
+    mutation: UseMutationResult<
+        TData,
+        Error,
+        FeatureWrite<TInput>,
+        FeatureContext
+    >
+) {
+    const { mutate: mutateWrite, mutateAsync: mutateWriteAsync } = mutation
+    const mutate = useCallback(
+        (
+            input: TInput,
+            options?: MutateOptions<TData, Error, TInput, FeatureContext>
+        ) =>
+            mutateWrite(
+                { input, ctx: captureFeatureContext() },
+                toWriteOptions(options)
+            ),
+        [mutateWrite]
+    )
+    const mutateAsync = useCallback(
+        (
+            input: TInput,
+            options?: MutateOptions<TData, Error, TInput, FeatureContext>
+        ) =>
+            mutateWriteAsync(
+                { input, ctx: captureFeatureContext() },
+                toWriteOptions(options)
+            ),
+        [mutateWriteAsync]
+    )
+    return {
+        ...mutation,
+        variables: mutation.variables?.input,
+        mutate,
+        mutateAsync,
+    }
 }
 
 async function invalidateAlertQueries(
@@ -192,12 +284,6 @@ function rowIdOf(id: string): string {
     return id
 }
 
-/** A pending row mutation call: its variables and its captured context. */
-type PendingRowCall<TVariables> = {
-    variables: TVariables | undefined
-    context: FeatureContext | undefined
-}
-
 /**
  * The id of every row with a call of one row mutation still pending in the
  * current account session and activation. A mutation observer reports only
@@ -209,29 +295,24 @@ type PendingRowCall<TVariables> = {
  * once the same account or the feature is back: its outcome will be
  * discarded, so it must not keep that row's controls disabled.
  */
-function usePendingRowIds<TVariables>(
+function usePendingRowIds<TInput>(
     mutationKey: MutationKey,
-    idOf: (variables: TVariables) => string
+    idOf: (input: TInput) => string
 ): ReadonlySet<string> {
     const pendingCalls = useMutationState<
-        PendingRowCall<TVariables>,
-        Mutation<unknown, Error, TVariables, FeatureContext>
+        FeatureWrite<TInput> | undefined,
+        Mutation<unknown, Error, FeatureWrite<TInput>, FeatureContext>
     >({
         filters: { mutationKey, exact: true, status: "pending" },
-        select: (mutation) => ({
-            variables: mutation.state.variables,
-            context: mutation.state.context,
-        }),
+        select: (mutation) => mutation.state.variables,
     })
     // Checked on every render rather than memoised: a logout or a shutdown
     // ends a call's context without any change in the mutation cache.
     const ids = new Set<string>()
-    for (const { variables, context } of pendingCalls) {
-        if (variables === undefined) continue
-        // A call is pending before `onMutate` returns its capture, so a call
-        // with no context yet has only just started, in the current context.
-        if (context === undefined || isCurrentFeatureContext(context)) {
-            ids.add(idOf(variables))
+    for (const call of pendingCalls) {
+        // Every call carries the capture of the moment it was started.
+        if (call !== undefined && isCurrentFeatureContext(call.ctx)) {
+            ids.add(idOf(call.input))
         }
     }
     return ids
@@ -258,11 +339,13 @@ function useRowErrors() {
 }
 
 /**
- * Failure handling shared by the three row mutations. A stale failure changes
- * nothing, a 403 shuts the feature down, and any other failure is recorded
- * for its own row only. A 404 also refreshes both lists, because the row may
- * be an alert list row or a notification; the panel keeps showing the message
- * once the refreshed list no longer has the row.
+ * Failure handling shared by the three row mutations. A write that was never
+ * sent, or was aborted, because its context ended, is only logged, as a debug
+ * entry. A stale failure changes nothing, a 403 shuts the feature down, and
+ * any other failure is recorded for its own row only. A 404 also refreshes
+ * both lists, because the row may be an alert list row or a notification; the
+ * panel keeps showing the message once the refreshed list no longer has the
+ * row.
  */
 async function applyRowFailure(
     hookName: string,
@@ -270,11 +353,20 @@ async function applyRowFailure(
     accountId: string,
     error: Error,
     id: string,
-    ctx: FeatureContext | undefined,
+    ctx: FeatureContext,
     setRowError: (id: string, message: string) => void
 ): Promise<void> {
-    console.error(`[${hookName}] failed`, error)
-    if (!isCurrentContext(ctx)) return
+    if (isDiscardedFeatureWrite(error)) {
+        console.debug(
+            `[${hookName}] discarded`,
+            loggableError(error, accountId, id)
+        )
+        return
+    }
+    // The original error, whose URL and message name the alert, still decides
+    // the outcome below; only its log entry is redacted.
+    console.error(`[${hookName}] failed`, loggableError(error, accountId, id))
+    if (!isCurrentFeatureContext(ctx)) return
     if (isFeatureDisabledError(error)) {
         onPortfolioInsightsDisabled(client)
         return
@@ -290,6 +382,18 @@ async function applyRowFailure(
  * Creates an alert. `created` drives `output#alert-created-id` and keeps its
  * value until the next successful create; `errorMessage` is the form's
  * message for the latest failure.
+ *
+ * Each of the four alert mutations captures the feature context when its
+ * `mutate` is called and sends its request through `dispatchFeatureWrite`
+ * under that capture, so a call that is still waiting, such as one paused
+ * while offline, sends nothing once its session, account or activation has
+ * ended, and one in flight is aborted by the shutdown or a logout. Such a
+ * call shows nothing.
+ *
+ * A create whose `input.accountId` is not this hook's `accountId` is refused
+ * the same way, with `StaleFeatureWriteError` and before any request: the
+ * guard checks the hook's account, but the body would name the input's. It
+ * shows no message, sends no event and refreshes nothing.
  */
 export function useCreateAlertMutation(accountId: string) {
     const client = useQueryClient()
@@ -297,12 +401,22 @@ export function useCreateAlertMutation(accountId: string) {
     const [errorMessage, setErrorMessage] = useState<string | null>(null)
 
     const mutation = useMutation({
-        mutationFn: (request: CreateAlertRequest) => createAlert(request),
-        onMutate: () => {
-            setErrorMessage(null)
-            return captureFeatureContext()
+        mutationFn: ({ input, ctx }: FeatureWrite<CreateAlertRequest>) => {
+            // The body names `input.accountId`, while the dispatch guard
+            // checks this hook's account, so a request for any other account
+            // is refused here, before any transport.
+            if (input.accountId !== accountId) {
+                return Promise.reject(new StaleFeatureWriteError())
+            }
+            return dispatchFeatureWrite(client, ctx, accountId, (signal) =>
+                createAlert(input, signal)
+            )
         },
-        onSuccess: async ({ alert, threshold }, _request, ctx) => {
+        onMutate: ({ ctx }) => {
+            setErrorMessage(null)
+            return ctx
+        },
+        onSuccess: async ({ alert, threshold }, { ctx }) => {
             if (!isCurrentFeatureContext(ctx)) return
             // Set before the refetch, so the output appears on the 201 and
             // the row once the list has reloaded. `threshold` is the token
@@ -331,9 +445,19 @@ export function useCreateAlertMutation(accountId: string) {
             }
             await invalidateAlertQueries(client, accountId)
         },
-        onError: (error, _request, ctx) => {
-            console.error("[useCreateAlertMutation] failed", error)
-            if (!isCurrentContext(ctx)) return
+        onError: (error, { ctx }) => {
+            if (isDiscardedFeatureWrite(error)) {
+                console.debug(
+                    "[useCreateAlertMutation] discarded",
+                    loggableError(error, accountId)
+                )
+                return
+            }
+            console.error(
+                "[useCreateAlertMutation] failed",
+                loggableError(error, accountId)
+            )
+            if (!isCurrentFeatureContext(ctx)) return
             if (isFeatureDisabledError(error)) {
                 onPortfolioInsightsDisabled(client)
                 return
@@ -342,7 +466,7 @@ export function useCreateAlertMutation(accountId: string) {
         },
     })
 
-    return { ...mutation, created, errorMessage }
+    return { ...useCallContextMutation(mutation), created, errorMessage }
 }
 
 /**
@@ -358,17 +482,22 @@ export function useUpdateAlertEnabledMutation(accountId: string) {
 
     const mutation = useMutation({
         mutationKey,
-        mutationFn: ({ id, enabled }: UpdateAlertEnabledVariables) =>
-            updateAlertEnabled(id, enabled),
-        onMutate: ({ id }) => {
+        mutationFn: ({
+            input: { id, enabled },
+            ctx,
+        }: FeatureWrite<UpdateAlertEnabledVariables>) =>
+            dispatchFeatureWrite(client, ctx, accountId, (signal) =>
+                updateAlertEnabled(id, enabled, signal)
+            ),
+        onMutate: ({ input: { id }, ctx }) => {
             clearRowError(id)
-            return captureFeatureContext()
+            return ctx
         },
-        onSuccess: async (_alert, _variables, ctx) => {
+        onSuccess: async (_alert, { ctx }) => {
             if (!isCurrentFeatureContext(ctx)) return
             await invalidateAlertQueries(client, accountId)
         },
-        onError: (error, { id }, ctx) =>
+        onError: (error, { input: { id }, ctx }) =>
             applyRowFailure(
                 "useUpdateAlertEnabledMutation",
                 client,
@@ -382,7 +511,7 @@ export function useUpdateAlertEnabledMutation(accountId: string) {
     const pendingIds = usePendingRowIds(mutationKey, updateRowIdOf)
 
     return {
-        ...mutation,
+        ...useCallContextMutation(mutation),
         pendingIds,
         rowErrors,
         dismissRowError: clearRowError,
@@ -407,12 +536,15 @@ export function useDeleteAlertMutation(accountId: string) {
 
     const mutation = useMutation({
         mutationKey,
-        mutationFn: (id: string) => deleteAlert(id),
-        onMutate: (id) => {
+        mutationFn: ({ input: id, ctx }: FeatureWrite<string>) =>
+            dispatchFeatureWrite(client, ctx, accountId, (signal) =>
+                deleteAlert(id, signal)
+            ),
+        onMutate: ({ input: id, ctx }) => {
             clearRowError(id)
-            return captureFeatureContext()
+            return ctx
         },
-        onSuccess: async (_data, id, ctx) => {
+        onSuccess: async (_data, { input: id, ctx }) => {
             if (!isCurrentFeatureContext(ctx)) return
             // Set before the refetch, so the output appears on the 204 and
             // the row disappears once the list has reloaded.
@@ -420,7 +552,7 @@ export function useDeleteAlertMutation(accountId: string) {
             setDeletedIds((ids) => (ids.has(id) ? ids : new Set(ids).add(id)))
             await invalidateAlertQueries(client, accountId)
         },
-        onError: (error, id, ctx) =>
+        onError: (error, { input: id, ctx }) =>
             applyRowFailure(
                 "useDeleteAlertMutation",
                 client,
@@ -434,7 +566,7 @@ export function useDeleteAlertMutation(accountId: string) {
     const pendingIds = usePendingRowIds(mutationKey, rowIdOf)
 
     return {
-        ...mutation,
+        ...useCallContextMutation(mutation),
         deletedId,
         deletedIds,
         pendingIds,
@@ -455,16 +587,19 @@ export function useAcknowledgeAlertMutation(accountId: string) {
 
     const mutation = useMutation({
         mutationKey,
-        mutationFn: (id: string) => acknowledgeAlert(id),
-        onMutate: (id) => {
+        mutationFn: ({ input: id, ctx }: FeatureWrite<string>) =>
+            dispatchFeatureWrite(client, ctx, accountId, (signal) =>
+                acknowledgeAlert(id, signal)
+            ),
+        onMutate: ({ input: id, ctx }) => {
             clearRowError(id)
-            return captureFeatureContext()
+            return ctx
         },
-        onSuccess: async (_data, _id, ctx) => {
+        onSuccess: async (_data, { ctx }) => {
             if (!isCurrentFeatureContext(ctx)) return
             await invalidateAlertQueries(client, accountId)
         },
-        onError: (error, id, ctx) =>
+        onError: (error, { input: id, ctx }) =>
             applyRowFailure(
                 "useAcknowledgeAlertMutation",
                 client,
@@ -478,7 +613,7 @@ export function useAcknowledgeAlertMutation(accountId: string) {
     const pendingIds = usePendingRowIds(mutationKey, rowIdOf)
 
     return {
-        ...mutation,
+        ...useCallContextMutation(mutation),
         pendingIds,
         rowErrors,
         dismissRowError: clearRowError,

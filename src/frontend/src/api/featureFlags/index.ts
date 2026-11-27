@@ -1,7 +1,7 @@
 import {
     ApiError,
     getJson,
-    getJsonWithTimeout,
+    getJsonWithTimeoutExactStatus,
     isReadDeadlineAbort,
     MalformedJsonError,
     put,
@@ -103,11 +103,11 @@ function isAbortError(error: unknown): boolean {
 
 // The diagnostic logged for an exception caught during the read. Every error
 // is kept as thrown. Within this read only parsing builds a message from the
-// response bytes, which are untrusted, and the parse boundary in http.ts
-// already makes that error content-safe: a `MalformedJsonError`, whose
-// message is fixed and whose stack holds frames but no body text. Only that
-// error counts as unreadable JSON; a SyntaxError raised anywhere else is
-// unrecognised.
+// response bytes, which are untrusted, and the parse boundary of
+// `getJsonWithTimeoutExactStatus` in http.ts already makes that error
+// content-safe: a `MalformedJsonError`, whose message is fixed and whose
+// stack holds frames but no body text. Only that error counts as unreadable
+// JSON; a SyntaxError raised anywhere else is unrecognised.
 function describeFlagReadFailure(
     error: unknown,
     signal?: AbortSignal
@@ -153,11 +153,15 @@ export async function getPortfolioInsightsFlag(
 ): Promise<boolean> {
     let body: unknown
     try {
-        body = await getJsonWithTimeout<unknown>(
+        // `getJsonWithTimeoutExactStatus`, not `getJsonWithTimeout`: the flag
+        // counts only for a 200, and an unparsable body must fail as the
+        // content-safe `MalformedJsonError`, while `getJsonWithTimeout` keeps
+        // its signature and parser error for the version page.
+        body = await getJsonWithTimeoutExactStatus<unknown>(
             `${services.featureFlag()}/flags/${PortfolioInsightsFlagId}`,
             PORTFOLIO_INSIGHTS_FLAG_TIMEOUT_MS,
-            signal,
-            PORTFOLIO_INSIGHTS_FLAG_STATUS
+            PORTFOLIO_INSIGHTS_FLAG_STATUS,
+            signal
         )
     } catch (error) {
         const diagnostic = describeFlagReadFailure(error, signal)

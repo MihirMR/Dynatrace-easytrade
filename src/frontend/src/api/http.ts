@@ -325,23 +325,28 @@ export async function post(url: string, body: unknown): Promise<void> {
  * JavaScript number; the caller is responsible for producing valid JSON.
  * Given `status`, only a 2xx equal to it resolves: any other response, 2xx
  * included, rejects with `ApiError` before the body is read, and so does a
- * non-2xx `status`; without it, any 2xx resolves.
+ * non-2xx `status`; without it, any 2xx resolves. A response body that is not
+ * valid JSON rejects with `MalformedJsonError`. `signal` is passed to `fetch`,
+ * so aborting it cancels the request and its body read with the standard
+ * `AbortError`.
  */
 export async function postJsonText<T>(
     url: string,
     bodyText: string,
-    status?: number
+    status?: number,
+    signal?: AbortSignal
 ): Promise<T> {
     const init: RequestInit = {
         method: "POST",
         headers: JSON_HEADERS,
         body: bodyText,
+        signal,
     }
     const response =
         status === undefined
             ? await request(url, init)
             : await requestExactStatus(url, init, status)
-    return (await response.json()) as T
+    return await readJsonBody<T>(response)
 }
 
 export async function put<T>(
@@ -357,13 +362,30 @@ export async function put<T>(
     return text ? (JSON.parse(text) as T) : undefined
 }
 
-export async function patchJson<T>(url: string, body: unknown): Promise<T> {
-    const response = await request(url, {
+/**
+ * PATCH `body` as JSON. As for `postJsonText`, given `status` only a 2xx
+ * equal to it resolves and any other response rejects with `ApiError` before
+ * the body is read; without it, any 2xx resolves. A response body that is not
+ * valid JSON rejects with `MalformedJsonError`, and aborting `signal` cancels
+ * the request and its body read with the standard `AbortError`.
+ */
+export async function patchJson<T>(
+    url: string,
+    body: unknown,
+    status?: number,
+    signal?: AbortSignal
+): Promise<T> {
+    const init: RequestInit = {
         method: "PATCH",
         headers: JSON_HEADERS,
         body: JSON.stringify(body),
-    })
-    return (await response.json()) as T
+        signal,
+    }
+    const response =
+        status === undefined
+            ? await request(url, init)
+            : await requestExactStatus(url, init, status)
+    return await readJsonBody<T>(response)
 }
 
 export async function del(url: string): Promise<void> {
@@ -391,15 +413,37 @@ async function requestExactStatus(
 /**
  * DELETE whose one success is a 2xx equal to `status`: any other response,
  * 2xx included, rejects with `ApiError`, and so does a non-2xx `status`. The
- * body is never read.
+ * body is never read. Aborting `signal` cancels the request with the standard
+ * `AbortError`.
  */
 export async function delExactStatus(
     url: string,
-    status: number
+    status: number,
+    signal?: AbortSignal
 ): Promise<void> {
     await requestExactStatus(
         url,
-        { method: "DELETE", headers: JSON_HEADERS },
+        { method: "DELETE", headers: JSON_HEADERS, signal },
+        status
+    )
+}
+
+/**
+ * POST with no request body, for an action that its URL alone names, whose
+ * one success is a 2xx equal to `status`: any other response, 2xx included,
+ * rejects with `ApiError`, and so does a non-2xx `status`. It sends no
+ * `Content-Type`, since there is no body to describe, and never reads the
+ * response body. Aborting `signal` cancels the request with the standard
+ * `AbortError`.
+ */
+export async function postExactStatus(
+    url: string,
+    status: number,
+    signal?: AbortSignal
+): Promise<void> {
+    await requestExactStatus(
+        url,
+        { method: "POST", headers: { Accept: "application/json" }, signal },
         status
     )
 }
@@ -424,21 +468,19 @@ export function isReadDeadlineAbort(error: unknown): boolean {
 }
 
 /**
- * GET JSON, aborted after `timeoutMs` or when the optional caller `signal`
- * aborts, whichever comes first. Both paths abort one internal controller, so
- * the rejection is always the standard `AbortError`; `isReadDeadlineAbort`
- * tells which one aborted it. The caller signal is linked by hand because
- * `AbortSignal.any` is missing from older browsers; its listener is removed
- * once the request settles. Given `requiredStatus`, any other status, 2xx
- * included, rejects with `ApiError` before the body is read; without it, any
- * 2xx resolves. A body that is not valid JSON rejects with
- * `MalformedJsonError`.
+ * GET for JSON whose result `read` takes from the 2xx response, aborted after
+ * `timeoutMs` or when the optional caller `signal` aborts, whichever comes
+ * first. `read` runs inside the deadline, so it bounds the body read too. Both
+ * paths abort one internal controller, so the rejection is always the
+ * standard `AbortError`; `isReadDeadlineAbort` tells which one aborted it. The
+ * caller signal is linked by hand because `AbortSignal.any` is missing from
+ * older browsers; its listener is removed once the read settles.
  */
-export async function getJsonWithTimeout<T>(
+async function readWithTimeout<T>(
     url: string,
     timeoutMs: number,
-    signal?: AbortSignal,
-    requiredStatus?: number
+    signal: AbortSignal | undefined,
+    read: (response: Response) => Promise<T>
 ): Promise<T> {
     const controller = new AbortController()
     // Decided when the deadline fires, since the caller may also abort before
@@ -459,13 +501,7 @@ export async function getJsonWithTimeout<T>(
             headers: { Accept: "application/json" },
             signal: controller.signal,
         })
-        if (
-            requiredStatus !== undefined &&
-            response.status !== requiredStatus
-        ) {
-            throw new ApiError(response.status, url)
-        }
-        return await readJsonBody<T>(response)
+        return await read(response)
     } catch (error) {
         if (
             deadlineAbortedFirst &&
@@ -479,4 +515,42 @@ export async function getJsonWithTimeout<T>(
         clearTimeout(timer)
         signal?.removeEventListener("abort", onAbort)
     }
+}
+
+/**
+ * GET JSON, aborted after `timeoutMs` or when the optional caller `signal`
+ * aborts, whichever comes first (see `readWithTimeout`). Any 2xx resolves. A
+ * body that is not valid JSON rejects with the parser's own `SyntaxError`.
+ */
+export async function getJsonWithTimeout<T>(
+    url: string,
+    timeoutMs: number,
+    signal?: AbortSignal
+): Promise<T> {
+    return await readWithTimeout(
+        url,
+        timeoutMs,
+        signal,
+        async (response) => (await response.json()) as T
+    )
+}
+
+/**
+ * `getJsonWithTimeout` for a read whose one success is a 2xx equal to
+ * `status`: any other response, 2xx included, rejects with `ApiError` before
+ * the body is read, and so does a non-2xx `status`. A body that is not valid
+ * JSON rejects with the content-safe `MalformedJsonError`.
+ */
+export async function getJsonWithTimeoutExactStatus<T>(
+    url: string,
+    timeoutMs: number,
+    status: number,
+    signal?: AbortSignal
+): Promise<T> {
+    return await readWithTimeout(url, timeoutMs, signal, async (response) => {
+        if (response.status !== status) {
+            throw new ApiError(response.status, url)
+        }
+        return await readJsonBody<T>(response)
+    })
 }

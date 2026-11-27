@@ -3,15 +3,18 @@ import { getPortfolioInsightsFlag } from "../../api/featureFlags"
 import { getPortfolioInsights } from "../../api/portfolioInsights"
 import type { PortfolioInsights } from "../../api/portfolioInsights/types"
 import {
+    acknowledgeAlert,
     createAlert,
     deleteAlert,
     listAlertNotifications,
     listAlerts,
+    updateAlertEnabled,
 } from "../../api/alerts"
 import type { Alert, CreateAlertRequest } from "../../api/alerts/types"
 import {
     ApiError,
     InvalidResponseError,
+    MalformedJsonError,
     patchJson,
     services,
 } from "../../api/http"
@@ -654,6 +657,11 @@ const malformedAlertBodies: {
         field: "results[0].id",
     },
     {
+        variant: "non-GUID id",
+        bodyText: JSON.stringify({ results: [{ ...alert, id: "not-a-guid" }] }),
+        field: "results[0].id",
+    },
+    {
         variant: "missing account id",
         bodyText: JSON.stringify({
             results: [{ ...alert, accountId: undefined }],
@@ -761,34 +769,62 @@ it.each(
     }
 )
 
-const featureReads: {
-    read: string
+const featureRequests: {
+    request: string
+    method: string
     url: string
     call: (signal: AbortSignal) => Promise<unknown>
 }[] = [
     {
-        read: "getPortfolioInsights",
+        request: "getPortfolioInsights",
+        method: "GET",
         url: `${services.broker()}/portfolio/insights/${accountId}`,
         call: (signal) => getPortfolioInsights(accountId, signal),
     },
     {
-        read: "listAlerts",
+        request: "listAlerts",
+        method: "GET",
         url: `${services.broker()}/alerts?accountId=${accountId}`,
         call: (signal) => listAlerts(accountId, signal),
     },
     {
-        read: "listAlertNotifications",
+        request: "listAlertNotifications",
+        method: "GET",
         url: `${services.broker()}/alerts/notifications?accountId=${accountId}&unacknowledged=true`,
         call: (signal) => listAlertNotifications(accountId, true, signal),
     },
+    {
+        request: "createAlert",
+        method: "POST",
+        url: `${services.broker()}/alerts`,
+        call: (signal) => createAlert(createRequest, signal),
+    },
+    {
+        request: "updateAlertEnabled",
+        method: "PATCH",
+        url: `${services.broker()}/alerts/${alertId}`,
+        call: (signal) => updateAlertEnabled(alertId, true, signal),
+    },
+    {
+        request: "deleteAlert",
+        method: "DELETE",
+        url: `${services.broker()}/alerts/${alertId}`,
+        call: (signal) => deleteAlert(alertId, signal),
+    },
+    {
+        request: "acknowledgeAlert",
+        method: "POST",
+        url: `${services.broker()}/alerts/${alertId}/acknowledge`,
+        call: (signal) => acknowledgeAlert(alertId, signal),
+    },
 ]
 
-it.each(featureReads)(
-    "featureRead_signalAborted_rejectsAbortError ($read)",
-    async ({ url, call }) => {
+it.each(featureRequests)(
+    "featureRequest_signalAborted_rejectsAbortError ($request)",
+    async ({ method, url, call }) => {
         const sent: (AbortSignal | null | undefined)[] = []
         stubFetch({
-            method: "GET",
+            method,
             url,
             respond: (init) => {
                 sent.push(init?.signal)
@@ -850,26 +886,6 @@ const createRequest: CreateAlertRequest = {
     threshold: "150.25",
 }
 
-// An alert-shaped body that is not a 201 must not confirm the create.
-it.each([200, 202])(
-    "createAlert_unexpectedSuccessStatus_rejectsApiErrorBeforeBodyRead (%i)",
-    async (status) => {
-        const response = jsonResponse(alert, status)
-        stubFetch({
-            method: "POST",
-            url: `${services.broker()}/alerts`,
-            respond: () => Promise.resolve(response),
-        })
-
-        const error = await rejectionOf(createAlert(createRequest))
-
-        expect({
-            ...apiErrorShape(error),
-            bodyRead: response.bodyUsed,
-        }).toEqual({ isApiError: true, status, bodyRead: false })
-    }
-)
-
 it("deleteAlert_noContent204_resolves", async () => {
     stubFetch({
         method: "DELETE",
@@ -882,22 +898,222 @@ it("deleteAlert_noContent204_resolves", async () => {
     expect(error).toBeUndefined()
 })
 
-it.each([200, 202])(
-    "deleteAlert_unexpectedSuccessStatus_rejectsApiErrorBeforeBodyRead (%i)",
-    async (status) => {
-        const response = jsonResponse(alert, status)
-        stubFetch({
-            method: "DELETE",
-            url: `${services.broker()}/alerts/${alertId}`,
-            respond: () => Promise.resolve(response),
-        })
+// The action is id-only: nothing is sent, so nothing is described either.
+it("acknowledgeAlert_noContent204_sendsIdOnlyRequestAndResolves", async () => {
+    let sent: RequestInit | undefined
+    stubFetch({
+        method: "POST",
+        url: `${services.broker()}/alerts/${alertId}/acknowledge`,
+        respond: (init) => {
+            sent = init
+            return Promise.resolve(new Response(null, { status: 204 }))
+        },
+    })
 
-        const error = await rejectionOf(deleteAlert(alertId))
+    const error = await rejectionOf(acknowledgeAlert(alertId))
+
+    expect({ error, body: sent?.body, headers: sent?.headers }).toEqual({
+        error: undefined,
+        body: undefined,
+        headers: { Accept: "application/json" },
+    })
+})
+
+/** The four alert writes, each with the one status the broker answers. */
+const alertWrites: {
+    write: string
+    method: string
+    url: string
+    call: () => Promise<unknown>
+    others: number[]
+}[] = [
+    {
+        write: "createAlert",
+        method: "POST",
+        url: `${services.broker()}/alerts`,
+        call: () => createAlert(createRequest),
+        others: [200, 202],
+    },
+    {
+        write: "updateAlertEnabled",
+        method: "PATCH",
+        url: `${services.broker()}/alerts/${alertId}`,
+        call: () => updateAlertEnabled(alertId, false),
+        others: [201, 202, 204],
+    },
+    {
+        write: "deleteAlert",
+        method: "DELETE",
+        url: `${services.broker()}/alerts/${alertId}`,
+        call: () => deleteAlert(alertId),
+        others: [200, 202],
+    },
+    {
+        write: "acknowledgeAlert",
+        method: "POST",
+        url: `${services.broker()}/alerts/${alertId}/acknowledge`,
+        call: () => acknowledgeAlert(alertId),
+        others: [200, 202],
+    },
+]
+
+/** A `status` reply carrying `alert`, or no body where the status forbids one. */
+function alertResponse(status: number): Response {
+    return status === 204
+        ? new Response(null, { status })
+        : jsonResponse(alert, status)
+}
+
+// An alert-shaped body under any other 2xx must not confirm the write.
+it.each(
+    alertWrites.flatMap(({ others, ...write }) =>
+        others.map((status) => ({ ...write, status }))
+    )
+)(
+    "alertWrite_unexpectedSuccessStatus_rejectsApiErrorBeforeBodyRead ($write $status)",
+    async ({ method, url, call, status }) => {
+        const response = alertResponse(status)
+        stubFetch({ method, url, respond: () => Promise.resolve(response) })
+
+        const error = await rejectionOf(call())
 
         expect({
             ...apiErrorShape(error),
             bodyRead: response.bodyUsed,
         }).toEqual({ isApiError: true, status, bodyRead: false })
+    }
+)
+
+it("updateAlertEnabled_ok200_sendsEnabledAndReturnsAlert", async () => {
+    const snapshot: Alert = { ...alert, enabled: false }
+    let sent: RequestInit | undefined
+    stubFetch({
+        method: "PATCH",
+        url: `${services.broker()}/alerts/${alertId}`,
+        respond: (init) => {
+            sent = init
+            return Promise.resolve(jsonResponse(snapshot))
+        },
+    })
+
+    const updated = await updateAlertEnabled(alertId, false)
+
+    expect({ updated, body: sent?.body }).toEqual({
+        updated: snapshot,
+        body: '{"enabled":false}',
+    })
+})
+
+/** The two writes whose success carries the alert: create 201, PATCH 200. */
+const alertBodyWrites: {
+    write: string
+    method: string
+    url: string
+    status: number
+    call: () => Promise<unknown>
+}[] = [
+    {
+        write: "createAlert",
+        method: "POST",
+        url: `${services.broker()}/alerts`,
+        status: 201,
+        call: () => createAlert(createRequest),
+    },
+    {
+        write: "updateAlertEnabled",
+        method: "PATCH",
+        url: `${services.broker()}/alerts/${alertId}`,
+        status: 200,
+        call: () => updateAlertEnabled(alertId, true),
+    },
+]
+
+const invalidAlertBodies: { variant: string; body: unknown; field: string }[] =
+    [
+        { variant: "array body", body: [], field: "body" },
+        { variant: "null body", body: null, field: "body" },
+        {
+            variant: "missing id",
+            body: { ...alert, id: undefined },
+            field: "body.id",
+        },
+        // An id other than the canonical GUID the broker writes must not
+        // confirm the write.
+        {
+            variant: "numeric text id",
+            body: { ...alert, id: "5" },
+            field: "body.id",
+        },
+        {
+            variant: "non-GUID id",
+            body: { ...alert, id: "not-a-guid" },
+            field: "body.id",
+        },
+        {
+            variant: "unhyphenated GUID id",
+            body: { ...alert, id: alertId.replaceAll("-", "") },
+            field: "body.id",
+        },
+        {
+            variant: "threshold as text",
+            body: { ...alert, threshold: "150.25" },
+            field: "body.threshold",
+        },
+        {
+            variant: "missing creation time",
+            body: { ...alert, createdAt: undefined },
+            field: "body.createdAt",
+        },
+    ]
+
+// The message names only the failing field: no URL, account id or value.
+it.each(
+    alertBodyWrites.flatMap((write) =>
+        invalidAlertBodies.map((body) => ({ ...write, ...body }))
+    )
+)(
+    "alertWrite_invalidAlertBody_rejectsInvalidResponseError ($write, $variant)",
+    async ({ method, url, status, call, body, field }) => {
+        stubFetch({ method, url, respond: respondWith(body, status) })
+
+        const error = await rejectionOf(call())
+
+        expect(invalidResponseShape(error)).toEqual({
+            isInvalidResponse: true,
+            name: "InvalidResponseError",
+            field,
+            message: `Invalid response body at ${field}`,
+            mentionsRequest: false,
+        })
+    }
+)
+
+it.each(alertBodyWrites)(
+    "alertWrite_malformedJson_rejectsMalformedJsonErrorWithoutBodyText ($write)",
+    async ({ method, url, status, call }) => {
+        const marker = "LEAK41c7"
+        stubFetch({
+            method,
+            url,
+            respond: () =>
+                Promise.resolve(
+                    new Response(`<${marker} ${accountId}>`, {
+                        status,
+                        headers: { "Content-Type": "application/json" },
+                    })
+                ),
+        })
+
+        const error = await rejectionOf(call())
+
+        const { name, message, stack } = error as Error
+        const shown = `${name}\n${message}\n${stack ?? ""}`
+        expect({
+            isMalformedJson: error instanceof MalformedJsonError,
+            leaked: [marker, accountId, alertId].filter((part) =>
+                shown.includes(part)
+            ),
+        }).toEqual({ isMalformedJson: true, leaked: [] })
     }
 )
 

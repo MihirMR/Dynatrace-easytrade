@@ -250,7 +250,12 @@ const BODY_FAILURES = [
 
 for (const { scenario, json, expected } of BODY_FAILURES) {
     test(`recordResponse_${scenario}_keepsFixedBodyError`, async () => {
-        const session = { responses: [], pendingBodies: new Set() }
+        const session = {
+            account: { accountId: ACCOUNT_ID },
+            origin: "http://127.0.0.1",
+            responses: [],
+            pendingBodies: new Set(),
+        }
         recordResponse(session, fakeResponse(json))
         await Promise.all([...session.pendingBodies])
         const [entry] = session.responses
@@ -432,6 +437,8 @@ function notificationEntry(seq, results) {
         seq,
         at: 0,
         status: 200,
+        accepted: true,
+        rejection: null,
         body: { results },
     }
 }
@@ -634,6 +641,8 @@ test("summariseNotifications_secretFields_keepsDefinedFormsOnly", () => {
                 parsed: false,
                 at: 0,
                 status: 200,
+                accepted: true,
+                rejection: null,
                 bodyError: "the body is not valid JSON",
             },
             { kind: "insights", parsed: true, at: 0, status: 200, body: {} },
@@ -644,6 +653,9 @@ test("summariseNotifications_secretFields_keepsDefinedFormsOnly", () => {
             account: "holder",
             at: "1970-01-01T00:00:00.000Z",
             status: 200,
+            accepted: true,
+            rejection: null,
+            counted: true,
             results: [
                 {
                     id: ALERT_ID,
@@ -667,6 +679,9 @@ test("summariseNotifications_secretFields_keepsDefinedFormsOnly", () => {
             account: "holder",
             at: "1970-01-01T00:00:00.000Z",
             status: 200,
+            accepted: true,
+            rejection: null,
+            counted: false,
             results: null,
             bodyError: "the body is not valid JSON",
         },
@@ -1119,9 +1134,15 @@ test("triggeredArmings_invalidFields_skipsOrDescribesThem", () => {
 test("recordRequest_traceHeaders_keepsEscapedBoundedTraceHeadersOnly", () => {
     const report = { traceHeaders: [] }
     const dynatrace = `FW4;1\n${"x".repeat(300)}`
-    recordRequest({ label: "holder" }, report, {
+    const session = {
+        label: "holder",
+        notificationRequests: [],
+        featureRequests: [],
+    }
+    recordRequest(session, report, {
         url: () =>
             `http://127.0.0.1/broker-service/v1/portfolio/insights/${ACCOUNT_ID}`,
+        method: () => "GET",
         headers: () => ({
             traceparent:
                 "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01",
@@ -1147,6 +1168,34 @@ test("recordRequest_traceHeaders_keepsEscapedBoundedTraceHeadersOnly", () => {
 test("login_errorToastsShown_countsThemWithoutText", async () => {
     const page = {
         goto: async () => {},
+        url: () => "http://127.0.0.1/login",
+        // The login form as `readLoginForm` reads it on the right origin.
+        evaluate: async () => ({
+            origin: "http://127.0.0.1",
+            missing: [],
+            masked: true,
+            actions: [],
+            targets: [],
+        }),
+        // The login's page alone in its browser context.
+        browserContext: () => ({ id: "context-login" }),
+        createCDPSession: async () => ({
+            send: async () => ({ targetInfo: { targetId: "own-page" } }),
+            detach: async () => {},
+        }),
+        browser: () => ({
+            target: () => ({
+                createCDPSession: async () => ({
+                    on: () => {},
+                    off: () => {},
+                    send: async () => ({}),
+                    detach: async () => {},
+                }),
+            }),
+        }),
+        on: () => {},
+        off: () => {},
+        setRequestInterception: async () => {},
         type: async () => {},
         click: async () => {},
         waitForSelector: async (selector) => {

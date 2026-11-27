@@ -294,12 +294,16 @@ restore_alerts() {
     fi
 }
 
-# Loads perf.sh: its options are parsed, its tools checked and a run directory made under TMPDIR,
-# and its source guard returns before any trap or step. Sourcing it from a function keeps the
-# linter from reading the script's final steps as part of this file.
+# Loads perf.sh, whose guarded main does not run when it is sourced, and sets up the state main
+# sets before its traps: perf.sh's own parse_options, check_tools and prepare_run read this
+# test's options, check its tools and make a run directory under TMPDIR. Sourcing it from a
+# function keeps the linter from reading the script's final steps as part of this file.
 load_perf() {
     # shellcheck source-path=SCRIPTDIR source=perf.sh
-    source "$PERF_SH" --project harness-sql-test --compose-file compose.dev.yaml
+    source "$PERF_SH"
+    parse_options --project harness-sql-test --compose-file compose.dev.yaml
+    check_tools
+    prepare_run
 }
 
 # Loads loadgen-check.sh, whose guarded main does not run when it is sourced.

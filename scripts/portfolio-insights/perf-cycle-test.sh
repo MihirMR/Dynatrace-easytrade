@@ -9,14 +9,18 @@
 #     nothing was re-armed it reads on in the same window; a failing step fails with its reason;
 #   - record_follow_ups fills a slot only with a clean follow-up whose owned set is unchanged,
 #     continues the same way after an unclean one, and fails `cycle follow-ups` on any shortfall;
+#   - the wait for the first line of a verified window, in either function, ends two intervals
+#     plus the margin after its T, the owned-set check and the window's first log read counted;
+#   - that wait parses the window's first log read before reading again, so a qualifying line
+#     already in it is used, and no log read that ends after its wait's deadline is used;
 #   - measure_cycle measures nothing unless the cycle inputs check of preflight_inputs passed,
 #     counts no time row as an armed alert, and records the follow-ups after a failing
 #     `cycle < 10 s` verdict as well.
 # The functions and constants under test are read from perf.sh in this directory without
 # running its main body. Only the pieces that reach the stack (HTTP, Docker logs, the database)
-# or the clock are replaced by scripted fakes, defined after loading; the sleep fake advances
-# SECONDS and the scripted clock instead of waiting, so every bounded wait reaches its deadline
-# at once.
+# or the clock are replaced by scripted fakes, defined after loading. SECONDS is an ordinary
+# variable that only the fakes advance: the sleep fake advances it and the scripted clock
+# instead of waiting, so every bounded wait reaches its deadline at once.
 #
 # Usage: scripts/portfolio-insights/perf-cycle-test.sh [--help]
 #   --help  Show this help and exit
@@ -34,7 +38,7 @@ LOADED_CONSTANTS="PRESET_COUNT HOLDINGS_EXPECTED ALERTS_PER_ACCOUNT TARGET_PRICE
 ALERTS_EXPECTED MAX_THRESHOLD CYCLE_LIMIT_MS LOG_STEP_SECONDS MAX_REJECTED_SAMPLES
 FOLLOW_UP_CYCLES CYCLE_WAIT_MARGIN_SECONDS CYCLE_MARKER CYCLE_RE ARMED_TIME_RE"
 LOADED_FUNCTIONS="pass fail info dec_to_units armed_sql read_armed_set
-parse_cycle_line cycle_is_clean cycle_summary_text wait_cycle_line open_verified_window
+parse_cycle_line cycle_is_clean cycle_summary_text read_window wait_cycle_line open_verified_window
 select_cycle_sample record_follow_ups measure_cycle"
 # The scripted clock reads FIXED_T at 0 s.
 FIXED_T="2026-01-01T00:00:00Z"
@@ -46,6 +50,8 @@ OUTAGE_ERROR="armed-set query failed: scripted outage  "
 REARM_FAILURE="PATCH alert [00000001-0000-4000-8000-000000000000] gave status 503"
 # measure_cycle's only line when the cycle inputs check did not pass.
 NOT_MEASURED_LINE="INFO cycle not measured: the cycle inputs check did not pass"
+# read_window's detail for a log read that ended at or after its wait's deadline.
+LATE_READ_DETAIL="broker-service logs read ended after the wait deadline and was discarded"
 
 usage() {
     cat <<'EOF'
@@ -76,6 +82,7 @@ summarized=0
 work=""
 status=0
 declare -a verify_appends=() verify_errors=() verify_times=() verify_at=() poll_appends=()
+declare -a verify_seconds=() read_seconds=()
 
 test_pass() {
     tests_passed=$((tests_passed + 1))
@@ -177,7 +184,12 @@ test_pass
 # (poll_appends, by sleep from 1); one without a STAMP of its own is stamped with the clock at
 # that moment. Each check advances the clock by a second and sets ARMED_AT, the time of its
 # query, to the clock or to verify_times[n]; verify_at[n] keeps it. verify_errors fails a
-# check, by number, with its text.
+# check, by number, with its text. Time spent outside sleeps is scripted too: check n takes
+# verify_seconds[n] seconds more, and log read n (log_reads counts them from 1) takes
+# read_seconds[n], each on SECONDS and the clock alike.
+
+# From here on SECONDS is an ordinary variable that only the fakes advance.
+unset SECONDS
 
 # clock_stamp SECONDS: the RFC3339 time SECONDS whole seconds after FIXED_T.
 clock_stamp() {
@@ -198,8 +210,16 @@ log_record() {
 
 # broker_logs SINCE: the records stamped at or after SINCE, without their stamps, as
 # `compose logs --since SINCE --no-log-prefix` prints them. Stamps compare as fixed-width text
-# once each fraction is padded to nine digits.
+# once each fraction is padded to nine digits. As perf.sh's own, it starts no read once
+# PROBE_DEADLINE, the deadline of the cycle wait reading, has passed, and fails at once instead,
+# counting no read.
 broker_logs() {
+    if [[ -n "${PROBE_DEADLINE:-}" && $SECONDS -ge $PROBE_DEADLINE ]]; then
+        return 1
+    fi
+    log_reads=$((log_reads + 1))
+    SECONDS=$((SECONDS + ${read_seconds[$log_reads]:-0}))
+    clock=$((clock + ${read_seconds[$log_reads]:-0}))
     if [[ $logs_unreadable -eq 1 ]]; then
         return 1
     fi
@@ -229,7 +249,8 @@ sleep() {
 
 verify_owned_set() {
     verify_calls=$((verify_calls + 1))
-    clock=$((clock + 1))
+    SECONDS=$((SECONDS + ${verify_seconds[$verify_calls]:-0}))
+    clock=$((clock + 1 + ${verify_seconds[$verify_calls]:-0}))
     ARMED_AT="${verify_times[$verify_calls]:-$(clock_stamp "$clock")}"
     verify_at[verify_calls]="$ARMED_AT"
     if [[ -n "${verify_appends[$verify_calls]:-}" ]]; then
@@ -296,8 +317,11 @@ start_test() {
     verify_times=()
     verify_at=()
     poll_appends=()
+    verify_seconds=()
+    read_seconds=()
     verify_calls=0
     sleep_calls=0
+    log_reads=0
     clock=0
     logs_unreadable=0
     logs_fail_after_rearm=0
@@ -315,10 +339,13 @@ start_test() {
     R_CYCLE_REJECTIONS="0"
     R_FOLLOW_UPS="n/a"
     CYCLE_T=""
+    CYCLE_DEADLINE=""
     CYCLE_INDEX=0
     CYCLE_LINE=""
     LOG_SINCE=""
     LOG_BASE=0
+    LOG_PROBE_DETAIL=""
+    WINDOW_READ_HELD=0
     OWNED_ERROR=""
     ARMED_ERROR=""
     ARMED_AT=""
@@ -392,12 +419,32 @@ expect_selected_since() {
     fi
 }
 
+# expect_selected_at LINE SINCE ELAPSED READS: select_cycle_sample accepted LINE, read in the
+# window that starts at SINCE, and ended with SECONDS at ELAPSED after READS log reads.
+expect_selected_at() {
+    if [[ $status -eq 0 && "$CYCLE_LINE" == "$1" && "$LOG_SINCE" == "$2" && $SECONDS -eq $3 && $log_reads -eq $4 ]]; then
+        test_pass
+    else
+        test_fail "status $status with line '$CYCLE_LINE' in the window since '$LOG_SINCE' at ${SECONDS}s after $log_reads log reads, expected status 0 with '$1' since '$2' at ${3}s after $4 log reads; output: $(one_line "$RUN_DIR/out")"
+    fi
+}
+
 # expect_line LINE: the code under test printed exactly LINE.
 expect_line() {
     if grep -qxF -- "$1" "$RUN_DIR/out"; then
         test_pass
     else
         test_fail "no output line '$1'; output: $(one_line "$RUN_DIR/out")"
+    fi
+}
+
+# expect_line_at LINE ELAPSED [READS]: the code under test printed exactly LINE and ended with
+# SECONDS at ELAPSED, after READS log reads when READS is given.
+expect_line_at() {
+    if grep -qxF -- "$1" "$RUN_DIR/out" && [[ $SECONDS -eq $2 && ($# -lt 3 || $log_reads -eq $3) ]]; then
+        test_pass
+    else
+        test_fail "ended at ${SECONDS}s after $log_reads log reads, expected line '$1' at ${2}s${3:+ after $3 log reads}; output: $(one_line "$RUN_DIR/out")"
     fi
 }
 
@@ -769,6 +816,109 @@ for step in armedQuery rearm logs ownedSet ownedSetNothingRearmed; do
     esac
     run_follow_ups
     expect_line "$expected"
+done
+
+# The first line's allowance after T
+
+# One case per verified window whose first log read takes 60 s of the 150 s allowance: the wait
+# for the window's first line still ends 150 s after the reading taken just before the owned-set
+# check that set its T, not 150 s after that read.
+for window in sample rearmedSample rearmedFollowUp; do
+    case "$window" in
+        sample)
+            start_test "selectCycleSample_slowFirstLogRead_waitEndsAllowanceAfterT"
+            read_seconds[1]=60
+            run_select
+            expected="FAIL cycle < 10 s: no cycle line rendered alerts [$ALERTS_EXPECTED] within 150s after ${verify_at[1]}"
+            ;;
+        rearmedSample)
+            start_test "selectCycleSample_slowFirstLogReadAfterRearm_waitEndsAllowanceAfterNewT"
+            verify_appends[1]="$(cycle_line "$ALERTS_EXPECTED" 2 0 0 completed 1500)"
+            read_seconds[2]=60
+            run_select
+            expected="FAIL cycle < 10 s: no cycle line rendered alerts [$ALERTS_EXPECTED] within 150s after ${verify_at[3]}; rejected: sample 1: $(shows "$ALERTS_EXPECTED" 2 0 0 completed 1500)"
+            ;;
+        rearmedFollowUp)
+            start_test "recordFollowUps_slowFirstLogReadAfterRearm_waitEndsAllowanceAfterNewT"
+            accepted_sample 2000
+            log_record "$(cycle_line "$ALERTS_EXPECTED" 1 0 0 completed 1400)"
+            read_seconds[2]=60
+            run_follow_ups
+            expected="FAIL cycle follow-ups: 0 of 2 clean follow-up cycles recorded; follow-up 1: $(shows "$ALERTS_EXPECTED" 1 0 0 completed 1400); follow-up 2: no cycle line rendered alerts [$ALERTS_EXPECTED] within 150s after ${verify_at[2]}"
+            ;;
+    esac
+    expect_line_at "$expected" 150
+done
+
+# An owned-set check that takes the whole allowance leaves no time for the window's first log
+# read: none starts, and the cycle check fails saying so.
+start_test "selectCycleSample_ownedSetCheckOutlastsAllowance_failsWithoutLogRead"
+verify_seconds[1]=150
+run_select
+expect_line_at "FAIL cycle < 10 s: broker-service logs probe not started: no time left of the 150s allowance after ${verify_at[1]}" 150 0
+
+# One case per log read of the first-line wait that holds a qualifying line but ends after the
+# 150 s allowance: the window's first read, ending at 150 s, and a poll read, ending at 155 s.
+# Neither line is the sample, and the cycle check fails saying the read ended late.
+for late_read in windowFirst poll; do
+    case "$late_read" in
+        windowFirst)
+            start_test "selectCycleSample_firstWindowReadEndsAfterAllowance_failsWithLateReadDetail"
+            verify_appends[1]="$(clean_line 2222)"
+            read_seconds[1]=150
+            run_select
+            expected="FAIL cycle < 10 s: $LATE_READ_DETAIL"
+            elapsed=150
+            reads=1
+            ;;
+        poll)
+            start_test "selectCycleSample_pollReadEndsAfterAllowance_failsWithLateReadDetail"
+            poll_appends[1]="$(clean_line 2222)"
+            read_seconds[2]=150
+            run_select
+            expected="FAIL cycle < 10 s: no cycle line rendered alerts [$ALERTS_EXPECTED] within 150s after ${verify_at[1]}; last read: $LATE_READ_DETAIL"
+            elapsed=155
+            reads=2
+            ;;
+    esac
+    expect_line_at "$expected" "$elapsed" "$reads"
+done
+
+# One case per verified window whose first log read holds a qualifying line and ends 145 s into
+# the 150 s allowance, while the next read would end after it: the wait parses the window's
+# first read before reading again, so that line is used and that wait needs no further read.
+for window in sample rearmedSample rearmedFollowUp; do
+    case "$window" in
+        sample)
+            start_test "selectCycleSample_lineInSlowFirstWindowRead_isSelectedWithoutRereading"
+            verify_appends[1]="$(clean_line 2222)"
+            read_seconds[1]=145
+            read_seconds[2]=60
+            run_select
+            expect_selected_at "$(clean_line 2222)" "${verify_at[1]}" 145 1
+            ;;
+        rearmedSample)
+            start_test "selectCycleSample_lineInSlowFirstReadAfterRearm_isSelectedWithoutRereading"
+            verify_appends[1]="$(cycle_line "$ALERTS_EXPECTED" 2 0 0 completed 1500)"
+            verify_appends[3]="$(clean_line 2600)"
+            read_seconds[2]=145
+            read_seconds[3]=60
+            run_select
+            expect_selected_at "$(clean_line 2600)" "${verify_at[3]}" 145 2
+            ;;
+        rearmedFollowUp)
+            # The 60 s read is then the next follow-up's, well within that wait's 90 s.
+            start_test "recordFollowUps_lineInSlowFirstReadAfterRearm_isRecordedWithoutRereading"
+            accepted_sample 2000
+            log_record "$(cycle_line "$ALERTS_EXPECTED" 1 0 0 completed 1400)"
+            verify_appends[2]="$(clean_line 1250)"
+            read_seconds[2]=145
+            read_seconds[3]=60
+            poll_appends[1]="$(clean_line 1260)"
+            run_follow_ups
+            expect_follow_ups_since "PASS cycle follow-ups" "1250 ms, 1260 ms" "${verify_at[2]}"
+            ;;
+    esac
 done
 
 # measure_cycle

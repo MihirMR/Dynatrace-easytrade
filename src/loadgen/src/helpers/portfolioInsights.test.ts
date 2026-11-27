@@ -4,17 +4,22 @@ import { IHandleWrapper } from "@demoability/loadgen-core/lib/handles"
 import {
     IPageActions,
     PageActions,
+    PageSetup,
     defineConfig,
 } from "@demoability/loadgen-core/lib/pageActions"
 import { ISelector } from "@demoability/loadgen-core/lib/selectors"
-import type { ElementHandle, Page } from "puppeteer"
+import type { ClickOptions, ElementHandle, Page } from "puppeteer"
 import { Logger, createLogger, format, transports } from "winston"
 import { selectors } from "../selectors"
 import { User } from "../user"
 import {
+    BoundedPageActions,
+    DOCUMENT_ORIGIN_UNVERIFIED,
     DomPresenceSelector,
     OwnedAlertOutcome,
+    PAGE_ACTION_TIMEOUT_MS,
     createAndDeleteOwnedAlert,
+    featureLossPresence,
     gotoPortfolioInsightsPage,
     isPortfolioInsightsEnabled,
     loginWithoutLoggingPassword,
@@ -45,8 +50,18 @@ const OPTION_KEY =
     selectors.portfolioInsightsPage_alertInstrumentOption.toString()
 const SUBMIT_KEY = selectors.portfolioInsightsPage_alertSubmit.toString()
 const THRESHOLD_KEY = selectors.portfolioInsightsPage_alertThreshold.toString()
-/** The navigation link, whose absence shows the feature was lost. */
+/**
+ * The navigation link, whose absence from a shown navigation shows the
+ * feature was lost.
+ */
 const NAV_KEY = selectors.navigation_portfolioInsightsPage.toString()
+/** The home link, present while the navigation of a protected page is shown. */
+const HOME_NAV_KEY = selectors.navigation_homePage.toString()
+/**
+ * The one DOM query of the feature check, answered from the page's home and
+ * Portfolio Insights link entries in one state.
+ */
+const FEATURE_LOSS_KEY = featureLossPresence.toString()
 const createdKey = (marker: string): string =>
     selectors.portfolioInsightsPage_createdAlert(marker).toString()
 const deletedKey = (id: string): string =>
@@ -88,6 +103,8 @@ const readError = new Error("Node is detached from document")
 const networkError = new TypeError("fetch failed")
 /** What a presence check throws once the browser target is gone. */
 const checkError = new Error("Target closed")
+/** What releasing a handle throws once its session is gone. */
+const disposeError = new Error("Protocol error (Runtime.releaseObject)")
 
 /**
  * Names the error objects this suite throws, so a log entry is checked to carry
@@ -98,6 +115,7 @@ const knownErrors = new Map<unknown, string>([
     [readError, "readError"],
     [networkError, "networkError"],
     [checkError, "checkError"],
+    [disposeError, "disposeError"],
 ])
 
 function describeError(error: unknown): string {
@@ -401,15 +419,97 @@ function unexpected(action: string): never {
     throw new Error(`Unexpected page action [${action}]`)
 }
 
-class FakeOptionHandle implements IHandleWrapper {
-    readonly value: string
+/**
+ * The instrument options of a fake page: present once emptyPolls presence
+ * checks found none, and how reading the first one's value behaves.
+ */
+type FakeOptions = {
+    emptyPolls: number
+    values: string[]
+    /** value reads that answer "" before the first option's own value */
+    blankReads?: number
+    /** the step of the value read that throws readError */
+    failingRead?: "getProperty" | "jsonValue"
+    /** whether disposing any option or value handle throws disposeError */
+    failingDispose?: boolean
+}
 
-    constructor(value: string) {
-        this.value = value
+/**
+ * The Puppeteer handles the fake options hand out, each under its own name,
+ * the dispose calls each receives, and the value reads they answer.
+ */
+class HandleLedger {
+    readonly acquired: string[] = []
+    valueReads = 0
+    private readonly disposals: string[] = []
+
+    acquire(kind: string): string {
+        const name = `${kind} #${this.acquired.length + 1}`
+        this.acquired.push(name)
+        return name
     }
 
-    getHandle(): never {
-        return unexpected("getHandle on an option")
+    dispose(name: string, fails: boolean): void {
+        this.disposals.push(name)
+        if (fails) {
+            throw disposeError
+        }
+    }
+
+    /** The acquired handles not disposed exactly once. */
+    unreleased(): string[] {
+        return this.acquired.filter(
+            (name) =>
+                this.disposals.filter((disposed) => disposed === name)
+                    .length !== 1
+        )
+    }
+}
+
+/**
+ * An option as getAllHandles wraps it. Its Puppeteer element answers the
+ * value property through a JSHandle, as a real option does, and the ledger
+ * records the element, each property handle, and their disposals.
+ */
+class FakeOptionHandle implements IHandleWrapper {
+    readonly value: string
+    private readonly element: ElementHandle
+
+    constructor(value: string, ledger: HandleLedger, options: FakeOptions) {
+        this.value = value
+        const name = ledger.acquire(`option[${value}]`)
+        const fails = options.failingDispose ?? false
+        const element = {
+            getProperty: async (propertyName: string) => {
+                if (propertyName !== "value") {
+                    return unexpected(
+                        `getProperty ${propertyName} of an option`
+                    )
+                }
+                if (options.failingRead === "getProperty") {
+                    throw readError
+                }
+                const property = ledger.acquire(`${name} value`)
+                return {
+                    jsonValue: async (): Promise<unknown> => {
+                        if (options.failingRead === "jsonValue") {
+                            throw readError
+                        }
+                        ledger.valueReads++
+                        return ledger.valueReads <= (options.blankReads ?? 0)
+                            ? ""
+                            : value
+                    },
+                    dispose: async () => ledger.dispose(property, fails),
+                }
+            },
+            dispose: async () => ledger.dispose(name, fails),
+        }
+        this.element = element as unknown as ElementHandle
+    }
+
+    getHandle(): ElementHandle {
+        return this.element
     }
 
     toString(): string {
@@ -418,12 +518,14 @@ class FakeOptionHandle implements IHandleWrapper {
 }
 
 type FakePage = {
-    /** selector key -> failed checks before the element is present */
+    /**
+     * selector key -> failed checks before the element is present; the
+     * feature-loss query reads the home and Portfolio Insights link entries
+     */
     present?: Record<string, number>
     /** selector key -> property name -> value */
     properties?: Record<string, Record<string, unknown>>
-    /** instrument options, present once emptyPolls presence checks found none */
-    options?: { emptyPolls: number; values: string[] }
+    options?: FakeOptions
     /** selector key whose presence check throws checkError */
     failingCheck?: string
     /** selector key whose click fails */
@@ -440,6 +542,8 @@ type PageCall = { action: string; target: string; value?: string }
 
 class FakePageActions implements IPageActions {
     readonly calls: PageCall[] = []
+    /** the handles of the options getAllHandles returned */
+    readonly handles = new HandleLedger()
     private readonly page: FakePage
     private readonly failedChecks = new Map<string, number>()
 
@@ -470,13 +574,24 @@ class FakePageActions implements IPageActions {
         if (key === OPTION_KEY) {
             return this.optionsLoaded()
         }
-        const failed = this.failedChecks.get(key) ?? 0
-        const appearsAfter = this.page.present?.[key]
-        if (appearsAfter !== undefined && failed >= appearsAfter) {
+        if (key === FEATURE_LOSS_KEY) {
+            // One query reads both links from the page as it stands.
+            return this.shown(HOME_NAV_KEY) && !this.shown(NAV_KEY)
+        }
+        if (this.shown(key)) {
             return true
         }
-        this.failedChecks.set(key, failed + 1)
+        this.failedChecks.set(key, (this.failedChecks.get(key) ?? 0) + 1)
         return false
+    }
+
+    /** Whether the element of key is present now, without counting a check. */
+    private shown(key: string): boolean {
+        const appearsAfter = this.page.present?.[key]
+        return (
+            appearsAfter !== undefined &&
+            (this.failedChecks.get(key) ?? 0) >= appearsAfter
+        )
     }
 
     async getAllHandles(selector: ISelector): Promise<IHandleWrapper[]> {
@@ -489,23 +604,14 @@ class FakePageActions implements IPageActions {
         ) {
             return []
         }
-        return options.values.map((value) => new FakeOptionHandle(value))
+        return options.values.map(
+            (value) => new FakeOptionHandle(value, this.handles, options)
+        )
     }
 
-    async getPropertyHandle<Type = unknown>(
-        handle: IHandleWrapper,
-        propertyName: string
-    ): Promise<Type> {
-        this.calls.push({
-            action: "getPropertyHandle",
-            target: handle.toString(),
-            value: propertyName,
-        })
-        if (!(handle instanceof FakeOptionHandle) || propertyName !== "value") {
-            return unexpected(`getPropertyHandle ${propertyName}`)
-        }
-        const value: unknown = handle.value
-        return value as Type
+    /** Leaves its property handle undisposed, so the helper never calls it. */
+    async getPropertyHandle<Type = unknown>(): Promise<Type> {
+        return unexpected("getPropertyHandle")
     }
 
     async getProperty<Type = unknown>(
@@ -628,14 +734,15 @@ class FakePageActions implements IPageActions {
 }
 
 /**
- * A page of the enabled feature, whose navigation link stays present, and
- * whose options, the created output of the marker, the own row and the
- * deleted output appear at once.
+ * A page of the enabled feature, whose navigation stays shown with its home
+ * and Portfolio Insights links, and whose options, the created output of the
+ * marker, the own row and the deleted output appear at once.
  */
 function ownAlertPage(overrides: FakePage = {}, marker = MARKER): FakePage {
     return {
         options: { emptyPolls: 0, values: [INSTRUMENT_ID] },
         present: {
+            [HOME_NAV_KEY]: 0,
             [NAV_KEY]: 0,
             [createdKey(marker)]: 0,
             [rowKey(OWN_ID)]: 0,
@@ -1807,98 +1914,353 @@ const LOGIN_USER: User = {
 /** Text left in the password field, as by browser autofill. */
 const STALE_PASSWORD = "stale-pw"
 
+/** The configured origin, as the login step takes it from BASE_URL. */
+const LOGIN_ORIGIN = BASE_URL.origin
+/** Where a redirect left the browser instead. */
+const ELSEWHERE_ORIGIN = "http://elsewhere.test"
+
+/** A document of the page under test, as far as its location's origin. */
+type FakeDocument = { location: { origin: string } }
+
+function fakeDocument(origin: string): FakeDocument {
+    return { location: { origin } }
+}
+
 /**
- * One field or button of the login form, as far as PageActions and the login
- * step use a Puppeteer element. Its calls go to the page's trace.
+ * Makes doc the page's global document, the one a page function checks a
+ * field's own document against, until the test ends.
  */
-class FakeLoginElement {
-    private readonly name: string
-    private readonly trace: string[]
-    private value: string
+function showDocument(t: TestContext, doc: FakeDocument): void {
+    Reflect.defineProperty(globalThis, "document", {
+        value: doc,
+        configurable: true,
+        writable: true,
+    })
+    t.after(() => {
+        Reflect.deleteProperty(globalThis, "document")
+    })
+}
 
-    constructor(name: string, trace: string[], value: string) {
-        this.name = name
-        this.trace = trace
-        this.value = value
+/**
+ * A text field as a page function finds it in the page. Like an
+ * HTMLInputElement it has its value accessor on its prototype. Each write
+ * through that accessor and each event dispatched on the field is recorded.
+ */
+class FakeField {
+    isConnected = true
+    ownerDocument: FakeDocument
+    private readonly record: (entry: string) => void
+    private text: string
+
+    constructor(
+        record: (entry: string) => void,
+        ownerDocument: FakeDocument,
+        text: string
+    ) {
+        this.record = record
+        this.ownerDocument = ownerDocument
+        this.text = text
     }
 
-    async focus(): Promise<void> {
-        this.trace.push(`focus ${this.name}`)
+    get value(): string {
+        return this.text
     }
 
-    async isIntersectingViewport(): Promise<boolean> {
+    set value(text: string) {
+        this.record(`set value ${text}`)
+        this.text = text
+    }
+
+    dispatchEvent(event: Event): boolean {
+        this.record(`${event.type} event${event.bubbles ? ", bubbling" : ""}`)
         return true
     }
+}
 
-    async getProperty(
-        propertyName: string
-    ): Promise<{ jsonValue(): Promise<unknown>; dispose(): Promise<void> }> {
-        const value = propertyName === "value" ? this.value : undefined
+/** The calls of a FakeElement that a test can hold or make fail. */
+type ElementStage =
+    | "focus"
+    | "isIntersectingViewport"
+    | "clickablePoint"
+    | "evaluate"
+    | "waitForNavigation"
+    | "dispose"
+
+/** Where a FakeElement's clickable point lies. */
+const CLICK_POINT = { x: 12, y: 34 }
+
+type FakeElementOptions = {
+    /** prefixes each entry the element records */
+    name?: string
+    /** the trace the element records into, shared with other elements */
+    trace?: string[]
+    /** the document the element's field is in, by default at LOGIN_ORIGIN */
+    document?: FakeDocument
+    /** the field's text before the action */
+    text?: string
+    /** the intersection check from which on the element is in the viewport */
+    intersectsFromCheck?: number
+    /** stage -> the promise the stage answers with, settled by the test */
+    held?: Partial<Record<ElementStage, Promise<unknown>>>
+    /** stage -> the error the stage rejects with */
+    failing?: Partial<Record<ElementStage, Error>>
+}
+
+/**
+ * A Puppeteer element as BoundedPageActions drives it, over a FakeField. It
+ * is in the viewport from its intersectsFromCheck-th check on, its clickable
+ * point is CLICK_POINT, and its evaluate runs the page function on node, the
+ * field unless a test replaces it. A held stage answers with the very promise
+ * it is given, so the test decides when it settles, and a failing stage
+ * rejects; a navigation wait otherwise ends with the next click. Each call is
+ * recorded as it is made, so a dispatch shows in trace exactly when it was
+ * sent.
+ */
+class FakeElement {
+    readonly trace: string[]
+    readonly field: FakeField
+    /** what evaluate runs page functions on */
+    node: object
+    disposed = false
+    /** resolves once the element is first focused, as an action starts */
+    readonly focused: Promise<void>
+    private readonly name: string | undefined
+    private readonly intersectsFromCheck: number
+    private readonly held: Partial<Record<ElementStage, Promise<unknown>>>
+    private readonly failing: Partial<Record<ElementStage, Error>>
+    private checks = 0
+    private markFocused: () => void = () => undefined
+    private navigated: () => void = () => undefined
+
+    constructor(options: FakeElementOptions = {}) {
+        this.name = options.name
+        this.trace = options.trace ?? []
+        this.intersectsFromCheck = options.intersectsFromCheck ?? 1
+        this.held = options.held ?? {}
+        this.failing = options.failing ?? {}
+        this.field = new FakeField(
+            (entry) => this.record(entry),
+            options.document ?? fakeDocument(LOGIN_ORIGIN),
+            options.text ?? ""
+        )
+        this.node = this.field
+        this.focused = new Promise((resolve) => {
+            this.markFocused = resolve
+        })
+    }
+
+    focus(): Promise<void> {
+        this.record("focus")
+        this.markFocused()
+        return this.answer("focus", undefined)
+    }
+
+    isIntersectingViewport(): Promise<boolean> {
+        this.record("isIntersectingViewport")
+        this.checks++
+        return this.answer(
+            "isIntersectingViewport",
+            this.checks >= this.intersectsFromCheck
+        )
+    }
+
+    clickablePoint(offset?: {
+        x: number
+        y: number
+    }): Promise<typeof CLICK_POINT> {
+        this.record(
+            offset === undefined
+                ? "clickablePoint"
+                : `clickablePoint ${offset.x},${offset.y}`
+        )
+        return this.answer("clickablePoint", CLICK_POINT)
+    }
+
+    async select(...values: string[]): Promise<string[]> {
+        this.record(`select ${values.join(",")}`)
+        return values
+    }
+
+    evaluate(
+        pageFunction: (node: object, ...args: unknown[]) => unknown,
+        ...args: unknown[]
+    ): Promise<unknown> {
+        this.record("evaluate")
+        const failure = this.failing.evaluate
+        if (failure !== undefined) {
+            return Promise.reject(failure)
+        }
+        // A page function that throws rejects, as in the page.
+        return new Promise((resolve) =>
+            resolve(pageFunction(this.node, ...args))
+        )
+    }
+
+    get frame(): unknown {
         return {
-            jsonValue: async () => value,
-            dispose: async () => undefined,
+            waitForNavigation: (): Promise<unknown> => {
+                this.record("waitForNavigation")
+                const navigation = new Promise((resolve) => {
+                    this.navigated = () => resolve(null)
+                })
+                return this.answer("waitForNavigation", navigation)
+            },
+            page: () => ({
+                mouse: {
+                    click: (x: number, y: number, options?: ClickOptions) =>
+                        this.click(x, y, options),
+                },
+            }),
         }
     }
 
-    async press(key: string): Promise<void> {
-        this.trace.push(`press ${this.name} ${key}`)
-        if (key === "Backspace") {
-            this.value = this.value.slice(0, -1)
+    async dispose(): Promise<void> {
+        this.disposed = true
+        const failure = this.failing.dispose
+        if (failure !== undefined) {
+            throw failure
         }
     }
 
-    async type(text: string): Promise<void> {
-        this.trace.push(`type ${this.name} ${text}`)
-        this.value += text
-    }
-
-    async click(): Promise<void> {
-        this.trace.push(`click ${this.name}`)
-    }
-
+    /** The field's text. */
     text(): string {
-        return this.value
+        return this.field.value
+    }
+
+    asHandle(): ElementHandle {
+        return this as unknown as ElementHandle
+    }
+
+    private async click(
+        x: number,
+        y: number,
+        options?: ClickOptions
+    ): Promise<void> {
+        const shown = options === undefined ? "" : ` ${JSON.stringify(options)}`
+        this.record(`mouse.click ${x},${y}${shown}`)
+        this.navigated()
+    }
+
+    private answer<T>(stage: ElementStage, value: T): Promise<T> {
+        const failure = this.failing[stage]
+        if (failure !== undefined) {
+            return Promise.reject(failure)
+        }
+        const held = this.held[stage]
+        return held === undefined
+            ? Promise.resolve(value)
+            : (held as Promise<T>)
+    }
+
+    private record(entry: string): void {
+        this.trace.push(
+            this.name === undefined ? entry : `${this.name} ${entry}`
+        )
+    }
+}
+
+/** A handle over a fake Puppeteer element, printed as label. */
+class FakeHandle implements IHandleWrapper {
+    private readonly element: { asHandle(): ElementHandle }
+    private readonly label: string
+
+    constructor(element: { asHandle(): ElementHandle }, label: string) {
+        this.element = element
+        this.label = label
+    }
+
+    getHandle(): ElementHandle {
+        return this.element.asHandle()
+    }
+
+    toString(): string {
+        return this.label
     }
 }
 
 /**
- * The login screen as a Puppeteer page, faking only the members PageActions
- * calls for input and navigate: a visible wait per selector and the
- * navigation wait.
+ * The login screen: its username and password fields and its login button,
+ * FakeElements in one document at LOGIN_ORIGIN that record into one trace.
+ * As a Puppeteer page it fakes only the visible wait PageActions finds them
+ * with.
  */
 class FakeLoginPage {
     readonly trace: string[] = []
-    readonly username = new FakeLoginElement("username", this.trace, "")
-    readonly password = new FakeLoginElement(
-        "password",
-        this.trace,
-        STALE_PASSWORD
-    )
-    private readonly elements = new Map<string, FakeLoginElement>([
+    readonly document = fakeDocument(LOGIN_ORIGIN)
+    readonly username = this.element("username", "")
+    readonly password = this.element("password", STALE_PASSWORD)
+    private readonly elements = new Map<string, FakeElement>([
         [selectors.loginPage_username.value, this.username],
         [selectors.loginPage_password.value, this.password],
         [
             selectors.loginPage_loginButton.value,
-            new FakeLoginElement("loginButton", this.trace, ""),
+            this.element("loginButton", ""),
         ],
     ])
 
-    async waitForSelector(selector: string): Promise<ElementHandle> {
-        const element = this.elements.get(selector)
+    /** The element of an XPath query, recorded as found. */
+    find(query: string): FakeElement {
+        const element = this.elements.get(query)
         if (element === undefined) {
-            throw new Error(`Unexpected selector [${selector}]`)
+            throw new Error(`Unexpected selector [${query}]`)
         }
-        this.trace.push(`find ${selector}`)
-        return element as unknown as ElementHandle
+        this.trace.push(`find ${query}`)
+        return element
     }
 
-    async waitForNavigation(): Promise<null> {
-        this.trace.push("waitForNavigation")
-        return null
+    async waitForSelector(query: string): Promise<ElementHandle> {
+        return this.find(query).asHandle()
     }
 
     asPage(): Page {
         return this as unknown as Page
+    }
+
+    private element(name: string, text: string): FakeElement {
+        return new FakeElement({
+            name,
+            trace: this.trace,
+            document: this.document,
+            text,
+        })
+    }
+}
+
+const LOGIN_SELECTORS = [
+    selectors.loginPage_username,
+    selectors.loginPage_password,
+    selectors.loginPage_loginButton,
+]
+
+/**
+ * The page actions the login step reaches through BoundedPageActions: a
+ * getHandle over the fake login page's elements, and a shortDelay during
+ * which onDelay can move the page, as a redirect would. Both are recorded in
+ * the page's trace.
+ */
+class LoginInnerActions extends FakePageActions {
+    private readonly login: FakeLoginPage
+    private readonly onDelay: () => void
+
+    constructor(login: FakeLoginPage, onDelay: () => void) {
+        super({})
+        this.login = login
+        this.onDelay = onDelay
+    }
+
+    // The parameter is optional, so this override stays assignable to the
+    // parameterless member of FakePageActions it replaces.
+    override async getHandle(selector?: ISelector): Promise<IHandleWrapper> {
+        const field = LOGIN_SELECTORS.find((known) => known === selector)
+        if (field === undefined) {
+            return unexpected(`getHandle ${String(selector)}`)
+        }
+        return new FakeHandle(this.login.find(field.value), field.toString())
+    }
+
+    override async shortDelay(): Promise<void> {
+        this.login.trace.push("shortDelay")
+        this.onDelay()
     }
 }
 
@@ -1930,8 +2292,25 @@ function wholeEntryLogger(): { logger: Logger; entries: string[] } {
     return { logger, entries }
 }
 
-test("loginWithoutLoggingPassword_debugLogging_passwordInNoEntry", async (t) => {
+const USERNAME_FOUND = `find ${selectors.loginPage_username.value}`
+const PASSWORD_FOUND = `find ${selectors.loginPage_password.value}`
+
+/** What a field records as BoundedPageActions writes text into it. */
+function writtenSteps(text: string, name?: string): string[] {
+    const steps = [
+        "focus",
+        "isIntersectingViewport",
+        "evaluate",
+        `set value ${text}`,
+        "input event, bubbling",
+        "change event, bubbling",
+    ]
+    return steps.map((step) => (name === undefined ? step : `${name} ${step}`))
+}
+
+test("loginWithoutLoggingPassword_debugLogging_credentialsInNoEntry", async (t) => {
     const page = new FakeLoginPage()
+    showDocument(t, page.document)
     const { logger, entries } = wholeEntryLogger()
     const pageActions = new PageActions(
         page.asPage(),
@@ -1942,46 +2321,167 @@ test("loginWithoutLoggingPassword_debugLogging_passwordInNoEntry", async (t) => 
         page.trace.push("shortDelay")
     })
 
-    await loginWithoutLoggingPassword(pageActions, LOGIN_USER)
+    await loginWithoutLoggingPassword(
+        new BoundedPageActions(pageActions, logger),
+        LOGIN_USER,
+        BASE_URL
+    )
 
-    // The username still goes through PageActions.input, whose debug entry
-    // shows the logger records the values that action types.
+    // loadgen-core's debug entries reach the logger, as its lookups show, yet
+    // none carries either credential or the stale text the password replaced.
+    // Each credential is written into its field in one step in the page, and
+    // the login button is clicked once the navigation wait has started.
     assert.deepEqual(
         {
             trace: page.trace,
             fields: [page.username.text(), page.password.text()],
-            secretEntries: entries.filter(
+            credentialEntries: entries.filter(
                 (entry) =>
+                    entry.includes(LOGIN_USER.username) ||
                     entry.includes(LOGIN_USER.password) ||
                     entry.includes(STALE_PASSWORD)
             ),
-            usernameEntries: entries.filter((entry) =>
-                entry.includes(`with value [${LOGIN_USER.username}]`)
+            lookupEntries: entries.filter((entry) =>
+                entry.includes("action [getHandle]")
             ).length,
         },
         {
             trace: [
-                `find ${selectors.loginPage_username.value}`,
-                "focus username",
-                "focus username",
-                `type username ${LOGIN_USER.username}`,
+                USERNAME_FOUND,
+                ...writtenSteps(LOGIN_USER.username, "username"),
                 "shortDelay",
-                `find ${selectors.loginPage_password.value}`,
-                "focus password",
-                "focus password",
-                ...Array.from(STALE_PASSWORD, () => "press password Backspace"),
-                `type password ${LOGIN_USER.password}`,
+                PASSWORD_FOUND,
+                ...writtenSteps(LOGIN_USER.password, "password"),
                 "shortDelay",
                 `find ${selectors.loginPage_loginButton.value}`,
-                "waitForNavigation",
-                "focus loginButton",
-                "click loginButton",
+                "loginButton waitForNavigation",
+                "loginButton focus",
+                "loginButton isIntersectingViewport",
+                "loginButton clickablePoint",
+                `loginButton mouse.click ${CLICK_POINT.x},${CLICK_POINT.y}`,
             ],
             fields: [LOGIN_USER.username, LOGIN_USER.password],
-            secretEntries: [],
-            usernameEntries: 1,
+            credentialEntries: [],
+            lookupEntries: 3,
         }
     )
+})
+
+/**
+ * What Puppeteer throws for an evaluate in a detached frame: its message
+ * quotes the frame's URL, here a redirect target carrying a token.
+ */
+const detachedFrameError = new Error(
+    `Execution context is not available in detached frame or worker "${ELSEWHERE_ORIGIN}/login?token=${SECRET}" (are you trying to evaluate?)`
+)
+
+/** The rejection for a document not verified at the configured origin. */
+const ORIGIN_UNVERIFIED = {
+    name: "Error",
+    message: DOCUMENT_ORIGIN_UNVERIFIED,
+    cause: undefined,
+}
+
+/** "resolved", or the rejection's name, message and cause. */
+async function settledStep(step: Promise<void>): Promise<unknown> {
+    return await step.then(
+        () => "resolved",
+        (error: unknown) =>
+            error instanceof Error
+                ? {
+                      name: error.name,
+                      message: error.message,
+                      cause: error.cause,
+                  }
+                : `not an error object: ${String(error)}`
+    )
+}
+
+/** The first steps of a field as BoundedPageActions refuses to write it. */
+const refusedSteps = (name: string): string[] => [
+    `${name} focus`,
+    `${name} isIntersectingViewport`,
+    `${name} evaluate`,
+]
+
+const loginRedirectRows: {
+    name: string
+    /** when the page moves to ELSEWHERE_ORIGIN, as a redirect would */
+    redirect: "beforeLogin" | "duringFirstDelay"
+    /** FakeLoginPage's trace up to the rejection */
+    trace: string[]
+    /** the username and password fields' text afterwards */
+    fields: string[]
+}[] = [
+    {
+        name: "redirectedBeforeUsername_writesNothing",
+        redirect: "beforeLogin",
+        trace: [USERNAME_FOUND, ...refusedSteps("username")],
+        fields: ["", STALE_PASSWORD],
+    },
+    {
+        name: "redirectedBetweenFields_writesNoPassword",
+        redirect: "duringFirstDelay",
+        trace: [
+            USERNAME_FOUND,
+            ...writtenSteps(LOGIN_USER.username, "username"),
+            "shortDelay",
+            PASSWORD_FOUND,
+            ...refusedSteps("password"),
+        ],
+        fields: [LOGIN_USER.username, STALE_PASSWORD],
+    },
+]
+
+test("loginWithoutLoggingPassword_documentLeftOrigin_rejectsWithNothingFurtherWritten", async (t) => {
+    for (const row of loginRedirectRows) {
+        await t.test(row.name, async (st) => {
+            const page = new FakeLoginPage()
+            showDocument(st, page.document)
+            const redirect = (): void => {
+                page.document.location.origin = ELSEWHERE_ORIGIN
+            }
+            if (row.redirect === "beforeLogin") {
+                redirect()
+            }
+            const inner = new LoginInnerActions(page, () => {
+                if (row.redirect === "duringFirstDelay") {
+                    redirect()
+                }
+            })
+            const { logger, entries } = wholeEntryLogger()
+
+            const settled = await settledStep(
+                loginWithoutLoggingPassword(
+                    new BoundedPageActions(inner, logger),
+                    LOGIN_USER,
+                    BASE_URL
+                )
+            )
+
+            // Neither origin reaches the error or any log entry, and nothing
+            // after the refused field runs: no password, no login click.
+            const exposed = [...entries, JSON.stringify(settled)].filter(
+                (text) =>
+                    text.includes(BASE_URL.hostname) ||
+                    text.includes(new URL(ELSEWHERE_ORIGIN).hostname)
+            )
+            assert.deepEqual(
+                {
+                    settled,
+                    trace: page.trace,
+                    fields: [page.username.text(), page.password.text()],
+                    exposed,
+                },
+                {
+                    settled: ORIGIN_UNVERIFIED,
+                    trace: row.trace,
+                    fields: row.fields,
+                    exposed: [],
+                }
+            )
+        })
+    }
 })
 
 /**
@@ -2132,10 +2632,21 @@ const UNCONFIRMED = `warn: Create unconfirmed threshold [${MARKER}], outcome unk
 const UI_DELETE_FAILED = `warn: UI deletion of alert [${OWN_ID}] failed, using the api`
 /** The classified diagnostic that follows a failed API DELETE's outcome line. */
 const DELETE_FAILED = `warn: Alert [${OWN_ID}] delete request failed: `
-/** The navigation link is gone, as once the flag turned off mid-visit. */
+/**
+ * The navigation link is gone from the shown navigation, as once the flag
+ * turned off mid-visit.
+ */
 const FEATURE_LOST = { [NAV_KEY]: Number.POSITIVE_INFINITY }
-/** The feature check that follows a failed page step. */
-const NAV_CHECK = checkStep(NAV_KEY, 1)
+/**
+ * The whole navigation is gone, as once an error page replaced the layout:
+ * nothing shows whether the flag changed.
+ */
+const NAVIGATION_GONE = {
+    [HOME_NAV_KEY]: Number.POSITIVE_INFINITY,
+    [NAV_KEY]: Number.POSITIVE_INFINITY,
+}
+/** The feature check that follows a failed page step: one DOM query. */
+const FEATURE_CHECK = checkStep(FEATURE_LOSS_KEY, 1)
 /** The feature check itself failed, so no loss is verified. */
 const CHECK_FAILED =
     "debug: Portfolio insights feature check failed, loss not verified: error [Error]"
@@ -2458,7 +2969,7 @@ const alertRows: AlertRow[] = [
         page: ownAlertPage({ failingClick: SUBMIT_KEY, present: FEATURE_LOST }),
         expected: {
             outcome: { kind: "unconfirmed", marker: MARKER },
-            steps: [...SUBMIT_STEPS, NAV_CHECK],
+            steps: [...SUBMIT_STEPS, FEATURE_CHECK],
             requests: [],
             messages: [UNCONFIRMED],
             errors: ["pageError"],
@@ -2469,7 +2980,23 @@ const alertRows: AlertRow[] = [
         page: ownAlertPage({ failingClick: SUBMIT_KEY }),
         rejects: pageError,
         expected: {
-            steps: [...SUBMIT_STEPS, NAV_CHECK],
+            steps: [...SUBMIT_STEPS, FEATURE_CHECK],
+            requests: [],
+            messages: [UNCONFIRMED],
+            errors: ["pageError"],
+        },
+    },
+    // The navigation is gone with the link, as on an error page: no loss is
+    // verified, so the page step's own error propagates.
+    {
+        name: "submitClickThrows_navigationGone_logsOutcomeUnknownAndRejects",
+        page: ownAlertPage({
+            failingClick: SUBMIT_KEY,
+            present: NAVIGATION_GONE,
+        }),
+        rejects: pageError,
+        expected: {
+            steps: [...SUBMIT_STEPS, FEATURE_CHECK],
             requests: [],
             messages: [UNCONFIRMED],
             errors: ["pageError"],
@@ -2479,10 +3006,13 @@ const alertRows: AlertRow[] = [
     // verified, so the page step's own error propagates.
     {
         name: "submitClickThrows_featureCheckFails_logsOutcomeUnknownAndRejects",
-        page: ownAlertPage({ failingClick: SUBMIT_KEY, failingCheck: NAV_KEY }),
+        page: ownAlertPage({
+            failingClick: SUBMIT_KEY,
+            failingCheck: FEATURE_LOSS_KEY,
+        }),
         rejects: pageError,
         expected: {
-            steps: [...SUBMIT_STEPS, NAV_CHECK],
+            steps: [...SUBMIT_STEPS, FEATURE_CHECK],
             requests: [],
             messages: [UNCONFIRMED, CHECK_FAILED],
             errors: ["pageError", "checkError"],
@@ -2496,7 +3026,7 @@ const alertRows: AlertRow[] = [
         }),
         expected: {
             outcome: { kind: "not_submitted" },
-            steps: [...SUBMIT_STEPS.slice(0, -1), NAV_CHECK],
+            steps: [...SUBMIT_STEPS.slice(0, -1), FEATURE_CHECK],
             requests: [],
             messages: [
                 "warn: Portfolio insights feature lost before submit, no alert created",
@@ -2509,7 +3039,21 @@ const alertRows: AlertRow[] = [
         page: ownAlertPage({ failingInput: THRESHOLD_KEY }),
         rejects: pageError,
         expected: {
-            steps: [...SUBMIT_STEPS.slice(0, -1), NAV_CHECK],
+            steps: [...SUBMIT_STEPS.slice(0, -1), FEATURE_CHECK],
+            requests: [],
+            messages: [],
+            errors: [],
+        },
+    },
+    {
+        name: "formInputThrows_navigationGone_rejectsWithoutOutcomeLine",
+        page: ownAlertPage({
+            failingInput: THRESHOLD_KEY,
+            present: NAVIGATION_GONE,
+        }),
+        rejects: pageError,
+        expected: {
+            steps: [...SUBMIT_STEPS.slice(0, -1), FEATURE_CHECK],
             requests: [],
             messages: [],
             errors: [],
@@ -2519,11 +3063,11 @@ const alertRows: AlertRow[] = [
         name: "formInputThrows_featureCheckFails_rejectsWithoutOutcomeLine",
         page: ownAlertPage({
             failingInput: THRESHOLD_KEY,
-            failingCheck: NAV_KEY,
+            failingCheck: FEATURE_LOSS_KEY,
         }),
         rejects: pageError,
         expected: {
-            steps: [...SUBMIT_STEPS.slice(0, -1), NAV_CHECK],
+            steps: [...SUBMIT_STEPS.slice(0, -1), FEATURE_CHECK],
             requests: [],
             messages: [CHECK_FAILED],
             errors: ["checkError"],
@@ -2621,6 +3165,153 @@ test("createAndDeleteOwnedAlert_scenario_outcome", async (t) => {
     }
 })
 
+const RELEASE_FAILED_MESSAGE = "Instrument option handle not released"
+/** The debug line of a failed handle release, with the error it carries. */
+const RELEASE_FAILED = `debug: ${RELEASE_FAILED_MESSAGE}: error [Error] disposeError`
+
+type OptionReadRow = {
+    name: string
+    options: FakeOptions
+    expected: {
+        /** the outcome's kind, or the rejection as describeError names it */
+        settled: string
+        /** presence checks of the options, one per probe of the value */
+        checks: number
+        /** option element and value property handles the probes acquired */
+        acquired: number
+        /** acquired handles not disposed exactly once */
+        unreleased: string[]
+        /** the failed releases logged, each with the error it carries */
+        releaseFailures: string[]
+    }
+}
+
+const TWO_OPTIONS = { emptyPolls: 0, values: [INSTRUMENT_ID, "other"] }
+
+const optionReadRows: OptionReadRow[] = [
+    {
+        name: "valueRead_submittedEveryHandleReleased",
+        options: TWO_OPTIONS,
+        expected: {
+            settled: "deleted",
+            checks: 1,
+            acquired: 3,
+            unreleased: [],
+            releaseFailures: [],
+        },
+    },
+    {
+        name: "blankValueThenValue_pollsOnEveryHandleReleased",
+        options: { ...TWO_OPTIONS, blankReads: 2 },
+        expected: {
+            settled: "deleted",
+            checks: 3,
+            acquired: 9,
+            unreleased: [],
+            releaseFailures: [],
+        },
+    },
+    {
+        name: "blankValueEveryCheck_stopsAfter20EveryHandleReleased",
+        options: { emptyPolls: 0, values: [""] },
+        expected: {
+            settled: "not_submitted",
+            checks: 20,
+            acquired: 40,
+            unreleased: [],
+            releaseFailures: [],
+        },
+    },
+    // The read fails before or after its property handle exists; the error
+    // still propagates as the lifecycle's own.
+    ...[
+        { failingRead: "getProperty" as const, acquired: 2 },
+        { failingRead: "jsonValue" as const, acquired: 3 },
+    ].map((row): OptionReadRow => ({
+        name: `${row.failingRead}Throws_rejectsEveryHandleReleased`,
+        options: { ...TWO_OPTIONS, failingRead: row.failingRead },
+        expected: {
+            settled: "rejects readError",
+            checks: 1,
+            acquired: row.acquired,
+            unreleased: [],
+            releaseFailures: [],
+        },
+    })),
+    // Every dispose throws: each is still attempted and logged, and neither
+    // the value read nor the read's error is replaced.
+    {
+        name: "disposeThrowsAfterValue_submittedFailuresLogged",
+        options: { ...TWO_OPTIONS, failingDispose: true },
+        expected: {
+            settled: "deleted",
+            checks: 1,
+            acquired: 3,
+            unreleased: [],
+            releaseFailures: [RELEASE_FAILED, RELEASE_FAILED, RELEASE_FAILED],
+        },
+    },
+    {
+        name: "disposeThrowsAfterReadError_rejectsWithReadError",
+        options: {
+            ...TWO_OPTIONS,
+            failingRead: "jsonValue",
+            failingDispose: true,
+        },
+        expected: {
+            settled: "rejects readError",
+            checks: 1,
+            acquired: 3,
+            unreleased: [],
+            releaseFailures: [RELEASE_FAILED, RELEASE_FAILED, RELEASE_FAILED],
+        },
+    },
+]
+
+test("createAndDeleteOwnedAlert_instrumentOptionRead_releasesEveryHandle", async (t) => {
+    for (const row of optionReadRows) {
+        await t.test(row.name, async (st) => {
+            st.mock.timers.enable({ apis: ["setTimeout"] })
+            const { fetchFn } = recordingFetch(() =>
+                Promise.reject(new Error("Unexpected request"))
+            )
+            const { logger, records } = recordingLogger()
+            const page = new FakePageActions({
+                ...ownAlertPage(),
+                options: row.options,
+            })
+
+            const settled = await createAndDeleteOwnedAlert(
+                page,
+                BASE_URL,
+                logger,
+                { fetchFn, random: () => 0.5 }
+            ).then(
+                (outcome) => outcome.kind,
+                (error: unknown) => `rejects ${describeError(error)}`
+            )
+
+            assert.deepEqual(
+                {
+                    settled,
+                    checks: page.count("isSelectorPresent", OPTION_KEY),
+                    acquired: page.handles.acquired.length,
+                    unreleased: page.handles.unreleased(),
+                    releaseFailures: records
+                        .filter((record) =>
+                            record.message.startsWith(RELEASE_FAILED_MESSAGE)
+                        )
+                        .map(
+                            (record) =>
+                                `${record.level}: ${record.message} ${describeError(record.error)}`
+                        ),
+                },
+                row.expected
+            )
+        })
+    }
+})
+
 test("createAndDeleteOwnedAlert_apiErrorCarryingSecret_diagnosticClassifiedOnly", async (t) => {
     const rows: { name: string; error: unknown }[] = [
         {
@@ -2704,7 +3395,7 @@ const openPageRows: AlertRow[] = [
         page: ownAlertPage({ failingNavigate: NAV_KEY, present: FEATURE_LOST }),
         expected: {
             outcome: { kind: "not_submitted" },
-            steps: [NAVIGATE_STEP, NAV_CHECK],
+            steps: [NAVIGATE_STEP, FEATURE_CHECK],
             requests: [],
             messages: [
                 "warn: Portfolio insights page unavailable, no alert created",
@@ -2717,7 +3408,24 @@ const openPageRows: AlertRow[] = [
         page: ownAlertPage({ failingNavigate: NAV_KEY }),
         rejects: pageError,
         expected: {
-            steps: [NAVIGATE_STEP, NAV_CHECK],
+            steps: [NAVIGATE_STEP, FEATURE_CHECK],
+            requests: [],
+            messages: [],
+            errors: [],
+        },
+    },
+    // An error page replaced the layout while the flag may still be on, as
+    // when the home page's data fails to load: the navigation error itself
+    // propagates, and no outcome line claims the feature was lost.
+    {
+        name: "navigationThrows_navigationGone_rejectsWithoutOutcomeLine",
+        page: ownAlertPage({
+            failingNavigate: NAV_KEY,
+            present: NAVIGATION_GONE,
+        }),
+        rejects: pageError,
+        expected: {
+            steps: [NAVIGATE_STEP, FEATURE_CHECK],
             requests: [],
             messages: [],
             errors: [],
@@ -2725,10 +3433,13 @@ const openPageRows: AlertRow[] = [
     },
     {
         name: "navigationThrows_featureCheckFails_rejectsWithoutOutcomeLine",
-        page: ownAlertPage({ failingNavigate: NAV_KEY, failingCheck: NAV_KEY }),
+        page: ownAlertPage({
+            failingNavigate: NAV_KEY,
+            failingCheck: FEATURE_LOSS_KEY,
+        }),
         rejects: pageError,
         expected: {
-            steps: [NAVIGATE_STEP, NAV_CHECK],
+            steps: [NAVIGATE_STEP, FEATURE_CHECK],
             requests: [],
             messages: [CHECK_FAILED],
             errors: ["checkError"],
@@ -2744,22 +3455,27 @@ test("openPageAndRunOwnedAlert_scenario_outcome", async (t) => {
     }
 })
 
+/** One state of a page's DOM: query -> matching elements, or its error. */
+type DomState = Record<string, number | Error>
+
 /**
  * A Puppeteer page on which the navigation to the insights page fails: every
- * visible wait rejects with waitError, and the DOM query rejects with dom when
- * it is an error, or else finds dom matching elements. It fakes only the two
- * page members the real navigation and the feature check call.
+ * visible wait rejects with waitError. Its DOM passes through states in
+ * order: each DOM query reads the current state, after which the page moves
+ * on to the next one, staying at the last. A query rejects with its entry
+ * when that is an error, or else finds that many matching elements. It fakes
+ * only the two page members the real navigation and the feature check call.
  */
 class NavigationFailurePage {
     readonly waitedFor: string[] = []
     readonly queried: string[] = []
     disposed = 0
     private readonly waitError: Error
-    private readonly dom: number | Error
+    private readonly states: DomState[]
 
-    constructor(waitError: Error, dom: number | Error) {
+    constructor(waitError: Error, states: DomState[]) {
         this.waitError = waitError
-        this.dom = dom
+        this.states = states
     }
 
     async waitForSelector(selector: string): Promise<never> {
@@ -2768,11 +3484,17 @@ class NavigationFailurePage {
     }
 
     async $$(selector: string): Promise<ElementHandle[]> {
+        const state =
+            this.states[Math.min(this.queried.length, this.states.length - 1)]
         this.queried.push(selector)
-        if (this.dom instanceof Error) {
-            throw this.dom
+        const found = state?.[selector]
+        if (found === undefined) {
+            throw new Error(`Unexpected DOM query [${selector}]`)
         }
-        return Array.from({ length: this.dom }, () => this.linkHandle())
+        if (found instanceof Error) {
+            throw found
+        }
+        return Array.from({ length: found }, () => this.linkHandle())
     }
 
     asPage(): Page {
@@ -2790,8 +3512,35 @@ class NavigationFailurePage {
 }
 
 const NAV_QUERY = selectors.navigation_portfolioInsightsPage.value
+const HOME_NAV_QUERY = selectors.navigation_homePage.value
+/**
+ * The feature check's one DOM query, spelled out: the home link, matched only
+ * while no Portfolio Insights link is anywhere in the document.
+ */
+const FEATURE_LOSS_QUERY =
+    '::-p-xpath(//a[@id="nav-home"][not(//a[@id="nav-portfolio-insights"])])'
+/**
+ * Pages as each of the three navigation queries finds them: one state
+ * answers all three consistently, the feature-loss query matching the home
+ * link only while the Portfolio Insights link is absent.
+ */
+const ERROR_PAGE: DomState = {
+    [HOME_NAV_QUERY]: 0,
+    [NAV_QUERY]: 0,
+    [FEATURE_LOSS_QUERY]: 0,
+}
+const NAVIGATION_WITH_LINK: DomState = {
+    [HOME_NAV_QUERY]: 1,
+    [NAV_QUERY]: 1,
+    [FEATURE_LOSS_QUERY]: 0,
+}
+const NAVIGATION_WITHOUT_LINK: DomState = {
+    [HOME_NAV_QUERY]: 1,
+    [NAV_QUERY]: 0,
+    [FEATURE_LOSS_QUERY]: 1,
+}
 
-test("openPageAndRunOwnedAlert_navigationFailsOnRealPage_lossOnlyFromDomAbsence", async (t) => {
+test("openPageAndRunOwnedAlert_navigationFailsOnRealPage_lossOnlyFromOneDomQuery", async (t) => {
     // Distinct objects with Puppeteer's messages, so a rejection is checked to
     // be the navigation's own error rather than the feature check's.
     const closedOnWait = new Error("Target closed")
@@ -2802,9 +3551,12 @@ test("openPageAndRunOwnedAlert_navigationFailsOnRealPage_lossOnlyFromDomAbsence"
     const rows: {
         name: string
         waitError: Error
-        dom: number | Error
+        /** the DOM states the page passes through, one per query */
+        states: DomState[]
         outcome?: OwnedAlertOutcome
         rejects?: Error
+        /** the DOM queries the feature check runs, in order */
+        queried: string[]
         messages: string[]
         /** the error objects the log entries carry */
         loggedErrors: Error[]
@@ -2813,39 +3565,74 @@ test("openPageAndRunOwnedAlert_navigationFailsOnRealPage_lossOnlyFromDomAbsence"
         {
             name: "targetClosed_rejectsWithNavigationError",
             waitError: closedOnWait,
-            dom: closedOnQuery,
+            states: [
+                {
+                    [HOME_NAV_QUERY]: closedOnQuery,
+                    [NAV_QUERY]: closedOnQuery,
+                    [FEATURE_LOSS_QUERY]: closedOnQuery,
+                },
+            ],
             rejects: closedOnWait,
+            queried: [FEATURE_LOSS_QUERY],
             messages: [CHECK_FAILED],
             loggedErrors: [closedOnQuery],
+            disposed: 0,
+        },
+        // An error page replaced the layout, so neither link is in the DOM:
+        // nothing shows the flag changed, and the navigation error propagates.
+        {
+            name: "navigationAbsentFromDom_rejectsWithNavigationError",
+            waitError: waitTimedOut,
+            states: [ERROR_PAGE],
+            rejects: waitTimedOut,
+            queried: [FEATURE_LOSS_QUERY],
+            messages: [],
+            loggedErrors: [],
             disposed: 0,
         },
         {
             name: "linkAbsentFromDom_notSubmitted",
             waitError: waitTimedOut,
-            dom: 0,
+            states: [NAVIGATION_WITHOUT_LINK],
             outcome: { kind: "not_submitted" },
+            queried: [FEATURE_LOSS_QUERY],
             messages: [
                 "warn: Portfolio insights page unavailable, no alert created",
             ],
             loggedErrors: [waitTimedOut],
-            disposed: 0,
+            disposed: 1,
         },
         // A visible wait misses a link that is in the DOM but hidden; the DOM
-        // lookup finds it, so no loss is verified.
+        // query finds it, so no loss is verified.
         {
             name: "linkInDomButHidden_rejectsWithNavigationError",
             waitError: waitTimedOut,
-            dom: 1,
+            states: [NAVIGATION_WITH_LINK],
             rejects: waitTimedOut,
+            queried: [FEATURE_LOSS_QUERY],
             messages: [],
             loggedErrors: [],
-            disposed: 1,
+            disposed: 0,
+        },
+        // The protected page with its link gives way to an error page after
+        // the first DOM query. Lookups of the home link and then of the
+        // Portfolio Insights link would each read a different page and claim
+        // a loss; the one query reads one page, so the error propagates.
+        {
+            name: "protectedPageReplacedByErrorPage_rejectsWithNavigationError",
+            waitError: waitTimedOut,
+            states: [NAVIGATION_WITH_LINK, ERROR_PAGE],
+            rejects: waitTimedOut,
+            queried: [FEATURE_LOSS_QUERY],
+            messages: [],
+            loggedErrors: [],
+            disposed: 0,
         },
     ]
     for (const row of rows) {
         await t.test(row.name, async (st) => {
             st.mock.timers.enable({ apis: ["setTimeout"] })
-            const page = new NavigationFailurePage(row.waitError, row.dom)
+            const page = new NavigationFailurePage(row.waitError, row.states)
             const pageActions = new PageActions(
                 page.asPage(),
                 recordingLogger().logger,
@@ -2890,7 +3677,7 @@ test("openPageAndRunOwnedAlert_navigationFailsOnRealPage_lossOnlyFromDomAbsence"
                 {
                     outcome: row.outcome,
                     waitedFor: [NAV_QUERY],
-                    queried: [NAV_QUERY],
+                    queried: row.queried,
                     disposed: row.disposed,
                     requests: 0,
                     messages: row.messages,
@@ -2944,6 +3731,1393 @@ test("ownedAlertFailure_outcome_errorUnlessClean", async (t) => {
     for (const row of rows) {
         await t.test(row.name, () => {
             assert.equal(ownedAlertFailure(row.outcome)?.message, row.message)
+        })
+    }
+})
+
+/** How often BoundedPageActions checks intersection by default. */
+const VIEWPORT_POLL_MS = 500
+/** The control the bounded action cases act on. */
+const BOUNDED_TARGET = selectors.portfolioInsightsPage_alertSubmit
+/** The handle of BOUNDED_TARGET as targetHandle prints it. */
+const TARGET_HANDLE = SUBMIT_KEY
+/** A written or selected value that no error or log line may carry. */
+const TYPED_VALUE = "typed-value-probe-7d1e"
+
+/**
+ * Page actions that record each call with its arguments and answer at once:
+ * getHandle and getAllHandles with handle, every other member with a fixed
+ * value. BoundedPageActions acts on elements itself, so the element actions
+ * it wraps must never be called.
+ */
+class RecordingInnerActions implements IPageActions {
+    readonly calls: string[] = []
+    private readonly handle: IHandleWrapper
+
+    constructor(handle: IHandleWrapper) {
+        this.handle = handle
+    }
+
+    async setupPage(setup: PageSetup): Promise<void> {
+        this.record("setupPage", setup.name)
+    }
+
+    async isSelectorPresent(selector: ISelector): Promise<boolean> {
+        this.record("isSelectorPresent", selector)
+        return true
+    }
+
+    async getHandle(selector: ISelector): Promise<IHandleWrapper> {
+        this.record("getHandle", selector)
+        return this.handle
+    }
+
+    async getAllHandles(selector: ISelector): Promise<IHandleWrapper[]> {
+        this.record("getAllHandles", selector)
+        return [this.handle]
+    }
+
+    async scrollIntoView(): Promise<void> {
+        return unexpected("scrollIntoView")
+    }
+
+    async clickHandle(): Promise<void> {
+        return unexpected("clickHandle")
+    }
+
+    async click(): Promise<void> {
+        return unexpected("click")
+    }
+
+    async inputHandle(): Promise<void> {
+        return unexpected("inputHandle")
+    }
+
+    async clearInput(handle: IHandleWrapper): Promise<void> {
+        this.record("clearInput", handle)
+    }
+
+    async input(): Promise<void> {
+        return unexpected("input")
+    }
+
+    async navigateHandle(): Promise<void> {
+        return unexpected("navigateHandle")
+    }
+
+    async navigate(): Promise<void> {
+        return unexpected("navigate")
+    }
+
+    async selectOptionHandle(): Promise<void> {
+        return unexpected("selectOptionHandle")
+    }
+
+    async selectOption(): Promise<void> {
+        return unexpected("selectOption")
+    }
+
+    async sleep(milliseconds: number, noiseProportion?: number): Promise<void> {
+        this.record("sleep", milliseconds, noiseProportion)
+    }
+
+    async getProperty<Type = unknown>(
+        selector: ISelector,
+        propertyName: string
+    ): Promise<Type> {
+        this.record("getProperty", selector, propertyName)
+        const value: unknown = "property"
+        return value as Type
+    }
+
+    async getPropertyHandle<Type = unknown>(
+        handle: IHandleWrapper,
+        propertyName: string
+    ): Promise<Type> {
+        this.record("getPropertyHandle", handle, propertyName)
+        const value: unknown = "property"
+        return value as Type
+    }
+
+    async endDtSession(): Promise<void> {
+        this.record("endDtSession")
+    }
+
+    async evaluate(func: unknown, ...args: unknown[]): Promise<unknown> {
+        this.record("evaluate", func, ...args)
+        return "evaluated"
+    }
+
+    async getInnerText(selector: ISelector): Promise<string> {
+        this.record("getInnerText", selector)
+        return "inner text"
+    }
+
+    async gotoPage(url: string): Promise<void> {
+        this.record("gotoPage", url)
+    }
+
+    async standardDelay(): Promise<void> {
+        this.record("standardDelay")
+    }
+
+    async shortDelay(): Promise<void> {
+        this.record("shortDelay")
+    }
+
+    async longDelay(): Promise<void> {
+        this.record("longDelay")
+    }
+
+    private record(name: string, ...args: unknown[]): void {
+        const shown = args.filter((arg) => arg !== undefined).map(String)
+        this.calls.push([name, ...shown].join(" "))
+    }
+}
+
+/** A handle over element, by default one in the viewport at once. */
+function targetHandle(element = new FakeElement()): FakeHandle {
+    return new FakeHandle(element, TARGET_HANDLE)
+}
+
+/** The rejection as `<name>: <message>`, or the value it settled with. */
+function describeSettled(settled: unknown): unknown {
+    return settled instanceof Error
+        ? `${settled.name}: ${settled.message}`
+        : settled
+}
+
+/**
+ * Ticks the mocked clock by ms in steps of the viewport poll, running the
+ * microtasks each step queues, so a polling action really polls.
+ */
+async function advance(t: TestContext, ms: number): Promise<void> {
+    for (let elapsed = 0; elapsed < ms; elapsed += VIEWPORT_POLL_MS) {
+        t.mock.timers.tick(Math.min(VIEWPORT_POLL_MS, ms - elapsed))
+        await drained()
+    }
+}
+
+/** The viewport wait every element action starts with, its element in view. */
+const IN_VIEW = ["focus", "isIntersectingViewport"]
+/** A click at the element's clickable point, as the element records it. */
+const CLICKED = [
+    "clickablePoint",
+    `mouse.click ${CLICK_POINT.x},${CLICK_POINT.y}`,
+]
+const ACQUIRED = [`getHandle ${SUBMIT_KEY}`]
+
+/** One bounded action of a case, on its target or on handle. */
+type BoundedRun = (
+    actions: BoundedPageActions,
+    handle: IHandleWrapper
+) => Promise<void>
+
+const boundedActionRows: {
+    name: string
+    /** the action as its TimeoutError names it */
+    action: string
+    run: BoundedRun
+    /** the calls the wrapped page actions receive */
+    inner: string[]
+    /** what the element records as the action runs to its end */
+    trace: string[]
+    /** the stage the action dispatches after; unset when it dispatches none */
+    lastStage?: ElementStage
+    /** what lastStage answers with */
+    answer?: unknown
+}[] = [
+    {
+        name: "click",
+        action: "click",
+        run: (actions) => actions.click(BOUNDED_TARGET),
+        inner: ACQUIRED,
+        trace: [...IN_VIEW, ...CLICKED],
+        lastStage: "clickablePoint",
+        answer: CLICK_POINT,
+    },
+    {
+        name: "clickHandle",
+        action: "click",
+        run: (actions, handle) =>
+            actions.clickHandle(handle, { count: 2, offset: { x: 1, y: 2 } }),
+        inner: [],
+        trace: [
+            ...IN_VIEW,
+            "clickablePoint 1,2",
+            `mouse.click ${CLICK_POINT.x},${CLICK_POINT.y} {"count":2,"offset":{"x":1,"y":2}}`,
+        ],
+        lastStage: "clickablePoint",
+        answer: CLICK_POINT,
+    },
+    {
+        name: "input",
+        action: "input",
+        run: (actions) => actions.input(BOUNDED_TARGET, TYPED_VALUE),
+        inner: ACQUIRED,
+        trace: writtenSteps(TYPED_VALUE),
+        lastStage: "isIntersectingViewport",
+        answer: true,
+    },
+    {
+        name: "inputHandle",
+        action: "input",
+        run: (actions, handle) => actions.inputHandle(handle, TYPED_VALUE),
+        inner: [],
+        trace: writtenSteps(TYPED_VALUE),
+        lastStage: "isIntersectingViewport",
+        answer: true,
+    },
+    {
+        name: "selectOption",
+        action: "selectOption",
+        run: (actions) => actions.selectOption(BOUNDED_TARGET, TYPED_VALUE),
+        inner: ACQUIRED,
+        trace: [...IN_VIEW, `select ${TYPED_VALUE}`],
+        lastStage: "isIntersectingViewport",
+        answer: true,
+    },
+    {
+        name: "selectOptionHandle",
+        action: "selectOption",
+        run: (actions, handle) =>
+            actions.selectOptionHandle(handle, TYPED_VALUE),
+        inner: [],
+        trace: [...IN_VIEW, `select ${TYPED_VALUE}`],
+        lastStage: "isIntersectingViewport",
+        answer: true,
+    },
+    {
+        name: "navigate",
+        action: "navigate",
+        run: (actions) => actions.navigate(BOUNDED_TARGET),
+        inner: ACQUIRED,
+        trace: ["waitForNavigation", ...IN_VIEW, ...CLICKED],
+        lastStage: "clickablePoint",
+        answer: CLICK_POINT,
+    },
+    {
+        name: "navigateHandle",
+        action: "navigate",
+        run: (actions, handle) => actions.navigateHandle(handle),
+        inner: [],
+        trace: ["waitForNavigation", ...IN_VIEW, ...CLICKED],
+        lastStage: "clickablePoint",
+        answer: CLICK_POINT,
+    },
+    {
+        name: "scrollIntoView",
+        action: "scrollIntoView",
+        run: (actions, handle) => actions.scrollIntoView(handle),
+        inner: [],
+        trace: IN_VIEW,
+    },
+    {
+        name: "enterCredential",
+        action: "enterCredential",
+        run: (actions, handle) =>
+            actions.enterCredential(handle, TYPED_VALUE, LOGIN_ORIGIN),
+        inner: [],
+        trace: writtenSteps(TYPED_VALUE),
+        lastStage: "isIntersectingViewport",
+        answer: true,
+    },
+]
+
+test("BoundedPageActions_elementAction_dispatchesOnElementWithinDeadline", async (t) => {
+    for (const row of boundedActionRows) {
+        await t.test(row.name, async (st) => {
+            st.mock.timers.enable({ apis: ["setTimeout"] })
+            const element = new FakeElement()
+            showDocument(st, element.field.ownerDocument)
+            const inner = new RecordingInnerActions(targetHandle(element))
+            const { logger, records } = recordingLogger()
+            const bounded = new BoundedPageActions(inner, logger)
+
+            await row.run(bounded, targetHandle(element))
+            // A deadline left armed would now fire and dispose the handle.
+            await advance(st, PAGE_ACTION_TIMEOUT_MS)
+
+            assert.deepEqual(
+                {
+                    calls: inner.calls,
+                    trace: element.trace,
+                    disposed: element.disposed,
+                    messages: records.map((record) => record.message),
+                },
+                {
+                    calls: row.inner,
+                    trace: row.trace,
+                    disposed: false,
+                    messages: [],
+                }
+            )
+        })
+    }
+})
+
+/** The intersection checks element has recorded. */
+function intersectionChecks(element: FakeElement): number {
+    return element.trace.filter((step) => step === "isIntersectingViewport")
+        .length
+}
+
+test("BoundedPageActions_elementEntersViewportLate_checksEachIntervalThenActs", async (t) => {
+    const rows: {
+        name: string
+        interval: number
+        run: BoundedRun
+        /** what the action records once the element is in view */
+        acts: string[]
+    }[] = [
+        {
+            name: "clickDefaultInterval_checksEvery500ms",
+            interval: VIEWPORT_POLL_MS,
+            run: (actions, handle) => actions.clickHandle(handle),
+            acts: CLICKED,
+        },
+        {
+            name: "scrollIntoViewGivenInterval_checksEveryInterval",
+            interval: 200,
+            run: (actions, handle) => actions.scrollIntoView(handle, 200),
+            acts: [],
+        },
+    ]
+    for (const row of rows) {
+        await t.test(row.name, async (st) => {
+            st.mock.timers.enable({ apis: ["setTimeout"] })
+            const element = new FakeElement({ intersectsFromCheck: 3 })
+            const bounded = new BoundedPageActions(
+                new RecordingInnerActions(targetHandle(element)),
+                recordingLogger().logger
+            )
+            let settled: unknown = STILL_PENDING
+            const pending = row.run(bounded, targetHandle(element)).then(() => {
+                settled = "resolved"
+            })
+
+            await drained()
+            st.mock.timers.tick(row.interval - 1)
+            await drained()
+            const beforeInterval = intersectionChecks(element)
+            st.mock.timers.tick(1)
+            await drained()
+            const atInterval = intersectionChecks(element)
+            st.mock.timers.tick(row.interval)
+            await pending
+
+            assert.deepEqual(
+                { beforeInterval, atInterval, settled, trace: element.trace },
+                {
+                    beforeInterval: 1,
+                    atInterval: 2,
+                    settled: "resolved",
+                    trace: [
+                        "focus",
+                        "isIntersectingViewport",
+                        "isIntersectingViewport",
+                        "isIntersectingViewport",
+                        ...row.acts,
+                    ],
+                }
+            )
+        })
+    }
+})
+
+async function pageSetupProbe(): Promise<void> {}
+
+test("BoundedPageActions_otherMember_delegatesUnchanged", async (t) => {
+    const handle = targetHandle()
+    const rows: {
+        name: string
+        call: (actions: IPageActions) => Promise<unknown>
+        calls: string[]
+        result?: unknown
+    }[] = [
+        {
+            name: "setupPage",
+            call: (actions) => actions.setupPage(pageSetupProbe),
+            calls: ["setupPage pageSetupProbe"],
+        },
+        {
+            name: "isSelectorPresent",
+            call: (actions) => actions.isSelectorPresent(BOUNDED_TARGET),
+            calls: [`isSelectorPresent ${SUBMIT_KEY}`],
+            result: true,
+        },
+        {
+            name: "getHandle",
+            call: (actions) => actions.getHandle(BOUNDED_TARGET),
+            calls: [`getHandle ${SUBMIT_KEY}`],
+            result: handle,
+        },
+        {
+            name: "getAllHandles",
+            call: (actions) => actions.getAllHandles(BOUNDED_TARGET),
+            calls: [`getAllHandles ${SUBMIT_KEY}`],
+            result: [handle],
+        },
+        {
+            name: "clearInput",
+            call: (actions) => actions.clearInput(handle),
+            calls: [`clearInput ${TARGET_HANDLE}`],
+        },
+        {
+            name: "sleep",
+            call: (actions) => actions.sleep(250, 0.5),
+            calls: ["sleep 250 0.5"],
+        },
+        {
+            name: "getProperty",
+            call: (actions) => actions.getProperty(BOUNDED_TARGET, "value"),
+            calls: [`getProperty ${SUBMIT_KEY} value`],
+            result: "property",
+        },
+        {
+            name: "getPropertyHandle",
+            call: (actions) => actions.getPropertyHandle(handle, "value"),
+            calls: [`getPropertyHandle ${TARGET_HANDLE} value`],
+            result: "property",
+        },
+        {
+            name: "endDtSession",
+            call: (actions) => actions.endDtSession(),
+            calls: ["endDtSession"],
+        },
+        {
+            name: "evaluate",
+            call: (actions) => actions.evaluate("1 + 1", 2, 3),
+            calls: ["evaluate 1 + 1 2 3"],
+            result: "evaluated",
+        },
+        {
+            name: "getInnerText",
+            call: (actions) => actions.getInnerText(BOUNDED_TARGET),
+            calls: [`getInnerText ${SUBMIT_KEY}`],
+            result: "inner text",
+        },
+        {
+            name: "gotoPage",
+            call: (actions) => actions.gotoPage(BASE_URL.href),
+            calls: [`gotoPage ${BASE_URL.href}`],
+        },
+        {
+            name: "standardDelay",
+            call: (actions) => actions.standardDelay(),
+            calls: ["standardDelay"],
+        },
+        {
+            name: "shortDelay",
+            call: (actions) => actions.shortDelay(),
+            calls: ["shortDelay"],
+        },
+        {
+            name: "longDelay",
+            call: (actions) => actions.longDelay(),
+            calls: ["longDelay"],
+        },
+    ]
+    for (const row of rows) {
+        await t.test(row.name, async () => {
+            const inner = new RecordingInnerActions(handle)
+            const bounded = new BoundedPageActions(
+                inner,
+                recordingLogger().logger
+            )
+
+            const result = await row.call(bounded)
+
+            assert.deepEqual(
+                { calls: inner.calls, result },
+                { calls: row.calls, result: row.result }
+            )
+        })
+    }
+})
+
+/** The TimeoutError of action on BOUNDED_TARGET, as describeSettled shows it. */
+const timedOut = (action: string): string =>
+    `TimeoutError: Page action [${action}] on [${TARGET_HANDLE}] did not finish within [${PAGE_ACTION_TIMEOUT_MS}] ms`
+
+test("BoundedPageActions_elementNeverInViewport_timeoutErrorAtDeadlineAndNothingDispatched", async (t) => {
+    for (const row of boundedActionRows) {
+        await t.test(row.name, async (st) => {
+            st.mock.timers.enable({ apis: ["setTimeout"] })
+            const element = new FakeElement({
+                intersectsFromCheck: Number.POSITIVE_INFINITY,
+            })
+            showDocument(st, element.field.ownerDocument)
+            const { logger, records } = recordingLogger()
+            const bounded = new BoundedPageActions(
+                new RecordingInnerActions(targetHandle(element)),
+                logger
+            )
+            let settled: unknown = STILL_PENDING
+            const pending = row.run(bounded, targetHandle(element)).then(
+                () => {
+                    settled = "resolved"
+                },
+                (error: unknown) => {
+                    settled = error
+                }
+            )
+
+            // Lets the action acquire its handle and arm its deadline at 0.
+            await drained()
+            await advance(st, PAGE_ACTION_TIMEOUT_MS - 1)
+            const beforeDeadline = settled
+            await advance(st, 1)
+            const atDeadline = describeSettled(settled)
+            await advance(st, 10 * VIEWPORT_POLL_MS)
+            await pending
+
+            // One check every 500 ms up to the deadline and none after it;
+            // nothing is dispatched, and the abandoned pause between two
+            // checks ends with the action, so no line follows the deadline.
+            assert.deepEqual(
+                {
+                    beforeDeadline,
+                    atDeadline,
+                    disposed: element.disposed,
+                    steps: element.trace.filter(
+                        (step) => step !== "isIntersectingViewport"
+                    ),
+                    checks: intersectionChecks(element),
+                    messages: records.map(
+                        (record) => `${record.level}: ${record.message}`
+                    ),
+                },
+                {
+                    beforeDeadline: STILL_PENDING,
+                    atDeadline: timedOut(row.action),
+                    disposed: true,
+                    steps: row.trace.filter(
+                        (step) =>
+                            step === "waitForNavigation" || step === "focus"
+                    ),
+                    checks: PAGE_ACTION_TIMEOUT_MS / VIEWPORT_POLL_MS,
+                    messages: [],
+                }
+            )
+        })
+    }
+})
+
+/** Whether a held stage settles after the deadline or in the deadline's tick. */
+const STAGE_RELEASES = ["afterDeadline", "inDeadlineTick"] as const
+
+test("BoundedPageActions_stageSettlesAtOrAfterDeadline_timeoutErrorAndNothingDispatched", async (t) => {
+    for (const row of boundedActionRows) {
+        const lastStage = row.lastStage
+        if (lastStage === undefined) {
+            continue
+        }
+        for (const release of STAGE_RELEASES) {
+            await t.test(`${row.name}_${release}`, async (st) => {
+                st.mock.timers.enable({ apis: ["setTimeout"] })
+                let releaseStage: () => void = () => undefined
+                // In the deadline's tick, the stage settles through a timer
+                // armed before the deadline's, so it runs just before it, and
+                // the action resumes only after the deadline has passed.
+                const held = new Promise((resolve) => {
+                    if (release === "inDeadlineTick") {
+                        setTimeout(
+                            () => resolve(row.answer),
+                            PAGE_ACTION_TIMEOUT_MS
+                        )
+                    } else {
+                        releaseStage = () => resolve(row.answer)
+                    }
+                })
+                const element = new FakeElement({ held: { [lastStage]: held } })
+                showDocument(st, element.field.ownerDocument)
+                const { logger, records } = recordingLogger()
+                const bounded = new BoundedPageActions(
+                    new RecordingInnerActions(targetHandle(element)),
+                    logger
+                )
+                let settled: unknown = STILL_PENDING
+                const pending = row.run(bounded, targetHandle(element)).then(
+                    () => {
+                        settled = "resolved"
+                    },
+                    (error: unknown) => {
+                        settled = error
+                    }
+                )
+
+                await drained()
+                st.mock.timers.tick(PAGE_ACTION_TIMEOUT_MS - 1)
+                await drained()
+                const beforeDeadline = settled
+                st.mock.timers.tick(1)
+                await drained()
+                const atDeadline = describeSettled(settled)
+                releaseStage()
+                await drained()
+                await pending
+
+                // The element records nothing after the held stage: no click,
+                // selection or write was sent once the deadline had passed.
+                const heldAt = row.trace.findIndex((step) =>
+                    step.startsWith(lastStage)
+                )
+                assert.deepEqual(
+                    {
+                        beforeDeadline,
+                        atDeadline,
+                        trace: element.trace,
+                        disposed: element.disposed,
+                        messages: records.map(
+                            (record) => `${record.level}: ${record.message}`
+                        ),
+                    },
+                    {
+                        beforeDeadline: STILL_PENDING,
+                        atDeadline: timedOut(row.action),
+                        trace: row.trace.slice(0, heldAt + 1),
+                        disposed: true,
+                        messages: [
+                            `debug: Page action [${row.action}] on [${TARGET_HANDLE}] finished after its deadline`,
+                        ],
+                    }
+                )
+            })
+        }
+    }
+})
+
+test("BoundedPageActions_actionFails_disposesHandleAndRethrows", async (t) => {
+    const disposeFailure = new Error("Protocol error: Target closed")
+    const notDisposed = (action: string): string =>
+        `debug: Page action [${action}] on [${TARGET_HANDLE}] handle not disposed: error [Error]`
+    const unavailable: IHandleWrapper = {
+        getHandle: () => {
+            throw disposeFailure
+        },
+        toString: () => TARGET_HANDLE,
+    }
+    const rows: {
+        name: string
+        run: BoundedRun
+        failing?: FakeElementOptions["failing"]
+        /** a handle whose element cannot be had, instead of the element's */
+        handle?: IHandleWrapper
+        rethrown: Error
+        disposed: boolean
+        messages: string[]
+        loggedErrors: Error[]
+    }[] = [
+        {
+            name: "clickStageFails_disposedNothingLogged",
+            run: (actions, handle) => actions.clickHandle(handle),
+            failing: { clickablePoint: pageError },
+            rethrown: pageError,
+            disposed: true,
+            messages: [],
+            loggedErrors: [],
+        },
+        // The click is sent; the navigation it was to cause fails.
+        {
+            name: "navigationFails_disposedNothingLogged",
+            run: (actions, handle) => actions.navigateHandle(handle),
+            failing: { waitForNavigation: pageError },
+            rethrown: pageError,
+            disposed: true,
+            messages: [],
+            loggedErrors: [],
+        },
+        {
+            name: "disposeRejects_failureLoggedAtDebug",
+            run: (actions, handle) => actions.clickHandle(handle),
+            failing: { clickablePoint: pageError, dispose: disposeFailure },
+            rethrown: pageError,
+            disposed: true,
+            messages: [notDisposed("click")],
+            loggedErrors: [disposeFailure],
+        },
+        {
+            name: "elementUnavailable_rethrownAndLoggedAtDebug",
+            run: (actions, handle) => actions.clickHandle(handle),
+            handle: unavailable,
+            rethrown: disposeFailure,
+            disposed: false,
+            messages: [notDisposed("click")],
+            loggedErrors: [disposeFailure],
+        },
+    ]
+    for (const row of rows) {
+        await t.test(row.name, async (st) => {
+            st.mock.timers.enable({ apis: ["setTimeout"] })
+            const element = new FakeElement({ failing: row.failing })
+            const handle = row.handle ?? targetHandle(element)
+            const { logger, records } = recordingLogger()
+            const bounded = new BoundedPageActions(
+                new RecordingInnerActions(handle),
+                logger
+            )
+
+            const thrown = await row.run(bounded, handle).then(
+                () => "resolved",
+                (error: unknown) => error
+            )
+            await drained()
+
+            assert.deepEqual(
+                {
+                    rethrown: thrown === row.rethrown,
+                    disposed: element.disposed,
+                    messages: records.map(
+                        (record) => `${record.level}: ${record.message}`
+                    ),
+                    loggedErrors: records
+                        .map((record) => record.error)
+                        .filter((error) => error !== undefined)
+                        .map(
+                            (error, index) => error === row.loggedErrors[index]
+                        ),
+                },
+                {
+                    rethrown: true,
+                    disposed: row.disposed,
+                    messages: row.messages,
+                    loggedErrors: row.loggedErrors.map(() => true),
+                }
+            )
+        })
+    }
+})
+
+test("BoundedPageActions_abandonedStageEndsLate_loggedAtDebug", async (t) => {
+    const rows: {
+        name: string
+        action: string
+        run: BoundedRun
+        /** the stage held past the deadline, and what it answers with */
+        stage: ElementStage
+        answer: unknown
+        ends: "resolves" | "rejects"
+        messages: string[]
+        /** the error objects the entries carry, as describeError names them */
+        errors: string[]
+    }[] = [
+        {
+            name: "clickStageResolvesLate_finishLogged",
+            action: "click",
+            run: (actions, handle) => actions.clickHandle(handle),
+            stage: "clickablePoint",
+            answer: CLICK_POINT,
+            ends: "resolves",
+            messages: [
+                `debug: Page action [click] on [${TARGET_HANDLE}] finished after its deadline`,
+            ],
+            errors: [],
+        },
+        {
+            name: "clickStageRejectsLate_failureLoggedWithError",
+            action: "click",
+            run: (actions, handle) => actions.clickHandle(handle),
+            stage: "clickablePoint",
+            answer: CLICK_POINT,
+            ends: "rejects",
+            messages: [
+                `debug: Page action [click] on [${TARGET_HANDLE}] failed after its deadline: error [Error]`,
+            ],
+            errors: ["readError"],
+        },
+        // A credential field's stage fails with errors that can quote the
+        // untrusted document's URL, so only the error's name is logged.
+        {
+            name: "credentialStageRejectsLate_failureLoggedByNameOnly",
+            action: "enterCredential",
+            run: (actions, handle) =>
+                actions.enterCredential(handle, TYPED_VALUE, LOGIN_ORIGIN),
+            stage: "isIntersectingViewport",
+            answer: true,
+            ends: "rejects",
+            messages: [
+                `debug: Page action [enterCredential] on [${TARGET_HANDLE}] failed after its deadline: error [Error]`,
+            ],
+            errors: [],
+        },
+    ]
+    for (const row of rows) {
+        await t.test(row.name, async (st) => {
+            st.mock.timers.enable({ apis: ["setTimeout"] })
+            let end: () => void = () => undefined
+            const held = new Promise((resolve, reject) => {
+                end = () =>
+                    row.ends === "resolves"
+                        ? resolve(row.answer)
+                        : reject(readError)
+            })
+            const element = new FakeElement({ held: { [row.stage]: held } })
+            const { logger, records } = recordingLogger()
+            const bounded = new BoundedPageActions(
+                new RecordingInnerActions(targetHandle(element)),
+                logger
+            )
+
+            const settled = row.run(bounded, targetHandle(element)).then(
+                () => "resolved",
+                (error: unknown) => describeSettled(error)
+            )
+            await drained()
+            st.mock.timers.tick(PAGE_ACTION_TIMEOUT_MS)
+            const atDeadline = await settled
+            end()
+            await drained()
+
+            assert.deepEqual(
+                {
+                    atDeadline,
+                    messages: records.map(
+                        (record) => `${record.level}: ${record.message}`
+                    ),
+                    errors: records
+                        .map((record) => record.error)
+                        .filter((error) => error !== undefined)
+                        .map(describeError),
+                },
+                {
+                    atDeadline: timedOut(row.action),
+                    messages: row.messages,
+                    errors: row.errors,
+                }
+            )
+        })
+    }
+})
+
+test("BoundedPageActions_navigateAbandonsNavigationWait_noUnhandledRejection", async (t) => {
+    const rows: {
+        name: string
+        failing?: FakeElementOptions["failing"]
+        held?: FakeElementOptions["held"]
+        settled: unknown
+    }[] = [
+        {
+            name: "clickFails_rejectsWithClickError",
+            failing: { clickablePoint: pageError },
+            settled: `Error: ${pageError.message}`,
+        },
+        {
+            name: "deadlinePassesBeforeClick_rejectsWithTimeoutError",
+            held: { clickablePoint: new Promise(() => undefined) },
+            settled: timedOut("navigate"),
+        },
+    ]
+    for (const row of rows) {
+        await t.test(row.name, async (st) => {
+            st.mock.timers.enable({ apis: ["setTimeout"] })
+            const unhandled: unknown[] = []
+            const onUnhandled = (reason: unknown): void => {
+                unhandled.push(reason)
+            }
+            process.on("unhandledRejection", onUnhandled)
+            st.after(() => {
+                process.off("unhandledRejection", onUnhandled)
+            })
+            let failNavigation: (error: Error) => void = () => undefined
+            const navigation = new Promise((_resolve, reject) => {
+                failNavigation = reject
+            })
+            const element = new FakeElement({
+                failing: row.failing,
+                held: { ...row.held, waitForNavigation: navigation },
+            })
+            const bounded = new BoundedPageActions(
+                new RecordingInnerActions(targetHandle(element)),
+                recordingLogger().logger
+            )
+
+            const pending = bounded.navigateHandle(targetHandle(element)).then(
+                () => "resolved",
+                (error: unknown) => describeSettled(error)
+            )
+            await drained()
+            st.mock.timers.tick(PAGE_ACTION_TIMEOUT_MS)
+            const settled = await pending
+            // Puppeteer's own navigation timeout ends the abandoned wait.
+            failNavigation(new Error("Navigation timeout of 30000 ms exceeded"))
+            await drained()
+
+            assert.deepEqual(
+                { settled, unhandled },
+                { settled: row.settled, unhandled: [] }
+            )
+        })
+    }
+})
+
+test("BoundedPageActions_inputHandle_writesThroughPrototypeValueSetter", async (t) => {
+    const rows: {
+        name: string
+        /** changes the element before the write */
+        prepare: (element: FakeElement) => void
+        settled: unknown
+        trace: string[]
+    }[] = [
+        // React tracks a controlled input through a value setter on the
+        // element itself, which an assignment would run, hiding the change.
+        {
+            name: "reactTrackedField_ownSetterBypassed",
+            prepare: (element) => {
+                Object.defineProperty(element.field, "value", {
+                    configurable: true,
+                    get: () => "tracked",
+                    set: (text: string) => {
+                        element.trace.push(`own setter ${text}`)
+                    },
+                })
+            },
+            settled: "resolved",
+            trace: writtenSteps(TYPED_VALUE),
+        },
+        {
+            name: "elementWithoutValue_rejectsWritingNothing",
+            prepare: (element) => {
+                element.node = {
+                    isConnected: true,
+                    dispatchEvent: (): boolean => {
+                        element.trace.push("event")
+                        return true
+                    },
+                }
+            },
+            settled: "Error: Element has no value to write",
+            trace: [...IN_VIEW, "evaluate"],
+        },
+    ]
+    for (const row of rows) {
+        await t.test(row.name, async () => {
+            const element = new FakeElement()
+            row.prepare(element)
+            const bounded = new BoundedPageActions(
+                new RecordingInnerActions(targetHandle(element)),
+                recordingLogger().logger
+            )
+
+            const settled = await bounded
+                .inputHandle(targetHandle(element), TYPED_VALUE)
+                .then(
+                    () => "resolved",
+                    (error: unknown) => describeSettled(error)
+                )
+
+            assert.deepEqual(
+                { settled, trace: element.trace },
+                { settled: row.settled, trace: row.trace }
+            )
+        })
+    }
+})
+
+/** What a field records as enterCredential refuses to write into it. */
+const CREDENTIAL_REFUSED = [...IN_VIEW, "evaluate"]
+
+const credentialRows: {
+    name: string
+    /** the origin of the document the field and the page show */
+    documentOrigin: string
+    /** the origin enterCredential requires; LOGIN_ORIGIN when unset */
+    origin?: string
+    /** changes the element before the write */
+    prepare?: (element: FakeElement) => void
+    failing?: FakeElementOptions["failing"]
+    settled: unknown
+    trace: string[]
+}[] = [
+    {
+        name: "documentAtOrigin_written",
+        documentOrigin: LOGIN_ORIGIN,
+        settled: "resolved",
+        trace: writtenSteps(TYPED_VALUE),
+    },
+    {
+        name: "otherHost_nothingWritten",
+        documentOrigin: ELSEWHERE_ORIGIN,
+        settled: ORIGIN_UNVERIFIED,
+        trace: CREDENTIAL_REFUSED,
+    },
+    {
+        name: "otherPort_nothingWritten",
+        documentOrigin: "http://easytrade.test:8080",
+        settled: ORIGIN_UNVERIFIED,
+        trace: CREDENTIAL_REFUSED,
+    },
+    {
+        name: "otherScheme_nothingWritten",
+        documentOrigin: "https://easytrade.test",
+        settled: ORIGIN_UNVERIFIED,
+        trace: CREDENTIAL_REFUSED,
+    },
+    {
+        name: "opaqueDocument_nothingWritten",
+        documentOrigin: "null",
+        settled: ORIGIN_UNVERIFIED,
+        trace: CREDENTIAL_REFUSED,
+    },
+    // Every about:blank or data: document has the opaque origin, so an
+    // expected opaque origin matches none of them: nothing is even waited for.
+    {
+        name: "opaqueExpectedOrigin_refusedBeforeAnyStage",
+        documentOrigin: "null",
+        origin: "null",
+        settled: ORIGIN_UNVERIFIED,
+        trace: [],
+    },
+    {
+        name: "fieldDetached_nothingWritten",
+        documentOrigin: LOGIN_ORIGIN,
+        prepare: (element) => {
+            element.field.isConnected = false
+        },
+        settled: ORIGIN_UNVERIFIED,
+        trace: CREDENTIAL_REFUSED,
+    },
+    // The field's own document is at the origin, but it is not the document
+    // of the frame the write runs in.
+    {
+        name: "fieldInOtherDocument_nothingWritten",
+        documentOrigin: LOGIN_ORIGIN,
+        prepare: (element) => {
+            element.field.ownerDocument = fakeDocument(LOGIN_ORIGIN)
+        },
+        settled: ORIGIN_UNVERIFIED,
+        trace: CREDENTIAL_REFUSED,
+    },
+    {
+        name: "fieldWithoutValue_nothingWritten",
+        documentOrigin: LOGIN_ORIGIN,
+        prepare: (element) => {
+            element.node = {
+                isConnected: true,
+                ownerDocument: element.field.ownerDocument,
+                dispatchEvent: (): boolean => true,
+            }
+        },
+        settled: ORIGIN_UNVERIFIED,
+        trace: CREDENTIAL_REFUSED,
+    },
+    // A failure quotes the frame's URL, so it is not passed on as cause.
+    {
+        name: "writeFails_rejectsWithoutWriteError",
+        documentOrigin: LOGIN_ORIGIN,
+        failing: { evaluate: detachedFrameError },
+        settled: ORIGIN_UNVERIFIED,
+        trace: CREDENTIAL_REFUSED,
+    },
+    {
+        name: "focusFails_rejectsWithoutFocusError",
+        documentOrigin: LOGIN_ORIGIN,
+        failing: { focus: detachedFrameError },
+        settled: ORIGIN_UNVERIFIED,
+        trace: ["focus"],
+    },
+]
+
+test("BoundedPageActions_enterCredential_writesOnlyIntoFieldOfDocumentAtOrigin", async (t) => {
+    for (const row of credentialRows) {
+        await t.test(row.name, async (st) => {
+            const doc = fakeDocument(row.documentOrigin)
+            const element = new FakeElement({
+                document: doc,
+                text: STALE_PASSWORD,
+                failing: row.failing,
+            })
+            row.prepare?.(element)
+            showDocument(st, doc)
+            const { logger, entries } = wholeEntryLogger()
+            const bounded = new BoundedPageActions(
+                new RecordingInnerActions(targetHandle(element)),
+                logger
+            )
+
+            const settled = await settledStep(
+                bounded.enterCredential(
+                    targetHandle(element),
+                    TYPED_VALUE,
+                    row.origin ?? LOGIN_ORIGIN
+                )
+            )
+            await drained()
+
+            // No origin, no URL a failure quotes and not the credential
+            // reaches the error or a log entry. A refused field keeps its
+            // text, and its handle is released.
+            const written = row.settled === "resolved"
+            const exposed = [...entries, JSON.stringify(settled)].filter(
+                (text) =>
+                    text.includes(BASE_URL.hostname) ||
+                    text.includes(new URL(ELSEWHERE_ORIGIN).hostname) ||
+                    text.includes(SECRET) ||
+                    text.includes(TYPED_VALUE)
+            )
+            assert.deepEqual(
+                {
+                    settled,
+                    trace: element.trace,
+                    text: element.text(),
+                    disposed: element.disposed,
+                    exposed,
+                },
+                {
+                    settled: row.settled,
+                    trace: row.trace,
+                    text: written ? TYPED_VALUE : STALE_PASSWORD,
+                    disposed: !written,
+                    exposed: [],
+                }
+            )
+        })
+    }
+})
+
+test("BoundedPageActions_deadline_acceptedOnlyInTimerRange", async (t) => {
+    const rows: { name: string; timeoutMs: number; accepted: boolean }[] = [
+        { name: "zero_rangeError", timeoutMs: 0, accepted: false },
+        { name: "negative_rangeError", timeoutMs: -1, accepted: false },
+        { name: "fraction_rangeError", timeoutMs: 1.5, accepted: false },
+        {
+            name: "notANumber_rangeError",
+            timeoutMs: Number.NaN,
+            accepted: false,
+        },
+        {
+            name: "infinite_rangeError",
+            timeoutMs: Number.POSITIVE_INFINITY,
+            accepted: false,
+        },
+        {
+            name: "aboveTimerMaximum_rangeError",
+            timeoutMs: 2_147_483_648,
+            accepted: false,
+        },
+        { name: "oneMillisecond_accepted", timeoutMs: 1, accepted: true },
+        {
+            name: "timerMaximum_accepted",
+            timeoutMs: 2_147_483_647,
+            accepted: true,
+        },
+    ]
+    for (const row of rows) {
+        await t.test(row.name, () => {
+            const construct = () =>
+                new BoundedPageActions(
+                    new RecordingInnerActions(targetHandle()),
+                    recordingLogger().logger,
+                    row.timeoutMs
+                )
+
+            const outcome = (() => {
+                try {
+                    construct()
+                    return "accepted"
+                } catch (error) {
+                    return error instanceof RangeError
+                        ? "RangeError"
+                        : describeSettled(error)
+                }
+            })()
+
+            assert.equal(outcome, row.accepted ? "accepted" : "RangeError")
+        })
+    }
+})
+
+/**
+ * A Puppeteer element, in the viewport at once, whose dispatches run the
+ * FakePageActions action of its selector: a mouse click runs its click, a
+ * selection its selectOption and a write in the page its input.
+ */
+class RoutedElement {
+    private readonly page: FakePageActions
+    private readonly selector: ISelector
+
+    constructor(page: FakePageActions, selector: ISelector) {
+        this.page = page
+        this.selector = selector
+    }
+
+    async focus(): Promise<void> {}
+
+    async isIntersectingViewport(): Promise<boolean> {
+        return true
+    }
+
+    async clickablePoint(): Promise<typeof CLICK_POINT> {
+        return CLICK_POINT
+    }
+
+    async select(option: string): Promise<string[]> {
+        await this.page.selectOption(this.selector, option)
+        return [option]
+    }
+
+    async evaluate(_pageFunction: unknown, text: string): Promise<boolean> {
+        await this.page.input(this.selector, text)
+        return true
+    }
+
+    get frame(): unknown {
+        return {
+            page: () => ({
+                mouse: { click: () => this.page.click(this.selector) },
+            }),
+        }
+    }
+
+    async dispose(): Promise<void> {}
+
+    asHandle(): ElementHandle {
+        return this as unknown as ElementHandle
+    }
+}
+
+/**
+ * FakePageActions behind BoundedPageActions: getHandle hands out, for each
+ * selector, a RoutedElement that runs the FakePageActions action of that
+ * selector, except for the selector of stalledKey, whose element never
+ * intersects the viewport.
+ */
+class StallingPageActions extends FakePageActions {
+    readonly stalled = new FakeElement({
+        intersectsFromCheck: Number.POSITIVE_INFINITY,
+    })
+    private readonly stalledKey: string
+
+    constructor(page: FakePage, stalledKey: string) {
+        super(page)
+        this.stalledKey = stalledKey
+    }
+
+    // The parameter is optional, so this override stays assignable to the
+    // parameterless member of FakePageActions it replaces.
+    override async getHandle(selector?: ISelector): Promise<IHandleWrapper> {
+        if (selector === undefined) {
+            return unexpected("getHandle without a selector")
+        }
+        const key = selector.toString()
+        const element =
+            key === this.stalledKey
+                ? this.stalled
+                : new RoutedElement(this, selector)
+        return new FakeHandle(element, key)
+    }
+}
+
+const TYPE_KEY = selectors.portfolioInsightsPage_alertType.toString()
+
+test("createAndDeleteOwnedAlert_boundedActionNeverInViewport_outcome", async (t) => {
+    const rows: {
+        name: string
+        stalledKey: string
+        deleteStatus?: number
+        expected: {
+            /** the outcome, or the rejection as `<name>: <message>` */
+            settled: unknown
+            /** the page actions that ran, in order, without checks and reads */
+            actions: string[]
+            requests: string[]
+            messages: string[]
+            errors: string[]
+        }
+    }[] = [
+        // The id is known, so the cleanup still reaches the API fallback.
+        {
+            name: "ownRowDeleteStalls_deletedViaApi",
+            stalledKey: rowDeleteKey(OWN_ID),
+            deleteStatus: 204,
+            expected: {
+                settled: { kind: "deleted", id: OWN_ID, via: "api" },
+                actions: submitSteps(MARKER),
+                requests: [DELETE_OWN],
+                messages: [
+                    CREATED_OWN,
+                    UI_DELETE_FAILED,
+                    `info: Deleted alert [${OWN_ID}] via api`,
+                ],
+                errors: ["TimeoutError"],
+            },
+        },
+        {
+            name: "formSelectStalls_rejectsWithNothingSubmitted",
+            stalledKey: TYPE_KEY,
+            expected: {
+                settled: `TimeoutError: Page action [selectOption] on [${TYPE_KEY}] did not finish within [${PAGE_ACTION_TIMEOUT_MS}] ms`,
+                actions: [],
+                requests: [],
+                messages: [],
+                errors: [],
+            },
+        },
+        {
+            name: "submitClickStalls_logsOutcomeUnknownAndRejects",
+            stalledKey: SUBMIT_KEY,
+            expected: {
+                settled: `TimeoutError: Page action [click] on [${SUBMIT_KEY}] did not finish within [${PAGE_ACTION_TIMEOUT_MS}] ms`,
+                actions: submitSteps(MARKER).slice(0, -1),
+                requests: [],
+                messages: [UNCONFIRMED],
+                errors: ["TimeoutError"],
+            },
+        },
+    ]
+    for (const row of rows) {
+        await t.test(row.name, async (st) => {
+            st.mock.timers.enable({ apis: ["setTimeout"] })
+            const { fetchFn, calls } = recordingFetch(() =>
+                row.deleteStatus === undefined
+                    ? Promise.reject(new Error("Unexpected request"))
+                    : statusResponse(row.deleteStatus)
+            )
+            const { logger, records } = recordingLogger()
+            const page = new StallingPageActions(ownAlertPage(), row.stalledKey)
+            // The wrapper's own debug lines go to a logger of their own.
+            const bounded = new BoundedPageActions(
+                page,
+                recordingLogger().logger
+            )
+            let settled: unknown = STILL_PENDING
+            const pending = createAndDeleteOwnedAlert(
+                bounded,
+                BASE_URL,
+                logger,
+                { fetchFn, random: () => 0.5 }
+            ).then(
+                (outcome) => {
+                    settled = outcome
+                },
+                (error: unknown) => {
+                    settled = describeSettled(error)
+                }
+            )
+
+            await Promise.race([page.stalled.focused, pending])
+            st.mock.timers.tick(PAGE_ACTION_TIMEOUT_MS - 1)
+            await drained()
+            const beforeDeadline = settled
+            st.mock.timers.tick(1)
+            await pending
+
+            const observation = observed(page, calls, records)
+            assert.deepEqual(
+                {
+                    beforeDeadline,
+                    settled,
+                    actions: observation.steps.filter(
+                        (step) =>
+                            !step.startsWith("check ") &&
+                            !step.startsWith("read ")
+                    ),
+                    requests: observation.requests,
+                    messages: observation.messages,
+                    errors: observation.errors,
+                },
+                { beforeDeadline: STILL_PENDING, ...row.expected }
+            )
         })
     }
 })

@@ -20,6 +20,7 @@ import {
     NotificationReadError,
     readNotifications,
     reconcileArmings,
+    WaitTimeoutError,
 } from "./portfolio-insights-page-check.mjs"
 
 /**
@@ -146,10 +147,12 @@ function pageResponse(seq, alerts) {
         kind: "notifications",
         accountId: ACCOUNT_ID,
         alertId: null,
-        url: `http://localhost${NOTIFICATIONS_TARGET}`,
+        url: `http://localhost${NOTIFICATIONS_TARGET}&unacknowledged=true`,
         path: "/broker-service/v1/alerts/notifications",
         method: "GET",
         status: 200,
+        accepted: true,
+        rejection: null,
         at: Date.parse("2026-11-25T22:01:00.000Z"),
         seq,
         body: { results: alerts.map((alert) => notification(alert)) },
@@ -750,6 +753,120 @@ test("checkOneToastPerArming_readFails_reportsClassAndJudgesPage", async (t) => 
     assert.deepEqual(details.expected, [])
     assert.ok(!JSON.stringify({ problems, details }).includes(SECRET))
 })
+
+/** Lets every promise continuation that is already due run. */
+function settle() {
+    return new Promise((resolve) => setImmediate(resolve))
+}
+
+/**
+ * Puts `performance.now()` and `setTimeout` under the test's control and
+ * returns a driver that moves both on, `stepMs` at a time, until `promise`
+ * settles or `limitMs` have passed, and resolves with how it settled.
+ */
+function controlClock(t) {
+    let now = 0
+    t.mock.method(performance, "now", () => now)
+    t.mock.timers.enable({ apis: ["setTimeout"] })
+    return async (promise, limitMs, stepMs) => {
+        const outcome = { state: "pending", error: undefined }
+        promise.then(
+            () => Object.assign(outcome, { state: "fulfilled" }),
+            (error) => Object.assign(outcome, { state: "rejected", error })
+        )
+        await settle()
+        for (
+            let elapsed = 0;
+            outcome.state === "pending" && elapsed < limitMs;
+            elapsed += stepMs
+        ) {
+            now += stepMs
+            t.mock.timers.tick(stepMs)
+            await settle()
+        }
+        return outcome
+    }
+}
+
+/**
+ * Bodies of an accepted 200 notification reply that are no results list,
+ * which the frontend rejects (`toAlertsDto`), so no poll wait may count one.
+ */
+const MALFORMED_BODIES = [
+    ["resultsNull", { results: null }],
+    ["resultsObject", { results: {} }],
+    ["bodyList", []],
+    ["bodyWithoutResults", {}],
+]
+
+for (const [stage, timeoutMs, what] of [
+    ["beforeReload", 90_000, "4 notification responses"],
+    ["afterReload", 60_000, "2 notification responses after the reload"],
+]) {
+    for (const [scenario, body] of MALFORMED_BODIES) {
+        test(`checkOneToastPerArming_awaitedPollNotResultsList_waitTimesOut (${stage}, ${scenario})`, async (t) => {
+            const read = [TARGET_ABOVE]
+            const baseUrl = await brokerAnswering(
+                t,
+                200,
+                JSON.stringify({
+                    results: read.map((alert) => notification(alert)),
+                })
+            )
+            const holder = holderSession(baseUrl, {
+                before: read,
+                toasted: read,
+            })
+            // The wait of `stage` gets every poll it needs, but the last one
+            // answers with `body`.
+            if (stage === "beforeReload") {
+                holder.responses.at(-1).body = body
+            } else {
+                const { reload } = holder.page
+                holder.page.reload = async () => {
+                    await reload()
+                    holder.responses.at(-1).body = body
+                }
+            }
+            let opened
+            const pageOpened = new Promise((resolve) => {
+                opened = resolve
+            })
+            const { bringToFront } = holder.page
+            holder.page.bringToFront = async () => {
+                await bringToFront()
+                opened()
+            }
+            const run = controlClock(t)
+
+            const checking = checkOneToastPerArming(
+                [],
+                {},
+                baseUrl,
+                holder,
+                ALERTS
+            )
+            // The read is loopback I/O; the clock moves once the page opens.
+            await Promise.race([pageOpened, checking])
+            const outcome = await run(checking, timeoutMs + 30_000, 1_000)
+
+            assert.deepEqual(
+                {
+                    state: outcome.state,
+                    timeout: outcome.error instanceof WaitTimeoutError,
+                    message: outcome.error?.message,
+                    reloaded: holder.calls.includes("reload"),
+                },
+                {
+                    state: "rejected",
+                    timeout: true,
+                    message: `timed out after ${timeoutMs} ms waiting for ${what}`,
+                    reloaded: stage === "afterReload",
+                }
+            )
+        })
+    }
+}
 
 test(
     "readNotifications_unknownAccountOnLiveStack_reportsStatusOnly",

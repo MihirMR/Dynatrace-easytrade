@@ -14,7 +14,9 @@
 #   - hard_timeout, the log reads inside and outside a deadline, perf.sh's cycle-line wait and
 #     loadgen-check.sh's progress watch and run B drain end by their bounds when Docker never
 #     answers, and loadgen-check.sh's cleanup still deletes the owned alerts and restores the
-#     flag then, whether loadgen was running or paused.
+#     flag then, whether loadgen was running or paused;
+#   - perf.sh's cycle-line wait discards a read that ends after its deadline, qualifying line
+#     and all, when Docker answered in time but the output filter ran late.
 # No Docker engine, network or stack is used: a fake docker, first on PATH, answers, fails or
 # hangs as each case needs and records every call.
 #
@@ -87,7 +89,8 @@ LF=$'\n'
 TAB=$'\t'
 # tests.md rules out sleeps and arbitrary timeouts as a way to wait for asynchronous work. Here
 # time is the behaviour under test: each timing case hands the code a fake docker that never
-# answers, the stimulus, and checks that the code's own deadline ends the wait within its bound.
+# answers, or a fake output filter that ends late, the stimulus, and checks that the code's own
+# deadline ends the wait within its bound.
 # The test itself never sleeps, and the fake's wait ends by itself after this many seconds, so
 # every wait is bounded even when a deadline under test is broken.
 export FAKE_DOCKER_HANG_SECONDS=15
@@ -99,6 +102,7 @@ TEST_DIR=""
 CASE_DIR=""
 CASE_RC=0
 CASE_MS=0
+BASELINE_MS=0
 
 pass() {
     passed=$((passed + 1))
@@ -174,7 +178,8 @@ cat >"$TEST_DIR/bin/docker" <<'EOF'
 #   hang              waits, ending on TERM;
 #   hang-ignore-term  waits with TERM ignored, ending only on KILL.
 # A wait ends by itself after FAKE_DOCKER_HANG_SECONDS. Its sleeps hold none of the call's
-# descriptors, so a killed call closes its output pipe at once.
+# descriptors, so a killed call closes its output pipe at once. With FAKE_DOCKER_HANG_FAILS set,
+# as in a timing case's baseline run, a call in either hang mode fails as in fail mode instead.
 set -u
 printf '%s\n' "$*" >>"$FAKE_DOCKER_RECORD"
 verb=""
@@ -192,6 +197,9 @@ if [[ -z "$verb" ]]; then
 fi
 mode_var="FAKE_DOCKER_MODE_$verb"
 mode="${!mode_var:-${FAKE_DOCKER_MODE:-answer}}"
+if [[ -n "${FAKE_DOCKER_HANG_FAILS:-}" && "$mode" == hang* ]]; then
+    mode=fail
+fi
 case "$mode" in
     answer) ;;
     fail)
@@ -411,6 +419,23 @@ expect_within_ms() {
     fi
 }
 
+# run_baseline NAME COMMAND [ARGS...]: the baseline run of a timing case, made just before it:
+# run_case with every fake docker call that would hang failing at once instead, so it does the
+# case's own work, process start-ups included, without the wait. Sets BASELINE_MS to its time.
+run_baseline() {
+    FAKE_DOCKER_HANG_FAILS=1 run_case "$@"
+    BASELINE_MS="$CASE_MS"
+}
+
+# expect_within_baseline_ms WAIT_MS: the last case ended within BASELINE_MS, plus WAIT_MS, the
+# wait the limit under test allows beyond the baseline run's own, plus TIMING_MARGIN_MS.
+expect_within_baseline_ms() {
+    local bound=$((BASELINE_MS + $1 + TIMING_MARGIN_MS))
+    if [[ "$CASE_MS" -gt "$bound" ]]; then
+        reasons+=("took ${CASE_MS} ms, more than the $bound ms bound: the baseline run's ${BASELINE_MS} ms, the $1 ms wait and the ${TIMING_MARGIN_MS} ms margin")
+    fi
+}
+
 expect_docker_calls() {
     local count
     count="$(docker_calls "$1")"
@@ -443,23 +468,26 @@ load_script() {
     POLL_DETAIL=""
     PROBE_DEADLINE=""
     LOG_PROBE_DETAIL=""
+    # perf.sh's wait_cycle_line reads it; no verified window holds a read here.
+    WINDOW_READ_HELD=0
     # e2e.sh's fail() redacts its two fixture passwords, which e2e.sh starts empty.
     HOLDER_PASSWORD=""
     EMPTY_PASSWORD=""
 }
 
 # ---------------------------------------------------------------------------------------------
-# Definitions under test. e2e.sh and perf.sh run main only when executed, but even when sourced
-# they parse their options, check their tools and create a run directory, so the functions and
-# constants these cases need are extracted from their text into one library per script; each
-# must be found exactly once. loadgen-check.sh does all of that in main, so the cases source it
-# whole.
+# Definitions under test. e2e.sh runs main only when executed, but even when sourced it parses
+# its options, checks its tools and creates a run directory, so the functions and constants these
+# cases need from it are extracted from its text into a library. perf.sh does all of that in
+# main, and its definitions are extracted the same way, so the cases load only those they test.
+# Each must be found exactly once. loadgen-check.sh also does all of that in main, and the cases
+# source it whole.
 
 SHARED_CONSTANTS="LOG_PROBE_TIMEOUT_SECONDS LOG_PROBE_KILL_SECONDS DEFAULT_INTERVAL_SECONDS MAX_INTERVAL_SECONDS"
 E2E_CONSTANTS="$SHARED_CONSTANTS INSIGHTS_LINE_RE"
 E2E_FUNCTIONS="$ORIGIN_HELPERS compose hard_timeout container_env resolve_interval probe_limit broker_logs insights_line_logged poll fail"
 PERF_CONSTANTS="$SHARED_CONSTANTS LOG_STEP_SECONDS CYCLE_MARKER CYCLE_RE"
-PERF_FUNCTIONS="$ORIGIN_HELPERS compose hard_timeout container_env resolve_interval probe_limit broker_logs parse_cycle_line cycle_summary_text info wait_cycle_line"
+PERF_FUNCTIONS="$ORIGIN_HELPERS compose hard_timeout container_env resolve_interval probe_limit broker_logs read_window parse_cycle_line cycle_summary_text info wait_cycle_line"
 LOADGEN_CHECK_FUNCTIONS="$ORIGIN_HELPERS hard_timeout container_env loadgen_logs probe_limit watch_progress cleanup"
 # The guard line of loadgen-check.sh that keeps sourcing it from starting a run.
 # shellcheck disable=SC2016 # Matched as text, never expanded.
@@ -972,21 +1000,34 @@ for script in e2e perf; do
 done
 
 # ---------------------------------------------------------------------------------------------
-# 6. Bounded Docker calls. A bound of N s is met when the call has ended within N s plus 1 s for
-# process start-up and the deadlines' whole-second clocks.
+# 6. Bounded Docker calls. A case that waits on a limit has ended within the time of its baseline
+# run, plus the wait that limit allows beyond the baseline run's own, plus TIMING_MARGIN_MS. The
+# baseline run (run_baseline), made just before the case, is the same case with the calls that
+# would hang failing at once; a few cases also give it a step or window that ends sooner. It
+# holds the case's own work and process start-ups, and grows with the host's load as the case
+# does. The margin covers the kill of the hung call and a change of load between the two runs.
+# With the limit under test broken, a case would end at hard_timeout's next signal, at the next
+# limit of the code or when the fake's wait ends by itself: at least 2 s past its wait, so at
+# least 1 s past its bound.
+TIMING_MARGIN_MS=1000
 
 # e2e.sh: a poll whose log reads never answer ends at its deadline and says why. The poll
-# command is step 5's insights_line_logged, waiting for an account's insights line.
+# command is step 5's insights_line_logged, waiting for an account's insights line, every STEP
+# seconds, 1 by default. The baseline run's 5 s step passes the deadline, so it ends after its
+# one failed read, and the wait is the deadline's 3 s.
 case_poll_logs_hang() {
     load_script e2e
     export FAKE_DOCKER_MODE=hang-ignore-term
     mark_start
-    poll "probe" 3 1 insights_line_logged "$LOG_SINCE_TEXT" "$ALERT_ID_1" 2 1.5 LOW
+    poll "probe" 3 "${1:-1}" insights_line_logged "$LOG_SINCE_TEXT" "$ALERT_ID_1" 2 1.5 LOW
 }
+run_baseline poll-hang-baseline case_poll_logs_hang 5
+expect_line "FAIL probe: deadline 3 s expired; broker-service logs unreadable, exit 3 (see $CASE_DIR/compose.log)"
+expect_docker_calls logs 1
 run_case poll-hang case_poll_logs_hang
 expect_status 1
 expect_line_re '^FAIL probe: deadline 3 s expired; broker-service logs probe timed out after [123] s \(Docker did not answer\)$'
-expect_within_ms 4000
+expect_within_baseline_ms 3000
 expect_docker_calls logs 1
 conclude "poll_brokerLogsNeverAnswer_failsByDeadlineWithTimeoutDetail"
 
@@ -1027,10 +1068,13 @@ expect_line "detail no broker-service line contains [x]"
 expect_docker_calls logs 0
 conclude "brokerLogs_noTimeLeftAfterEarlierAttempt_keepsThatAttemptsDetail"
 
+# The read's 2 s bound is the whole wait.
+run_baseline logs-fixed-bound-baseline case_broker_logs hang-ignore-term
+expect_line "detail broker-service logs unreadable, exit 3 (see $CASE_DIR/compose.log)"
 run_case logs-fixed-bound case_broker_logs hang-ignore-term
 expect_status 0
 expect_line "detail broker-service logs probe timed out after 2 s (Docker did not answer)"
-expect_within_ms 3000
+expect_within_baseline_ms 2000
 conclude "brokerLogs_outsidePollNeverAnswers_endsByFixedBound"
 
 case_broker_logs_lines() {
@@ -1049,13 +1093,16 @@ fi
 conclude "brokerLogs_dockerAnswers_printsLinesWithoutColourOrCarriageReturn"
 
 # hard_timeout, with its grace LOG_PROBE_KILL_SECONDS set per row:
-# check|grace|limit|fake docker mode|status|bound in ms
+# check|grace|limit|fake docker mode|status|cut-off in ms, 0 for a program that ends by itself
+# A program that ends by itself has ended within 2 s, well inside its 3 s limit; the failing
+# one's time is the baseline of the rows a limit cuts off, which follow. In those, a signal sent
+# late would come at least 2 s past the cut-off, and one of the wrong kind gives another status.
 HARD_TIMEOUT_ROWS=(
-    "hardTimeout_termIgnored_exits137AtLimit|1|3|hang-ignore-term|137|4000"
-    "hardTimeout_termHonoured_exits124AtLimitLessGrace|1|3|hang|124|3000"
-    "hardTimeout_limitWithinGrace_killsAtLimitWith137|5|2|hang|137|3000"
-    "hardTimeout_programFails_keepsItsStatus|1|3|fail|3|2000"
-    "hardTimeout_programAnswers_keepsItsOutput|1|3|answer|0|2000"
+    "hardTimeout_programFails_keepsItsStatus|1|3|fail|3|0"
+    "hardTimeout_programAnswers_keepsItsOutput|1|3|answer|0|0"
+    "hardTimeout_termIgnored_exits137AtLimit|2|4|hang-ignore-term|137|4000"
+    "hardTimeout_termHonoured_exits124AtLimitLessGrace|2|4|hang|124|2000"
+    "hardTimeout_limitWithinGrace_killsAtLimitWith137|5|2|hang|137|2000"
 )
 
 # case_hard_timeout GRACE LIMIT MODE: one e2e.sh hard_timeout run of a fake docker log read.
@@ -1069,10 +1116,17 @@ case_hard_timeout() {
     hard_timeout "$2" docker compose -p "$PROJECT" -f "$COMPOSE_FILE" logs broker-service
 }
 for row in "${HARD_TIMEOUT_ROWS[@]}"; do
-    IFS='|' read -r check grace limit mode status bound <<<"$row"
+    IFS='|' read -r check grace limit mode status cutoff <<<"$row"
     run_case "$check" case_hard_timeout "$grace" "$limit" "$mode"
     expect_status "$status"
-    expect_within_ms "$bound"
+    if [[ "$cutoff" -eq 0 ]]; then
+        expect_within_ms 2000
+    else
+        expect_within_baseline_ms "$cutoff"
+    fi
+    if [[ "$mode" == fail ]]; then
+        BASELINE_MS="$CASE_MS"
+    fi
     if [[ "$mode" == answer ]]; then
         expect_line "program output"
     fi
@@ -1086,17 +1140,57 @@ case_wait_cycle_line_hang() {
     export FAKE_DOCKER_MODE=hang-ignore-term
     LOG_SINCE="$LOG_SINCE_TEXT"
     mark_start
-    if wait_cycle_line 0 3; then
+    if wait_cycle_line 0 "$((SECONDS + 3))"; then
         printf 'found %s\n' "$CYCLE_LINE"
     fi
     printf 'detail %s\n' "$LOG_PROBE_DETAIL"
 }
+# The baseline run ends after its one failed read, as no time is left for another, so the wait
+# is the deadline's 3 s.
+run_baseline wait-cycle-line-hang-baseline case_wait_cycle_line_hang
+expect_line "detail broker-service logs unreadable, exit 3 (see $CASE_DIR/compose.log)"
+expect_docker_calls logs 1
 run_case wait-cycle-line-hang case_wait_cycle_line_hang
 expect_status 0
 expect_line_re '^detail broker-service logs probe timed out after [123] s \(Docker did not answer\)$'
-expect_within_ms 4000
+expect_within_baseline_ms 3000
 expect_docker_calls logs 1
 conclude "waitCycleLine_brokerLogsNeverAnswer_endsByDeadline"
+
+# perf.sh: a cycle-line read that ends after the wait's deadline is discarded, the qualifying line
+# in it included, although Docker answered at once: the output filter after the Docker call, a
+# sed that starts LATE_FILTER_SECONDS late, is the stimulus here and ends the read at least 1 s
+# after the 3 s deadline. The wait then gives up, as no time is left for another read.
+LATE_FILTER_SECONDS=4
+# shellcheck disable=SC2034 # LOG_SINCE is read by wait_cycle_line.
+case_wait_cycle_line_late_read() {
+    local real_sed
+    load_script perf
+    real_sed="$(command -v sed)"
+    mkdir "$CASE_DIR/bin"
+    printf '#!/usr/bin/env bash\nsleep %s </dev/null >/dev/null\nexec %q "$@"\n' \
+        "$LATE_FILTER_SECONDS" "$real_sed" >"$CASE_DIR/bin/sed"
+    chmod +x "$CASE_DIR/bin/sed"
+    PATH="$CASE_DIR/bin:$PATH"
+    printf '%s: alerts [1000] triggered [0] failed [0] skipped [0] outcome [completed] duration [812] ms\n' \
+        "$CYCLE_MARKER" >"$CASE_DIR/lines"
+    export FAKE_DOCKER_LINES="$CASE_DIR/lines"
+    LOG_SINCE="$LOG_SINCE_TEXT"
+    mark_start
+    if wait_cycle_line 0 "$((SECONDS + 3))" 1000; then
+        printf 'found %s\n' "$CYCLE_LINE"
+    fi
+    printf 'detail %s\n' "$LOG_PROBE_DETAIL"
+}
+run_case wait-cycle-line-late-read case_wait_cycle_line_late_read
+expect_status 0
+expect_line "detail broker-service logs read ended after the wait deadline and was discarded"
+if grep -q '^found ' "$CASE_DIR/out"; then
+    reasons+=("the late read's line was accepted: $(one_line "$CASE_DIR/out")")
+fi
+expect_within_ms $(((LATE_FILTER_SECONDS + 2) * 1000))
+expect_docker_calls logs 1
+conclude "waitCycleLine_readEndsAfterDeadline_discardsItsQualifyingLine"
 
 # loadgen-check.sh: each Docker call of container_env has ended by DOCKER_CALL_TIMEOUT_SECONDS.
 # shellcheck disable=SC2034 # DOCKER_CALL_TIMEOUT_SECONDS is read by container_env.
@@ -1109,10 +1203,13 @@ case_container_env_hang() {
     container_env loadgen PORTFOLIO_INSIGHTS_ALERT_WEIGHT >/dev/null || status=$?
     printf 'status %s\n' "$status"
 }
+# The inspect's 2 s call limit is the whole wait.
+run_baseline container-env-hang-baseline case_container_env_hang
+expect_line "status 3"
 run_case container-env-hang case_container_env_hang
 expect_status 0
 expect_line "status 137"
-expect_within_ms 3000
+expect_within_baseline_ms 2000
 expect_docker_calls inspect 1
 conclude "containerEnv_loadgenCheckInspectNeverAnswers_failsWith137ByCallLimit"
 
@@ -1129,18 +1226,29 @@ case_watch_progress() {
     mark_start
     watch_progress B $((WINDOW_START_EPOCH + $2))
 }
-# With the script's 60 s step the first read is due at the window's end, so it is skipped.
+# With the script's 60 s step the first read is due at the window's end, so it is skipped. The
+# wait is the window's 2 s, which no Docker call shortens, so the baseline run is the same watch
+# over a window already at its end, which returns at once.
+run_baseline watch-progress-skip-baseline case_watch_progress 60 0
+expect_status 0
+if [[ -s "$CASE_DIR/out" ]]; then
+    reasons+=("the watch over a window already at its end printed [$(one_line "$CASE_DIR/out")]")
+fi
 run_case watch-progress-skip case_watch_progress 60 2
 expect_status 0
 expect_line "INFO run B progress 0/35 min: read skipped at the window end; the breakdown and the window's closing read follow"
-expect_within_ms 3000
+expect_within_baseline_ms 2000
 expect_docker_calls logs 0
 conclude "watchProgress_readDueAtWindowEnd_skipsItWithoutDockerCall"
 
+# The baseline run waits out the same whole-second window end, each read failing at once; the
+# hung read, whose limit is the whole seconds left, can end up to 1 s past the baseline run's end.
+run_baseline watch-progress-capped-baseline case_watch_progress 1 3
+expect_line "INFO run B progress 0/35 min: loadgen logs unreadable, exit 3 (see $CASE_DIR/compose.log)"
 run_case watch-progress-capped case_watch_progress 1 3
 expect_status 0
 expect_line_re '^INFO run B progress 0/35 min: loadgen logs probe timed out after [12] s \(Docker did not answer\)$'
-expect_within_ms 4000
+expect_within_baseline_ms 1000
 expect_docker_calls logs 1
 conclude "watchProgress_logsNeverAnswer_readEndsByWindowEnd"
 
@@ -1295,12 +1403,16 @@ case_drain_pause_hang() {
     printf 'detail %s\n' "$DRAIN_DETAIL"
     printf 'paused %s\n' "$LOADGEN_PAUSED"
 }
+# The pause's 2 s call limit is the whole wait; the baseline run also reads and checks the window
+# before its pause fails at once.
+run_baseline drain-pause-hangs-baseline case_drain_pause_hang
+expect_line "detail pausing loadgen failed, exit 3 (see $CASE_DIR/compose.log)"
 run_case drain-pause-hangs case_drain_pause_hang
 expect_status 0
 expect_line "status 1"
 expect_line "detail pausing loadgen timed out after 2 s (Docker did not answer)"
 expect_line "paused 1"
-expect_within_ms 3000
+expect_within_baseline_ms 2000
 expect_docker_calls logs 1
 expect_docker_calls pause 1
 expect_docker_calls kill 0

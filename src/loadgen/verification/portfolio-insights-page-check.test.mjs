@@ -24,6 +24,7 @@ import process from "node:process"
 import { test } from "node:test"
 import { fileURLToPath, pathToFileURL } from "node:url"
 import {
+    HELP,
     UsageError,
     WaitTimeoutError,
     armingKey,
@@ -199,6 +200,8 @@ function notifications(seq, items, overrides = {}) {
         alertId: null,
         method: "GET",
         status: 200,
+        accepted: true,
+        rejection: null,
         at: AT0 + seq * 1000,
         seq,
         parsed: true,
@@ -437,6 +440,43 @@ test("parseOptions_args_returnsOptionsOrRejects", async (t) => {
             args: argsWith("base-url", "http://admin:secret@localhost/"),
             expected: usageError("--base-url must not carry credentials"),
         },
+        {
+            name: "helpAlone_helpRequested",
+            args: ["--help"],
+            expected: { returned: { help: true } },
+        },
+        {
+            name: "shortHelpAlone_helpRequested",
+            args: ["-h"],
+            expected: { returned: { help: true } },
+        },
+        {
+            name: "helpWithEveryOption_helpRequested",
+            args: [...VALID_ARGS, "--help"],
+            expected: { returned: { help: true } },
+        },
+        {
+            name: "helpWithUnknownMode_helpRequested",
+            args: ["--mode", "bogus", "--help"],
+            expected: { returned: { help: true } },
+        },
+        {
+            name: "shortHelpWithInvalidBaseUrl_helpRequested",
+            args: [...argsWith("base-url", "ftp://localhost/"), "-h"],
+            expected: { returned: { help: true } },
+        },
+        {
+            name: "helpWithUnknownOption_usageError",
+            args: ["--help", "--verbose"],
+            expected: usageError("Unknown option '--verbose'"),
+        },
+        {
+            name: "helpWithValue_usageError",
+            args: ["--help=yes"],
+            expected: usageError(
+                "Option '-h, --help' does not take an argument"
+            ),
+        },
     ]
     for (const row of rows) {
         await t.test(row.name, () => {
@@ -539,7 +579,23 @@ test("parseAlert_value_returnsAlertOrRejects", async (t) => {
     const invalid = (reason) =>
         usageError(`--fixture ${FIXTURE_PATH}: alerts[2] ${reason}`)
     const badThreshold = invalid("needs a plain decimal string threshold")
-    const badRevision = invalid("needs an integer armingRevision of at least 1")
+    const outOfDomain = invalid(
+        "needs a threshold of at most 10 integer and 8 fractional digits, not counting trailing fractional zeros"
+    )
+    const notPositive = invalid(
+        "of type TARGET_PRICE needs a threshold above 0"
+    )
+    const badRevision = invalid(
+        "needs an integer armingRevision from 1 to 2147483647"
+    )
+    const rawProfitLoss = {
+        id: PL_ABOVE_ID,
+        pair: "profit_loss",
+        type: "PROFIT_LOSS",
+        direction: "ABOVE",
+        threshold: "-0.00000001",
+        armingRevision: 1,
+    }
     const rows = [
         {
             name: "validAlert_idLowerCasedExtraDropped",
@@ -568,9 +624,88 @@ test("parseAlert_value_returnsAlertOrRejects", async (t) => {
             },
         },
         {
-            name: "zeroThreshold_alert",
+            name: "targetPriceDomainMaximum_alert",
+            value: { ...raw, threshold: "9999999999.99999999" },
+            expected: {
+                returned: { ...TP_ABOVE, threshold: "9999999999.99999999" },
+            },
+        },
+        {
+            name: "targetPriceSmallestThreshold_alert",
+            value: { ...raw, threshold: "0.00000001" },
+            expected: { returned: { ...TP_ABOVE, threshold: "0.00000001" } },
+        },
+        {
+            name: "trailingZerosBeyondEightPlaces_alertKeepsText",
+            value: { ...raw, threshold: "1.500000000000" },
+            expected: {
+                returned: { ...TP_ABOVE, threshold: "1.500000000000" },
+            },
+        },
+        {
+            name: "profitLossZeroThreshold_alert",
+            value: { ...rawProfitLoss, threshold: "0" },
+            expected: { returned: { ...rawProfitLoss, threshold: "0" } },
+        },
+        {
+            name: "profitLossNegativeDomainMinimum_alert",
+            value: { ...rawProfitLoss, threshold: "-9999999999.99999999" },
+            expected: {
+                returned: {
+                    ...rawProfitLoss,
+                    threshold: "-9999999999.99999999",
+                },
+            },
+        },
+        {
+            name: "maximumRevision_alert",
+            value: { ...raw, armingRevision: 2147483647 },
+            expected: { returned: { ...TP_ABOVE, armingRevision: 2147483647 } },
+        },
+        {
+            name: "elevenIntegerDigits_usageError",
+            value: { ...raw, threshold: "12345678901" },
+            expected: outOfDomain,
+        },
+        {
+            name: "negativeElevenIntegerDigits_usageError",
+            value: { ...rawProfitLoss, threshold: "-10000000000" },
+            expected: outOfDomain,
+        },
+        {
+            name: "nineFractionalDigits_usageError",
+            value: { ...raw, threshold: "0.000000001" },
+            expected: outOfDomain,
+        },
+        {
+            name: "nineFractionalDigitsBeforeTrailingZeros_usageError",
+            value: { ...raw, threshold: "1.0000000010" },
+            expected: outOfDomain,
+        },
+        {
+            name: "overPrecisionNearSmallest_usageError",
+            value: { ...raw, threshold: "0.000000010000000000000000000001" },
+            expected: outOfDomain,
+        },
+        {
+            name: "targetPriceZeroThreshold_usageError",
             value: { ...raw, threshold: "0" },
-            expected: { returned: { ...TP_ABOVE, threshold: "0" } },
+            expected: notPositive,
+        },
+        {
+            name: "targetPriceZeroWithFraction_usageError",
+            value: { ...raw, threshold: "0.000" },
+            expected: notPositive,
+        },
+        {
+            name: "targetPriceNegativeZero_usageError",
+            value: { ...raw, threshold: "-0" },
+            expected: notPositive,
+        },
+        {
+            name: "targetPriceNegativeThreshold_usageError",
+            value: { ...raw, threshold: "-0.00000001" },
+            expected: notPositive,
         },
         {
             name: "null_usageError",
@@ -655,6 +790,11 @@ test("parseAlert_value_returnsAlertOrRejects", async (t) => {
         {
             name: "revisionZero_usageError",
             value: { ...raw, armingRevision: 0 },
+            expected: badRevision,
+        },
+        {
+            name: "revisionAboveInt32_usageError",
+            value: { ...raw, armingRevision: 2147483648 },
             expected: badRevision,
         },
         {
@@ -763,8 +903,16 @@ test("readFixture_fileContent_returnsFixtureOrRejects", async (t) => {
     const json = (value) => JSON.stringify(value)
     const badInterval = (file) =>
         usageError(
-            `--fixture ${file} needs a positive integer evaluationIntervalSeconds`
+            `--fixture ${file} needs an integer evaluationIntervalSeconds from 1 to 4294967`
         )
+    const parsedWithInterval = (evaluationIntervalSeconds) => () => ({
+        returned: {
+            evaluationIntervalSeconds,
+            holder: HOLDER,
+            empty: EMPTY,
+            alerts: FIXTURE_ALERTS,
+        },
+    })
     const rows = [
         {
             name: "flagOnFixture_parsed",
@@ -806,11 +954,30 @@ test("readFixture_fileContent_returnsFixtureOrRejects", async (t) => {
             }),
         },
         {
+            name: "intervalOne_parsed",
+            text: json({ ...flagOn, evaluationIntervalSeconds: 1 }),
+            mode: "flag-on",
+            expected: parsedWithInterval(1),
+        },
+        {
+            name: "intervalBrokerMaximum_parsed",
+            text: json({ ...flagOn, evaluationIntervalSeconds: 4294967 }),
+            mode: "flag-on",
+            expected: parsedWithInterval(4294967),
+        },
+        {
             name: "intervalZero_usageError",
             text: json({ ...flagOn, evaluationIntervalSeconds: 0 }),
             mode: "flag-on",
             expected: badInterval,
         },
+        {
+            name: "intervalAboveBrokerMaximum_usageError",
+            text: json({ ...flagOn, evaluationIntervalSeconds: 4294968 }),
+            mode: "flag-on",
+            expected: badInterval,
+        },
+
         {
             name: "fractionalInterval_usageError",
             text: json({ ...flagOn, evaluationIntervalSeconds: 1.5 }),
@@ -1146,8 +1313,14 @@ function fakeResponse({ method = "GET", url, status = 200, text }) {
     return response
 }
 
+/** The recorder's part of a session `openSession` opens on `BASE_URL`. */
 function responseSession() {
-    return { responses: [], pendingBodies: new Set() }
+    return {
+        account: HOLDER,
+        origin: BASE_URL,
+        responses: [],
+        pendingBodies: new Set(),
+    }
 }
 
 const NOTIFICATIONS_URL = `${BASE_URL}/broker-service/v1/alerts/notifications?accountId=${HOLDER_ID}&unacknowledged=true`
@@ -1497,6 +1670,8 @@ test("triggeredArmings_notificationResponses_collectsFixtureArmings", async (t) 
             responses: [
                 notifications(10, [triggered(TP_ABOVE_ID, 1)], {
                     accountId: OTHER_ACCOUNT_ID,
+                    accepted: false,
+                    rejection: "is for another account",
                 }),
             ],
             expected: [],
@@ -1592,6 +1767,8 @@ test("attributeToasts_toastsAndResponses_assignsAnnouncedArming", async (t) => {
             responses: [
                 notifications(10, [triggered(TP_ABOVE_ID, 1)], {
                     accountId: OTHER_ACCOUNT_ID,
+                    accepted: false,
+                    rejection: "is for another account",
                 }),
             ],
             toasts: [toastAt(25, TOAST_TP_ABOVE)],
@@ -2151,6 +2328,65 @@ test("entryGuard_fileStartedByNode_runsTheCheck", async (t) => {
             assert.deepEqual(runNode([await row.scriptPath(st)]), USAGE_RUN)
         })
     }
+})
+
+test("main_helpOption_printsHelpAndExits0", async (t) => {
+    const helpRun = {
+        status: 0,
+        stdout: HELP.split("\n").filter((line) => line !== ""),
+        stderr: [],
+    }
+    const rows = [
+        { name: "longHelp", args: ["--help"] },
+        { name: "shortHelp", args: ["-h"] },
+        { name: "unknownMode", args: ["--mode", "bogus", "--help"] },
+        {
+            // A fixture that does not exist and an origin nothing serves:
+            // the help reads neither.
+            name: "missingFixtureUnservedOrigin",
+            args: [
+                "--base-url",
+                "http://localhost:9",
+                "--mode",
+                "flag-on",
+                "--fixture",
+                "missing-fixture.json",
+                "--evidence-dir",
+                "missing-evidence",
+                "-h",
+            ],
+        },
+    ]
+    for (const row of rows) {
+        await t.test(row.name, () => {
+            assert.deepEqual(runNode([MODULE_PATH, ...row.args]), helpRun)
+        })
+    }
+})
+
+test("HELP_text_namesEveryOptionModeFieldAndExitCode", () => {
+    const topics = [
+        USAGE,
+        "--base-url URL",
+        "--mode MODE",
+        "--fixture FILE",
+        "--evidence-dir DIR",
+        "-h, --help",
+        "flag-off  The flag must be false.",
+        "flag-on   The flag must be true.",
+        "evaluationIntervalSeconds  Optional integer from 1 to 4294967",
+        "holder, empty",
+        "alerts ",
+        "threshold ",
+        "armingRevision             An integer from 1 to 2147483647.",
+        "Exit codes:",
+        "Example, from src/loadgen:",
+    ]
+
+    assert.deepEqual(
+        topics.filter((topic) => !HELP.includes(topic)),
+        []
+    )
 })
 
 test("entryGuard_moduleImported_runsNothing", async (t) => {

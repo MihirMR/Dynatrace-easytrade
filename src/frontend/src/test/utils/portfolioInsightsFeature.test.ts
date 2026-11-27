@@ -5,11 +5,14 @@ import { alertNotificationsQuery, alertsQuery } from "../../hooks/useAlerts"
 import { portfolioInsightsQuery } from "../../hooks/usePortfolioInsights"
 import {
     type FeatureContext,
+    StaleFeatureWriteError,
     captureFeatureContext,
     currentActivation,
+    dispatchFeatureWrite,
     featureQueryRetry,
     featureResultContext,
     isCurrentFeatureContext,
+    isDiscardedFeatureWrite,
     isFeatureDisabledError,
     onPortfolioInsightsDisabled,
     recordFeatureResultContext,
@@ -23,6 +26,7 @@ import {
     featureFlagKeys,
     instrumentKeys,
     invalidateOnLogout,
+    onLogout,
     portfolioKeys,
     priceKeys,
     transactionKeys,
@@ -488,3 +492,241 @@ it("invalidateOnLogout_cachedQueries_removesAccountQueriesAndCountsLogout", () =
         kept: kept.map(([key]) => client.getQueryData(key)),
     }).toEqual({ logouts: 1, removed: [], kept: kept.map(([, data]) => data) })
 })
+
+it("onLogout_listener_runsOnceCountedUntilStopped", () => {
+    const counted: number[] = []
+    const stop = onLogout(() => counted.push(currentLogoutCount()))
+    const before = currentLogoutCount()
+
+    invalidateOnLogout(newClient())
+    stop()
+    invalidateOnLogout(newClient())
+
+    expect(counted).toEqual([before + 1])
+})
+
+it("invalidateOnLogout_listenerThrows_logsFullErrorAndStillRemovesQueries", () => {
+    const failure = new Error("listener failed")
+    const stop = onLogout(() => {
+        throw failure
+    })
+    const log = vi.spyOn(console, "error").mockImplementation(() => undefined)
+    const client = newClient()
+    client.setQueryData(alertKeys.list(ACCOUNT), [])
+
+    try {
+        invalidateOnLogout(client)
+    } finally {
+        stop()
+    }
+
+    expect({
+        alerts: client.getQueryData(alertKeys.list(ACCOUNT)),
+        logged: log.mock.calls,
+    }).toEqual({
+        alerts: undefined,
+        logged: [["[invalidateOnLogout] logout listener failed", failure]],
+    })
+})
+
+/** A client whose shared flag state reads `true`, as while the feature is on. */
+function enabledClient(): QueryClient {
+    const client = newClient()
+    client.setQueryData<boolean>(featureFlagKeys.portfolioInsights, true)
+    return client
+}
+
+// The capture is taken for "user-1" first; each row then ends it, or makes
+// the write one the tab must not send, before the dispatch.
+it.each<{
+    change: string
+    apply: (client: QueryClient) => void
+    accountId: string
+}>([
+    {
+        change: "logout",
+        apply: (client) => {
+            sessionStorage.removeItem(SESSION_KEY)
+            invalidateOnLogout(client)
+        },
+        accountId: "user-1",
+    },
+    {
+        change: "logout and same-account login",
+        apply: (client) => {
+            invalidateOnLogout(client)
+            sessionStorage.setItem(SESSION_KEY, "user-1")
+        },
+        accountId: "user-1",
+    },
+    {
+        change: "account switch",
+        apply: () => sessionStorage.setItem(SESSION_KEY, "user-2"),
+        accountId: "user-1",
+    },
+    {
+        change: "shutdown",
+        apply: (client) => onPortfolioInsightsDisabled(client),
+        accountId: "user-1",
+    },
+    {
+        change: "shutdown then resume",
+        apply: (client) => {
+            onPortfolioInsightsDisabled(client)
+            client.setQueryData<boolean>(
+                featureFlagKeys.portfolioInsights,
+                true
+            )
+        },
+        accountId: "user-1",
+    },
+    { change: "other account", apply: () => undefined, accountId: "user-2" },
+    {
+        change: "flag state false",
+        apply: (client) =>
+            client.setQueryData<boolean>(
+                featureFlagKeys.portfolioInsights,
+                false
+            ),
+        accountId: "user-1",
+    },
+    {
+        change: "flag state unknown",
+        apply: (client) =>
+            client.removeQueries({
+                queryKey: featureFlagKeys.portfolioInsights,
+            }),
+        accountId: "user-1",
+    },
+])(
+    "dispatchFeatureWrite_writeNoLongerAllowed_rejectsBeforeSend ($change)",
+    async ({ apply, accountId }) => {
+        const client = enabledClient()
+        const ctx = captureFeatureContext()
+        const send = vi.fn(() => Promise.resolve("sent"))
+        apply(client)
+
+        const error = await dispatchFeatureWrite(
+            client,
+            ctx,
+            accountId,
+            send
+        ).catch((rejection: unknown) => rejection)
+
+        expect({
+            stale: error instanceof StaleFeatureWriteError,
+            discarded: isDiscardedFeatureWrite(error),
+            sends: send.mock.calls.length,
+        }).toEqual({ stale: true, discarded: true, sends: 0 })
+    }
+)
+
+it("dispatchFeatureWrite_currentContext_sendsWithLiveSignalAndResolves", async () => {
+    const client = enabledClient()
+    const signals: AbortSignal[] = []
+
+    const value = await dispatchFeatureWrite(
+        client,
+        captureFeatureContext(),
+        "user-1",
+        (signal) => {
+            signals.push(signal)
+            return Promise.resolve("sent")
+        }
+    )
+
+    expect({
+        value,
+        aborted: signals.map((signal) => signal.aborted),
+    }).toEqual({ value: "sent", aborted: [false] })
+})
+
+/** A write that never answers and rejects as `fetch` does on abort. */
+function heldWrite(signals: AbortSignal[]) {
+    return (signal: AbortSignal): Promise<never> => {
+        signals.push(signal)
+        return new Promise<never>((_, reject) => {
+            signal.addEventListener(
+                "abort",
+                () => reject(new DOMException("Aborted", "AbortError")),
+                { once: true }
+            )
+        })
+    }
+}
+
+it.each<{ boundary: string; end: (client: QueryClient) => void }>([
+    {
+        boundary: "shutdown",
+        end: (client) => onPortfolioInsightsDisabled(client),
+    },
+    { boundary: "logout", end: (client) => invalidateOnLogout(client) },
+])(
+    "dispatchFeatureWrite_contextEndsInFlight_abortsAndMarksDiscarded ($boundary)",
+    async ({ end }) => {
+        const client = enabledClient()
+        const signals: AbortSignal[] = []
+        const settled = dispatchFeatureWrite(
+            client,
+            captureFeatureContext(),
+            "user-1",
+            heldWrite(signals)
+        ).catch((rejection: unknown) => rejection)
+
+        end(client)
+        const error = await settled
+
+        expect({
+            aborted: signals.map((signal) => signal.aborted),
+            name: (error as Error).name,
+            discarded: isDiscardedFeatureWrite(error),
+        }).toEqual({ aborted: [true], name: "AbortError", discarded: true })
+    }
+)
+
+it("dispatchFeatureWrite_settledWrite_laterShutdownAbortsNothing", async () => {
+    const client = enabledClient()
+    const signals: AbortSignal[] = []
+    await dispatchFeatureWrite(
+        client,
+        captureFeatureContext(),
+        "user-1",
+        (signal) => {
+            signals.push(signal)
+            return Promise.resolve("sent")
+        }
+    )
+
+    onPortfolioInsightsDisabled(client)
+
+    expect(signals.map((signal) => signal.aborted)).toEqual([false])
+})
+
+it.each<{ failure: string; produce: () => Promise<unknown> }>([
+    {
+        failure: "ApiError",
+        produce: () => Promise.resolve(new ApiError(500, ALERTS_URL)),
+    },
+    {
+        failure: "AbortError of another request",
+        produce: () =>
+            Promise.resolve(new DOMException("Aborted", "AbortError")),
+    },
+    {
+        failure: "failure of a current write",
+        produce: () =>
+            dispatchFeatureWrite(
+                enabledClient(),
+                captureFeatureContext(),
+                "user-1",
+                () => Promise.reject(new ApiError(404, ALERTS_URL))
+            ).catch((rejection: unknown) => rejection),
+    },
+])(
+    "isDiscardedFeatureWrite_ordinaryFailure_isFalse ($failure)",
+    async ({ produce }) => {
+        const error = await produce()
+
+        expect(isDiscardedFeatureWrite(error)).toBe(false)
+    }
+)

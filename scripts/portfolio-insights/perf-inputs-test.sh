@@ -1,15 +1,16 @@
 #!/usr/bin/env bash
 # Tests the input checks of scripts/portfolio-insights/perf.sh offline, through the script's
-# own functions. Sourcing perf.sh defines them without running a measurement; the checks
-# below then call them:
+# own functions. Sourcing perf.sh only defines them; its parse_options, check_tools and
+# prepare_run then set up the stubbed run as main does, and the checks below call them:
 #   - read_id_list and id_file_matches: a body is exactly one JSON value with a results
 #     array, and the file written holds exactly the canonical UUIDs counted;
-#   - fetch_presets: exactly 25 distinct canonical preset account ids, otherwise none;
+#   - fetch_presets: each canonical preset id once, in order, and PRESETS_ERROR unless 25;
 #   - insights_profile: 15 allocations, each with a numeric quantity > 0 on a distinct
 #     canonical instrumentId; a non-canonical account is refused before any request or file;
 #   - verify_cycle_inputs and preflight_inputs: every preset lists exactly the instruments it
 #     holds, and a non-canonical preset id is refused before any request;
-#   - select_insights_account: the p95 account comes only from what preflight_inputs recorded;
+#   - select_insights_account: the first preset preflight_inputs recorded with 15 allocations,
+#     each with a numeric quantity > 0, whatever its listing or the count of presets read;
 #   - post_alert: jq encodes the request's strings, and the threshold is sent as the exact
 #     token it was given, or refused before any request when it is not a plain decimal.
 # http, docker and curl are shell functions here, so nothing leaves the shell: no Docker
@@ -83,7 +84,7 @@ if ! test_dir="$(mktemp -d -t perf-inputs-test.XXXXXX)"; then
 fi
 
 # ---------------------------------------------------------------------------------------------
-# Stubs for the sourced preamble. Its tool check finds these functions with command -v. Only
+# Stubs. perf.sh's check_tools, run below, finds these functions with command -v. Only
 # "docker compose version", which that check runs, succeeds; every other docker or curl call
 # is recorded as unexpected, and the last check fails on any.
 
@@ -102,11 +103,14 @@ curl() {
 
 : >"$test_dir/unexpected"
 : >"$test_dir/compose.yaml"
-# perf.sh creates its run directory under TMPDIR, so it lands inside this run's directory.
+# prepare_run makes perf.sh's run directory under TMPDIR, so it lands inside this run's directory.
 TMPDIR="$test_dir"
 # shellcheck source-path=SCRIPTDIR source=perf.sh
-source "$PERF_SH" --project perf-inputs-test --base-url http://stub.invalid \
+source "$PERF_SH"
+parse_options --project perf-inputs-test --base-url http://stub.invalid \
     --compose-file "$test_dir/compose.yaml"
+check_tools
+prepare_run
 
 # ---------------------------------------------------------------------------------------------
 # Reporting. perf.sh's pass and fail count its own checks, which preflight_inputs prints, so
@@ -151,7 +155,7 @@ conclude() {
     reasons=()
 }
 
-check="perfSh_sourcedWithValidOptions_definesFunctionsWithoutRunningChecks"
+check="perfSh_sourcedThenInitialized_definesFunctionsWithoutRunningChecks"
 expect_eq "STARTED_AT" "$STARTED_AT" ""
 expect_eq "perf.sh passed and failed counts" "$passed $failed" "0 0"
 expect_eq "EXIT trap" "$(trap -p EXIT)" "trap -- 'cleanup' EXIT"
@@ -520,28 +524,56 @@ presets_rejected() {
     conclude "$1"
 }
 
+# presets_short CHECK BODY PRESETS_ERROR IDS: fetch_presets answered 200 and a readable BODY
+# that is not 25 distinct canonical ids names PRESETS_ERROR and still writes exactly IDS, each
+# canonical id once at its first occurrence and at most 25 of them, replacing a stale id.
+presets_short() {
+    local rc=0
+    reset_state
+    stub_reply GET "$PRESETS_URL" 200 "$2"
+    account 99 >"$RUN_DIR/presets"
+    fetch_presets || rc=$?
+    expect_eq "exit status" "$rc" 0
+    expect_eq "PRESETS_ERROR" "$PRESETS_ERROR" "$3"
+    expect_eq "presets file" "$(cat "$RUN_DIR/presets")" "$4"
+    conclude "$1"
+}
+
+ALL_BUT_FOURTH_ACCOUNT="$(id_lines account 1 3)
+$(id_lines account 5 25)"
+ALL_BUT_THIRD_ACCOUNT="$(id_lines account 1 2)
+$(id_lines account 4 25)"
+
 presets_accepted "fetchPresets_25DistinctCanonicalIds_writesThemInOrder" "$PRESETS_OK"
 presets_accepted "fetchPresets_25UpperCaseIds_writesThemLowerCased" \
     "$(presets_json 25 'map(.id |= ascii_upcase)')"
-presets_rejected "fetchPresets_24Ids_failsNamingCounts" 200 "$(presets_json 24)" \
-    "$(presets_counts 24 0 0)"
-presets_rejected "fetchPresets_26Ids_failsNamingCounts" 200 "$(presets_json 26)" \
-    "$(presets_counts 26 0 0)"
+presets_short "fetchPresets_24Ids_keepsThemNamingCounts" "$(presets_json 24)" \
+    "$(presets_counts 24 0 0)" "$(id_lines account 1 24)"
+presets_short "fetchPresets_26Ids_keepsFirst25NamingCounts" "$(presets_json 26)" \
+    "$(presets_counts 26 0 0)" "$ALL_ACCOUNTS"
+presets_short "fetchPresets_26IdsWithDuplicate_keeps25DistinctNamingCounts" \
+    "$(presets_json 26 '.[1].id = .[0].id')" "$(presets_counts 26 0 1)" \
+    "$(account 1)
+$(id_lines account 3 26)"
+presets_short "fetchPresets_emptyResults_keepsNoIdNamingCounts" '{"results":[]}' \
+    "$(presets_counts 0 0 0)" ""
+presets_short "fetchPresets_nonCanonicalId_keepsTheOthersNamingCounts" \
+    "$(presets_json 25 '.[3].id = "../../etc/passwd"')" "$(presets_counts 25 1 0)" \
+    "$ALL_BUT_FOURTH_ACCOUNT"
+presets_short "fetchPresets_multiLineId_keepsTheOthersNamingCounts" \
+    "$(presets_json 25 '.[3].id = (account(4) + "\n" + account(26))')" \
+    "$(presets_counts 25 1 0)" "$ALL_BUT_FOURTH_ACCOUNT"
+presets_short "fetchPresets_numericId_keepsTheOthersNamingCounts" \
+    "$(presets_json 25 '.[3].id = 5')" "$(presets_counts 25 1 0)" "$ALL_BUT_FOURTH_ACCOUNT"
+presets_short "fetchPresets_duplicateId_keepsFirstOccurrenceNamingCounts" \
+    "$(presets_json 25 '.[2].id = .[0].id')" "$(presets_counts 25 0 1)" "$ALL_BUT_THIRD_ACCOUNT"
+presets_short "fetchPresets_caseOnlyDuplicateId_keepsFirstOccurrenceNamingCounts" \
+    "$(presets_json 25 '.[2].id = (.[0].id | ascii_upcase)')" "$(presets_counts 25 0 1)" \
+    "$ALL_BUT_THIRD_ACCOUNT"
 presets_rejected "fetchPresets_status503_failsNamingStatus" 503 "$PRESETS_OK" \
     "GET presets gave status 503; exactly 25 distinct canonical account ids are needed"
 presets_rejected "fetchPresets_transportError_failsNamingCurlError" 000 "" \
     "GET presets gave transport error ($TRANSPORT_ERROR); exactly 25 distinct canonical account ids are needed"
-presets_rejected "fetchPresets_nonCanonicalId_failsNamingCounts" 200 \
-    "$(presets_json 25 '.[3].id = "../../etc/passwd"')" "$(presets_counts 25 1 0)"
-presets_rejected "fetchPresets_multiLineId_failsNamingCounts" 200 \
-    "$(presets_json 25 '.[3].id = (account(4) + "\n" + account(26))')" \
-    "$(presets_counts 25 1 0)"
-presets_rejected "fetchPresets_numericId_failsNamingCounts" 200 "$(presets_json 25 '.[3].id = 5')" \
-    "$(presets_counts 25 1 0)"
-presets_rejected "fetchPresets_duplicateId_failsNamingCounts" 200 \
-    "$(presets_json 25 '.[24].id = .[0].id')" "$(presets_counts 25 0 1)"
-presets_rejected "fetchPresets_caseOnlyDuplicateId_failsNamingCounts" 200 \
-    "$(presets_json 25 '.[24].id = (.[0].id | ascii_upcase)')" "$(presets_counts 25 0 1)"
 presets_rejected "fetchPresets_twoEnvelopes_failsAsUnreadable" 200 "$PRESETS_OK$PRESETS_OK" \
     "GET presets gave status 200 with $unreadable; exactly 25 distinct canonical account ids are needed"
 presets_rejected "fetchPresets_trailingGarbage_failsAsUnreadable" 200 "$PRESETS_OK garbage" \
@@ -558,45 +590,52 @@ ALL_BUT_FIFTH="$(id_lines instrument 1 4)
 $(id_lines instrument 6 15)"
 UNREADABLE_PROFILE="status 200 with $unreadable"
 
-# profile_accepted CHECK BODY: insights_profile accepts BODY for account 1 and writes the 15
-# held instrument ids, sorted and lower-cased.
+# profile_accepted CHECK BODY: insights_profile accepts BODY for account 1, qualifies it for
+# the p95 and writes the 15 held instrument ids, sorted and lower-cased.
 profile_accepted() {
     local rc=0
     reset_state
     stub_reply GET "$INSIGHTS_URL/$(account 1)" 200 "$2"
+    PROFILE_QUALIFIES="stale"
     insights_profile "$(account 1)" || rc=$?
     expect_eq "exit status" "$rc" 0
     expect_eq "PROFILE_STATUS" "$PROFILE_STATUS" "status 200"
     expect_eq "PROFILE_COUNTS" "$PROFILE_COUNTS" "$(profile_counts 15 15 0 15 15)"
+    expect_eq "PROFILE_QUALIFIES" "$PROFILE_QUALIFIES" 1
     expect_eq "held file" "$(cat "$RUN_DIR/held-$(account 1)")" "$ALL_INSTRUMENTS"
     conclude "$1"
 }
 
-# profile_rejected CHECK STATUS BODY PROFILE_STATUS PROFILE_COUNTS HELD [EXTRA_LINE]:
-# insights_profile fails for account 1 answered STATUS and BODY, names PROFILE_STATUS and
-# PROFILE_COUNTS, and leaves exactly HELD in the held file. EXTRA_LINE is a line jq writes
-# without counting it.
+# profile_rejected CHECK STATUS BODY PROFILE_STATUS PROFILE_COUNTS HELD QUALIFIES
+# [EXTRA_LINE]: insights_profile fails for account 1 answered STATUS and BODY, names
+# PROFILE_STATUS and PROFILE_COUNTS, sets PROFILE_QUALIFIES to QUALIFIES and leaves exactly
+# HELD in the held file. EXTRA_LINE is a line jq writes without counting it.
 profile_rejected() {
     local rc=0
     reset_state
     stub_reply GET "$INSIGHTS_URL/$(account 1)" "$2" "$3"
-    JQ_EXTRA_LINE="${7-}"
+    JQ_EXTRA_LINE="${8-}"
+    PROFILE_QUALIFIES="stale"
     insights_profile "$(account 1)" || rc=$?
     JQ_EXTRA_LINE=""
     expect_eq "exit status" "$rc" 1
     expect_eq "PROFILE_STATUS" "$PROFILE_STATUS" "$4"
     expect_eq "PROFILE_COUNTS" "$PROFILE_COUNTS" "$5"
+    expect_eq "PROFILE_QUALIFIES" "$PROFILE_QUALIFIES" "$7"
     expect_eq "held file" "$(cat "$RUN_DIR/held-$(account 1)" 2>/dev/null || echo "missing")" "$6"
     conclude "$1"
 }
 
-# profile_refused CHECK ACCOUNT: insights_profile refuses ACCOUNT with no request and no file.
+# profile_refused CHECK ACCOUNT: insights_profile refuses ACCOUNT with no request and no file,
+# and does not qualify it.
 profile_refused() {
     local rc=0
     reset_state
+    PROFILE_QUALIFIES="stale"
     insights_profile "$2" || rc=$?
     expect_eq "exit status" "$rc" 1
     expect_eq "PROFILE_STATUS" "$PROFILE_STATUS" "refused: the account id is not a canonical UUID"
+    expect_eq "PROFILE_QUALIFIES" "$PROFILE_QUALIFIES" 0
     expect_eq "requests" "$(request_count)" 0
     expect_eq "held files" "$(held_files)" 0
     conclude "$1"
@@ -605,58 +644,63 @@ profile_refused() {
 profile_accepted "insightsProfile_15HeldNumericQuantities_succeedsWithSortedHeldFile" "$INSIGHTS_OK"
 profile_accepted "insightsProfile_unsortedUpperCaseFractionalHoldings_succeedsWithSortedHeldFile" \
     "$(insights_json 'reverse | map(.instrumentId |= ascii_upcase | .quantity = 0.5)')"
-profile_rejected "insightsProfile_stringQuantity_failsNamingCounts" 200 \
+profile_rejected "insightsProfile_stringQuantity_failsNamingCountsUnqualified" 200 \
     "$(insights_json '.[4].quantity = "5"')" "status 200" "$(profile_counts 15 14 0 14 14)" \
-    "$ALL_BUT_FIFTH"
-profile_rejected "insightsProfile_zeroQuantity_failsNamingCounts" 200 \
+    "$ALL_BUT_FIFTH" 0
+profile_rejected "insightsProfile_zeroQuantity_failsNamingCountsUnqualified" 200 \
     "$(insights_json '.[4].quantity = 0')" "status 200" "$(profile_counts 15 14 0 14 14)" \
-    "$ALL_BUT_FIFTH"
-profile_rejected "insightsProfile_negativeQuantity_failsNamingCounts" 200 \
+    "$ALL_BUT_FIFTH" 0
+profile_rejected "insightsProfile_negativeQuantity_failsNamingCountsUnqualified" 200 \
     "$(insights_json '.[4].quantity = -1')" "status 200" "$(profile_counts 15 14 0 14 14)" \
-    "$ALL_BUT_FIFTH"
-profile_rejected "insightsProfile_missingQuantity_failsNamingCounts" 200 \
+    "$ALL_BUT_FIFTH" 0
+profile_rejected "insightsProfile_missingQuantity_failsNamingCountsUnqualified" 200 \
     "$(insights_json '.[4] |= del(.quantity)')" "status 200" "$(profile_counts 15 14 0 14 14)" \
-    "$ALL_BUT_FIFTH"
-profile_rejected "insightsProfile_nonCanonicalInstrumentId_failsNamingCounts" 200 \
+    "$ALL_BUT_FIFTH" 0
+profile_rejected "insightsProfile_nonCanonicalInstrumentId_failsNamingCountsButQualifies" 200 \
     "$(insights_json '.[4].instrumentId = "../../x"')" "status 200" \
-    "$(profile_counts 15 15 1 14 14)" "$ALL_BUT_FIFTH"
-profile_rejected "insightsProfile_allocationNotAnObject_failsNamingCounts" 200 \
-    "$(insights_json '.[4] = 7')" "status 200" "$(profile_counts 15 14 1 14 14)" "$ALL_BUT_FIFTH"
-profile_rejected "insightsProfile_14Allocations_failsNamingCounts" 200 "$(insights_json '.[:14]')" \
-    "status 200" "$(profile_counts 14 14 0 14 14)" "$(id_lines instrument 1 14)"
-profile_rejected "insightsProfile_14DistinctInstruments_failsNamingCounts" 200 \
+    "$(profile_counts 15 15 1 14 14)" "$ALL_BUT_FIFTH" 1
+profile_rejected "insightsProfile_missingInstrumentId_failsNamingCountsButQualifies" 200 \
+    "$(insights_json '.[4] |= del(.instrumentId)')" "status 200" \
+    "$(profile_counts 15 15 1 14 14)" "$ALL_BUT_FIFTH" 1
+profile_rejected "insightsProfile_allocationNotAnObject_failsNamingCountsUnqualified" 200 \
+    "$(insights_json '.[4] = 7')" "status 200" "$(profile_counts 15 14 1 14 14)" \
+    "$ALL_BUT_FIFTH" 0
+profile_rejected "insightsProfile_14Allocations_failsNamingCountsUnqualified" 200 \
+    "$(insights_json '.[:14]')" "status 200" "$(profile_counts 14 14 0 14 14)" \
+    "$(id_lines instrument 1 14)" 0
+profile_rejected "insightsProfile_14DistinctInstruments_failsNamingCountsButQualifies" 200 \
     "$(insights_json '.[4].instrumentId = .[5].instrumentId')" "status 200" \
-    "$(profile_counts 15 15 0 15 14)" "$ALL_BUT_FIFTH"
-profile_rejected "insightsProfile_16Allocations_failsNamingCounts" 200 \
+    "$(profile_counts 15 15 0 15 14)" "$ALL_BUT_FIFTH" 1
+profile_rejected "insightsProfile_16Allocations_failsNamingCountsUnqualified" 200 \
     "$(insights_json '. + [.[0] | .instrumentId = instrument(16)]')" "status 200" \
-    "$(profile_counts 16 16 0 16 16)" "$(id_lines instrument 1 16)"
+    "$(profile_counts 16 16 0 16 16)" "$(id_lines instrument 1 16)" 0
 profile_rejected "insightsProfile_twoEnvelopes_failsAsUnreadableWithEmptyHeldFile" 200 \
-    "$INSIGHTS_OK$INSIGHTS_OK" "$UNREADABLE_PROFILE" "" ""
+    "$INSIGHTS_OK$INSIGHTS_OK" "$UNREADABLE_PROFILE" "" "" 0
 profile_rejected "insightsProfile_secondEnvelopeOnItsOwnLine_failsAsUnreadableWithEmptyHeldFile" \
     200 "$INSIGHTS_OK
-{\"allocations\":[]}" "$UNREADABLE_PROFILE" "" ""
+{\"allocations\":[]}" "$UNREADABLE_PROFILE" "" "" 0
 profile_rejected "insightsProfile_trailingText_failsAsUnreadableWithEmptyHeldFile" 200 \
-    "$INSIGHTS_OK trailing" "$UNREADABLE_PROFILE" "" ""
+    "$INSIGHTS_OK trailing" "$UNREADABLE_PROFILE" "" "" 0
 profile_rejected "insightsProfile_nonJsonBody_failsAsUnreadableWithEmptyHeldFile" 200 \
-    "<html>502 Bad Gateway</html>" "$UNREADABLE_PROFILE" "" ""
+    "<html>502 Bad Gateway</html>" "$UNREADABLE_PROFILE" "" "" 0
 profile_rejected "insightsProfile_emptyBody_failsAsUnreadableWithEmptyHeldFile" 200 "" \
-    "$UNREADABLE_PROFILE" "" ""
+    "$UNREADABLE_PROFILE" "" "" 0
 profile_rejected "insightsProfile_allocationsNotAnArray_failsAsUnreadableWithEmptyHeldFile" 200 \
-    '{"allocations":null}' "$UNREADABLE_PROFILE" "" ""
+    '{"allocations":null}' "$UNREADABLE_PROFILE" "" "" 0
 profile_rejected "insightsProfile_status404_failsNamingStatusWithEmptyHeldFile" 404 \
-    '{"error":"Account not found"}' "status 404" "" ""
+    '{"error":"Account not found"}' "status 404" "" "" 0
 profile_rejected "insightsProfile_status403_failsNamingStatusWithEmptyHeldFile" 403 \
-    '{"error":"feature_disabled"}' "status 403" "" ""
+    '{"error":"feature_disabled"}' "status 403" "" "" 0
 profile_rejected "insightsProfile_transportError_failsNamingCurlErrorWithEmptyHeldFile" 000 "" \
-    "transport error ($TRANSPORT_ERROR)" "" ""
+    "transport error ($TRANSPORT_ERROR)" "" "" 0
 profile_rejected "insightsProfile_parserWritesUncountedCanonicalId_failsNamingCounts" 200 \
     "$INSIGHTS_OK" \
     "status 200 with held instruments that do not match their counts: 16 id lines written, 0 of them not canonical UUIDs, 15 canonical ids counted" \
-    "$(profile_counts 15 15 0 15 15)" "" "$(instrument 16)"
+    "$(profile_counts 15 15 0 15 15)" "" 1 "$(instrument 16)"
 profile_rejected "insightsProfile_parserWritesUncountedMalformedLine_failsNamingCounts" 200 \
     "$INSIGHTS_OK" \
     "status 200 with held instruments that do not match their counts: 16 id lines written, 1 of them not canonical UUIDs, 15 canonical ids counted" \
-    "$(profile_counts 15 15 0 15 15)" "" "not-a-uuid"
+    "$(profile_counts 15 15 0 15 15)" "" 1 "not-a-uuid"
 profile_refused "insightsProfile_pathTraversalAccount_refusedWithoutRequestOrFile" "../../evil"
 profile_refused "insightsProfile_canonicalIdWithPathSuffix_refusedWithoutRequestOrFile" \
     "$(account 1)/../x"
@@ -696,16 +740,14 @@ verify_accepted() {
     expect_eq "exit status" "$rc" 0
     expect_eq "INPUTS_ERROR" "$INPUTS_ERROR" ""
     expect_eq "INPUT_IDS" "$(printf '%s\n' "${INPUT_IDS[@]}")" "$(id_lines account 1 "$2")"
-    expect_eq "INPUT_HELD" "${INPUT_HELD[*]}" "$(words 1 "$2")"
-    expect_eq "INPUT_LISTING joined" "$(printf '%s' "${INPUT_LISTING[@]}")" ""
+    expect_eq "INPUT_QUALIFIES" "${INPUT_QUALIFIES[*]}" "$(words 1 "$2")"
     expect_eq "requests" "$(cat "$test_dir/requests")" "$expected_requests"
     conclude "$1"
 }
 
-# verify_rejected CHECK INSIGHTS_STATUS INSIGHTS LISTING_STATUS LISTING HELD SHORTFALL
-# [RECORDED]: with three presets and account 2 answered as given, verify_cycle_inputs fails
-# naming only account 2's SHORTFALL, records HELD as its INPUT_HELD and, when given, RECORDED
-# as its INPUT_LISTING.
+# verify_rejected CHECK INSIGHTS_STATUS INSIGHTS LISTING_STATUS LISTING QUALIFIES SHORTFALL:
+# with three presets and account 2 answered as given, verify_cycle_inputs fails naming only
+# account 2's SHORTFALL, and records QUALIFIES as its INPUT_QUALIFIES.
 verify_rejected() {
     local rc=0
     reset_state
@@ -715,17 +757,14 @@ verify_rejected() {
     verify_cycle_inputs || rc=$?
     expect_eq "exit status" "$rc" 1
     expect_eq "INPUTS_ERROR" "$INPUTS_ERROR" "$SHORTFALL_PREFIX [$(account 2)] $7;"
-    expect_eq "INPUT_HELD[1]" "${INPUT_HELD[1]-unset}" "$6"
-    if [[ $# -ge 8 ]]; then
-        expect_eq "INPUT_LISTING[1]" "${INPUT_LISTING[1]-unset}" "$8"
-    fi
+    expect_eq "INPUT_QUALIFIES" "${INPUT_QUALIFIES[*]}" "1 $6 1"
     conclude "$1"
 }
 
 # listing_rejected CHECK STATUS BODY LISTING: account 2's listing answered STATUS and BODY is
-# the only shortfall, recorded as LISTING.
+# the only shortfall, named as LISTING, and account 2 still qualifies for the p95.
 listing_rejected() {
-    verify_rejected "$1" 200 "$INSIGHTS_OK" "$2" "$3" 1 "instrument listing $4" "$4"
+    verify_rejected "$1" 200 "$INSIGHTS_OK" "$2" "$3" 1 "instrument listing $4"
 }
 
 # preset_refused CHECK ID: a presets file whose second id is ID makes verify_cycle_inputs
@@ -744,8 +783,7 @@ preset_refused() {
     verify_cycle_inputs || rc=$?
     expect_eq "exit status" "$rc" 1
     expect_eq "INPUTS_ERROR" "$INPUTS_ERROR" "$SHORTFALL_PREFIX [$2] refused: the account id is not a canonical UUID, so neither its insights nor its instrument listing is requested;"
-    expect_eq "INPUT_HELD[1] INPUT_LISTING[1]" "${INPUT_HELD[1]-unset} ${INPUT_LISTING[1]-unset}" \
-        "0 not requested"
+    expect_eq "INPUT_QUALIFIES" "${INPUT_QUALIFIES[*]}" "1 0 1"
     expect_eq "requests naming the id" "$(grep -cF -- "$2" "$test_dir/requests" || true)" 0
     expect_eq "requests" "$(request_count)" 4
     expect_eq "held files" "$(held_files)" 2
@@ -776,6 +814,12 @@ verify_rejected "verifyCycleInputs_insightsShortfallAndListingMismatch_namesBoth
     "insights status 200, $(profile_counts 15 14 0 14 14), instrument listing $(listing_counts 15 0 0 0 1)"
 verify_rejected "verifyCycleInputs_insightsStatus503_namesStatusAndUnheldListing" 503 "" 200 \
     "$LISTING_OK" 0 "insights status 503, instrument listing $(listing_counts 15 0 0 0 15)"
+verify_rejected "verifyCycleInputs_nonCanonicalInstrumentId_qualifiesButFailsNamingCounts" 200 \
+    "$(insights_json '.[4].instrumentId = "../../x"')" 200 "$LISTING_OK" 1 \
+    "insights status 200, $(profile_counts 15 15 1 14 14), instrument listing $(listing_counts 15 0 0 0 1)"
+verify_rejected "verifyCycleInputs_repeatedInstrumentId_qualifiesButFailsNamingCounts" 200 \
+    "$(insights_json '.[4].instrumentId = .[5].instrumentId')" 200 "$LISTING_OK" 1 \
+    "insights status 200, $(profile_counts 15 15 0 15 14), instrument listing $(listing_counts 15 0 0 0 1)"
 preset_refused "verifyCycleInputs_pathTraversalPreset_refusedWithoutRequest" "../../evil"
 preset_refused "verifyCycleInputs_nonHexPreset_refusedWithoutRequest" \
     "a0000000-0000-4000-8000-00000000000g"
@@ -783,16 +827,37 @@ preset_refused "verifyCycleInputs_upperCasePreset_refusedWithoutRequest" \
     "$(account 2 | tr '[:lower:]' '[:upper:]')"
 preset_refused "verifyCycleInputs_pathPreset_refusedWithoutRequest" "x/../y"
 
-check="verifyCycleInputs_presetsError_failsWithItAndNoRequest"
-reset_state
-PRESETS_ERROR="GET presets gave status 503; exactly 25 distinct canonical account ids are needed"
-rc=0
-verify_cycle_inputs || rc=$?
-expect_eq "exit status" "$rc" 1
-expect_eq "INPUTS_ERROR" "$INPUTS_ERROR" "$PRESETS_ERROR"
-expect_eq "INPUT_IDS count" "${#INPUT_IDS[@]}" 0
-expect_eq "requests" "$(request_count)" 0
-conclude "$check"
+# verify_after_presets CHECK STATUS BODY INSIGHTS INPUTS_ERROR QUALIFIES REQUESTS:
+# fetch_presets answered STATUS and BODY, which are not 25 distinct canonical presets, and
+# account 2's insights answered INSIGHTS. verify_cycle_inputs still profiles every preset id
+# fetch_presets kept, with REQUESTS GETs in all, records QUALIFIES as their INPUT_QUALIFIES,
+# and fails naming INPUTS_ERROR: PRESETS_ERROR, then any account's shortfall.
+verify_after_presets() {
+    local rc=0
+    reset_state
+    stub_reply GET "$PRESETS_URL" "$2" "$3"
+    stub_reply GET "$INSIGHTS_URL/$(account 2)" 200 "$4"
+    fetch_presets || true
+    : >"$test_dir/requests"
+    verify_cycle_inputs || rc=$?
+    expect_eq "exit status" "$rc" 1
+    expect_eq "INPUTS_ERROR" "$INPUTS_ERROR" "$5"
+    expect_eq "INPUT_QUALIFIES" "${INPUT_QUALIFIES[*]}" "$6"
+    expect_eq "requests" "$(request_count)" "$7"
+    conclude "$1"
+}
+
+verify_after_presets "verifyCycleInputs_presetsStatus503_failsWithPresetsErrorAndNoRequest" 503 \
+    "" "$INSIGHTS_OK" \
+    "GET presets gave status 503; exactly 25 distinct canonical account ids are needed" "" 0
+verify_after_presets "verifyCycleInputs_threePresets_profilesEachAndFailsNamingPresetCounts" 200 \
+    "$(presets_json 3)" "$INSIGHTS_OK" "$(presets_counts 3 0 0)" "1 1 1" 6
+verify_after_presets "verifyCycleInputs_duplicatedPreset_profilesItOnceAndFailsNamingPresetCounts" \
+    200 "$(presets_json 3 '. + [.[0]]')" "$INSIGHTS_OK" "$(presets_counts 4 0 1)" "1 1 1" 6
+verify_after_presets "verifyCycleInputs_threePresetsOneShort_failsNamingPresetCountsAndShortfall" \
+    200 "$(presets_json 3)" "$(insights_json '.[4].quantity = 0')" \
+    "$(presets_counts 3 0 0); $SHORTFALL_PREFIX [$(account 2)] insights status 200, $(profile_counts 15 14 0 14 14), instrument listing $(listing_counts 15 0 0 0 1);" \
+    "1 0 1" 6
 
 # ---------------------------------------------------------------------------------------------
 # preflight_inputs and select_insights_account
@@ -862,14 +927,36 @@ expect_eq "INPUTS_VERIFIED" "$INPUTS_VERIFIED" 0
 expect_eq "requests" "$(request_count)" 0
 conclude "$check"
 
-select_fails "selectInsightsAccount_presetsError_failsWithIt" "$PRESETS_ERROR"
+select_fails "selectInsightsAccount_noPresetRead_failsWithPresetsError" "$PRESETS_ERROR"
+
+check="selectInsightsAccount_noPresetRecordedWithoutPresetsError_failsNamingIt"
+reset_state
+PRESETS_ERROR=""
+INPUTS_VERIFIED=0
+INPUT_IDS=()
+select_fails "$check" "no preset account id was read"
+
+# A preset list short of 25, its first preset without 15 positive allocations: the cycle
+# inputs fail on both, and the p95 account is still the first preset that qualifies.
+check="preflightInputs_shortPresetList_printsFailNamingShortfallAndLeavesUnverified"
+reset_state
+stub_reply GET "$PRESETS_URL" 200 "$(presets_json 3)"
+stub_reply GET "$INSIGHTS_URL/$(account 1)" 200 "$(insights_json '.[0].quantity = 0')"
+fetch_presets || true
+run_preflight
+expect_eq "output" "$(cat "$test_dir/preflight.out")" \
+    "FAIL cycle inputs: $(presets_counts 3 0 0); $SHORTFALL_PREFIX [$(account 1)] insights status 200, $(profile_counts 15 14 0 14 14), instrument listing $(listing_counts 15 0 0 0 1);"
+expect_eq "INPUTS_VERIFIED" "$INPUTS_VERIFIED" 0
+conclude "$check"
+
+select_succeeds "selectInsightsAccount_shortPresetList_selectsFirstQualifyingPreset" "$(account 2)"
 
 reset_state
 use_three_presets
 stub_reply GET "$INSIGHTS_URL/$(account 1)" 200 "$(insights_json '.[0].quantity = "5"')"
 stub_reply GET "$INSIGHTS_URL/$(account 2)" 404 '{"error":"Account not found"}'
 run_preflight
-select_succeeds "selectInsightsAccount_earlierPresetsFailInsights_selectsFirstHeldPreset" \
+select_succeeds "selectInsightsAccount_earlierPresetsFailInsights_selectsFirstQualifyingPreset" \
     "$(account 3)"
 
 reset_state
@@ -877,14 +964,30 @@ use_three_presets
 stub_reply GET "$INSIGHTS_URL/$(account 1)" 200 "$(insights_json '.[0].quantity = 0')"
 stub_reply GET "$LISTING_URL$(account 2)" 200 "$(listing_json '.[:14]')"
 run_preflight
-select_fails "selectInsightsAccount_firstHeldPresetListingMismatch_failsNamingCounts" \
-    "the first preset with exactly 15 allocations, each with a numeric quantity > 0 on a distinct canonical instrumentId, [$(account 2)], is not timed because its instrument listing does not match its holdings: $(listing_counts 14 0 0 1 0); presets before it: [$(account 1)] status 200, $(profile_counts 15 14 0 14 14);"
+expect_eq "INPUTS_VERIFIED" "$INPUTS_VERIFIED" 0
+select_succeeds "selectInsightsAccount_firstQualifyingPresetListingShortfall_selectsIt" \
+    "$(account 2)"
+
+# One case per instrumentId the cycle workload cannot use: name | jq edit of account 1's
+# allocations. Its 15 allocations each still hold a numeric quantity > 0, so it is the p95
+# account while the cycle inputs fail on it.
+while IFS='|' read -r check edit; do
+    reset_state
+    use_three_presets
+    stub_reply GET "$INSIGHTS_URL/$(account 1)" 200 "$(insights_json "$edit")"
+    run_preflight
+    expect_eq "INPUTS_VERIFIED" "$INPUTS_VERIFIED" 0
+    select_succeeds "$check" "$(account 1)"
+done <<'EOF'
+selectInsightsAccount_firstPresetNonCanonicalInstrumentId_selectsItWithInputsUnverified|.[4].instrumentId = "../../x"
+selectInsightsAccount_firstPresetRepeatedInstrumentId_selectsItWithInputsUnverified|.[4].instrumentId = .[5].instrumentId
+EOF
 
 reset_state
 use_three_presets
 DEFAULT_INSIGHTS="$(insights_json '.[0].quantity = 0')"
 run_preflight
-no_preset_error="no preset account has exactly 15 allocations, each with a numeric quantity > 0 on a distinct canonical instrumentId:"
+no_preset_error="no preset account has exactly 15 allocations, each with a numeric quantity > 0:"
 for ((k = 1; k <= 3; k++)); do
     no_preset_error="$no_preset_error [$(account "$k")] status 200, $(profile_counts 15 14 0 14 14);"
 done

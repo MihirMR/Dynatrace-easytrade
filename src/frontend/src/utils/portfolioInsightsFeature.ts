@@ -9,6 +9,7 @@ import {
     alertKeys,
     currentLogoutCount,
     featureFlagKeys,
+    onLogout,
     portfolioKeys,
 } from "./queryKeys"
 
@@ -21,6 +22,10 @@ import {
  * - every feature query and mutation calls `captureFeatureContext()` when it
  *   starts, and applies or toasts its result only while
  *   `isCurrentFeatureContext()` still holds for that capture;
+ * - every feature mutation sends its request through `dispatchFeatureWrite`
+ *   with the capture taken when the caller started it, so a write that waited,
+ *   such as one paused offline, is never sent once that capture has ended, and
+ *   one in flight is aborted by the shutdown or a logout;
  * - a feature query's result is cached with the capture of the request that
  *   produced it (`recordFeatureResultContext`, `shareFeatureResult`), so a
  *   consumer that acts on cached data later, such as a Toast or a business
@@ -49,11 +54,32 @@ export function currentActivation(): number {
     return activation
 }
 
+/** The controllers of the feature writes now in flight. */
+const writesInFlight = new Set<AbortController>()
+
+/** Rejections of feature writes that `abortFeatureWrites` aborted. */
+const abortedWrites = new WeakSet<object>()
+
+/**
+ * Aborts every feature write in flight. A write's request may already have
+ * reached broker-service, so this stops the transport and the use of its
+ * result; it never undoes a committed write.
+ */
+function abortFeatureWrites(): void {
+    const controllers = Array.from(writesInFlight)
+    writesInFlight.clear()
+    controllers.forEach((controller) => controller.abort())
+}
+
+// A logout ends the session every write in flight belongs to.
+onLogout(abortFeatureWrites)
+
 /**
  * Turns the feature off in this tab: advances the activation counter,
- * publishes `false` as the flag state, and cancels and drops every insights
- * and alert query. Runs whenever a flag read returns `false` or an insights or
- * alert request answers 403. Repeated calls leave the cache in the same state.
+ * publishes `false` as the flag state, cancels and drops every insights and
+ * alert query, and aborts every feature write in flight. Runs whenever a flag
+ * read returns `false` or an insights or alert request answers 403. Repeated
+ * calls leave the cache in the same state.
  *
  * The shared flag query passes `fromFlagRead` from its own read, so it never
  * cancels itself; every other caller passes no options.
@@ -78,6 +104,7 @@ export function onPortfolioInsightsDisabled(
     client.removeQueries({ queryKey: portfolioKeys.insightsAll })
     void client.cancelQueries({ queryKey: alertKeys.all })
     client.removeQueries({ queryKey: alertKeys.all })
+    abortFeatureWrites()
 }
 
 /**
@@ -143,6 +170,81 @@ export function isCurrentFeatureContext(ctx: FeatureContext): boolean {
         now.userId === ctx.userId &&
         now.session === ctx.session &&
         now.activation === ctx.activation
+    )
+}
+
+/**
+ * A feature write refused before any request was sent: the session, account
+ * or activation it was started under has ended, it is for an account other
+ * than the tab's, its request names an account other than the one its caller
+ * writes for, or the shared flag state no longer reads `true`. Its message is
+ * fixed and names no account or alert, so the error can be logged whole.
+ */
+export class StaleFeatureWriteError extends Error {
+    constructor() {
+        super("Portfolio Insights write not sent: its context has ended")
+        this.name = "StaleFeatureWriteError"
+    }
+}
+
+/**
+ * Sends the feature write that `send` makes for `accountId`, started by its
+ * caller under `ctx`.
+ *
+ * - Before any request, it rejects with `StaleFeatureWriteError` unless `ctx`
+ *   is still current, its account is `accountId` and the shared flag state
+ *   reads `true`, as `guardFeatureRequest` requires of a feature read. A write
+ *   that waited before it was dispatched, such as a mutation paused while
+ *   offline and resumed on reconnect, is thereby never sent after a logout,
+ *   an account switch or a shutdown.
+ * - `send` gets a signal for `fetch` that the shutdown and every logout abort
+ *   while the write is in flight. The write then rejects with the transport's
+ *   own error, which `isDiscardedFeatureWrite` recognises.
+ *
+ * Nothing is undone: an aborted request may already have been committed.
+ */
+export async function dispatchFeatureWrite<T>(
+    client: QueryClient,
+    ctx: FeatureContext,
+    accountId: string,
+    send: (signal: AbortSignal) => Promise<T>
+): Promise<T> {
+    if (
+        !isCurrentFeatureContext(ctx) ||
+        ctx.userId !== accountId ||
+        client.getQueryData<boolean>(featureFlagKeys.portfolioInsights) !== true
+    ) {
+        throw new StaleFeatureWriteError()
+    }
+    const controller = new AbortController()
+    writesInFlight.add(controller)
+    try {
+        return await send(controller.signal)
+    } catch (error) {
+        if (
+            controller.signal.aborted &&
+            typeof error === "object" &&
+            error !== null
+        ) {
+            abortedWrites.add(error)
+        }
+        throw error
+    } finally {
+        writesInFlight.delete(controller)
+    }
+}
+
+/**
+ * True for the rejection of a feature write that `dispatchFeatureWrite` never
+ * sent, or that the shutdown or a logout aborted in flight. Its outcome
+ * belongs to a context that has ended, so it is discarded, never shown.
+ */
+export function isDiscardedFeatureWrite(error: unknown): boolean {
+    return (
+        error instanceof StaleFeatureWriteError ||
+        (typeof error === "object" &&
+            error !== null &&
+            abortedWrites.has(error))
     )
 }
 

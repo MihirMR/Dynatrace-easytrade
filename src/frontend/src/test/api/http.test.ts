@@ -5,17 +5,20 @@ import {
     delExactStatus,
     getJsonWithSignal,
     getJsonWithTimeout,
+    getJsonWithTimeoutExactStatus,
     isReadDeadlineAbort,
     loggableError,
     MalformedJsonError,
     patchJson,
+    postExactStatus,
     postJsonText,
     services,
     withStackFramesOf,
 } from "../../api/http"
 
 // Transport-level cases for http.ts itself, chiefly the caller-signal paths of
-// getJsonWithTimeout, which the feature API suites never pass a signal through.
+// getJsonWithTimeout and getJsonWithTimeoutExactStatus, which the feature API
+// suites never pass a signal through.
 
 type Respond = (init: RequestInit | undefined) => Promise<Response>
 
@@ -158,29 +161,31 @@ const abortSources: {
         },
     },
     {
-        source: "deadline, required status",
+        source: "deadline, getJsonWithTimeoutExactStatus",
         run: async () => {
             const pending = settle(
-                getJsonWithTimeout(url, 2000, undefined, 200)
+                getJsonWithTimeoutExactStatus(url, 2000, 200)
             )
             await vi.advanceTimersByTimeAsync(2000)
             return pending
         },
     },
     {
-        source: "pre-aborted signal, required status",
+        source: "pre-aborted signal, getJsonWithTimeoutExactStatus",
         run: () => {
             const caller = new AbortController()
             caller.abort()
-            return settle(getJsonWithTimeout(url, 2000, caller.signal, 200))
+            return settle(
+                getJsonWithTimeoutExactStatus(url, 2000, 200, caller.signal)
+            )
         },
     },
     {
-        source: "signal aborted mid-request, required status",
+        source: "signal aborted mid-request, getJsonWithTimeoutExactStatus",
         run: async () => {
             const caller = new AbortController()
             const pending = settle(
-                getJsonWithTimeout(url, 2000, caller.signal, 200)
+                getJsonWithTimeoutExactStatus(url, 2000, 200, caller.signal)
             )
             await vi.advanceTimersByTimeAsync(100)
             caller.abort()
@@ -255,9 +260,17 @@ it.each([201, 202, 203, 206])(
     }
 )
 
-it.each([201, 202, 203, 206, 404])(
-    "getJsonWithTimeout_requiredStatusOther_rejectsApiErrorBeforeBodyRead (%i)",
-    async (status) => {
+// The last row's exact status is not a 2xx, so `request` rejects it first.
+it.each([
+    { exact: 200, status: 201 },
+    { exact: 200, status: 202 },
+    { exact: 200, status: 203 },
+    { exact: 200, status: 206 },
+    { exact: 200, status: 404 },
+    { exact: 404, status: 404 },
+])(
+    "getJsonWithTimeoutExactStatus_notExact2xx_rejectsApiErrorBeforeBodyRead ($status, exact $exact)",
+    async ({ exact, status }) => {
         const response = jsonResponse(
             { id: "portfolio-insights-enabled", enabled: true },
             status
@@ -265,7 +278,7 @@ it.each([201, 202, 203, 206, 404])(
         stubFetch(() => Promise.resolve(response))
 
         const error = await settle(
-            getJsonWithTimeout(url, 2000, undefined, 200)
+            getJsonWithTimeoutExactStatus(url, 2000, exact)
         )
 
         expect({
@@ -277,11 +290,11 @@ it.each([201, 202, 203, 206, 404])(
 )
 
 it.each([200, 203])(
-    "getJsonWithTimeout_requiredStatusMatches_resolvesBody (%i)",
+    "getJsonWithTimeoutExactStatus_statusMatches_resolvesBody (%i)",
     async (status) => {
         stubFetch(() => Promise.resolve(jsonResponse({ version: "1" }, status)))
 
-        const value = await getJsonWithTimeout(url, 2000, undefined, status)
+        const value = await getJsonWithTimeoutExactStatus(url, 2000, status)
 
         expect(value).toEqual({ version: "1" })
     }
@@ -683,12 +696,8 @@ const jsonReaders: {
         read: (target) => getJsonWithSignal(target),
     },
     {
-        helper: "getJsonWithTimeout",
-        read: (target) => getJsonWithTimeout(target, 2000),
-    },
-    {
-        helper: "getJsonWithTimeout with required status",
-        read: (target) => getJsonWithTimeout(target, 2000, undefined, 200),
+        helper: "getJsonWithTimeoutExactStatus",
+        read: (target) => getJsonWithTimeoutExactStatus(target, 2000, 200),
     },
 ]
 
@@ -699,6 +708,49 @@ function textResponse(text: string): Response {
         headers: { "Content-Type": "application/json" },
     })
 }
+
+// The version page reads through the two-argument helper and logs what it
+// rejects with, so that helper keeps the parser's own error; only the
+// exact-status read makes a malformed body content-safe.
+const malformedBodyReads: {
+    helper: string
+    read: (target: string) => Promise<unknown>
+    expected: { name: string; isSyntaxError: boolean; isMalformedJson: boolean }
+}[] = [
+    {
+        helper: "getJsonWithTimeout",
+        read: (target) => getJsonWithTimeout(target, 2000),
+        expected: {
+            name: "SyntaxError",
+            isSyntaxError: true,
+            isMalformedJson: false,
+        },
+    },
+    {
+        helper: "getJsonWithTimeoutExactStatus",
+        read: (target) => getJsonWithTimeoutExactStatus(target, 2000, 200),
+        expected: {
+            name: "MalformedJsonError",
+            isSyntaxError: true,
+            isMalformedJson: true,
+        },
+    },
+]
+
+it.each(malformedBodyReads)(
+    "timedJsonRead_malformedBody_rejectsWithHelpersParseError ($helper)",
+    async ({ read, expected }) => {
+        stubFetch(() => Promise.resolve(textResponse(MALFORMED_BODY)))
+
+        const error = await settle(read(insightsUrl))
+
+        expect({
+            name: (error as Error).name,
+            isSyntaxError: error instanceof SyntaxError,
+            isMalformedJson: error instanceof MalformedJsonError,
+        }).toEqual(expected)
+    }
+)
 
 /** A 200 whose body read rejects with `failure`. */
 function bodyReadRejecting(failure: unknown): Response {
@@ -889,6 +941,44 @@ const bodyReadRejections: {
         },
         deadline: false,
     },
+    {
+        label: "getJsonWithTimeoutExactStatus, deadline",
+        run: async () => {
+            const aborts: unknown[] = []
+            stubFetch((init) =>
+                Promise.resolve(bodyReadUntilAborted(init, aborts))
+            )
+            const pending = settle(
+                getJsonWithTimeoutExactStatus(insightsUrl, 2000, 200)
+            )
+            await vi.advanceTimersByTimeAsync(100)
+            await vi.advanceTimersByTimeAsync(1900)
+            return { error: await pending, thrown: aborts[0] }
+        },
+        deadline: true,
+    },
+    {
+        label: "getJsonWithTimeoutExactStatus, caller abort",
+        run: async () => {
+            const aborts: unknown[] = []
+            stubFetch((init) =>
+                Promise.resolve(bodyReadUntilAborted(init, aborts))
+            )
+            const caller = new AbortController()
+            const pending = settle(
+                getJsonWithTimeoutExactStatus(
+                    insightsUrl,
+                    2000,
+                    200,
+                    caller.signal
+                )
+            )
+            await vi.advanceTimersByTimeAsync(100)
+            caller.abort()
+            return { error: await pending, thrown: aborts[0] }
+        },
+        deadline: false,
+    },
 ]
 
 it.each(bodyReadRejections)(
@@ -914,6 +1004,12 @@ const writeHelpers: {
     {
         helper: "patchJson",
         call: (target) => patchJson(target, { enabled: true }),
+        method: "PATCH",
+        body: '{"enabled":true}',
+    },
+    {
+        helper: "patchJson with exact status",
+        call: (target) => patchJson(target, { enabled: true }, 200),
         method: "PATCH",
         body: '{"enabled":true}',
     },
@@ -962,6 +1058,69 @@ it.each(writeHelpers)(
     }
 )
 
+// The write helpers parse their response as the feature reads do, so a body
+// that is not JSON is never quoted by what they reject with.
+it.each<{
+    helper: string
+    call: (target: string) => Promise<unknown>
+    status: number
+}>([
+    {
+        helper: "patchJson",
+        call: (target) => patchJson(target, { enabled: true }),
+        status: 200,
+    },
+    {
+        helper: "patchJson with exact status",
+        call: (target) => patchJson(target, { enabled: true }, 200),
+        status: 200,
+    },
+    {
+        helper: "postJsonText",
+        call: (target) => postJsonText(target, "{}"),
+        status: 201,
+    },
+    {
+        helper: "postJsonText with exact status",
+        call: (target) => postJsonText(target, "{}", 201),
+        status: 201,
+    },
+])(
+    "jsonWriteHelper_malformedBody_rejectsContentSafeSyntaxError ($helper)",
+    async ({ call, status }) => {
+        stubFetch(() =>
+            Promise.resolve(
+                new Response(MALFORMED_BODY, {
+                    status,
+                    headers: { "Content-Type": "application/json" },
+                })
+            )
+        )
+
+        const error = await settle(
+            call(`${services.broker()}/alerts/${SESSION_ID}`)
+        )
+
+        const { name, message, stack } = error as Error
+        const shown = `${name}\n${message}\n${stack ?? ""}`
+        expect({
+            isMalformedJson: error instanceof MalformedJsonError,
+            isSyntaxError: error instanceof SyntaxError,
+            message,
+            header: (stack ?? "").split("\n")[0],
+            leaked: [BODY_MARKER, SESSION_ID].filter((part) =>
+                shown.includes(part)
+            ),
+        }).toEqual({
+            isMalformedJson: true,
+            isSyntaxError: true,
+            message: "Response body is not valid JSON",
+            header: MALFORMED_HEADER,
+            leaked: [],
+        })
+    }
+)
+
 const alertsUrl = `${services.broker()}/alerts`
 
 /** A response of `status`, with a JSON body unless the status forbids one. */
@@ -997,8 +1156,16 @@ it.each<{ helper: string; call: (status: number) => Promise<unknown> }>([
         call: (status) => postJsonText(alertsUrl, "{}", status),
     },
     {
+        helper: "patchJson",
+        call: (status) => patchJson(alertsUrl, { enabled: true }, status),
+    },
+    {
         helper: "delExactStatus",
         call: (status) => delExactStatus(alertsUrl, status),
+    },
+    {
+        helper: "postExactStatus",
+        call: (status) => postExactStatus(alertsUrl, status),
     },
 ])(
     "exactStatusHelper_nonOkExactStatusMatches_rejectsApiErrorBeforeBodyRead ($helper)",
@@ -1016,13 +1183,44 @@ it.each<{ helper: string; call: (status: number) => Promise<unknown> }>([
     }
 )
 
-it.each([200, 202, 404, 500])(
-    "postJsonText_exactStatusOtherResponse_rejectsApiErrorBeforeBodyRead (%i)",
-    async (status) => {
+const exactStatusCalls: {
+    helper: string
+    call: () => Promise<unknown>
+    others: number[]
+}[] = [
+    {
+        helper: "postJsonText",
+        call: () => postJsonText(alertsUrl, "{}", 201),
+        others: [200, 202, 404, 500],
+    },
+    {
+        helper: "patchJson",
+        call: () => patchJson(alertsUrl, { enabled: true }, 200),
+        others: [201, 202, 204, 404, 500],
+    },
+    {
+        helper: "delExactStatus",
+        call: () => delExactStatus(alertsUrl, 204),
+        others: [200, 202, 404, 500],
+    },
+    {
+        helper: "postExactStatus",
+        call: () => postExactStatus(alertsUrl, 204),
+        others: [200, 201, 202, 404, 500],
+    },
+]
+
+it.each(
+    exactStatusCalls.flatMap(({ helper, call, others }) =>
+        others.map((status) => ({ helper, call, status }))
+    )
+)(
+    "exactStatusHelper_otherResponse_rejectsApiErrorBeforeBodyRead ($helper $status)",
+    async ({ call, status }) => {
         const response = statusResponse(status)
         stubFetch(() => Promise.resolve(response))
 
-        const error = await settle(postJsonText(alertsUrl, "{}", 201))
+        const error = await settle(call())
 
         expect({
             isApiError: error instanceof ApiError,
@@ -1066,18 +1264,24 @@ it("delExactStatus_matchingStatus_sendsDeleteAndResolves", async () => {
     })
 })
 
-it.each([200, 202, 404, 500])(
-    "delExactStatus_otherResponse_rejectsApiErrorBeforeBodyRead (%i)",
-    async (status) => {
-        const response = statusResponse(status)
-        stubFetch(() => Promise.resolve(response))
+it("postExactStatus_matchingStatus_sendsPostWithoutBodyAndResolves", async () => {
+    let sent: RequestInit | undefined
+    stubFetch((init) => {
+        sent = init
+        return Promise.resolve(statusResponse(204))
+    })
 
-        const error = await settle(delExactStatus(alertsUrl, 204))
+    const outcome = await settle(postExactStatus(`${alertsUrl}/a/ack`, 204))
 
-        expect({
-            isApiError: error instanceof ApiError,
-            status: error instanceof ApiError ? error.status : undefined,
-            bodyRead: response.bodyUsed,
-        }).toEqual({ isApiError: true, status, bodyRead: false })
-    }
-)
+    expect({
+        outcome,
+        method: sent?.method,
+        headers: sent?.headers,
+        body: sent?.body,
+    }).toEqual({
+        outcome: { resolved: undefined },
+        method: "POST",
+        headers: { Accept: "application/json" },
+        body: undefined,
+    })
+})
