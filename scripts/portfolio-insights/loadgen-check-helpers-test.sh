@@ -8,6 +8,8 @@
 #     and run A/B comparison checks built on them, and the per-minute progress lines;
 #   - setup's stack checks, the flag switch, the weighted loadgen recreate, the wait for the
 #     first visit and run A;
+#   - the per-project run lock: taking it, refusing a run another run's lock stops, naming that
+#     run from a regular owner file read within its time limit, and releasing it;
 #   - the created, resolved and unresolved ids of loadgen's output, the ids it owns for cleanup,
 #     and the count of visits between opening the page and their create outcome;
 #   - the read-only Alerts count: SQL and client per dialect, refusal of non-canonical ids,
@@ -16,16 +18,20 @@
 #     exit: owned alerts deleted, a DELETE retried after a transport error, owned and deleted
 #     lists that cannot be read or written, the flag restored, and the exit status;
 #   - the recovery record of a run directory and the --resume-cleanup run that deletes the owned
-#     alerts a cleanup left, once Docker shows that --base-url reaches the project's reverse proxy.
+#     alerts a cleanup left, once Docker shows that --base-url reaches the project's reverse proxy,
+#     under the project's run lock, which it releases however it ends.
 # loadgen-check-test.sh covers the rest: run B's drain and owned-id audit, loadgen's log
-# sanitizer, the restore of loadgen and the flag-off window. harness-test.sh covers
-# container_env, the time limits of the bounded Docker calls and the cleanup of a window still
-# open.
+# sanitizer, setup's restorability check, the drain of the loadgen found at start, the restore
+# of loadgen and the flag-off window. harness-test.sh covers container_env, the time limits of
+# the bounded Docker calls and the cleanup of a window still open.
 # The script is sourced, which defines its functions without running it. docker, curl, date and
 # sleep are then replaced by bash functions that record each call and answer from files the case
 # writes: loadgen's output, a fake Alerts table, HTTP responses and a fake clock. timeout is
 # replaced too, so the Docker calls the script bounds with timeout(1) reach the docker stub.
-# Nothing reaches Docker, the network or a database, and no case waits in real time. The
+# The lock_refusal cases alone source the script in a fresh bash run under the real timeout(1),
+# since the time limit of the owner read is what they test.
+# Nothing reaches Docker, the network or a database, and no case waits in real time but the
+# owner read that never ends, for the one second its lowered limit allows. The
 # harness itself starts as few processes as it can, since each one is slow to start under Git
 # Bash.
 #
@@ -63,7 +69,7 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-for t_tool in jq awk sed grep sort comm paste tr wc mktemp cmp stat; do
+for t_tool in jq awk sed grep sort comm paste tr wc mktemp cmp head timeout mkfifo ln chmod stat; do
     if ! command -v "$t_tool" >/dev/null 2>&1; then
         echo "$t_tool is required on PATH." >&2
         exit 2
@@ -117,6 +123,10 @@ printf -v T_DASHES '%36s' ''
 T_DASHES="${T_DASHES// /-}"
 # The message the stub curl prints on a transport error.
 T_CURL_REFUSED="curl: (7) Failed to connect to stub.invalid port 80: Connection refused"
+# The flag as feature-flag-service serializes flag/model.go's Flag, off and on: every field, with
+# enabledAt only while it is on, as SetEnabled sets it.
+T_FLAG_OFF='{"id":"portfolio-insights-enabled","enabled":false,"name":"Portfolio insights","description":"When enabled, shows the simulated Portfolio Insights page and alerts and enables alert evaluation in broker-service. Demo feature, not financial advice.","isModifiable":true,"tag":"feature"}'
+T_FLAG_ON='{"id":"portfolio-insights-enabled","enabled":true,"name":"Portfolio insights","description":"When enabled, shows the simulated Portfolio Insights page and alerts and enables alert evaluation in broker-service. Demo feature, not financial advice.","isModifiable":true,"tag":"feature","enabledAt":"2026-01-01T00:00:00Z"}'
 
 # ---------------------------------------------------------------------------------------------
 # Reporting
@@ -252,8 +262,20 @@ t_new_case() {
     LOADGEN_WAS_RUNNING=0
     LOADGEN_TOUCHED=0
     LOADGEN_AT_START=""
+    LOADGEN_IMAGE_AT_START=""
+    LOADGEN_HASH_AT_START=""
+    LOADGEN_CONFIG_AT_START=""
+    LOADGEN_STARTED_AT=""
     LOADGEN_PAUSED=0
     RESTORE_ERROR=""
+    LOADGEN_ID_AT_START=""
+    LOADGEN_TWIN=""
+    TWIN_ERROR=""
+    TWIN_REMOVED=""
+    TWIN_DETAIL=""
+    LOADGEN_CID_AT_START=""
+    AT_START_DRAINING=0
+    RECOVER_ERROR=""
     WINDOW_OPEN=0
     WINDOW_UNREAD=0
     WINDOW_LABEL="B"
@@ -280,6 +302,11 @@ t_new_case() {
     STUB_VERSION_STATUS=0
     STARTED_DETAIL=""
     FAKE_NOW=1767225600
+    # The run lock under this case's directory, never the shared /tmp the script's LOCK_ROOT names.
+    LOCK_ROOT="$T_CASE_DIR"
+    LOCK_DIR=""
+    LOCK_HELD=0
+    LOCK_ERROR=""
 }
 
 # t_run_sub COMMAND [ARGS...]: runs COMMAND in a subshell with errexit on, as the script runs its
@@ -306,47 +333,90 @@ t_print_file() {
     fi
 }
 
+# The image every stub container runs, which its image reference names, and the config hash the
+# stub's Compose gives loadgen and labels every container with: both invented, so every loadgen
+# container is restorable (loadgen-check-test.sh covers the refusals).
+T_STUB_IMAGE="sha256:0123456789ab0123456789ab0123456789ab0123456789ab0123456789ab0123"
+T_STUB_HASH="fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"
+
 # docker: records each call in STUB_DIR/docker.calls, its MSYS_NO_PATHCONV value and then one
 # argument per line, ended by "--". docker inspect --format '{{json .Config.Env}}' cid-SERVICE
 # prints the entries of STUB_DIR/env.SERVICE as the JSON array container_env and
-# container_env_entry read; any other format fails. The compose subcommand after the -p
-# and -f options plays as follows: config prints STUB_DIR/services; ps ... --services prints
-# STUB_DIR/running and exits STUB_PS_STATUS, and ps ... SERVICE prints cid-SERVICE when
-# STUB_DIR/env.SERVICE exists; port SERVICE PORT prints STUB_DIR/port.SERVICE, the published
-# HOST:PORT, or, when STUB_PORT_STATUS is not 0, prints Compose's error and exits with it; logs
-# prints STUB_DIR/loadgen.log and exits STUB_LOGS_STATUS; up records the
+# container_env_entry read, and --format '{{json .}}' the container as loadgen_identity reads it:
+# T_STUB_IMAGE, created from et-test-SERVICE, labelled with T_STUB_HASH; any other format fails.
+# docker image inspect prints T_STUB_IMAGE. The compose subcommand after the -p and -f options
+# plays as follows: config --hash SERVICE prints SERVICE and T_STUB_HASH, config
+# --no-interpolate the declaration of loadgen's weight, and any other config STUB_DIR/services;
+# ps ... --services prints STUB_DIR/running and exits STUB_PS_STATUS, and ps ... SERVICE prints
+# cid-SERVICE when STUB_DIR/env.SERVICE exists; port SERVICE PORT prints STUB_DIR/port.SERVICE,
+# the published HOST:PORT, or, when STUB_PORT_STATUS is not 0, prints Compose's error and exits
+# with it; logs prints STUB_DIR/loadgen.log and exits STUB_LOGS_STATUS; up records the
 # PORTFOLIO_INSIGHTS_ALERT_WEIGHT it gets in STUB_DIR/up.env and exits STUB_UP_STATUS, giving
 # loadgen that weight, or STUB_LOADGEN_WEIGHT when set, on success; stop, and the kill that ends
 # a paused loadgen, exit STUB_STOP_STATUS; pause and unpause succeed; version exits
 # STUB_VERSION_STATUS; exec runs the db client stub on its last argument; anything else succeeds
-# without output.
+# without output. The twin the restorability check creates, up ... --scale loadgen=2, records its
+# weight in STUB_DIR/twin.env and becomes container cid-loadgen-twin, answered as loadgen's own
+# container is and listed after it by ps ... loadgen, until docker rm --force --volumes
+# cid-loadgen-twin removes it.
 docker() {
     local -a args=("$@")
-    local i=1 last="${*: -1}"
+    local i=1 last="${*: -1}" service
     {
         printf 'MSYS_NO_PATHCONV=%s\n' "${MSYS_NO_PATHCONV:-}"
         printf '%s\n' "$@"
         printf -- '--\n'
     } >>"$STUB_DIR/docker.calls"
-    if [[ "${args[0]:-}" == "inspect" ]]; then
-        if [[ "${args[2]:-}" != "{{json .Config.Env}}" ]]; then
-            echo "stub docker: unexpected inspect format [${args[2]:-}]" >&2
-            return 1
+    if [[ "${args[0]:-}" == "rm" ]]; then
+        if [[ "$last" == "cid-loadgen-twin" ]]; then
+            rm -f "$STUB_DIR/twin.loadgen"
         fi
-        t_print_file "$STUB_DIR/env.${last#cid-}" | jq -c -R -s 'split("\n") | map(select(length > 0))'
+        return 0
+    fi
+    if [[ "${args[0]:-} ${args[1]:-}" == "image inspect" ]]; then
+        echo "$T_STUB_IMAGE"
+        return 0
+    fi
+    if [[ "${args[0]:-}" == "inspect" ]]; then
+        service="${last#cid-}"
+        service="${service%-twin}"
+        case "${args[2]:-}" in
+            "{{json .Config.Env}}")
+                t_print_file "$STUB_DIR/env.$service" | jq -c -R -s 'split("\n") | map(select(length > 0))'
+                ;;
+            "{{json .}}")
+                jq -c -n --arg image "$T_STUB_IMAGE" --arg ref "et-test-$service" --arg hash "$T_STUB_HASH" \
+                    '{Image: $image, Config: {Image: $ref, Labels: {"com.docker.compose.config-hash": $hash}},
+                        State: {StartedAt: "2026-01-01T00:00:00.5Z"}}'
+                ;;
+            *)
+                echo "stub docker: unexpected inspect format [${args[2]:-}]" >&2
+                return 1
+                ;;
+        esac
         return 0
     fi
     while [[ $i -lt ${#args[@]} && ("${args[i]}" == "-p" || "${args[i]}" == "-f") ]]; do
         i=$((i + 2))
     done
     case "${args[i]:-}" in
-        config) t_print_file "$STUB_DIR/services" ;;
+        config)
+            # shellcheck disable=SC2016 # Compose's declaration text, never expanded.
+            case "${args[i + 1]:-}" in
+                --hash) echo "$last $T_STUB_HASH" ;;
+                --no-interpolate) echo '{"services":{"loadgen":{"environment":{"PORTFOLIO_INSIGHTS_ALERT_WEIGHT":"${PORTFOLIO_INSIGHTS_ALERT_WEIGHT:-0}"}}}}' ;;
+                *) t_print_file "$STUB_DIR/services" ;;
+            esac
+            ;;
         ps)
             if [[ "$last" == "--services" ]]; then
                 t_print_file "$STUB_DIR/running"
                 return "$STUB_PS_STATUS"
             elif [[ -f "$STUB_DIR/env.$last" ]]; then
                 echo "cid-$last"
+                if [[ "$last" == loadgen && -f "$STUB_DIR/twin.loadgen" ]]; then
+                    echo "cid-loadgen-twin"
+                fi
             fi
             ;;
         port)
@@ -361,6 +431,11 @@ docker() {
             return "$STUB_LOGS_STATUS"
             ;;
         up)
+            if [[ " ${args[*]} " == *" --scale loadgen=2 "* ]]; then
+                printf 'PORTFOLIO_INSIGHTS_ALERT_WEIGHT=%s\n' "${PORTFOLIO_INSIGHTS_ALERT_WEIGHT-unset}" >>"$STUB_DIR/twin.env"
+                : >"$STUB_DIR/twin.loadgen"
+                return 0
+            fi
             printf 'PORTFOLIO_INSIGHTS_ALERT_WEIGHT=%s\n' "${PORTFOLIO_INSIGHTS_ALERT_WEIGHT-unset}" >>"$STUB_DIR/up.env"
             if [[ $STUB_UP_STATUS -ne 0 ]]; then
                 return "$STUB_UP_STATUS"
@@ -438,12 +513,15 @@ t_db_client() {
 
 # curl: answers http()'s request from STUB_DIR/http.responses, lines METHOD<TAB>URL<TAB>STATUS
 # <TAB>BODY whose first match on METHOD and URL answers; BODY @request echoes the request body.
-# Status 000, or no matching line, is a transport error. A request STUB_DIR/http.transient lists
-# as METHOD URL is a transport error first, once per such line (t_respond_transient). Each request
-# is recorded in STUB_DIR/http.calls as METHOD URL [BODY], and its --max-time in
-# STUB_DIR/http.max-times.
+# BODY @flag plays feature-flag-service: it answers T_FLAG_ON or T_FLAG_OFF for the state in
+# STUB_DIR/flag.enabled, false while that file is absent, which a PUT first sets to the enabled
+# value of its request body. Status 000, or no matching line, is a transport error. A request
+# STUB_DIR/http.transient lists as METHOD URL is a transport error first, once per such line
+# (t_respond_transient). Each request is recorded in STUB_DIR/http.calls as METHOD URL [BODY],
+# and its --max-time in STUB_DIR/http.max-times.
 curl() {
     local method="GET" out="" url="" body="" status="" reply="" r_method r_url r_status r_body
+    local state=false flag_re='"enabled": (true|false)'
     while [[ $# -gt 0 ]]; do
         case "$1" in
             -X)
@@ -493,8 +571,20 @@ curl() {
     if [[ "$reply" == "@request" ]]; then
         reply="$body"
     fi
+    if [[ "$reply" == "@flag" ]]; then
+        if [[ "$method" == "PUT" && "$body" =~ $flag_re ]]; then
+            printf '%s\n' "${BASH_REMATCH[1]}" >"$STUB_DIR/flag.enabled"
+        fi
+        if [[ -f "$STUB_DIR/flag.enabled" ]]; then
+            read -r state <"$STUB_DIR/flag.enabled"
+        fi
+        reply="$T_FLAG_OFF"
+        if [[ "$state" == "true" ]]; then
+            reply="$T_FLAG_ON"
+        fi
+    fi
     printf '%s' "$reply" >"$out"
-    printf '%s application/json' "$status"
+    printf '%s' "$status"
 }
 
 # date: the fake clock FAKE_NOW for date -u +%s, the system date for anything else.
@@ -704,7 +794,15 @@ t_ready_stack() {
     printf '%s\n' "PATH=/usr/local/bin" "PORTFOLIO_INSIGHTS_ALERT_WEIGHT=0" >"$STUB_DIR/env.loadgen"
     t_respond GET "$BASE_URL/broker-service/readyz" 200 'ok'
     t_respond GET "$BASE_URL/feature-flag-service/readyz" 200 'ok'
-    t_respond GET "$FLAG_URL" 200 '{"id":"portfolio-insights-enabled","enabled":false,"isModifiable":true}'
+    t_respond GET "$FLAG_URL" 200 "$T_FLAG_OFF"
+}
+
+# t_flag_body FILTER: T_FLAG_OFF after the jq FILTER, compact, with a string result printed raw,
+# so a FILTER can also give a body that is no JSON object, or no JSON at all.
+t_flag_body() {
+    local body
+    body="$(jq -r -c "$1" <<<"$T_FLAG_OFF")"
+    printf '%s' "${body//$'\r'/}"
 }
 
 # t_setup_facts: setup, then the dialect and initial flag value it gathered.
@@ -749,11 +847,15 @@ t_new_case
 t_expect_usage_error "missing --project" "Option --project is required." --weight 2
 t_expect_usage_error "unknown option" "Unknown option: --bogus" --project et-test --bogus
 t_expect_usage_error "value missing at the end" "Option --project requires a value." --project
-t_expect_usage_error "value is an option" "Option --minutes requires a value." --minutes --project et-test
+t_dash_refused="requires a value; the next argument starts with '-' and is not taken as one."
+t_expect_usage_error "value is an option" "Option --minutes $t_dash_refused" --minutes --project et-test
 t_expect_usage_error "empty value" "Option --out requires a value." --project et-test --out ""
+t_expect_usage_error "dash-prefixed value" "Option --project $t_dash_refused" --project -x-not-shown-7d1e
+t_expect_no_match "dash-prefixed value: not echoed" "$T_CASE_DIR/err" "not-shown-7d1e"
 for option in --weight --minutes; do
-    t_expect_usage_error "$option -1" "Option $option requires a value." --project et-test "$option" -1
-    for value in 0 1.5 1234567890; do
+    t_expect_usage_error "$option -x" "Option $option $t_dash_refused" --project et-test "$option" -x
+    # A negative number is taken as the value, so the count rule names it.
+    for value in -1 -5 0 1.5 1234567890; do
         t_expect_usage_error "$option $value" \
             "Option $option needs a positive integer of at most 9 digits, got: $value" \
             --project et-test "$option" "$value"
@@ -787,13 +889,22 @@ OUT_FILE=
 COMPOSE_ARGS=-f compose.dev.yaml"
 t_conclude "$check"
 
-check="parseOptions_help_printsUsageAndExitsZero"
-t_new_case
-t_run_sub parse_options --help
-first=""
-IFS= read -r first <"$T_CASE_DIR/out" || true
-t_expect "help" "$T_STATUS|$first" \
-    "0|Usage: scripts/portfolio-insights/loadgen-check.sh --project NAME [--base-url URL]"
+check="parseOptions_shortOrLongHelp_printsUsageWithExamplesAndExitsZero"
+for option in -h --help; do
+    t_new_case
+    t_run_sub parse_options --project et-test "$option"
+    first=""
+    IFS= read -r first <"$T_CASE_DIR/out" || true
+    t_expect "$option" "$T_STATUS|$first|$(<"$T_CASE_DIR/err")" \
+        "0|Usage: scripts/portfolio-insights/loadgen-check.sh --project NAME [--base-url URL]|"
+    t_expect_line "$option: both spellings listed" "$T_CASE_DIR/out" \
+        "  -h, --help           Show this help and exit"
+    t_expect_line "$option: examples heading" "$T_CASE_DIR/out" "Examples:"
+    t_expect_line "$option: full run example" "$T_CASE_DIR/out" \
+        "    scripts/portfolio-insights/loadgen-check.sh --project pi-dev-mssql"
+    t_expect_line "$option: override file example" "$T_CASE_DIR/out" \
+        "        --compose-file compose.dev.yaml --compose-file OVERRIDE.yaml --out FILE"
+done
 t_conclude "$check"
 
 # t_resume_settings ARGS...: parse_options ARGS, then the run directory to resume.
@@ -838,20 +949,421 @@ t_expect "compose plugin missing" "$T_STATUS|$(<"$T_CASE_DIR/err")" \
 t_conclude "$check"
 
 # ---------------------------------------------------------------------------------------------
+# Run lock
+
+# t_lock_dir: the lock directory of project et-test under the LOCK_ROOT t_new_case sets.
+t_lock_dir() {
+    printf '%s' "$T_CASE_DIR/pi-loadgen-check.et-test.lock"
+}
+
+# t_lock_presence PATH: present or absent.
+t_lock_presence() {
+    if [[ -e "$1" ]]; then
+        echo present
+    else
+        echo absent
+    fi
+}
+
+# t_setup_lock_state: setup, printing LOCK_HELD on the way out, whether setup returns or ends the
+# run.
+t_setup_lock_state() {
+    trap 'echo "LOCK_HELD=$LOCK_HELD"' EXIT
+    setup
+}
+
+# t_setup_through_cleanup: setup, ending through the script's EXIT trap as a run of the script ends.
+t_setup_through_cleanup() {
+    trap cleanup EXIT
+    setup
+}
+
+# t_lock_through_cleanup [EXTRA]: acquire_run_lock, then the end of the run through the script's
+# EXIT trap; with EXTRA, a file of that name is left in the lock directory first.
+t_lock_through_cleanup() {
+    trap cleanup EXIT
+    acquire_run_lock
+    if [[ -n "${1:-}" ]]; then
+        : >"$LOCK_DIR/$1"
+    fi
+    exit 0
+}
+
+# t_lock_through_resume_exit [EXTRA]: acquire_run_lock, then the end of a --resume-cleanup run
+# before cleanup takes over, through resume_exit; with EXTRA, a file of that name is left in the
+# lock directory first.
+t_lock_through_resume_exit() {
+    trap resume_exit EXIT
+    acquire_run_lock
+    if [[ -n "${1:-}" ]]; then
+        : >"$LOCK_DIR/$1"
+    fi
+    exit 0
+}
+
+# t_exit_through_resume_exit: the end of a --resume-cleanup run through resume_exit, without its
+# run lock, as when the lock is refused.
+t_exit_through_resume_exit() {
+    trap resume_exit EXIT
+    exit 0
+}
+
+# t_unrecordable_lock: acquire_run_lock with an mv that fails, ending through the EXIT trap.
+t_unrecordable_lock() {
+    mv() {
+        echo "mv: simulated failure" >&2
+        return 1
+    }
+    trap cleanup EXIT
+    acquire_run_lock
+}
+
+# t_expect_refused LABEL HOLDER [ENDED_PID]: setup on a ready stack whose lock another run holds
+# fails the run lock check naming the holder as HOLDER, saying the holder has ended when its pid
+# ENDED_PID is given, reads and requests nothing more, and leaves that run's lock as it was.
+t_expect_refused() {
+    local dir hint before="none" after="none"
+    dir="$(t_lock_dir)"
+    if [[ -f "$dir/owner" ]]; then
+        before="$(<"$dir/owner")"
+    fi
+    if [[ -n "${3:-}" ]]; then
+        hint="Pid $3 no longer runs on this host, so that run has ended and left the lock stale: remove $dir once no run on the project is active, and start again."
+    else
+        hint="If no run on the project is active, as after a run killed before its cleanup, remove $dir and start again."
+    fi
+    t_ready_stack
+    t_run_sub t_setup_through_cleanup
+    t_expect "$1: exit status" "$T_STATUS" 1
+    t_expect_line "$1: verdict" "$T_CASE_DIR/out" \
+        "FAIL run lock: project [et-test] is in use by another run, which holds $dir ($2). One invocation per project runs at a time, so this run stops before it reads or changes anything. $hint"
+    t_expect_line "$1: summary" "$T_CASE_DIR/out" "SUMMARY 1 passed, 1 failed"
+    t_expect_no_match "$1: no later check" "$T_CASE_DIR/out" 'readiness|runtime facts|flag modifiable|released'
+    t_expect "$1: no request" "$(<"$STUB_DIR/http.calls")" ""
+    t_expect_no_match "$1: no container read" "$STUB_DIR/docker.calls" '^(ps|inspect)$'
+    if [[ -f "$dir/owner" ]]; then
+        after="$(<"$dir/owner")"
+    fi
+    t_expect "$1: holder's lock kept" "$(t_lock_presence "$dir")|$after" "present|$before"
+}
+
+check="acquireRunLock_lockFree_holdsLockRecordingThisRunBeforeReadiness"
+t_new_case
+t_ready_stack
+t_run_sub t_setup_lock_state
+first=""
+IFS= read -r first <"$T_CASE_DIR/out" || true
+t_expect "exit status and first check" "$T_STATUS|$first" "0|PASS run lock: $(t_lock_dir)"
+t_expect_line "readiness follows" "$T_CASE_DIR/out" "PASS readiness"
+t_expect_line "lock held" "$T_CASE_DIR/out" "LOCK_HELD=1"
+t_expect "owner file" "$(<"$(t_lock_dir)/owner")" "pid=$$
+host=$HOSTNAME
+started=$STARTED_AT
+run_dir=$RUN_DIR"
+t_expect "no partial owner file" "$(t_lock_presence "$(t_lock_dir)/owner.new")" absent
+t_conclude "$check"
+
+check="acquireRunLock_lockHeld_failsNamingHolderAndLeavesItsLock"
+# A pid that has just ended: a subshell, waited for.
+(exit 0) &
+t_ended_pid=$!
+wait "$t_ended_pid" || true
+# The first run is this test's shell: alive, on this host.
+t_new_case
+t_run_sub acquire_run_lock
+t_expect "first run: exit status" "$T_STATUS" 0
+t_expect_refused "holder running here" "started $STARTED_AT, pid $$, host $HOSTNAME, run dir $RUN_DIR"
+t_new_case
+mkdir "$(t_lock_dir)"
+printf '%s\n' "pid=$t_ended_pid" "host=$HOSTNAME" "started=2026-01-01T00:00:00Z" \
+    "run_dir=/tmp/pi-loadgen.AbC123" >"$(t_lock_dir)/owner"
+t_expect_refused "holder ended here" \
+    "started 2026-01-01T00:00:00Z, pid $t_ended_pid, host $HOSTNAME, run dir /tmp/pi-loadgen.AbC123" \
+    "$t_ended_pid"
+t_new_case
+mkdir "$(t_lock_dir)"
+printf '%s\n' "pid=$t_ended_pid" "host=other-host.invalid" "started=2026-01-01T00:00:00Z" \
+    "run_dir=/tmp/pi-loadgen.AbC123" >"$(t_lock_dir)/owner"
+t_expect_refused "holder on another host" \
+    "started 2026-01-01T00:00:00Z, pid $t_ended_pid, host other-host.invalid, run dir /tmp/pi-loadgen.AbC123"
+t_new_case
+mkdir "$(t_lock_dir)"
+printf '%s\n' "pid=1; touch probe-7d1e" $'host=\e[31mprobe-7d1e' "started=probe-7d1e" \
+    $'run_dir=/tmp/a\tprobe-7d1e' "probe-7d1e" >"$(t_lock_dir)/owner"
+t_expect_refused "owner fields in another form" \
+    "started unknown, pid unknown, host unknown, run dir unknown"
+t_expect_no_match "owner fields in another form: file text not shown" "$T_CASE_DIR/out" $'probe-7d1e|\e'
+t_new_case
+mkdir "$(t_lock_dir)"
+t_expect_refused "no owner file" "started unknown, pid unknown, host unknown, run dir unknown"
+t_conclude "$check"
+
+# The bound of each lock_refusal run under the real timeout(1), far above the fraction of a
+# second a run takes, so only an owner read that never ends reaches it. tests.md rules out sleeps
+# and arbitrary timeouts as a way to wait for asynchronous work: this bound waits for nothing,
+# and only turns a read that hangs into a failing case rather than a suite that never ends.
+T_LOCK_BOUND_SECONDS=20
+
+# t_owner_fields: the text of an owner file, as acquire_run_lock writes it, of a run on another
+# host.
+t_owner_fields() {
+    printf '%s\n' "pid=1" "host=other-host.invalid" "started=2026-01-01T00:00:00Z" \
+        "run_dir=/tmp/pi-loadgen.AbC123"
+}
+
+# t_entry_kind PATH: what PATH is, a symlink not followed: symlink, fifo, file, other or absent.
+t_entry_kind() {
+    if [[ -L "$1" ]]; then
+        echo symlink
+    elif [[ -p "$1" ]]; then
+        echo fifo
+    elif [[ -f "$1" ]]; then
+        echo file
+    elif [[ -e "$1" ]]; then
+        echo other
+    else
+        echo absent
+    fi
+}
+
+# t_refusal HOLDER: lock_refusal's text for project et-test over t_lock_dir, naming HOLDER, a run
+# not known to have ended.
+t_refusal() {
+    printf '%s' "project [et-test] is in use by another run, which holds $(t_lock_dir) ($1). One invocation per project runs at a time, so this run stops before it reads or changes anything. If no run on the project is active, as after a run killed before its cleanup, remove $(t_lock_dir) and start again."
+}
+
+# t_lock_refusal_within READ_LIMIT [BIN_DIR]: lock_refusal for project et-test over t_lock_dir,
+# with LOCK_READ_TIMEOUT_SECONDS at READ_LIMIT and BIN_DIR, when given, first on PATH. It runs in
+# a fresh bash that sources the script, so hard_timeout reaches the real timeout(1) rather than
+# the stub, and that bash runs under the real timeout(1) too, which kills it
+# T_LOCK_BOUND_SECONDS after its start: T_STATUS is then 137, and each FIFO of the lock directory
+# gets a writer, which ends a reader still blocked on it. Output goes to T_CASE_DIR/out.
+t_lock_refusal_within() {
+    local entry
+    set +e
+    # shellcheck disable=SC2016 # The fresh bash expands its own arguments.
+    command timeout -s KILL "$T_LOCK_BOUND_SECONDS" bash -c '
+        source "$1" || exit 2
+        PROJECT=et-test
+        LOCK_DIR="$2"
+        LOCK_READ_TIMEOUT_SECONDS="$3"
+        if [[ -n "$4" ]]; then
+            PATH="$4:$PATH"
+        fi
+        lock_refusal' _ "$T_SCRIPT" "$(t_lock_dir)" "$1" "${2:-}" \
+        >"$T_CASE_DIR/out" 2>"$T_CASE_DIR/err" </dev/null
+    T_STATUS=$?
+    set -e
+    if [[ $T_STATUS -eq 137 ]]; then
+        for entry in "$(t_lock_dir)"/*; do
+            if [[ -p "$entry" ]]; then
+                # shellcheck disable=SC2016 # The writer's bash expands its own argument.
+                command timeout -s KILL 2 bash -c ': >"$1"' _ "$entry" || true
+            fi
+        done
+    fi
+}
+
+# t_hanging_head DIR: a head in DIR that never answers within T_LOCK_BOUND_SECONDS. This is the
+# stimulus, a read that never ends, as harness-test.sh's fake docker hangs: it outlasts the bound,
+# so a broken read limit fails the case, and then ends by itself, so it leaves no process behind.
+t_hanging_head() {
+    mkdir -p "$1"
+    printf '#!/usr/bin/env bash\nexec sleep %s\n' "$((T_LOCK_BOUND_SECONDS + 10))" >"$1/head"
+    chmod +x "$1/head"
+}
+
+check="lockRefusal_ownerEntryKinds_namesHolderOnlyFromARegularFileAndKeepsTheLock"
+# The read limit lies beyond the bound, so only the entry-type test can end in time a run whose
+# owner is a FIFO. Under Git Bash, ln makes a real symlink only with winsymlinks:sys; other
+# systems ignore MSYS.
+for t_kind in "regular file" FIFO "symlink to a regular file" "symlink to a FIFO"; do
+    t_new_case
+    mkdir "$(t_lock_dir)"
+    t_owner="$(t_lock_dir)/owner"
+    t_holder="started unknown, pid unknown, host unknown, run dir unknown"
+    t_made="symlink"
+    case "$t_kind" in
+        "regular file")
+            t_owner_fields >"$t_owner"
+            t_holder="started 2026-01-01T00:00:00Z, pid 1, host other-host.invalid, run dir /tmp/pi-loadgen.AbC123"
+            t_made="file"
+            ;;
+        FIFO)
+            mkfifo "$t_owner"
+            t_made="fifo"
+            ;;
+        "symlink to a regular file")
+            t_owner_fields >"$T_CASE_DIR/owner.target"
+            MSYS=winsymlinks:sys ln -s "$T_CASE_DIR/owner.target" "$t_owner"
+            ;;
+        "symlink to a FIFO")
+            mkfifo "$T_CASE_DIR/owner.target"
+            MSYS=winsymlinks:sys ln -s "$T_CASE_DIR/owner.target" "$t_owner"
+            ;;
+    esac
+    t_expect "[$t_kind]: entry made" "$(t_entry_kind "$t_owner")" "$t_made"
+    t_lock_refusal_within $((T_LOCK_BOUND_SECONDS * 3))
+    t_expect "[$t_kind]: status and refusal" "$T_STATUS|$(<"$T_CASE_DIR/out")" "0|$(t_refusal "$t_holder")"
+    t_expect "[$t_kind]: lock kept" "$(t_lock_presence "$(t_lock_dir)")|$(t_entry_kind "$t_owner")" \
+        "present|$t_made"
+done
+t_conclude "$check"
+
+check="lockRefusal_ownerReadNeverEnds_namesUnknownHolderAtTheReadLimit"
+t_new_case
+mkdir "$(t_lock_dir)"
+t_owner_fields >"$(t_lock_dir)/owner"
+t_hanging_head "$T_CASE_DIR/bin"
+t_lock_refusal_within 1 "$T_CASE_DIR/bin"
+t_expect "status and refusal" "$T_STATUS|$(<"$T_CASE_DIR/out")" \
+    "0|$(t_refusal "started unknown, pid unknown, host unknown, run dir unknown")"
+t_expect "lock kept" "$(t_lock_presence "$(t_lock_dir)")|$(<"$(t_lock_dir)/owner")" "present|$(t_owner_fields)"
+t_conclude "$check"
+
+check="acquireRunLock_notComposeProjectName_failsWithoutTakingLock"
+for t_name in Et-test _et et.test et/../x "et test"; do
+    t_new_case
+    PROJECT="$t_name"
+    t_run_sub acquire_run_lock
+    t_expect "[$t_name]: exit status" "$T_STATUS" 1
+    t_expect_line "[$t_name]: verdict" "$T_CASE_DIR/out" \
+        "FAIL run lock: project name [$(printf '%q' "$t_name")] is not a Compose project name (lower-case letters, digits, - and _, starting with a letter or digit), so no lock is taken for it"
+    t_expect "[$t_name]: no lock" "$(compgen -G "$T_CASE_DIR/*.lock" || true)" ""
+done
+t_conclude "$check"
+
+check="acquireRunLock_lockNotCreatable_failsNamingTheError"
+t_new_case
+LOCK_ROOT="$T_CASE_DIR/absent"
+t_run_sub acquire_run_lock
+first=""
+IFS= read -r first <"$T_CASE_DIR/out" || true
+t_expect "exit status" "$T_STATUS" 1
+if [[ "$first" != "FAIL run lock: could not create $T_CASE_DIR/absent/pi-loadgen-check.et-test.lock: mkdir: "* ]]; then
+    t_reasons+=("verdict: got [$(t_text "$first")]")
+fi
+t_conclude "$check"
+
+check="acquireRunLock_ownerNotRecorded_failsAndCleanupRemovesTheLock"
+t_new_case
+t_run_sub t_unrecordable_lock
+t_expect "exit status" "$T_STATUS" 1
+t_expect_line "verdict" "$T_CASE_DIR/out" \
+    "FAIL run lock: created $(t_lock_dir) but could not record this run in it: mv: simulated failure"
+t_expect_line "released" "$T_CASE_DIR/out" "INFO cleanup: run lock $(t_lock_dir) released"
+t_expect "lock removed" "$(t_lock_presence "$(t_lock_dir)")" absent
+t_conclude "$check"
+
+check="cleanup_runLock_releasesOnlyALockThisRunHolds"
+t_new_case
+t_run_sub t_lock_through_cleanup
+t_expect "held: exit status" "$T_STATUS" 0
+t_expect_line "held: released" "$T_CASE_DIR/out" "INFO cleanup: run lock $(t_lock_dir) released"
+t_expect_line "held: cleanup passes" "$T_CASE_DIR/out" "PASS cleanup"
+t_expect "held: lock removed" "$(t_lock_presence "$(t_lock_dir)")" absent
+t_new_case
+mkdir "$(t_lock_dir)"
+echo "pid=1" >"$(t_lock_dir)/owner"
+t_run_sub t_exit_through_cleanup 0
+t_expect "not held: exit status" "$T_STATUS" 0
+t_expect_no_match "not held: nothing released" "$T_CASE_DIR/out" 'run lock'
+t_expect "not held: other run's lock kept" "$(<"$(t_lock_dir)/owner")" "pid=1"
+t_new_case
+t_run_sub t_lock_through_cleanup extra
+t_expect "removal fails: exit status" "$T_STATUS" 1
+t_expect_match "removal fails: verdict" "$T_CASE_DIR/out" \
+    '^FAIL cleanup: run lock not released: removing .*/pi-loadgen-check[.]et-test[.]lock failed: rmdir: '
+t_expect "removal fails: unknown file kept" "$(t_lock_presence "$(t_lock_dir)/extra")" present
+t_conclude "$check"
+
+check="resumeExit_runLock_releasesOnlyALockThisRunHolds"
+# resume_exit ends a --resume-cleanup run that stops before cleanup takes over: it removes the
+# lock the run took, fails the cleanup check when that removal fails, and prints the SUMMARY line.
+t_new_case
+t_run_sub t_lock_through_resume_exit
+t_expect "held: exit status" "$T_STATUS" 0
+t_expect_line "held: released" "$T_CASE_DIR/out" "INFO cleanup: run lock $(t_lock_dir) released"
+t_expect_line "held: summary" "$T_CASE_DIR/out" "SUMMARY 1 passed, 0 failed"
+t_expect "held: lock removed" "$(t_lock_presence "$(t_lock_dir)")" absent
+t_new_case
+mkdir "$(t_lock_dir)"
+echo "pid=1" >"$(t_lock_dir)/owner"
+t_run_sub t_exit_through_resume_exit
+t_expect "not held: exit status" "$T_STATUS" 0
+t_expect_no_match "not held: nothing released" "$T_CASE_DIR/out" 'run lock'
+t_expect_line "not held: summary" "$T_CASE_DIR/out" "SUMMARY 0 passed, 0 failed"
+t_expect "not held: other run's lock kept" "$(<"$(t_lock_dir)/owner")" "pid=1"
+t_new_case
+t_run_sub t_lock_through_resume_exit extra
+t_expect "removal fails: exit status" "$T_STATUS" 1
+t_expect_match "removal fails: verdict" "$T_CASE_DIR/out" \
+    '^FAIL cleanup: run lock not released: removing .*/pi-loadgen-check[.]et-test[.]lock failed: rmdir: '
+t_expect_line "removal fails: summary" "$T_CASE_DIR/out" "SUMMARY 1 passed, 1 failed"
+t_expect "removal fails: unknown file kept" "$(t_lock_presence "$(t_lock_dir)/extra")" present
+t_conclude "$check"
+
+# ---------------------------------------------------------------------------------------------
 # HTTP, polling and logs
 
-check="http_responses_setsStatusTypeAndBodyOrTransportError"
+check="http_responses_setsStatusAndBodyOrTransportError"
 t_new_case
-t_respond GET "$FLAG_URL" 200 '{"id":"portfolio-insights-enabled","enabled":true}'
+t_respond GET "$FLAG_URL" 200 "$T_FLAG_ON"
 t_respond PUT "$FLAG_URL" 200 '@request'
 http GET "$FLAG_URL"
-t_expect "GET" "$HTTP_STATUS|$HTTP_CTYPE|$HTTP_BODY" \
-    '200|application/json|{"id":"portfolio-insights-enabled","enabled":true}'
+t_expect "GET" "$HTTP_STATUS|$HTTP_BODY" "200|$T_FLAG_ON"
 http PUT "$FLAG_URL" '{"enabled": false}'
 t_expect "PUT body through stdin" "$HTTP_STATUS|$HTTP_BODY" '200|{"enabled": false}'
 http DELETE "$ALERTS_URL/$ID1"
-t_expect "transport error" "$HTTP_STATUS|$HTTP_CTYPE|$HTTP_BODY|$(status_text)" \
-    "000|||transport error ($T_CURL_REFUSED)"
+t_expect "transport error" "$HTTP_STATUS|$HTTP_BODY|$(status_text)" \
+    "000||transport error ($T_CURL_REFUSED)"
+t_conclude "$check"
+
+check="flagReply_bodies_normalizesTheFlagOrNamesTheFirstBrokenRule"
+# LABEL;FILTER;RESULT: the body is T_FLAG_OFF after FILTER (t_flag_body). RESULT is
+# "ENABLED MODIFIABLE" for an accepted flag, otherwise the fixed reason.
+for row in 'flag off;.;false true' \
+    'flag on since a time;.enabled = true | .enabledAt = "2026-01-01T00:00:00Z";true true' \
+    'flag on since a time in nanoseconds;.enabled = true | .enabledAt = "2026-11-26T19:42:31.989559443Z";true true' \
+    'flag on since a time with an offset;.enabled = true | .enabledAt = "2026-11-26T19:42:31+01:00";true true' \
+    'flag locked;.isModifiable = false;false false' \
+    'enabled quoted true;.enabled = "true";enabled is not a boolean' \
+    'enabled quoted false;.enabled = "false";enabled is not a boolean' \
+    'enabled null;.enabled = null;enabled is not a boolean' \
+    'enabled missing;del(.enabled);enabled is not a boolean' \
+    'another id;.id = "db_not_responding";id is not portfolio-insights-enabled' \
+    'id a number;.id = 7;id is not a string' \
+    'id missing;del(.id);id is not a string' \
+    'isModifiable quoted;.isModifiable = "true";isModifiable is not a boolean' \
+    'name missing;del(.name);name is not a string' \
+    'description missing;del(.description);description is not a string' \
+    'tag missing;del(.tag);tag is not a string' \
+    'enabledAt a number;.enabledAt = 1767225600;enabledAt is not a string' \
+    'enabledAt null;.enabledAt = null;enabledAt is not a string' \
+    'enabledAt not a time;.enabledAt = "not-a-time";enabledAt is not an RFC 3339 time' \
+    'enabledAt a date only;.enabledAt = "2026-11-26";enabledAt is not an RFC 3339 time' \
+    'enabledAt a space for T;.enabledAt = "2026-11-26 19:42:31Z";enabledAt is not an RFC 3339 time' \
+    'enabledAt ten fraction digits;.enabledAt = "2026-11-26T19:42:31.1234567890Z";enabledAt is not an RFC 3339 time' \
+    'enabledAt a trailing newline;.enabledAt = "2026-11-26T19:42:31Z\n";enabledAt is not an RFC 3339 time' \
+    'enabledAt empty;.enabledAt = "";enabledAt is not an RFC 3339 time' \
+    'two JSON values;., .;not one JSON value' \
+    'empty body;empty;not one JSON value' \
+    'array of the flag;[.];not a JSON object' \
+    'bare boolean;"true";not a JSON object' \
+    'invalid JSON;"{\"id\":";not valid JSON' \
+    'trailing text;tojson + " x";not valid JSON'; do
+    IFS=';' read -r t_label t_filter t_result <<<"$row"
+    t_body="$(t_flag_body "$t_filter")"
+    set +e
+    flag_reply "$t_body"
+    status=$?
+    set -e
+    if [[ "$t_result" == "true "* || "$t_result" == "false "* ]]; then
+        t_expect "$t_label" "$status|$FLAG_ENABLED $FLAG_MODIFIABLE|$FLAG_REASON" "0|$t_result|"
+    else
+        t_expect "$t_label" "$status|$FLAG_ENABLED$FLAG_MODIFIABLE|$FLAG_REASON" "1||$t_result"
+    fi
+done
 t_conclude "$check"
 
 check="poll_attempts_returnsOnSuccessOrFailsAtDeadlineWithoutWaiting"
@@ -1445,6 +1957,9 @@ t_run_sub t_setup_facts
 t_expect "ready stack" "$T_STATUS" 0
 t_expect_no_match "ready stack: no failure" "$T_CASE_DIR/out" '^FAIL '
 t_expect_line "ready stack: facts" "$T_CASE_DIR/out" "DIALECT=postgres FLAG_INITIAL=false"
+t_expect "ready stack: loadgen's twin created with its weight at start, then removed" \
+    "$(t_print_file "$STUB_DIR/twin.env")|$(t_lock_presence "$STUB_DIR/twin.loadgen")|$(t_print_file "$STUB_DIR/up.env")" \
+    "PORTFOLIO_INSIGHTS_ALERT_WEIGHT=0|absent|"
 t_new_case
 t_ready_stack
 grep -vxF offer-service "$STUB_DIR/services" >"$STUB_DIR/running"
@@ -1466,47 +1981,59 @@ t_expect "unknown dialect" "$T_STATUS" 1
 t_expect_line "unknown dialect: verdict" "$T_CASE_DIR/out" \
     "FAIL runtime facts: db-adapter DB_TYPE is [sqlite], expected mssql or postgres"
 t_new_case
-t_respond GET "$FLAG_URL" 200 '{"id":"portfolio-insights-enabled","enabled":false,"isModifiable":false}'
+t_respond GET "$FLAG_URL" 200 "$(t_flag_body '.isModifiable = false')"
 t_ready_stack
 t_run_sub t_setup_facts
 t_expect "flag locked" "$T_STATUS" 1
 t_expect_line "flag locked: verdict" "$T_CASE_DIR/out" \
     "FAIL flag modifiable: isModifiable is [false]; a deployment with ENABLE_MODIFY=false cannot be toggled"
-t_new_case
-t_respond GET "$FLAG_URL" 200 '{"error":"feature_disabled"}'
-t_ready_stack
-t_run_sub t_setup_facts
-t_expect "not the flag" "$T_STATUS" 1
-t_expect_line "not the flag: verdict" "$T_CASE_DIR/out" \
-    "FAIL flag modifiable: GET $FLAG_ID answered id [null] enabled [null] as application/json"
+# LABEL;FILTER;RULE;PROBE: the flag read answers T_FLAG_OFF after FILTER; setup fails naming RULE,
+# and no line of its output matches PROBE, a value only the reply holds.
+for row in 'not the flag;{error: "feature_disabled"};id is not a string;feature_disabled' \
+    'quoted enabled;.enabled = "true";enabled is not a boolean;\[true\]|"true"' \
+    'another id;.id = "probe-7d1e";id is not portfolio-insights-enabled;probe-7d1e' \
+    'quoted isModifiable;.isModifiable = "true";isModifiable is not a boolean;\[true\]|"true"'; do
+    IFS=';' read -r t_label t_filter t_rule t_probe <<<"$row"
+    t_new_case
+    t_respond GET "$FLAG_URL" 200 "$(t_flag_body "$t_filter")"
+    t_ready_stack
+    t_run_sub t_setup_facts
+    t_expect "$t_label" "$T_STATUS" 1
+    t_expect_line "$t_label: verdict" "$T_CASE_DIR/out" \
+        "FAIL flag modifiable: GET $FLAG_ID gave status 200 with a reply that is not the flag: $t_rule"
+    t_expect_no_match "$t_label: reply not echoed" "$T_CASE_DIR/out" "$t_probe"
+done
 t_conclude "$check"
 
 check="setFlag_responses_passesOnReadBackOrEndsRunWithFlagTouched"
 t_new_case
-t_respond PUT "$FLAG_URL" 200 '@request'
-t_respond GET "$FLAG_URL" 200 '{"id":"portfolio-insights-enabled","enabled":true}'
+t_respond PUT "$FLAG_URL" 200 '@flag'
+t_respond GET "$FLAG_URL" 200 '@flag'
 t_run_sub t_set_flag_touch "run B flag true" true
 t_expect "read back" "$T_STATUS|$(<"$T_CASE_DIR/out")|$(<"$STUB_DIR/http.calls")" "0|PASS run B flag true
 FLAG_TOUCHED=1|PUT $FLAG_URL {\"enabled\": true}
 GET $FLAG_URL"
-t_new_case
-t_respond PUT "$FLAG_URL" 500 '{"error":"internal"}'
-t_run_sub t_set_flag_touch "run B flag true" true
-t_expect "PUT refused" "$T_STATUS|$(<"$T_CASE_DIR/out")" "1|FAIL run B flag true: PUT {\"enabled\": true} gave status 500
-FLAG_TOUCHED=1"
-t_new_case
-t_respond PUT "$FLAG_URL" 200 '@request'
-t_respond GET "$FLAG_URL" 200 '{"id":"portfolio-insights-enabled","enabled":false}'
-t_run_sub t_set_flag_touch "run B flag true" true
-t_expect "read back differs" "$T_STATUS|$(<"$T_CASE_DIR/out")" \
-    "1|FAIL run B flag true: read-back gave status 200 with enabled [false], expected true
-FLAG_TOUCHED=1"
-t_new_case
-t_respond PUT "$FLAG_URL" 200 '@request'
-t_run_sub t_set_flag_touch "run B flag true" true
-t_expect "read back unreachable" "$T_STATUS|$(<"$T_CASE_DIR/out")" \
-    "1|FAIL run B flag true: read-back gave transport error ($T_CURL_REFUSED) with enabled [], expected true
-FLAG_TOUCHED=1"
+# LABEL;PUT_STATUS;PUT_FILTER;GET_FILTER;CALLS;REASON: the PUT answers PUT_STATUS with T_FLAG_OFF
+# after PUT_FILTER, and the read-back, if any, T_FLAG_OFF after GET_FILTER, or a transport error
+# for an empty GET_FILTER. set_flag makes CALLS requests and ends the run with REASON.
+for row in 'PUT refused;500;{error: "internal"};.;1;PUT {"enabled": true} gave status 500' \
+    'PUT gives the flag off;200;.;.enabled = true;1;PUT {"enabled": true} gave status 200 with enabled=false, expected true' \
+    'PUT gives a quoted boolean;200;.enabled = "true";.enabled = true;1;PUT {"enabled": true} gave status 200 with a reply that is not the flag: enabled is not a boolean' \
+    'read back differs;200;.enabled = true;.;2;read-back gave status 200 with enabled=false, expected true' \
+    'read back quoted;200;.enabled = true;.enabled = "true";2;read-back gave status 200 with a reply that is not the flag: enabled is not a boolean' \
+    'read back of another flag;200;.enabled = true;.enabled = true | .id = "db_not_responding";2;read-back gave status 200 with a reply that is not the flag: id is not portfolio-insights-enabled' \
+    "read back unreachable;200;.enabled = true;;2;read-back gave transport error ($T_CURL_REFUSED)"; do
+    IFS=';' read -r t_label t_put_status t_put_filter t_get_filter t_calls t_reason <<<"$row"
+    t_new_case
+    t_respond PUT "$FLAG_URL" "$t_put_status" "$(t_flag_body "$t_put_filter")"
+    if [[ -n "$t_get_filter" ]]; then
+        t_respond GET "$FLAG_URL" 200 "$(t_flag_body "$t_get_filter")"
+    fi
+    t_run_sub t_set_flag_touch "run B flag true" true
+    t_expect "$t_label" "$T_STATUS|$(<"$T_CASE_DIR/out")|$(t_count "$STUB_DIR/http.calls")" \
+        "1|FAIL run B flag true: $t_reason
+FLAG_TOUCHED=1|$t_calls"
+done
 t_conclude "$check"
 
 check="openWindow_recreatedWeights_passesOnlyTheRequestedWeight"
@@ -1583,8 +2110,8 @@ RUN_A_VISIT_JSON='{"deposit_and_buy_success":{"total":2,"avgDurationMs":1,"failR
 # and then a cumulative breakdown JSON, or no visit for an empty JSON.
 t_run_a_stack() {
     MINUTES=1
-    t_respond PUT "$FLAG_URL" 200 '@request'
-    t_respond GET "$FLAG_URL" 200 '{"id":"portfolio-insights-enabled","enabled":false}'
+    t_respond PUT "$FLAG_URL" 200 '@flag'
+    t_respond GET "$FLAG_URL" 200 '@flag'
     if [[ -n "$1" ]]; then
         {
             t_visit_line v1 "Running visit [deposit_and_buy_success]" deposit_and_buy_success
@@ -1907,8 +2434,8 @@ t_conclude "$check"
 check="finishRun_endOfRun_writesTableAndRestoresFlagOrEndsRun"
 t_new_case
 FLAG_INITIAL="true"
-t_respond PUT "$FLAG_URL" 200 '@request'
-t_respond GET "$FLAG_URL" 200 '{"id":"portfolio-insights-enabled","enabled":true}'
+t_respond PUT "$FLAG_URL" 200 '@flag'
+t_respond GET "$FLAG_URL" 200 '@flag'
 t_run_sub finish_run
 t_expect "restored: exit status" "$T_STATUS" 0
 t_expect_line "restored: table" "$T_CASE_DIR/out" "PASS table: $OUT_FILE"
@@ -1932,8 +2459,8 @@ check="finishRun_tableNotGenerated_failsTableAndExitsOne"
 t_new_case
 FLAG_INITIAL="true"
 printf '%s\n' '{"long_sell_error":' >"$RUN_DIR/breakdown-B.json"
-t_respond PUT "$FLAG_URL" 200 '@request'
-t_respond GET "$FLAG_URL" 200 '{"id":"portfolio-insights-enabled","enabled":true}'
+t_respond PUT "$FLAG_URL" 200 '@flag'
+t_respond GET "$FLAG_URL" 200 '@flag'
 t_run_sub t_finish_through_cleanup
 t_expect "exit status" "$T_STATUS" 1
 t_expect_line "table verdict" "$T_CASE_DIR/out" \
@@ -2116,46 +2643,85 @@ check="cleanup_flagOffWithOwnedAlerts_enablesFlagToDeleteThenRestoresIt"
 t_new_case
 FLAG_INITIAL="false"
 printf '%s\n' "$ID1" >"$RUN_DIR/owned"
-t_respond GET "$FLAG_URL" 200 '{"id":"portfolio-insights-enabled","enabled":false}'
-t_respond PUT "$FLAG_URL" 200 '@request'
+t_respond GET "$FLAG_URL" 200 '@flag'
+t_respond PUT "$FLAG_URL" 200 '@flag'
 t_respond DELETE "$ALERTS_URL/$ID1" 204
 t_run_sub t_exit_through_cleanup 0
 t_expect "requests" "$(<"$STUB_DIR/http.calls")" "GET $FLAG_URL
 PUT $FLAG_URL {\"enabled\": true}
+GET $FLAG_URL
 DELETE $ALERTS_URL/$ID1
-PUT $FLAG_URL {\"enabled\": false}"
+PUT $FLAG_URL {\"enabled\": false}
+GET $FLAG_URL"
 t_expect "exit status" "$T_STATUS" 0
+t_expect_line "switched on" "$T_CASE_DIR/out" \
+    "INFO cleanup: flag $FLAG_ID switched on to delete 1 owned alerts (status 200)"
+t_expect_line "restored" "$T_CASE_DIR/out" "INFO cleanup: flag $FLAG_ID restored to enabled=false"
 t_expect_line "cleanup verdict" "$T_CASE_DIR/out" "PASS cleanup"
+t_conclude "$check"
+
+check="cleanup_preDeleteFlagReplies_switchesFlagOnOnlyWhenTheFlagReadsOff"
+# LABEL;GET_FILTER;PUT_FILTER;STATUS;METHODS;LINE: with one owned alert, the flag read answers
+# T_FLAG_OFF after GET_FILTER and every PUT T_FLAG_OFF after PUT_FILTER. Cleanup exits STATUS
+# after requests of METHODS in order, and reports INFO "cleanup: flag portfolio-insights-enabled
+# LINE".
+for row in 'quoted enabled;.enabled = "false";.;0;GET DELETE;not read before deleting 1 owned alerts: GET portfolio-insights-enabled gave status 200 with a reply that is not the flag: enabled is not a boolean' \
+    'another flag;.id = "db_not_responding";.;0;GET DELETE;not read before deleting 1 owned alerts: GET portfolio-insights-enabled gave status 200 with a reply that is not the flag: id is not portfolio-insights-enabled' \
+    'switch answered with a quoted boolean;.;.enabled = "true";1;GET PUT DELETE PUT;not confirmed switched on to delete 1 owned alerts: PUT {"enabled": true} gave status 200 with a reply that is not the flag: enabled is not a boolean'; do
+    IFS=';' read -r t_label t_get_filter t_put_filter t_expected t_methods t_line <<<"$row"
+    t_new_case
+    FLAG_INITIAL="false"
+    printf '%s\n' "$ID1" >"$RUN_DIR/owned"
+    t_respond GET "$FLAG_URL" 200 "$(t_flag_body "$t_get_filter")"
+    t_respond PUT "$FLAG_URL" 200 "$(t_flag_body "$t_put_filter")"
+    t_respond DELETE "$ALERTS_URL/$ID1" 204
+    t_run_sub t_exit_through_cleanup 0
+    mapfile -t t_requests <"$STUB_DIR/http.calls"
+    t_expect "$t_label" "$T_STATUS|${t_requests[*]%% *}" "$t_expected|$t_methods"
+    t_expect_line "$t_label: flag line" "$T_CASE_DIR/out" "INFO cleanup: flag $FLAG_ID $t_line"
+done
+t_conclude "$check"
+
+check="cleanup_flagRestore_restoresOnlyWhenPutAndReadBackGiveInitialValue"
+# LABEL;PUT_STATUS;PUT_FILTER;GET_FILTER;REASON: the restore PUT answers PUT_STATUS with T_FLAG_OFF
+# after PUT_FILTER, 000 being a transport error, and the read-back T_FLAG_OFF after GET_FILTER, or a
+# transport error for an empty GET_FILTER. An empty REASON is a restore; any other fails cleanup.
+for row in 'restored;200;.;.;' \
+    'PUT refused;500;{error: "internal"};.;PUT {"enabled": false} gave status 500' \
+    "flag service unreachable;000;.;;PUT {\"enabled\": false} gave transport error ($T_CURL_REFUSED)" \
+    'PUT gives the flag on;200;.enabled = true;.;PUT {"enabled": false} gave status 200 with enabled=true, expected false' \
+    'PUT gives a quoted boolean;200;.enabled = "false";.;PUT {"enabled": false} gave status 200 with a reply that is not the flag: enabled is not a boolean' \
+    'read back differs;200;.;.enabled = true;read-back gave status 200 with enabled=true, expected false' \
+    'read back quoted;200;.;.enabled = "false";read-back gave status 200 with a reply that is not the flag: enabled is not a boolean' \
+    'read back of another flag;200;.;.id = "db_not_responding";read-back gave status 200 with a reply that is not the flag: id is not portfolio-insights-enabled' \
+    "read back unreachable;200;.;;read-back gave transport error ($T_CURL_REFUSED)"; do
+    IFS=';' read -r t_label t_put_status t_put_filter t_get_filter t_reason <<<"$row"
+    t_new_case
+    FLAG_TOUCHED=1
+    FLAG_INITIAL="false"
+    t_respond PUT "$FLAG_URL" "$t_put_status" "$(t_flag_body "$t_put_filter")"
+    if [[ -n "$t_get_filter" ]]; then
+        t_respond GET "$FLAG_URL" 200 "$(t_flag_body "$t_get_filter")"
+    fi
+    t_run_sub t_exit_through_cleanup 0
+    if [[ -z "$t_reason" ]]; then
+        t_expect "$t_label: exit status" "$T_STATUS" 0
+        t_expect_line "$t_label: flag line" "$T_CASE_DIR/out" "INFO cleanup: flag $FLAG_ID restored to enabled=false"
+        t_expect_line "$t_label: verdict" "$T_CASE_DIR/out" "PASS cleanup"
+    else
+        t_expect "$t_label: exit status" "$T_STATUS" 1
+        t_expect_line "$t_label: verdict" "$T_CASE_DIR/out" \
+            "FAIL cleanup: flag $FLAG_ID not restored to enabled=false: $t_reason"
+        t_expect_no_match "$t_label: no restored line" "$T_CASE_DIR/out" '^INFO cleanup: flag .* restored to '
+    fi
+done
 t_conclude "$check"
 
 check="cleanup_failures_failsCleanupAndExitsOne"
 t_new_case
-FLAG_TOUCHED=1
-FLAG_INITIAL="false"
-t_respond PUT "$FLAG_URL" 500 '{"error":"internal"}'
-t_run_sub t_exit_through_cleanup 0
-t_expect "flag restore refused: exit status" "$T_STATUS" 1
-t_expect_line "flag restore refused" "$T_CASE_DIR/out" \
-    "FAIL cleanup: flag $FLAG_ID not restored to enabled=false: status 500"
-t_new_case
-FLAG_TOUCHED=1
-FLAG_INITIAL="false"
-t_run_sub t_exit_through_cleanup 0
-t_expect "flag service unreachable: exit status" "$T_STATUS" 1
-t_expect_line "flag service unreachable" "$T_CASE_DIR/out" \
-    "FAIL cleanup: flag $FLAG_ID not restored to enabled=false: transport error ($T_CURL_REFUSED)"
-t_new_case
-FLAG_TOUCHED=1
-FLAG_INITIAL="false"
-t_respond PUT "$FLAG_URL" 200 '{"id":"portfolio-insights-enabled","enabled":true}'
-t_run_sub t_exit_through_cleanup 0
-t_expect "flag read back differs: exit status" "$T_STATUS" 1
-t_expect_line "flag read back differs" "$T_CASE_DIR/out" \
-    "FAIL cleanup: flag $FLAG_ID not restored to enabled=false: status 200"
-t_new_case
 FLAG_INITIAL="true"
 printf '%s\n' "$ID1" "$ID2" >"$RUN_DIR/owned"
-t_respond GET "$FLAG_URL" 200 '{"id":"portfolio-insights-enabled","enabled":true}'
+t_respond GET "$FLAG_URL" 200 "$T_FLAG_ON"
 t_respond DELETE "$ALERTS_URL/$ID1" 500 '{"error":"internal"}'
 t_run_sub t_exit_through_cleanup 0
 t_expect "alerts left in place: exit status" "$T_STATUS" 1
@@ -2177,21 +2743,32 @@ rm -f "$RUN_DIR/owned"
 mkdir "$RUN_DIR/owned"
 FLAG_TOUCHED=1
 FLAG_INITIAL="false"
-t_respond PUT "$FLAG_URL" 200 '@request'
+t_respond PUT "$FLAG_URL" 200 '@flag'
+t_respond GET "$FLAG_URL" 200 '@flag'
 LOADGEN_TOUCHED=1
 TABLE_WRITTEN=1
 LOADGEN_WAS_RUNNING=1
 LOADGEN_AT_START="running, PORTFOLIO_INSIGHTS_ALERT_WEIGHT=0"
 echo loadgen >"$STUB_DIR/running"
+# loadgen's container at start, with the image ID, config hash and effective configuration that
+# check_loadgen_restorable records for restore_loadgen to verify.
+printf '%s\n' "PATH=/usr/local/bin" "PORTFOLIO_INSIGHTS_ALERT_WEIGHT=0" >"$STUB_DIR/env.loadgen"
+t_identity=""
+if ! t_identity="$(loadgen_identity "$RUN_DIR/loadgen-at-start.config.json")" || [[ -z "$t_identity" ]]; then
+    t_reasons+=("loadgen at start: loadgen_identity read no container")
+fi
+IFS=$'\t' read -r LOADGEN_IMAGE_AT_START LOADGEN_HASH_AT_START _ <<<"$t_identity"
+LOADGEN_CONFIG_AT_START="$RUN_DIR/loadgen-at-start.config.json"
 t_run_sub t_exit_through_cleanup 0
 t_expect "exit status and requests" "$T_STATUS|$(<"$STUB_DIR/http.calls")" \
-    "1|PUT $FLAG_URL {\"enabled\": false}"
+    "1|PUT $FLAG_URL {\"enabled\": false}
+GET $FLAG_URL"
 t_expect_line "verdict" "$T_CASE_DIR/out" \
     "FAIL cleanup: owned-alert lists of the run dir could not be read or written, owned alerts not deleted"
 t_expect_line "flag restored" "$T_CASE_DIR/out" "INFO cleanup: flag $FLAG_ID restored to enabled=false"
 t_expect "loadgen recreated" "$(t_lines "$STUB_DIR/up.env")" "PORTFOLIO_INSIGHTS_ALERT_WEIGHT=0"
 t_expect_line "loadgen restored" "$T_CASE_DIR/out" \
-    "INFO cleanup: loadgen restored as at start: running, PORTFOLIO_INSIGHTS_ALERT_WEIGHT=0"
+    "INFO cleanup: loadgen restored as at start: running, PORTFOLIO_INSIGHTS_ALERT_WEIGHT=0, image ID 0123456789ab, config hash fedcba987654, effective configuration verified as recorded at start"
 printf -v t_line '%s --resume-cleanup %q' \
     "INFO cleanup: to delete the owned alerts left, and only those, run: scripts/portfolio-insights/loadgen-check.sh --project et-test --base-url http://stub.invalid --compose-file compose.dev.yaml" \
     "$RUN_DIR"
@@ -2205,8 +2782,8 @@ check="cleanup_receiptNotRecorded_failsWithIdLeftAndRestoresFlag"
 t_new_case
 FLAG_INITIAL="false"
 printf '%s\n' "$ID1" >"$RUN_DIR/owned"
-t_respond GET "$FLAG_URL" 200 '{"id":"portfolio-insights-enabled","enabled":false}'
-t_respond PUT "$FLAG_URL" 200 '@request'
+t_respond GET "$FLAG_URL" 200 '@flag'
+t_respond PUT "$FLAG_URL" 200 '@flag'
 t_respond DELETE "$ALERTS_URL/$ID1" 204
 chmod a-w "$RUN_DIR/deleted"
 # A user who can write a read-only file, as root can, cannot set up this case.
@@ -2217,8 +2794,10 @@ t_run_sub t_exit_through_cleanup 0
 chmod u+w "$RUN_DIR/deleted"
 t_expect "exit status and requests" "$T_STATUS|$(<"$STUB_DIR/http.calls")" "1|GET $FLAG_URL
 PUT $FLAG_URL {\"enabled\": true}
+GET $FLAG_URL
 DELETE $ALERTS_URL/$ID1
-PUT $FLAG_URL {\"enabled\": false}"
+PUT $FLAG_URL {\"enabled\": false}
+GET $FLAG_URL"
 t_expect "deleted list" "$(t_count "$RUN_DIR/deleted")" 0
 t_expect_line "id left" "$T_CASE_DIR/out" \
     "INFO cleanup left alert $ID1: gone (status 204), but $RUN_DIR/deleted could not record it; a resume DELETEs it again"
@@ -2375,8 +2954,8 @@ check="main_resumeCleanup_deletesOnlyOwnedIdsNotDeletedAndRestoresFlag"
 t_new_case
 t_resumable_run_dir
 echo "earlier verdict" >"$RUN_DIR/verdicts"
-t_respond GET "$FLAG_URL" 200 '{"id":"portfolio-insights-enabled","enabled":false,"isModifiable":true}'
-t_respond PUT "$FLAG_URL" 200 '@request'
+t_respond GET "$FLAG_URL" 200 '@flag'
+t_respond PUT "$FLAG_URL" 200 '@flag'
 t_respond DELETE "$ALERTS_URL/$ID2" 204
 t_respond DELETE "$ALERTS_URL/$ID3" 404 '{"error":"not_found"}'
 # A trailing slash on --base-url is the origin the record holds.
@@ -2385,16 +2964,18 @@ t_expect "exit status" "$T_STATUS" 0
 t_expect "requests" "$(<"$STUB_DIR/http.calls")" "GET $FLAG_URL
 GET $FLAG_URL
 PUT $FLAG_URL {\"enabled\": true}
+GET $FLAG_URL
 DELETE $ALERTS_URL/$ID2
 DELETE $ALERTS_URL/$ID3
-PUT $FLAG_URL {\"enabled\": false}"
+PUT $FLAG_URL {\"enabled\": false}
+GET $FLAG_URL"
 t_expect_line "flag read" "$T_CASE_DIR/out" "PASS resume flag: enabled=false"
 t_expect_line "ids left" "$T_CASE_DIR/out" \
     "INFO resume: 2 owned alerts of this run directory are not deleted yet"
 t_expect_line "ids deleted" "$T_CASE_DIR/out" "INFO cleanup: 2 of 2 owned alerts deleted or already absent"
 t_expect_line "flag restored" "$T_CASE_DIR/out" "INFO cleanup: flag $FLAG_ID restored to enabled=false"
 t_expect_line "cleanup verdict" "$T_CASE_DIR/out" "PASS cleanup"
-t_expect_line "summary" "$T_CASE_DIR/out" "SUMMARY 2 passed, 0 failed"
+t_expect_line "summary" "$T_CASE_DIR/out" "SUMMARY 3 passed, 0 failed"
 t_expect "deleted list" "$(t_lines "$RUN_DIR/deleted")" "$ID1 $ID2 $ID3"
 # Besides check_tools's docker compose version, the only Docker calls are the two reads that bind
 # --base-url to the project: no loadgen or database call.
@@ -2436,10 +3017,11 @@ t_expect_line "second resume: cleanup verdict" "$T_CASE_DIR/out" "PASS cleanup"
 t_conclude "$check"
 
 check="main_resumeCleanupFlagUnreadable_exitsOneWithoutDeleting"
-# ROW|ANSWER|REASON: the flag read's status and body, and the reason the check gives.
+# ROW|ANSWER|REASON: the flag read's status and body, a 200 body being T_FLAG_OFF with one rule
+# broken (t_flag_body), and the reason the check gives.
 for row in "flag service fails|500 {\"error\":\"internal\"}|GET $FLAG_ID gave status 500" \
-    "enabled a string|200 {\"id\":\"$FLAG_ID\",\"enabled\":\"false\"}|GET $FLAG_ID answered without its id and a boolean enabled" \
-    "another flag|200 {\"id\":\"other\",\"enabled\":false}|GET $FLAG_ID answered without its id and a boolean enabled"; do
+    "enabled a string|200 $(t_flag_body '.enabled = "false"')|GET $FLAG_ID gave status 200 with a reply that is not the flag: enabled is not a boolean" \
+    "another flag|200 $(t_flag_body '.id = "other"')|GET $FLAG_ID gave status 200 with a reply that is not the flag: id is not $FLAG_ID"; do
     IFS='|' read -r t_label t_answer t_reason <<<"$row"
     t_new_case
     t_resumable_run_dir
@@ -2448,7 +3030,7 @@ for row in "flag service fails|500 {\"error\":\"internal\"}|GET $FLAG_ID gave st
     t_run_sub t_resume --project et-test --base-url "$T_RESUME_BASE"
     t_expect "$t_label: exit status and requests" "$T_STATUS|$(<"$STUB_DIR/http.calls")" "1|GET $FLAG_URL"
     t_expect_line "$t_label: verdict" "$T_CASE_DIR/out" "FAIL resume flag: $t_reason; nothing was deleted"
-    t_expect_line "$t_label: summary" "$T_CASE_DIR/out" "SUMMARY 0 passed, 1 failed"
+    t_expect_line "$t_label: summary" "$T_CASE_DIR/out" "SUMMARY 1 passed, 1 failed"
     t_expect "$t_label: deleted list" "$(t_lines "$RUN_DIR/deleted")" "$ID1"
 done
 t_conclude "$check"
@@ -2460,8 +3042,8 @@ check="main_resumeCleanupLedgerUnwritable_printsNoCountAndFailsCleanup"
 t_new_case
 t_resumable_run_dir
 mkdir "$RUN_DIR/owned.sorted"
-t_respond GET "$FLAG_URL" 200 '{"id":"portfolio-insights-enabled","enabled":false}'
-t_respond PUT "$FLAG_URL" 200 '@request'
+t_respond GET "$FLAG_URL" 200 '@flag'
+t_respond PUT "$FLAG_URL" 200 '@flag'
 t_respond DELETE "$ALERTS_URL/$ID2" 204
 t_respond DELETE "$ALERTS_URL/$ID3" 204
 t_run_sub t_resume --project et-test --base-url "$T_RESUME_BASE"
@@ -2474,7 +3056,7 @@ printf -v t_line 'INFO cleanup: to delete the owned alerts left, and only those,
     scripts/portfolio-insights/loadgen-check.sh et-test "$T_RESUME_BASE" "$T_CASE_DIR/compose.yaml" \
     "$RUN_DIR"
 t_expect_line "resume command" "$T_CASE_DIR/out" "$t_line"
-t_expect_line "summary" "$T_CASE_DIR/out" "SUMMARY 1 passed, 1 failed"
+t_expect_line "summary" "$T_CASE_DIR/out" "SUMMARY 2 passed, 1 failed"
 t_expect "deleted list" "$(t_lines "$RUN_DIR/deleted")" "$ID1"
 t_conclude "$check"
 
@@ -2493,7 +3075,7 @@ for row in "wildcard binding, localhost|http://localhost:20480|0.0.0.0:20480" \
     IFS='|' read -r t_label t_base t_published <<<"$row"
     t_new_case
     t_resumable_run_dir "$t_base" "$t_published"
-    t_respond GET "$FLAG_URL" 200 '{"id":"portfolio-insights-enabled","enabled":true}'
+    t_respond GET "$FLAG_URL" 200 "$T_FLAG_ON"
     t_respond DELETE "$ALERTS_URL/$ID2" 204
     t_respond DELETE "$ALERTS_URL/$ID3" 204
     t_run_sub t_resume --project et-test --base-url "$t_base"
@@ -2525,7 +3107,7 @@ for row in "reverse-proxy not running in --project" "running services unreadable
         "binding on another host address") t_published="192.0.2.10:20480" ;;
     esac
     t_resumable_run_dir "$t_base" "$t_published"
-    t_respond GET "$FLAG_URL" 200 '{"id":"portfolio-insights-enabled","enabled":true}'
+    t_respond GET "$FLAG_URL" 200 "$T_FLAG_ON"
     t_respond DELETE "$ALERTS_URL/$ID2" 204
     t_respond DELETE "$ALERTS_URL/$ID3" 204
     case "$row" in
@@ -2566,12 +3148,58 @@ for row in "reverse-proxy not running in --project" "running services unreadable
 done
 t_conclude "$check"
 
+check="main_resumeCleanupRunLockHeld_failsBeforeFlagReadAndKeepsTheLock"
+# Another run on the project holds its lock, with an owner file as acquire_run_lock writes it: the
+# resume stops at the lock, before it reads the flag or deletes anything, and leaves that run's
+# lock as it was.
+t_new_case
+t_resumable_run_dir
+mkdir "$(t_lock_dir)"
+t_owner_fields >"$(t_lock_dir)/owner"
+t_respond GET "$FLAG_URL" 200 "$T_FLAG_OFF"
+t_respond PUT "$FLAG_URL" 200 '@flag'
+t_respond DELETE "$ALERTS_URL/$ID2" 204
+t_respond DELETE "$ALERTS_URL/$ID3" 204
+t_run_sub t_resume --project et-test --base-url "$T_RESUME_BASE"
+t_expect "exit status and requests" "$T_STATUS|$(<"$STUB_DIR/http.calls")" "1|"
+t_expect_line "verdict" "$T_CASE_DIR/out" \
+    "FAIL run lock: $(t_refusal "started 2026-01-01T00:00:00Z, pid 1, host other-host.invalid, run dir /tmp/pi-loadgen.AbC123")"
+t_expect_line "summary" "$T_CASE_DIR/out" "SUMMARY 0 passed, 1 failed"
+t_expect_no_match "no flag read, cleanup or release" "$T_CASE_DIR/out" '^PASS |^INFO cleanup|resume flag'
+t_expect "deleted list" "$(t_lines "$RUN_DIR/deleted")" "$ID1"
+t_expect "holder's lock kept" "$(t_lock_presence "$(t_lock_dir)")|$(<"$(t_lock_dir)/owner")" \
+    "present|$(t_owner_fields)"
+t_conclude "$check"
+
+check="main_resumeCleanup_runLock_releasedOnEveryEnd"
+# ROW|STATUS|BODY|EXIT: the flag read answers STATUS with BODY, @flag being the flag off, so that
+# cleanup takes over and deletes, and the resume exits EXIT. Either way the resume takes the
+# project's lock under the case's LOCK_ROOT, never under the /tmp the script names, and releases
+# it: through cleanup, or through resume_exit when it ends at the flag read.
+for row in "cleanup ran|200|@flag|0" "flag read failed|500|{\"error\":\"internal\"}|1"; do
+    IFS='|' read -r t_label t_status t_body t_exit <<<"$row"
+    t_new_case
+    t_resumable_run_dir
+    t_respond GET "$FLAG_URL" "$t_status" "$t_body"
+    t_respond PUT "$FLAG_URL" 200 '@flag'
+    t_respond DELETE "$ALERTS_URL/$ID2" 204
+    t_respond DELETE "$ALERTS_URL/$ID3" 204
+    t_run_sub t_resume --project et-test --base-url "$T_RESUME_BASE"
+    t_expect "$t_label: exit status" "$T_STATUS" "$t_exit"
+    t_expect_line "$t_label: lock taken under LOCK_ROOT" "$T_CASE_DIR/out" \
+        "PASS run lock: $T_CASE_DIR/pi-loadgen-check.et-test.lock"
+    t_expect_line "$t_label: released" "$T_CASE_DIR/out" "INFO cleanup: run lock $(t_lock_dir) released"
+    t_expect "$t_label: lock removed" "$(t_lock_presence "$(t_lock_dir)")" absent
+    t_expect "$t_label: no lock under /tmp" "$(t_lock_presence /tmp/pi-loadgen-check.et-test.lock)" absent
+done
+t_conclude "$check"
+
 check="cleanup_alertsLeft_printsResumeCommandOnlyForIdsLeft"
 # ROW: which owned alerts cleanup leaves, and the Compose files of the run.
 for row in "one left" "one left, compose file with a space" "only a refused line left" "none left"; do
     t_new_case
     FLAG_INITIAL="true"
-    t_respond GET "$FLAG_URL" 200 '{"id":"portfolio-insights-enabled","enabled":true}'
+    t_respond GET "$FLAG_URL" 200 "$T_FLAG_ON"
     t_respond DELETE "$ALERTS_URL/$ID1" 500 '{"error":"internal"}'
     t_respond DELETE "$ALERTS_URL/$ID2" 204
     t_extra=""
@@ -2614,7 +3242,7 @@ t_resumable_run_dir
 : >"$RUN_DIR/deleted"
 printf '%s\n' "$ID1" "$ID2" >"$RUN_DIR/owned"
 FLAG_INITIAL="true"
-t_respond GET "$FLAG_URL" 200 '{"id":"portfolio-insights-enabled","enabled":true}'
+t_respond GET "$FLAG_URL" 200 "$T_FLAG_ON"
 t_respond DELETE "$ALERTS_URL/$ID2" 204
 t_respond_transient DELETE "$ALERTS_URL/$ID1" 3
 t_respond DELETE "$ALERTS_URL/$ID1" 204

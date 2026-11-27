@@ -6,25 +6,45 @@
 # The script enables the portfolio-insights-enabled flag itself and restores it on exit.
 #
 # Usage: scripts/portfolio-insights/perf.sh --project NAME [--base-url URL] [--compose-file FILE]
-#   --project NAME       Compose project of the running stack (required)
+#   --project NAME       Compose project of the running stack (required): lowercase letters,
+#                        digits, dashes and underscores, starting with a letter or digit
 #   --base-url URL       Reverse-proxy origin of that stack (default: http://localhost)
 #   --compose-file FILE  Compose file of that project, relative to the current directory
 #                        (default: compose.dev.yaml)
 #   -h, --help           Show this help and exit
 #
-# One project per invocation. Never run it alongside e2e.sh or loadgen-check.sh: all three
-# toggle the same flag and work on the same preset accounts.
+# One project per invocation, and one invocation per project at a time: before it reads or
+# changes the stack, a run takes the project's run lock, bound to the project on its Docker
+# engine as a stopped container named pi-perf-lock.<project>, and a second run is refused while
+# a live run holds it. A run removes its lock container on exit; the lock container of a run
+# that was killed is reclaimed by the next run on the same host. Never run it alongside e2e.sh
+# or loadgen-check.sh: all three toggle the same flag and work on the same preset accounts.
 #
 # What it touches: it reads the 25 PRESET accounts without trading on them, creates 1,000
 # alerts of its own on them, stops loadgen while it measures, and runs read-only SELECTs
 # through the db container's own client. On exit, normal or not, it deletes every alert it
 # created by id, restores the flag to the value it read at start, and starts loadgen again
-# only if loadgen was running at start.
+# only if loadgen was running at start. A DELETE that ends in a transport error or a 5xx is
+# tried twice more. After a 403 it reads the flag: a flag at enabled=false is switched on and the
+# DELETE tried once more, one at enabled=true gets that try without a PUT, and one it cannot read
+# changes nothing. A create whose outcome is unknown, such as a POST cut off by an interrupt, is
+# looked for among its account's alerts and deleted by id when its alert can be told from all
+# others: by the fields it was created with, armingRevision 1, and a createdAt at or after the
+# run's cycle precondition. Otherwise nothing is deleted for it and the cleanup check fails,
+# naming the account, type, instrument, direction and threshold.
+# It keeps state under ${TMPDIR:-/tmp}/pi-perf-state.<project>: a record of every run
+# directory whose owned alerts are not all deleted or whose unknown creates are not all
+# reconciled. Each create is written to the run directory before its POST is sent, so the one in
+# flight when a run is killed outright, which runs no cleanup, is among its unknown creates. The
+# next run on the project with the same base url and compose file deletes those alerts by id and
+# looks for those creates' alerts first, as its "recovery" check, before it measures; a record
+# made with another base url or compose file stops it before it changes anything.
 #
-# Prints one PASS or FAIL line per check, a REPORT block and a final SUMMARY line. Exits 0
-# when every check passes, 1 when any check fails, 2 on a usage error, a missing tool or a run
-# directory it cannot make, and 130 on an interrupt. Working files stay in the run directory
-# printed at start and end.
+# Prints one PASS or FAIL line per check, a REPORT block and a final SUMMARY line, on the run's
+# own stdout even when an interrupt or an error ends the run while a step writes to a file.
+# Exits 0 when every check passes, 1 when any check fails, 2 on a usage error, a missing tool, a
+# run directory it cannot make or a closed stdout, and 130 on an interrupt. Working files stay
+# in the run directory printed at start and end.
 
 set -euo pipefail
 
@@ -83,8 +103,28 @@ CYCLE_WAIT_MARGIN_SECONDS=30
 # The broker's interval rule: a whole number from 1 to 4294967 seconds, otherwise 60.
 DEFAULT_INTERVAL_SECONDS=60
 MAX_INTERVAL_SECONDS=4294967
-# Cleanup stops sending DELETEs after this many transport errors in a row.
+# Cleanup stops sending DELETEs after this many alerts in a row whose every attempt ended in a
+# transport error.
 MAX_CONSECUTIVE_TRANSPORT_ERRORS=5
+# Each DELETE that ends in a transport error or a 5xx is tried up to DELETE_ATTEMPTS times, the
+# retry after attempt n waiting n * DELETE_RETRY_STEP_SECONDS (1 s, then 2 s).
+DELETE_ATTEMPTS=3
+DELETE_RETRY_STEP_SECONDS=1
+# A DELETE answers 403 when someone switched the flag off, or while the broker cannot read it;
+# one cleanup reads the flag after a 403, and switches it on again or tries the id once more, at
+# most this many times, so a flag toggled off over and over cannot hold the exit.
+MAX_FLAG_REENABLES=3
+# A create whose outcome is unknown is looked for among its account's alerts every
+# UNKNOWN_CREATE_STEP_SECONDS until UNKNOWN_CREATE_SETTLE_SECONDS after its POST ended. The
+# broker may still be writing the alert after the POST's curl has ended: its create call to
+# db-adapter has a 10 s deadline (AlertRepository.CallTimeout), and the flag read and account
+# reads before that call take their own time; 30 s covers them with a margin. A create carried
+# from an earlier run is looked for until HTTP_TIMEOUT_SECONDS + UNKNOWN_CREATE_SETTLE_SECONDS
+# after this run adopted it: that run had ended by then, and the curl of a POST that its kill
+# left running ends within HTTP_TIMEOUT_SECONDS.
+UNKNOWN_CREATE_SETTLE_SECONDS=30
+UNKNOWN_CREATE_STEP_SECONDS=5
+UNKNOWN_CREATE_NOTE="the alert may exist without an id this run knows; cleanup looks for it among the account's alerts"
 
 CYCLE_MARKER="Alert evaluation cycle finished"
 CYCLE_RE='alerts \[([0-9]+)\] triggered \[([0-9]+)\] failed \[([0-9]+)\] skipped \[([0-9]+)\] outcome \[([A-Za-z_]+)\] duration \[([0-9]+(\.[0-9]+)?)\] ms'
@@ -96,19 +136,26 @@ ARMED_TIME_RE='^at,([0-9]{4}-[0-9]{2}-[0-9]{2})t([0-9]{2}:[0-9]{2}:[0-9]{2})(\.[
 usage() {
     cat <<'EOF'
 Usage: scripts/portfolio-insights/perf.sh --project NAME [--base-url URL] [--compose-file FILE]
-  --project NAME       Compose project of the running stack (required)
+  --project NAME       Compose project of the running stack (required): lowercase letters,
+                       digits, dashes and underscores, starting with a letter or digit
   --base-url URL       Reverse-proxy origin of that stack (default: http://localhost)
   --compose-file FILE  Compose file of that project, relative to the current directory
                        (default: compose.dev.yaml)
   -h, --help           Show this help and exit
-Run one project at a time, never alongside e2e.sh or loadgen-check.sh.
+Run one project at a time, never alongside e2e.sh or loadgen-check.sh; a second run on the
+same project is refused while the first holds its run lock, a stopped container named
+pi-perf-lock.NAME on the project's Docker engine. The next run on the same host reclaims the
+lock container of a run that was killed. Owned alerts a run could not
+delete are recorded under ${TMPDIR:-/tmp}/pi-perf-state.NAME, and the next run on NAME with
+the same --base-url and --compose-file deletes them by id before it measures.
 
 Examples:
   scripts/portfolio-insights/perf.sh --project pi-dev-postgres
   scripts/portfolio-insights/perf.sh --project pi-dev-mssql --base-url http://localhost \
       --compose-file compose.dev.yaml
 
-Exit: 0 all passed, 1 a check failed, 2 bad usage, missing tool or no run dir, 130 interrupted.
+Exit: 0 all passed, 1 a check failed, 2 bad usage, missing tool, no run dir or closed stdout,
+130 interrupted.
 EOF
 }
 
@@ -213,9 +260,9 @@ is_base_origin() {
     [[ -z "$port" ]] || { [[ "$port" == :* ]] && is_port_number "${port#:}"; }
 }
 
-# parse_options ARGS...: sets BASE_URL, COMPOSE_FILE and PROJECT from the command line. A usage
-# error prints its reason and the usage on stderr and exits 2; -h or --help prints the usage on
-# stdout and exits 0.
+# parse_options ARGS...: sets BASE_URL, COMPOSE_FILE and PROJECT from the command line, and
+# COMPOSE_PATH to the compose file's absolute path. A usage error prints its reason and the usage
+# on stderr and exits 2; -h or --help prints the usage on stdout and exits 0.
 parse_options() {
     BASE_URL="http://localhost"
     COMPOSE_FILE="compose.dev.yaml"
@@ -251,6 +298,10 @@ parse_options() {
     if [[ -z "$PROJECT" ]]; then
         usage_error "Option --project is required."
     fi
+    # Compose's own rule for a project name; the name also keys this script's state directory.
+    if [[ ! "$PROJECT" =~ ^[abcdefghijklmnopqrstuvwxyz0123456789][abcdefghijklmnopqrstuvwxyz0123456789_-]*$ ]]; then
+        usage_error "Option --project needs a Compose project name: lowercase letters, digits, dashes and underscores, starting with a letter or digit."
+    fi
     # The refused value is never echoed, since it can hold credentials.
     if ! is_base_origin "$BASE_URL"; then
         usage_error "Option --base-url needs an http:// or https:// origin: a host and optional port, without credentials, path, query or fragment."
@@ -259,6 +310,8 @@ parse_options() {
     if [[ ! -f "$COMPOSE_FILE" ]]; then
         usage_error "Compose file not found: $COMPOSE_FILE (resolved from $(pwd); the repository root is $REPO_ROOT)"
     fi
+    # The compose file's absolute path, which the run record keeps (record_run).
+    COMPOSE_PATH="$(cd "$(dirname "$COMPOSE_FILE")" && pwd)/$(basename "$COMPOSE_FILE")"
 }
 
 # check_tools: exits 2 with the reason on stderr unless every program the run calls is on PATH
@@ -280,8 +333,16 @@ check_tools() {
     fi
 }
 
+# The run lock's owner labels (acquire_run_lock, read_lock_owner) are this prefix followed by
+# pid, host, started and run-dir.
+LOCK_LABEL_PREFIX="pi-perf.lock."
+# A container id as docker create prints it and docker inspect reads it: 64 lower-case hex
+# digits, of which Docker also accepts a 12-digit short form.
+CONTAINER_ID_RE='^[0-9a-f]{12}([0-9a-f]{52})?$'
+
 # prepare_run: makes the run directory under TMPDIR, with empty owned, expected and deleted
-# files, and sets the request URLs from BASE_URL. Exits 2 when the directory cannot be made.
+# files, sets the request URLs from BASE_URL, and sets STATE_DIR and LOCK_NAME from PROJECT.
+# It writes nothing under STATE_DIR and takes no lock. Exits 2 when the directory cannot be made.
 prepare_run() {
     if ! RUN_DIR="$(mktemp -d "${TMPDIR:-/tmp}/pi-perf.XXXXXX")"; then
         echo "Could not create a run directory under ${TMPDIR:-/tmp}." >&2
@@ -293,6 +354,13 @@ prepare_run() {
     FLAG_URL="$BASE_URL/feature-flag-service/v1/flags/$FLAG_ID"
     ALERTS_URL="$BASE_URL/broker-service/v1/alerts"
     INSIGHTS_URL="$BASE_URL/broker-service/v1/portfolio/insights"
+    # State kept between runs on one project, written only once main runs: runs/, one record
+    # per run directory that may still hold owned alerts not yet deleted.
+    STATE_DIR="${TMPDIR:-/tmp}/pi-perf-state.$PROJECT"
+    # The run lock: a container of this name on the project's Docker engine, which exists while a
+    # run holds the lock and carries that run's owner labels. Being a Docker name, it is the same
+    # for every run that reaches that engine, whatever its TMPDIR.
+    LOCK_NAME="pi-perf-lock.$PROJECT"
 }
 
 passed=0
@@ -306,9 +374,27 @@ FLAG_INITIAL=""
 FLAG_TOUCHED=0
 LOADGEN_WAS_RUNNING=0
 LOADGEN_STOPPED=0
+RUNNING_SERVICES=""
+LOCK_HELD=0
+# The id of the lock container this run created, the only one it ever releases.
+LOCK_ID=""
+RUN_RECORD=""
+REPORT_PRINTED=0
+# The descriptors, 8 and 9, that hold the copies of the run's own stdout and stderr install_traps
+# keeps for restore_run_output, empty until it has kept them.
+RUN_STDOUT_FD=""
+RUN_STDERR_FD=""
 DIALECT=""
 EVAL_INTERVAL=""
 STARTED_AT=""
+# The database's UTC time of the passed cycle precondition, empty until it passes; it is also
+# kept in $RUN_DIR/precondition-at for the next run (measure_cycle).
+PRECONDITION_AT=""
+# The settle deadline (on the $SECONDS clock) of the creates carried from earlier runs, set when
+# adopt_earlier_runs carries any; 0 until then.
+CARRIED_SETTLE_UNTIL=0
+# The number of lines of an unknown-creates file, as count_unknown_creates last counted them.
+UNKNOWN_COUNT=0
 # The deadline (on the $SECONDS clock) of the cycle wait running now (wait_cycle_line, or the
 # first read of open_verified_window), empty outside one, and why the last log read failed.
 PROBE_DEADLINE=""
@@ -344,8 +430,23 @@ info() {
     echo "INFO $*"
 }
 
-# Fails the check and ends the run through finish, so cleanup still runs.
+# restore_run_output: points stdout and stderr back at the run's own, which install_traps kept.
+# bash runs a trap inside the function it interrupts, under that function's redirections, and an
+# exit or abort inside a call whose output goes to a file, as read_window's log read into
+# broker.log or a compose call into compose.log, ends the run with that file as its output. So
+# on_exit and abort call this before they print, and the FAIL line, the REPORT, the cleanup check
+# and the SUMMARY reach the run's own output. Without the copies, as when a suite calls on_exit
+# or abort directly, stdout and stderr stay as they are.
+restore_run_output() {
+    if [[ -n "$RUN_STDOUT_FD" && -n "$RUN_STDERR_FD" ]]; then
+        exec 1>&"$RUN_STDOUT_FD" 2>&"$RUN_STDERR_FD"
+    fi
+}
+
+# Fails the check and ends the run through finish, so cleanup still runs, on the run's own
+# stdout and stderr (restore_run_output).
 abort() {
+    restore_run_output
     fail "$1" "$2"
     finish
 }
@@ -359,8 +460,18 @@ abort() {
 # 0 as no limit at all. Sets HTTP_STATUS (000 on a transport error or a refused limit),
 # HTTP_CTYPE, HTTP_BODY and HTTP_ERROR (curl's message on a transport error, or why the request
 # was not sent). Never trips set -e.
+# curl writes the record "<http_code> <exitcode> <content_type>", content_type last because it
+# can hold spaces. A complete record carries curl's own exit status and outranks the status of
+# the command substitution: under Git Bash an interrupt that arrives while curl runs sets that
+# status to 130 although curl finished the transfer. Without a record (a curl killed before it
+# wrote one) the substitution's status stands for curl's, and so it does when the record's exit
+# field is empty, as a curl older than 7.75 that knows no %{exitcode} writes it.
+# A POST creates an alert and is never repeated, so its curl ignores INT and TERM: an interrupt
+# cannot cut off a request the server may already have committed, and --max-time still bounds
+# it. Native Windows curl under Git Bash is killed by a TERM to its process group all the same;
+# post_alert records such a create for cleanup to reconcile.
 http_within() {
-    local max_time="$1" method="$2" url="$3" out rc=0
+    local max_time="$1" method="$2" url="$3" out rc=0 record_re='^([0-9]{3}) ([0-9]*) (.*)$'
     if [[ ! "$max_time" =~ ^[1-9][0-9]*$ ]]; then
         HTTP_STATUS="000"
         HTTP_CTYPE=""
@@ -369,20 +480,37 @@ http_within() {
         return 0
     fi
     local args=(-sS --max-time "$max_time" -X "$method"
-        -o "$RUN_DIR/body" -D "$RUN_DIR/headers" -w '%{http_code} %{content_type}'
+        -o "$RUN_DIR/body" -D "$RUN_DIR/headers" -w '%{http_code} %{exitcode} %{content_type}'
         -H 'Accept: application/json')
     if [[ $# -ge 4 ]]; then
         args+=(-H 'Content-Type: application/json' --data-binary "$4")
     fi
     : >"$RUN_DIR/body"
-    out="$(curl "${args[@]}" "$url" 2>"$RUN_DIR/curl-error")" || rc=$?
-    if [[ $rc -ne 0 ]]; then
+    if [[ "$method" == "POST" ]]; then
+        out="$(
+            trap '' INT TERM
+            curl "${args[@]}" "$url" 2>"$RUN_DIR/curl-error"
+        )" || rc=$?
+    else
+        out="$(curl "${args[@]}" "$url" 2>"$RUN_DIR/curl-error")" || rc=$?
+    fi
+    HTTP_STATUS="000"
+    HTTP_CTYPE=""
+    if [[ "$out" =~ $record_re ]]; then
+        if [[ -n "${BASH_REMATCH[2]}" ]]; then
+            rc="${BASH_REMATCH[2]}"
+        fi
+        HTTP_STATUS="${BASH_REMATCH[1]}"
+        HTTP_CTYPE="${BASH_REMATCH[3]}"
+    elif [[ "$rc" == "0" ]]; then
+        # A curl that ends with 0 but wrote no record has not reported any answer.
+        rc=1
+    fi
+    if [[ "$rc" != "0" ]]; then
         HTTP_STATUS="000"
         HTTP_CTYPE=""
         HTTP_ERROR="$(tr -d '\r' <"$RUN_DIR/curl-error" | head -c 300)"
     else
-        HTTP_STATUS="${out%% *}"
-        HTTP_CTYPE="${out#* }"
         HTTP_ERROR=""
     fi
     HTTP_BODY="$(cat "$RUN_DIR/body")"
@@ -394,9 +522,88 @@ http() {
     http_within "$HTTP_TIMEOUT_SECONDS" "$@"
 }
 
-# jget FILTER JSON: prints jq's raw output, or nothing when the JSON does not parse.
-jget() {
-    jq -r "$1" 2>/dev/null <<<"$2" | tr -d '\r' || true
+# read_flag JSON: reads a flag reply as exactly one JSON object whose id is FLAG_ID and whose
+# enabled and isModifiable are JSON booleans, and sets FLAG_ENABLED and FLAG_MODIFIABLE to true
+# or false. Each type is tested, because raw jq output reads the string "false" as the boolean.
+# Otherwise fails with FLAG_ERROR, a fixed reason that never repeats the reply.
+read_flag() {
+    local fields
+    FLAG_ENABLED=""
+    FLAG_MODIFIABLE=""
+    FLAG_ERROR=""
+    if ! fields="$(jq -rs --arg id "$FLAG_ID" "$JQ_ONE_VALUE"'
+        one_value
+        | if type != "object" then "object"
+          elif .id != $id then "id"
+          elif (.enabled | type) != "boolean" then "enabled"
+          elif (.isModifiable | type) != "boolean" then "isModifiable"
+          else "ok \(.enabled) \(.isModifiable)" end' 2>/dev/null <<<"$1" | tr -d '\r')"; then
+        fields="object"
+    fi
+    case "$fields" in
+        "ok true true" | "ok true false" | "ok false true" | "ok false false")
+            fields="${fields#ok }"
+            FLAG_ENABLED="${fields% *}"
+            FLAG_MODIFIABLE="${fields#* }"
+            return 0
+            ;;
+        id) FLAG_ERROR="its id is not $FLAG_ID" ;;
+        enabled) FLAG_ERROR="its enabled is not a JSON boolean" ;;
+        isModifiable) FLAG_ERROR="its isModifiable is not a JSON boolean" ;;
+        *) FLAG_ERROR="its reply is not one JSON object" ;;
+    esac
+    return 1
+}
+
+# put_flag VALUE: PUTs {"enabled": VALUE} and succeeds only when the reply, read by read_flag,
+# shows enabled VALUE: a 200 alone does not show that the flag holds it. Sets FLAG_PUT_ERROR to
+# the status or a fixed reason on failure.
+put_flag() {
+    FLAG_PUT_ERROR=""
+    http PUT "$FLAG_URL" "{\"enabled\": $1}"
+    if [[ "$HTTP_STATUS" != "200" ]]; then
+        FLAG_PUT_ERROR="$(status_text)"
+        return 1
+    fi
+    if ! read_flag "$HTTP_BODY"; then
+        FLAG_PUT_ERROR="status 200, but $FLAG_ERROR"
+        return 1
+    fi
+    if [[ "$FLAG_ENABLED" != "$1" ]]; then
+        FLAG_PUT_ERROR="status 200, but its reply shows enabled=$FLAG_ENABLED"
+        return 1
+    fi
+}
+
+# read_alert_reply JSON: reads the alert a create or re-arm answered with, as exactly one JSON
+# object, and sets REPLY_ID to its id when that is a canonical UUID string (lower-cased),
+# REPLY_ENABLED to true or false when enabled is a JSON boolean, and REPLY_REVISION to its
+# armingRevision when that is a JSON integer of 1 to 10 digits (a string "1" or 1.5 is not);
+# each is empty otherwise. Fails, all three empty, when the reply is not one JSON object.
+read_alert_reply() {
+    local fields id enabled revision
+    REPLY_ID=""
+    REPLY_ENABLED=""
+    REPLY_REVISION=""
+    if ! fields="$(jq -rs --arg re "$UUID_RE" "$JQ_CANONICAL$JQ_ONE_VALUE"'
+        one_value
+        | if type == "object" then . else error("not an object") end
+        | "\(.id | canonical // "-") \(.enabled | if type == "boolean" then tostring else "-" end) \(.armingRevision | if type == "number" then tojson else "-" end)"' \
+        2>/dev/null <<<"$1" | tr -d '\r')" || [[ ! "$fields" =~ ^([^\ ]+)\ ([^\ ]+)\ ([^\ ]+)$ ]]; then
+        return 1
+    fi
+    id="${BASH_REMATCH[1]}"
+    enabled="${BASH_REMATCH[2]}"
+    revision="${BASH_REMATCH[3]}"
+    if [[ "$id" =~ $UUID_RE ]]; then
+        REPLY_ID="$id"
+    fi
+    case "$enabled" in
+        true | false) REPLY_ENABLED="$enabled" ;;
+    esac
+    if [[ "$revision" =~ ^[1-9][0-9]{0,9}$ ]]; then
+        REPLY_REVISION="$revision"
+    fi
 }
 
 # Status text for a failure reason, with curl's message on a transport error.
@@ -486,10 +693,13 @@ nearest_rank() {
 
 # create_alert ACCOUNT TYPE INSTRUMENT DIRECTION THRESHOLD: POST /v1/alerts with the threshold
 # written into the body as the exact JSON number token, never converted. On 201 the id is
-# recorded as owned at once, so cleanup deletes it whatever happens next, and id,revision is
-# appended to the expected armed set. Sets CREATE_ERROR on failure.
-# An interrupt that arrives while the POST is in flight is held until the id is recorded:
-# exiting in between would leave an alert this run created but cannot delete.
+# recorded as owned at once, so cleanup deletes it whatever happens next, and id,1 is appended
+# to the expected armed set once the receipt shows the alert enabled at revision 1. A create
+# whose outcome is unknown is recorded for cleanup to reconcile (record_unknown_create). Sets
+# CREATE_ERROR on failure.
+# An interrupt that arrives while the POST is in flight is held until the id, or the unknown
+# outcome, is recorded: exiting in between would leave an alert this run created but cannot
+# delete. A kill that no trap sees is covered by post_alert's write-ahead record instead.
 create_alert() {
     local rc=0
     IN_CREATE=1
@@ -502,7 +712,7 @@ create_alert() {
 }
 
 post_alert() {
-    local strings body id revision fields
+    local strings body
     if [[ ! "$5" =~ ^-?(0|[1-9][0-9]*)(\.[0-9]+)?$ ]]; then
         CREATE_ERROR="threshold [$5] is not a plain decimal token"
         return 1
@@ -516,28 +726,76 @@ post_alert() {
         return 1
     fi
     body="${strings%?},\"threshold\":$5}"
+    # Write-ahead: the create goes to $RUN_DIR/in-flight-create before its POST is sent, and the
+    # file is emptied only once the outcome is recorded below, so a run killed in between, by a
+    # SIGKILL that runs no trap for one, still leaves the create for the next run to look for
+    # (earlier_open_creates). Its one line has the fields of an unknown-creates line, led by the
+    # number of lines unknown-creates held before this create instead of the second its POST
+    # ended: more lines than that show the create recorded there already. Nothing is sent without
+    # it.
+    count_unknown_creates "$RUN_DIR"
+    if ! printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$UNKNOWN_COUNT" "$1" "$2" "$3" "$4" "$5" \
+        >"$RUN_DIR/in-flight-create"; then
+        CREATE_ERROR="the create could not be written to $RUN_DIR/in-flight-create, so its POST was not sent"
+        return 1
+    fi
     http POST "$ALERTS_URL" "$body"
-    if [[ "$HTTP_STATUS" == "000" ]]; then
-        CREATE_ERROR="$(status_text); the alert may exist without an id this run knows"
+    # A 4xx refuses the create before anything is written. After any other answer but a 201,
+    # a transport error included, the alert may exist.
+    case "$HTTP_STATUS" in
+        201) ;;
+        4??)
+            : >"$RUN_DIR/in-flight-create"
+            CREATE_ERROR="$(status_text)"
+            return 1
+            ;;
+        *)
+            record_unknown_create "$@"
+            : >"$RUN_DIR/in-flight-create"
+            CREATE_ERROR="$(status_text); $UNKNOWN_CREATE_NOTE"
+            return 1
+            ;;
+    esac
+    # The id is recorded as soon as it is known, before the rest of the receipt is checked, so
+    # cleanup deletes the alert even when its receipt is refused. A create answers with the alert
+    # armed: enabled the JSON boolean true and armingRevision the JSON integer 1. Any other
+    # receipt fails the workload, since the measured set must be 1,000 alerts at revision 1.
+    if ! read_alert_reply "$HTTP_BODY" || [[ -z "$REPLY_ID" ]]; then
+        record_unknown_create "$@"
+        : >"$RUN_DIR/in-flight-create"
+        CREATE_ERROR="201 without a readable id; $UNKNOWN_CREATE_NOTE"
         return 1
     fi
-    if [[ "$HTTP_STATUS" != "201" ]]; then
-        CREATE_ERROR="$(status_text)"
+    echo "$REPLY_ID" >>"$RUN_DIR/owned"
+    : >"$RUN_DIR/in-flight-create"
+    if [[ "$REPLY_ENABLED" != "true" ]]; then
+        CREATE_ERROR="201 for alert [$REPLY_ID] whose enabled is not the JSON boolean true"
         return 1
     fi
-    fields="$(jget '"\(.id // "") \(.armingRevision // "")"' "$HTTP_BODY")"
-    id="$(tr '[:upper:]' '[:lower:]' <<<"${fields%% *}")"
-    revision="${fields#* }"
-    if [[ ! "$id" =~ $UUID_RE ]]; then
-        CREATE_ERROR="201 without a readable id; the created alert cannot be deleted by this run"
+    if [[ "$REPLY_REVISION" != "1" ]]; then
+        CREATE_ERROR="201 for alert [$REPLY_ID] whose armingRevision is not the JSON integer 1"
         return 1
     fi
-    echo "$id" >>"$RUN_DIR/owned"
-    if [[ ! "$revision" =~ ^[0-9]+$ ]]; then
-        CREATE_ERROR="201 for alert [$id] without a readable armingRevision"
-        return 1
+    echo "$REPLY_ID,1" >>"$RUN_DIR/expected"
+}
+
+# record_unknown_create ACCOUNT TYPE INSTRUMENT DIRECTION THRESHOLD: appends a create whose
+# outcome is unknown to $RUN_DIR/unknown-creates as one tab-separated line, led by $SECONDS when
+# its POST ended, for cleanup_all to reconcile (reconcile_unknown_creates).
+record_unknown_create() {
+    printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$SECONDS" "$1" "$2" "$3" "$4" "$5" >>"$RUN_DIR/unknown-creates"
+}
+
+# count_unknown_creates DIR: sets UNKNOWN_COUNT to the number of lines of DIR/unknown-creates, 0
+# when it is missing or empty. It reads with builtins only, since post_alert counts before every
+# create and every fork is slow under Git Bash.
+count_unknown_creates() {
+    local -a records=()
+    UNKNOWN_COUNT=0
+    if [[ -s "$1/unknown-creates" ]]; then
+        mapfile -t records <"$1/unknown-creates"
+        UNKNOWN_COUNT=${#records[@]}
     fi
-    echo "$id,$revision" >>"$RUN_DIR/expected"
 }
 
 # ---------------------------------------------------------------------------------------------
@@ -791,8 +1049,30 @@ armed_set_difference() {
 # ---------------------------------------------------------------------------------------------
 # Runtime facts, read from the project's containers rather than from any input
 
+# running_services: the project's running services, one per line. The call has ended within
+# DOCKER_CALL_TIMEOUT_SECONDS (hard_timeout); one cut off fails the function with 124 or 137.
 running_services() {
-    compose ps --status running --services 2>>"$RUN_DIR/compose.log" | tr -d '\r'
+    hard_timeout "$DOCKER_CALL_TIMEOUT_SECONDS" docker compose -p "$PROJECT" -f "$COMPOSE_FILE" \
+        ps --status running --services </dev/null 2>>"$RUN_DIR/compose.log" | tr -d '\r'
+}
+
+# require_running_services: samples the project's running services into RUNNING_SERVICES and
+# aborts the run as "readiness", naming every required service that is not among them, or the
+# Docker problem that kept the sample from being read.
+require_running_services() {
+    local service missing="" rc=0
+    RUNNING_SERVICES="$(running_services)" || rc=$?
+    if [[ $rc -ne 0 ]]; then
+        abort "readiness" "$(docker_problem "compose ps" "$rc" "$DOCKER_CALL_TIMEOUT_SECONDS")"
+    fi
+    for service in $REQUIRED_SERVICES; do
+        if ! grep -qxF "$service" <<<"$RUNNING_SERVICES"; then
+            missing="$missing $service"
+        fi
+    done
+    if [[ -n "$missing" ]]; then
+        abort "readiness" "services not running in project [$PROJECT]:$missing"
+    fi
 }
 
 # container_env SERVICE NAME: the value of NAME (which holds no "=") in the service container's
@@ -843,10 +1123,44 @@ add_cleanup_problem() {
     CLEANUP_PROBLEMS="${CLEANUP_PROBLEMS:+$CLEANUP_PROBLEMS; }$1"
 }
 
-# delete_owned_alerts: DELETEs every owned id not yet deleted. 204 and 404 are clean; any
-# other outcome is printed with its id and listed in $RUN_DIR/left-in-place.
+# delete_alert ID: DELETEs one alert by id. A transport error or a 5xx is tried again, up to
+# DELETE_ATTEMPTS attempts in all, the wait after attempt n being n * DELETE_RETRY_STEP_SECONDS.
+# Leaves the last answer in HTTP_STATUS and sets DELETE_ALL_TRANSPORT to 1 when every attempt
+# ended in a transport error, otherwise to 0.
+delete_alert() {
+    local attempt
+    DELETE_ALL_TRANSPORT=1
+    for ((attempt = 1; attempt <= DELETE_ATTEMPTS; attempt++)); do
+        http DELETE "$ALERTS_URL/$1"
+        if [[ "$HTTP_STATUS" != "000" ]]; then
+            DELETE_ALL_TRANSPORT=0
+        fi
+        case "$HTTP_STATUS" in
+            000 | 5??) ;;
+            *) return 0 ;;
+        esac
+        if [[ $attempt -lt $DELETE_ATTEMPTS ]]; then
+            sleep $((attempt * DELETE_RETRY_STEP_SECONDS))
+        fi
+    done
+}
+
+# delete_owned_alerts [LABEL]: DELETEs every owned id not yet deleted, through delete_alert, and
+# prints its lines under LABEL, cleanup by default. 204 and 404 are clean. A 403 comes from a
+# flag switched off after it was read, or from the broker failing closed while it cannot read the
+# flag, so the flag is read first (read_flag), at most MAX_FLAG_REENABLES times per call. Read as
+# enabled=false, it is switched on again (put_flag) and the id tried once more; when FLAG_INITIAL
+# is still empty, the run having ended before setup read the flag, false becomes the value
+# cleanup_all restores, and a FLAG_INITIAL already set is kept. Read as enabled=true, the flag is
+# left as it is and the id tried once more. A flag that cannot be read is left as it is, and the
+# id keeps its 403. Any other outcome is printed with its id and listed in
+# $RUN_DIR/left-in-place. After MAX_CONSECUTIVE_TRANSPORT_ERRORS ids in a row whose every
+# attempt ended in a transport error, the once-more try included, the remaining ids are listed
+# as not attempted. Ids left in place stay owned and undeleted, so the run record hands them to
+# the next run on the project (adopt_earlier_runs).
 delete_owned_alerts() {
-    local id deleted=0 absent=0 left=0 skipped=0 transport=0
+    local label="${1:-cleanup}" id deleted=0 absent=0 left=0 skipped=0 transport=0 reenables=0
+    local status text all_transport retry
     LC_ALL=C sort -u "$RUN_DIR/owned" >"$RUN_DIR/owned.sorted"
     LC_ALL=C sort -u "$RUN_DIR/deleted" >"$RUN_DIR/deleted.sorted"
     LC_ALL=C comm -23 "$RUN_DIR/owned.sorted" "$RUN_DIR/deleted.sorted" >"$RUN_DIR/to-delete"
@@ -857,8 +1171,39 @@ delete_owned_alerts() {
             skipped=$((skipped + 1))
             continue
         fi
-        http DELETE "$ALERTS_URL/$id"
-        case "$HTTP_STATUS" in
+        delete_alert "$id"
+        status="$HTTP_STATUS"
+        text="$(status_text)"
+        all_transport="$DELETE_ALL_TRANSPORT"
+        if [[ "$status" == "403" && $reenables -lt $MAX_FLAG_REENABLES ]]; then
+            reenables=$((reenables + 1))
+            retry=0
+            http GET "$FLAG_URL"
+            if [[ "$HTTP_STATUS" != "200" ]]; then
+                info "$label: alert [$id] answered 403 and flag $FLAG_ID could not be read ($(status_text)); the flag is left as it is"
+            elif ! read_flag "$HTTP_BODY"; then
+                info "$label: alert [$id] answered 403 and flag $FLAG_ID could not be read (status 200, but $FLAG_ERROR); the flag is left as it is"
+            elif [[ "$FLAG_ENABLED" == "true" ]]; then
+                info "$label: alert [$id] answered 403 while flag $FLAG_ID reads enabled=true; trying it once more"
+                retry=1
+            else
+                FLAG_TOUCHED=1
+                FLAG_INITIAL="${FLAG_INITIAL:-$FLAG_ENABLED}"
+                if put_flag true; then
+                    info "$label: flag $FLAG_ID was switched off; switched on again to delete alert [$id]"
+                    retry=1
+                else
+                    info "$label: flag $FLAG_ID was switched off and could not be switched on again: $FLAG_PUT_ERROR"
+                fi
+            fi
+            if [[ $retry -eq 1 ]]; then
+                delete_alert "$id"
+                status="$HTTP_STATUS"
+                text="$(status_text)"
+                all_transport="$DELETE_ALL_TRANSPORT"
+            fi
+        fi
+        case "$status" in
             204)
                 deleted=$((deleted + 1))
                 transport=0
@@ -871,47 +1216,396 @@ delete_owned_alerts() {
                 ;;
             *)
                 left=$((left + 1))
-                if [[ "$HTTP_STATUS" == "000" ]]; then
+                if [[ "$status" == "000" && "$all_transport" == "1" ]]; then
                     transport=$((transport + 1))
                 else
                     transport=0
                 fi
-                echo "$id $(status_text)" >>"$RUN_DIR/left-in-place"
-                info "cleanup: alert [$id] left in place: $(status_text)"
+                echo "$id $text" >>"$RUN_DIR/left-in-place"
+                info "$label: alert [$id] left in place: $text"
                 ;;
         esac
     done <"$RUN_DIR/to-delete"
-    info "cleanup: $deleted alerts deleted, $absent already absent, $left left in place, $skipped not attempted"
+    info "$label: $deleted alerts deleted, $absent already absent, $left left in place, $skipped not attempted"
     if [[ $((left + skipped)) -gt 0 ]]; then
-        add_cleanup_problem "$((left + skipped)) owned alerts left in place, ids in $RUN_DIR/left-in-place"
+        add_cleanup_problem "$((left + skipped)) owned alerts left in place, ids in $RUN_DIR/left-in-place${RUN_RECORD:+; the next run on project [$PROJECT] with base url $BASE_URL and compose file $COMPOSE_PATH deletes them first}"
     fi
 }
 
-cleanup_all() {
-    local remaining rc=0
-    CLEANUP_PROBLEMS=""
+# undeleted_count: the number of owned ids not yet deleted.
+undeleted_count() {
     LC_ALL=C sort -u "$RUN_DIR/owned" >"$RUN_DIR/owned.sorted"
     LC_ALL=C sort -u "$RUN_DIR/deleted" >"$RUN_DIR/deleted.sorted"
-    remaining=$(($(LC_ALL=C comm -23 "$RUN_DIR/owned.sorted" "$RUN_DIR/deleted.sorted" | wc -l)))
-    if [[ $remaining -gt 0 ]]; then
-        # DELETE answers 403 while the flag is off, so the flag is switched on to delete.
+    echo $(($(LC_ALL=C comm -23 "$RUN_DIR/owned.sorted" "$RUN_DIR/deleted.sorted" | wc -l)))
+}
+
+# Unknown creates. post_alert records each create whose outcome it cannot know in
+# $RUN_DIR/unknown-creates, one "ENDED<TAB>ACCOUNT<TAB>TYPE<TAB>INSTRUMENT<TAB>DIRECTION<TAB>
+# THRESHOLD" line each, ENDED being $SECONDS when its POST ended; the numbers of the lines that
+# are reconciled go to $RUN_DIR/unknown-resolved. A create in $RUN_DIR/in-flight-create, which
+# post_alert writes ahead of each POST and empties once the outcome is recorded, is an unknown
+# create as well: cleanup moves it into unknown-creates (settle_in_flight), and a later run
+# carries it from the directory of a run killed outright. The unknown creates an earlier run on
+# the project left unreconciled are carried into $RUN_DIR/carried-creates (adopt_earlier_runs),
+# one line each in the same form but led by that run's precondition time instead of ENDED; their
+# reconciled line numbers go to $RUN_DIR/carried-resolved. Such an alert is found by its fields
+# and deleted by its id, never by account, and its POST is never repeated.
+#
+# The broker logs a create without a trace id, so the alert of an unknown create is told only by
+# what its row shows: this run does not own it, its type, instrumentId and direction are exactly
+# the create's, its threshold has the create's value, its armingRevision is the JSON integer 1,
+# and its createdAt, which db-adapter stamps from its UTC clock, is at or after the database's
+# time of the cycle precondition that passed before the create (PRECONDITION_AT, kept in
+# $RUN_DIR/precondition-at). The database and db-adapter containers read the one clock of their
+# Docker engine. Its enabled and triggeredAt are no evidence either way: the evaluator may have
+# triggered the alert already, since no threshold is assumed unreachable. The precondition found
+# no armed alert, loadgen is stopped while alerts are created, e2e.sh never runs alongside, and
+# the run lock keeps every other perf.sh run off the project, so an alert that shows all of this
+# is the create's. An alert whose createdAt is a readable UTC time before the precondition time
+# was made before the create and is left out, whatever its other fields. Any other alert of the
+# same type, instrument and direction that this run does not own and that does not show all of
+# this, one whose createdAt is no readable UTC time included, means the create's alert cannot be
+# told from others, and so do more alerts that show all of it than such creates: nothing is
+# deleted for them, and the check fails naming the create. So does a create whose precondition
+# time is unknown. For a create carried from an earlier run, alerts made since that run ended,
+# by loadgen for one, fall under the same rule.
+
+# open_line_numbers CREATES RESOLVED: the numbers of the lines of the file CREATES that the file
+# RESOLVED does not list, one per line; nothing when CREATES is missing or empty.
+open_line_numbers() {
+    local n=0 line
+    if [[ ! -s "$1" ]]; then
+        return 0
+    fi
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        n=$((n + 1))
+        if ! grep -qxF "$n" "$2" 2>/dev/null; then
+            echo "$n"
+        fi
+    done <"$1"
+}
+
+# unknown_open_lines [carried]: the line numbers of this run's unknown creates not yet
+# reconciled, or with "carried" those of the creates carried from earlier runs, one per line.
+unknown_open_lines() {
+    if [[ "${1:-}" == "carried" ]]; then
+        open_line_numbers "$RUN_DIR/carried-creates" "$RUN_DIR/carried-resolved"
+    else
+        open_line_numbers "$RUN_DIR/unknown-creates" "$RUN_DIR/unknown-resolved"
+    fi
+}
+
+# read_create_line LINE: splits one unknown-create line into CR_FIRST, CR_ACCOUNT, CR_TYPE,
+# CR_INSTRUMENT, CR_DIRECTION and CR_THRESHOLD, and sets CR_UNITS to the threshold in units of
+# 1e-8. Fails unless LINE holds exactly six tab-separated fields of which the last five are
+# canonical account and instrument ids around an exact type, an exact direction and a plain
+# decimal threshold; what the first field must be is the caller's to check.
+read_create_line() {
+    local extra=""
+    CR_FIRST=""
+    CR_ACCOUNT=""
+    CR_TYPE=""
+    CR_INSTRUMENT=""
+    CR_DIRECTION=""
+    CR_THRESHOLD=""
+    CR_UNITS=""
+    IFS=$'\t' read -r CR_FIRST CR_ACCOUNT CR_TYPE CR_INSTRUMENT CR_DIRECTION CR_THRESHOLD extra \
+        <<<"$1" || true
+    [[ -z "$extra" && -n "$CR_FIRST" && "$CR_ACCOUNT" =~ $UUID_RE && "$CR_INSTRUMENT" =~ $UUID_RE ]] &&
+        [[ "$CR_TYPE" == "TARGET_PRICE" || "$CR_TYPE" == "PROFIT_LOSS" ]] &&
+        [[ "$CR_DIRECTION" == "ABOVE" || "$CR_DIRECTION" == "BELOW" ]] &&
+        CR_UNITS="$(dec_to_units "$CR_THRESHOLD")"
+}
+
+# utc_time_key TIME: prints the fixed-width key of an RFC 3339 UTC time, which is
+# YYYY-MM-DDTHH:MM:SS, an optional fraction of 1 to 9 digits, then Z or +00:00: its 14 date and
+# time digits, then its fraction padded with zeros to 9 digits. Fails on any other text, a time
+# with another offset included, so such a time is never compared.
+utc_time_key() {
+    local re='^([0-9]{4})-(0[1-9]|1[0-2])-(0[1-9]|[12][0-9]|3[01])T([01][0-9]|2[0-3]):([0-5][0-9]):([0-5][0-9]|60)(\.([0-9]{1,9}))?(Z|\+00:00)$'
+    local frac
+    if [[ ! "$1" =~ $re ]]; then
+        return 1
+    fi
+    frac="${BASH_REMATCH[8]}000000000"
+    echo "${BASH_REMATCH[1]}${BASH_REMATCH[2]}${BASH_REMATCH[3]}${BASH_REMATCH[4]}${BASH_REMATCH[5]}${BASH_REMATCH[6]}${frac:0:9}"
+}
+
+# time_key_at_or_after KEY FROM: succeeds when the utc_time_key KEY is the time FROM or later.
+# The 14 whole-second digits and the 9 fraction digits are compared as two numbers, since all
+# 23 digits do not fit in one.
+time_key_at_or_after() {
+    local seconds=$((10#${1:0:14})) from=$((10#${2:0:14}))
+    if [[ $seconds -ne $from ]]; then
+        [[ $seconds -gt $from ]]
+        return
+    fi
+    [[ $((10#${1:14:9})) -ge $((10#${2:14:9})) ]]
+}
+
+# unowned_matching_alerts ACCOUNT TYPE INSTRUMENT DIRECTION: GETs ACCOUNT's alerts and writes to
+# $RUN_DIR/candidates one "ID THRESHOLD REVISION CREATED" line for each alert this run does not
+# own whose type, instrumentId and direction are exactly these, whatever its enabled and
+# triggeredAt. THRESHOLD and REVISION are the JSON number tokens of threshold and
+# armingRevision, CREATED is the createdAt string when it holds only characters an RFC 3339 time
+# has, and each is "-" otherwise. The reply must be one JSON object whose results array holds
+# only objects with canonical ids; otherwise, and on any status but 200, it fails with
+# LIST_ERROR, which never repeats the reply.
+unowned_matching_alerts() {
+    local rows
+    LIST_ERROR=""
+    : >"$RUN_DIR/candidates"
+    http GET "$ALERTS_URL?accountId=$1"
+    if [[ "$HTTP_STATUS" != "200" ]]; then
+        LIST_ERROR="GET alerts of account [$1] gave $(status_text)"
+        return 1
+    fi
+    if ! rows="$(jq -rs --arg re "$UUID_RE" --arg type "$2" --arg instrument "$3" --arg direction "$4" \
+        "$JQ_CANONICAL$JQ_ONE_VALUE"'
+        def token: if type == "number" then tojson else "-" end;
+        def stamp: if type == "string" and test("^[0-9A-Za-z:.+-]{1,64}$") then . else "-" end;
+        (one_value | if type == "object" and (.results | type) == "array" then .results
+            else error("no results array") end) as $all
+        | if any($all[]; type != "object" or (.id | canonical) == null) then error("unreadable alert")
+          else $all[] end
+        | select(.type == $type and (.instrumentId | canonical) == $instrument
+            and .direction == $direction)
+        | "\(.id | canonical) \(.threshold | token) \(.armingRevision | token) \(.createdAt | stamp)"' \
+        2>/dev/null <<<"$HTTP_BODY" | tr -d '\r')"; then
+        LIST_ERROR="GET alerts of account [$1] gave status 200, but its reply is not one JSON object with a results array of alerts with canonical ids"
+        return 1
+    fi
+    if [[ -n "$rows" ]]; then
+        LC_ALL=C sort -u "$RUN_DIR/owned" >"$RUN_DIR/owned.sorted"
+        awk 'FILENAME == ARGV[1] { own[$1]; next } !($1 in own)' "$RUN_DIR/owned.sorted" - \
+            <<<"$rows" >"$RUN_DIR/candidates"
+    fi
+}
+
+# reconcile_unknown_creates [LABEL [carried]]: reconciles this run's unknown creates not yet
+# reconciled, or with "carried" those carried from earlier runs, and prints its lines under
+# LABEL, cleanup by default. Creates with the same account, type, instrument, direction,
+# threshold value and precondition time form a group of N creates. Each poll reads the group's
+# account list once (unowned_matching_alerts): its candidates are the alerts this run does not
+# own with the create's type, instrument and direction, less those whose createdAt is a readable
+# UTC time before the group's precondition time, which are left untouched, and the exact ones
+# among them also show the rest of the evidence set out above. When a candidate is not exact,
+# its createdAt not being a readable UTC time included, or there are more than N exact ones, the
+# creates' alerts cannot be told from others: nothing is deleted for the group and the check
+# fails naming it. Once there are N exact ones, or the group's settle deadline has passed, the
+# exact ones join the owned set, for delete_owned_alerts to delete by id, and any shortfall is
+# reported as not created. This run's deadline is UNKNOWN_CREATE_SETTLE_SECONDS after the
+# group's last POST ended, and until then the list is read again every
+# UNKNOWN_CREATE_STEP_SECONDS; a carried create's deadline is CARRIED_SETTLE_UNTIL, set when
+# adopt_earlier_runs carried it. A failed list read, an unknown precondition time, or a line that
+# cannot be read fails the check naming the create.
+reconcile_unknown_creates() {
+    local label="${1:-cleanup}" source="${2:-own}"
+    local creates="$RUN_DIR/unknown-creates" resolved="$RUN_DIR/unknown-resolved"
+    local -a records=() state=() keys=() deadlines=() descs=()
+    local -a members=() exact=()
+    local line n i j start deadline pending loose unreadable id token revision created value
+    local account type instrument direction units since
+    if [[ "$source" == "carried" ]]; then
+        creates="$RUN_DIR/carried-creates"
+        resolved="$RUN_DIR/carried-resolved"
+    fi
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        records+=("$line")
+    done <"$creates"
+    for ((i = 0; i < ${#records[@]}; i++)); do
+        state[i]="done"
+        keys[i]=""
+        deadlines[i]=0
+        descs[i]=""
+    done
+    while IFS= read -r n; do
+        i=$((n - 1))
+        # This run's lines lead with the second its POST ended, and carried lines with the
+        # precondition time of the run that made them.
+        if ! read_create_line "${records[i]}" ||
+            { [[ "$source" == "own" ]] && [[ ! "$CR_FIRST" =~ ^[0-9]+$ ]]; } ||
+            { [[ "$source" == "carried" ]] && ! utc_time_key "$CR_FIRST" >/dev/null; }; then
+            add_cleanup_problem "unknown create $n in $creates cannot be read, so it is not reconciled"
+            state[i]="failed"
+            continue
+        fi
+        descs[i]="$CR_TYPE $CR_DIRECTION $CR_THRESHOLD on instrument [$CR_INSTRUMENT] for account [$CR_ACCOUNT]"
+        if [[ "$source" == "own" ]]; then
+            start="$PRECONDITION_AT"
+            deadlines[i]=$((CR_FIRST + UNKNOWN_CREATE_SETTLE_SECONDS))
+        else
+            start="$CR_FIRST"
+            deadlines[i]=$CARRIED_SETTLE_UNTIL
+        fi
+        if ! since="$(utc_time_key "$start")"; then
+            add_cleanup_problem "the create of ${descs[i]}, whose outcome is unknown, was not reconciled: the time of the cycle precondition before it is unknown, so no alert can be shown to be its own"
+            state[i]="failed"
+            continue
+        fi
+        keys[i]="$CR_ACCOUNT $CR_TYPE $CR_INSTRUMENT $CR_DIRECTION $CR_UNITS $since"
+        state[i]="pending"
+    done < <(unknown_open_lines "$source")
+
+    while :; do
+        pending=0
+        for ((i = 0; i < ${#records[@]}; i++)); do
+            if [[ "${state[i]}" != "pending" ]]; then
+                continue
+            fi
+            members=()
+            deadline=0
+            for ((j = i; j < ${#records[@]}; j++)); do
+                if [[ "${state[j]}" == "pending" && "${keys[j]}" == "${keys[i]}" ]]; then
+                    members+=("$j")
+                    if [[ ${deadlines[j]} -gt $deadline ]]; then
+                        deadline=${deadlines[j]}
+                    fi
+                fi
+            done
+            read -r account type instrument direction units since <<<"${keys[i]}"
+            if ! unowned_matching_alerts "$account" "$type" "$instrument" "$direction"; then
+                add_cleanup_problem "the create of ${descs[i]}, whose outcome is unknown, was not reconciled: $LIST_ERROR"
+                for j in "${members[@]}"; do
+                    state[j]="failed"
+                done
+                continue
+            fi
+            loose=0
+            unreadable=0
+            exact=()
+            while read -r id token revision created; do
+                if ! created="$(utc_time_key "$created")"; then
+                    unreadable=$((unreadable + 1))
+                elif ! time_key_at_or_after "$created" "$since"; then
+                    # Made before the precondition that passed before the create: not its alert.
+                    continue
+                elif value="$(dec_to_units "$token")" && [[ "$value" == "$units" && "$revision" == "1" ]]; then
+                    exact+=("$id")
+                fi
+                loose=$((loose + 1))
+            done <"$RUN_DIR/candidates"
+            if [[ $loose -ne ${#exact[@]} || ${#exact[@]} -gt ${#members[@]} ]]; then
+                add_cleanup_problem "the create of ${descs[i]}, whose outcome is unknown, cannot be told from other alerts: $loose alerts this run does not own match its type, instrument and direction without a createdAt before the cycle precondition, ${#exact[@]} of them with its threshold, armingRevision 1 and a createdAt at or after it, $unreadable of them with a createdAt that is no UTC time, for ${#members[@]} such creates; none of them was deleted"
+                for j in "${members[@]}"; do
+                    state[j]="failed"
+                done
+                continue
+            fi
+            if [[ ${#exact[@]} -lt ${#members[@]} && $SECONDS -lt $deadline ]]; then
+                pending=$((pending + 1))
+                for j in "${members[@]}"; do
+                    state[j]="waiting"
+                done
+                continue
+            fi
+            for id in "${exact[@]}"; do
+                echo "$id" >>"$RUN_DIR/owned"
+                info "$label: alert [$id] is the create of ${descs[i]}, whose outcome was unknown; it is deleted as an owned alert"
+            done
+            if [[ ${#exact[@]} -lt ${#members[@]} ]]; then
+                if [[ "$source" == "own" ]]; then
+                    info "$label: $((${#members[@]} - ${#exact[@]})) create(s) of ${descs[i]}, whose outcome was unknown, made no alert within ${UNKNOWN_CREATE_SETTLE_SECONDS}s of the POST"
+                else
+                    info "$label: $((${#members[@]} - ${#exact[@]})) create(s) of ${descs[i]}, whose outcome an earlier run did not know, made no alert"
+                fi
+            fi
+            for j in "${members[@]}"; do
+                echo "$((j + 1))" >>"$resolved"
+                state[j]="done"
+            done
+        done
+        if [[ $pending -eq 0 ]]; then
+            return 0
+        fi
+        sleep "$UNKNOWN_CREATE_STEP_SECONDS"
+        for ((i = 0; i < ${#records[@]}; i++)); do
+            if [[ "${state[i]}" == "waiting" ]]; then
+                state[i]="pending"
+            fi
+        done
+    done
+}
+
+# settle_in_flight: the create left in $RUN_DIR/in-flight-create, by a run that ended between
+# post_alert's write-ahead and its record of the outcome, as through an error or a signal no trap
+# holds, becomes an unknown create of this run: its line joins unknown-creates, led by $SECONDS,
+# by which its POST has ended, and the file is emptied. A line already recorded there, which
+# unknown-creates holding more lines than the count that leads it shows, is not recorded twice.
+# A line that cannot be read stays where it is, so the run record keeps it for the next run
+# (update_run_record), and is recorded as a cleanup problem.
+settle_in_flight() {
+    local line extra=""
+    if [[ ! -s "$RUN_DIR/in-flight-create" ]]; then
+        return 0
+    fi
+    if ! { IFS= read -r line && ! IFS= read -r extra; } 2>/dev/null <"$RUN_DIR/in-flight-create" ||
+        ! read_create_line "$line" || [[ ! "$CR_FIRST" =~ ^[0-9]{1,9}$ ]]; then
+        add_cleanup_problem "the create in $RUN_DIR/in-flight-create cannot be read, so it is not reconciled"
+        return 0
+    fi
+    count_unknown_creates "$RUN_DIR"
+    if [[ $UNKNOWN_COUNT -le $((10#$CR_FIRST)) ]]; then
+        info "cleanup: the create of $CR_TYPE $CR_DIRECTION $CR_THRESHOLD on instrument [$CR_INSTRUMENT] for account [$CR_ACCOUNT] was in flight when the run ended; its outcome is unknown"
+        record_unknown_create "$CR_ACCOUNT" "$CR_TYPE" "$CR_INSTRUMENT" "$CR_DIRECTION" "$CR_THRESHOLD"
+    fi
+    : >"$RUN_DIR/in-flight-create"
+}
+
+# cleanup_all: reconciles the unknown creates, this run's, the one it left in flight
+# (settle_in_flight) and those carried from earlier runs, deletes every owned id not yet
+# deleted, restores the flag and starts loadgen again, and records each problem in
+# CLEANUP_PROBLEMS. Once the flag has been changed (FLAG_TOUCHED), it is
+# restored to FLAG_INITIAL, the value setup read. A run that ends before setup read it can still
+# own ids adopted from an earlier run: FLAG_INITIAL is then empty, and the value restored is the
+# one found just before cleanup changed the flag, enabled=false, as cleanup's own read found it
+# or the read after a DELETE's 403 found it (delete_owned_alerts). A FLAG_INITIAL that setup
+# read is never replaced.
+cleanup_all() {
+    local remaining unknown carried rc=0
+    CLEANUP_PROBLEMS=""
+    settle_in_flight
+    remaining="$(undeleted_count)"
+    unknown=$(($(unknown_open_lines | wc -l)))
+    carried=$(($(unknown_open_lines carried | wc -l)))
+    if [[ $remaining -gt 0 || $unknown -gt 0 || $carried -gt 0 ]]; then
+        # DELETE answers 403 while the flag is off, and so does the alert list a reconciliation
+        # reads, so the flag is switched on first. Only a flag read as enabled=false is switched;
+        # one that cannot be read is left as it is, and a DELETE that then answers 403 reads it
+        # again and switches it on only when that read shows enabled=false (delete_owned_alerts).
         http GET "$FLAG_URL"
-        if [[ "$HTTP_STATUS" == "200" && "$(jget '.enabled' "$HTTP_BODY")" == "false" ]]; then
+        if [[ "$HTTP_STATUS" != "200" ]]; then
+            info "cleanup: flag $FLAG_ID not read ($(status_text)); deleting without switching it on"
+        elif ! read_flag "$HTTP_BODY"; then
+            info "cleanup: flag $FLAG_ID not read (status 200, but $FLAG_ERROR); deleting without switching it on"
+        elif [[ "$FLAG_ENABLED" == "false" ]]; then
             FLAG_TOUCHED=1
-            http PUT "$FLAG_URL" '{"enabled": true}'
-            if [[ "$HTTP_STATUS" != "200" ]]; then
-                add_cleanup_problem "flag could not be switched on for deletion: $(status_text)"
+            FLAG_INITIAL="${FLAG_INITIAL:-$FLAG_ENABLED}"
+            if ! put_flag true; then
+                add_cleanup_problem "flag could not be switched on for deletion: $FLAG_PUT_ERROR"
             fi
         fi
-        info "cleanup: deleting $remaining owned alerts"
-        delete_owned_alerts
+        if [[ $unknown -gt 0 ]]; then
+            info "cleanup: reconciling $unknown creates whose outcome is unknown"
+            reconcile_unknown_creates
+        fi
+        # Creates carried from earlier runs that recovery did not reconcile, or that the run
+        # ended before recovery reached.
+        if [[ $carried -gt 0 ]]; then
+            info "cleanup: reconciling $carried creates whose outcome earlier runs did not know"
+            reconcile_unknown_creates cleanup carried
+        fi
+        remaining="$(undeleted_count)"
+        if [[ $remaining -gt 0 ]]; then
+            info "cleanup: deleting $remaining owned alerts"
+            delete_owned_alerts
+        fi
     fi
     if [[ $FLAG_TOUCHED -eq 1 && -n "$FLAG_INITIAL" ]]; then
-        http PUT "$FLAG_URL" "{\"enabled\": $FLAG_INITIAL}"
-        if [[ "$HTTP_STATUS" == "200" ]]; then
+        if put_flag "$FLAG_INITIAL"; then
             info "cleanup: flag $FLAG_ID restored to enabled=$FLAG_INITIAL"
         else
-            add_cleanup_problem "flag $FLAG_ID not restored to enabled=$FLAG_INITIAL: $(status_text)"
+            add_cleanup_problem "flag $FLAG_ID not restored to enabled=$FLAG_INITIAL: $FLAG_PUT_ERROR"
         fi
     fi
     # loadgen starts again last, after the deletions and the flag, and under a hard limit, so a
@@ -925,13 +1619,398 @@ cleanup_all() {
             add_cleanup_problem "loadgen was running at start and could not be started again: $(docker_problem "compose start loadgen" "$rc" "$DOCKER_CALL_TIMEOUT_SECONDS")"
         fi
     fi
+    update_run_record
     CLEANUP_DONE=1
+}
+
+# ---------------------------------------------------------------------------------------------
+# Run lock and run records. The lock, a container on the project's Docker engine, lets one run
+# at a time work on the project; a run record, kept in STATE_DIR, hands the owned alerts a run
+# could not delete to the next run on it.
+
+# lock_docker WHAT ARGS...: runs docker ARGS for the run lock under hard_timeout with
+# DOCKER_CALL_TIMEOUT_SECONDS, so an engine that never answers cannot hold the run. Its output,
+# without carriage returns, goes to LOCK_OUT and its errors to compose.log. On failure
+# LOCK_PROBLEM tells why, naming the call WHAT (docker_problem).
+lock_docker() {
+    local what="$1" rc=0
+    shift
+    LOCK_PROBLEM=""
+    LOCK_OUT="$(hard_timeout "$DOCKER_CALL_TIMEOUT_SECONDS" docker "$@" </dev/null 2>>"$RUN_DIR/compose.log" |
+        tr -d '\r')" || rc=$?
+    if [[ $rc -ne 0 ]]; then
+        LOCK_PROBLEM="$(docker_problem "$what" "$rc" "$DOCKER_CALL_TIMEOUT_SECONDS")"
+        return 1
+    fi
+}
+
+# lock_host: this run's host as the lock records it, the host name and the system name. kill -0
+# can judge only a pid of its own process table, and a Git Bash shell and a WSL shell on one
+# machine share the host name but not their pids.
+lock_host() {
+    echo "$(uname -n) ($(uname -s))"
+}
+
+# read_lock_owner JSON: reads the lock container's docker inspect JSON, exactly one object, into
+# LOCK_OWNER_ID, its container id, and from its owner labels into LOCK_OWNER_PID,
+# LOCK_OWNER_HOST, LOCK_OWNER_STARTED and LOCK_OWNER_RUN, control characters shown as ?. Fails
+# when the id is not a container id, or the labels lack a pid of 1 to 10 digits, a host or a run
+# directory.
+read_lock_owner() {
+    local fields
+    LOCK_OWNER_ID=""
+    LOCK_OWNER_PID=""
+    LOCK_OWNER_HOST=""
+    LOCK_OWNER_STARTED=""
+    LOCK_OWNER_RUN=""
+    if ! fields="$(jq -rs --arg p "$LOCK_LABEL_PREFIX" "$JQ_ONE_VALUE"'
+        one_value
+        | (.Config.Labels // {}) as $labels
+        | [.Id, $labels[$p + "pid"], $labels[$p + "host"], ($labels[$p + "started"] // ""),
+            $labels[$p + "run-dir"]]
+        | if (.[0] | type == "string" and test("\\A[0-9a-f]{12}([0-9a-f]{52})?\\z"))
+            and (.[1] | type == "string" and test("\\A[0-9]{1,10}\\z"))
+            and (.[2] | type == "string" and length > 0)
+            and (.[3] | type == "string")
+            and (.[4] | type == "string" and length > 0)
+          then .[] | gsub("[[:cntrl:]]"; "?")
+          else error("unreadable owner labels") end' <<<"$1" 2>/dev/null | tr -d '\r')"; then
+        return 1
+    fi
+    {
+        IFS= read -r LOCK_OWNER_ID && IFS= read -r LOCK_OWNER_PID && IFS= read -r LOCK_OWNER_HOST &&
+            IFS= read -r LOCK_OWNER_STARTED && IFS= read -r LOCK_OWNER_RUN
+    } <<<"$fields"
+}
+
+# acquire_run_lock: takes the project's run lock before anything about the stack is sampled or
+# changed. The lock is the container LOCK_NAME, which docker create makes atomically on the
+# project's Docker engine and which is never started. It is made from the image of the
+# project's running db container, which that engine is sure to hold, and every Compose label
+# that image carries is blanked, so Compose never counts the container in any project. Its owner
+# labels hold this shell's pid, lock_host, the start time and the run directory, and LOCK_ID
+# keeps its id.
+#   - A name already taken by a lock whose owner ran on this host and no longer runs (kill -0
+#     fails, or the pid is this shell's under another run directory) is stale: that container is
+#     removed by its id, never by name, so a lock another run made meanwhile stays, and the
+#     create is tried once more.
+#   - Any other lock, a second conflict, owner labels that cannot be read, a Docker call that
+#     fails or does not answer in time, or a state directory that is not this user's own aborts
+#     the run as "run lock"; it never waits for a lock.
+#   - A project whose db container is not running has no image to make the lock from, and aborts
+#     the run as "readiness", naming every required service that is not running.
+# Each abort comes before anything is changed; a lock container this run made is released on the
+# way out.
+acquire_run_lock() {
+    local attempt host db_cid image keys key create_problem
+    local args=()
+    host="$(lock_host)"
+    if ! (umask 077 && mkdir -p "$STATE_DIR/runs") 2>/dev/null || [[ -L "$STATE_DIR" || ! -O "$STATE_DIR" ]]; then
+        abort "run lock" "state directory $STATE_DIR could not be made as this user's own"
+    fi
+    if ! lock_docker "compose ps db" compose -p "$PROJECT" -f "$COMPOSE_FILE" ps -q --status running db; then
+        abort "run lock" "$LOCK_PROBLEM"
+    fi
+    db_cid="$(sed -n '1p' <<<"$LOCK_OUT")"
+    if [[ -z "$db_cid" ]]; then
+        require_running_services
+        # The db service started after the lookup above: it was not running when the lock
+        # needed it.
+        abort "readiness" "services not running in project [$PROJECT]: db"
+    fi
+    if [[ ! "$db_cid" =~ $CONTAINER_ID_RE ]]; then
+        abort "run lock" "compose ps db printed no container id"
+    fi
+    if ! lock_docker "docker inspect of the db container" inspect --type container --format '{{.Image}}' "$db_cid"; then
+        abort "run lock" "$LOCK_PROBLEM"
+    fi
+    image="$LOCK_OUT"
+    if [[ ! "$image" =~ ^[0-9A-Za-z][0-9A-Za-z_.:@/-]*$ ]]; then
+        abort "run lock" "the db container's image cannot be read"
+    fi
+    if ! lock_docker "docker image inspect of the db image" image inspect --format '{{json .Config.Labels}}' "$image"; then
+        abort "run lock" "$LOCK_PROBLEM"
+    fi
+    if ! keys="$(jq -r '(. // {}) | keys
+        | if any(.[]; test("[[:cntrl:]]")) then error("control character in a label key") else . end
+        | .[] | select(startswith("com.docker.compose."))' <<<"$LOCK_OUT" 2>/dev/null | tr -d '\r')"; then
+        abort "run lock" "the labels of the db image cannot be read"
+    fi
+    args=(create --name "$LOCK_NAME")
+    while IFS= read -r key; do
+        if [[ -n "$key" ]]; then
+            args+=(--label "$key=")
+        fi
+    done <<<"$keys"
+    args+=(--label "${LOCK_LABEL_PREFIX}pid=$$" --label "${LOCK_LABEL_PREFIX}host=$host"
+        --label "${LOCK_LABEL_PREFIX}started=$STARTED_AT" --label "${LOCK_LABEL_PREFIX}run-dir=$RUN_DIR"
+        "$image")
+    for attempt in 1 2; do
+        if lock_docker "docker create $LOCK_NAME" "${args[@]}"; then
+            if [[ "$LOCK_OUT" =~ $CONTAINER_ID_RE ]]; then
+                LOCK_ID="$LOCK_OUT"
+                LOCK_HELD=1
+                pass "run lock"
+                return 0
+            fi
+            create_problem="docker create $LOCK_NAME printed no container id"
+        else
+            create_problem="$LOCK_PROBLEM"
+        fi
+        # The name is taken, or the create failed; the container under the name, if any, tells.
+        if ! lock_docker "docker inspect $LOCK_NAME" inspect --type container --format '{{json .}}' "$LOCK_NAME"; then
+            abort "run lock" "$create_problem"
+        fi
+        if ! read_lock_owner "$LOCK_OUT"; then
+            abort "run lock" "project [$PROJECT] is locked by container $LOCK_NAME, whose owner labels cannot be read; run docker rm -v $LOCK_NAME once no perf.sh runs on this project"
+        fi
+        if [[ "$LOCK_OWNER_HOST" == "$host" && "$LOCK_OWNER_PID" == "$$" && "$LOCK_OWNER_RUN" == "$RUN_DIR" ]]; then
+            # This run's own create reached the engine, but its answer did not: the container is
+            # this run's, so the abort releases it by its id.
+            LOCK_ID="$LOCK_OWNER_ID"
+            LOCK_HELD=1
+            abort "run lock" "$create_problem"
+        fi
+        if [[ $attempt -eq 1 && "$LOCK_OWNER_HOST" == "$host" ]] &&
+            { [[ "$LOCK_OWNER_PID" == "$$" ]] || ! kill -0 "$LOCK_OWNER_PID" 2>/dev/null; }; then
+            info "run lock: removing the lock container $LOCK_OWNER_ID of pid $LOCK_OWNER_PID (run dir $LOCK_OWNER_RUN), which no longer runs"
+            if ! lock_docker "docker rm $LOCK_OWNER_ID" rm -v "$LOCK_OWNER_ID"; then
+                abort "run lock" "the stale lock container $LOCK_OWNER_ID was not removed: $LOCK_PROBLEM"
+            fi
+            continue
+        fi
+        break
+    done
+    abort "run lock" "project [$PROJECT] is locked by pid $LOCK_OWNER_PID on host $LOCK_OWNER_HOST since $LOCK_OWNER_STARTED (run dir $LOCK_OWNER_RUN); run one perf.sh at a time per project, or run docker rm -v $LOCK_NAME once that run has ended"
+}
+
+# release_run_lock: removes, by its id, the lock container this run created (LOCK_ID), and only
+# while this run holds it; a container found by name is never removed here. A removal that fails
+# or does not answer in time is reported and does not fail the run: the container stays, and
+# the next run on this host reclaims it as stale.
+release_run_lock() {
+    if [[ $LOCK_HELD -ne 1 ]]; then
+        return 0
+    fi
+    LOCK_HELD=0
+    if ! lock_docker "docker rm $LOCK_ID" rm -v "$LOCK_ID"; then
+        info "run lock: lock container $LOCK_ID not removed: $LOCK_PROBLEM; the next run on this host reclaims it, or run docker rm -v $LOCK_ID"
+    fi
+}
+
+# record_run: writes this run's record, runs/<run directory name>, holding the run directory,
+# the base URL and the compose file's absolute path, one per line. It is written before any
+# alert is created, so the alerts of a run that ends without its cleanup are found as well.
+record_run() {
+    RUN_RECORD="$STATE_DIR/runs/${RUN_DIR##*/}"
+    if ! printf '%s\n%s\n%s\n' "$RUN_DIR" "$BASE_URL" "$COMPOSE_PATH" >"$RUN_RECORD"; then
+        abort "run lock" "the run record $RUN_RECORD could not be written"
+    fi
+}
+
+# update_run_record: removes this run's record once every owned alert is deleted and every
+# create whose outcome is unknown, this run's, the one left in $RUN_DIR/in-flight-create or one
+# carried from an earlier run, is reconciled. Until then the record stays, so the next run on the
+# project deletes those alerts and looks for those creates' alerts first (adopt_earlier_runs);
+# creates left unreconciled are also recorded as a cleanup problem that says so.
+update_run_record() {
+    local open in_flight=0 files="unknown-creates"
+    if [[ -z "$RUN_RECORD" ]]; then
+        return 0
+    fi
+    if [[ -s "$RUN_DIR/in-flight-create" ]]; then
+        in_flight=1
+        files="unknown-creates, in-flight-create"
+    fi
+    open=$(($(unknown_open_lines | wc -l) + $(unknown_open_lines carried | wc -l) + in_flight))
+    if [[ $open -gt 0 ]]; then
+        add_cleanup_problem "$open creates whose outcome is unknown are not reconciled (lines of $RUN_DIR/$files and carried-creates); the next run on project [$PROJECT] with base url $BASE_URL and compose file $COMPOSE_PATH looks for their alerts first, and $RUN_RECORD can be removed by hand once those alerts are known to be gone"
+    elif [[ "$(undeleted_count)" == "0" ]]; then
+        rm -f "$RUN_RECORD"
+        RUN_RECORD=""
+    fi
+}
+
+# read_run_record FILE: reads a run record into RECORD_RUN_DIR, RECORD_BASE_URL and
+# RECORD_COMPOSE. Fails unless FILE holds exactly three lines: a run directory whose name is the
+# record's own, an origin is_base_origin accepts, and a compose file path.
+read_run_record() {
+    local extra=""
+    RECORD_RUN_DIR=""
+    RECORD_BASE_URL=""
+    RECORD_COMPOSE=""
+    {
+        IFS= read -r RECORD_RUN_DIR && IFS= read -r RECORD_BASE_URL &&
+            IFS= read -r RECORD_COMPOSE && ! IFS= read -r extra
+    } <"$1" 2>/dev/null || return 1
+    [[ -z "$extra" && "${RECORD_RUN_DIR##*/}" == "${1##*/}" && -n "$RECORD_COMPOSE" ]] &&
+        is_base_origin "$RECORD_BASE_URL"
+}
+
+# earlier_open_creates DIR: prints, one carried line each, the creates whose outcome is unknown
+# that the run directory DIR left unreconciled: every open line of DIR/unknown-creates, then the
+# create DIR/in-flight-create holds, which a run killed between post_alert's write-ahead and its
+# record of the outcome left there, each led by the precondition time in DIR/precondition-at
+# instead of its first field, then every open line of DIR/carried-creates as it is. An in-flight
+# create already recorded in unknown-creates, which holds more lines than the count that leads
+# it then, is carried only as that line. Fails when any of these lines cannot be read
+# (read_create_line, led by a second, a count or a UTC precondition time as its file requires),
+# when DIR/in-flight-create holds more than one line, or when DIR has open unknown creates or an
+# in-flight create of its own but no precondition-at of exactly one UTC time: a create is only
+# made after the precondition passed.
+earlier_open_creates() {
+    local dir="$1" n precondition="" extra="" in_flight=""
+    local -a records=()
+    if [[ -s "$dir/in-flight-create" ]]; then
+        if ! { IFS= read -r in_flight && ! IFS= read -r extra; } 2>/dev/null <"$dir/in-flight-create" ||
+            ! read_create_line "$in_flight" || [[ ! "$CR_FIRST" =~ ^[0-9]{1,9}$ ]]; then
+            return 1
+        fi
+        count_unknown_creates "$dir"
+        if [[ $UNKNOWN_COUNT -gt $((10#$CR_FIRST)) ]]; then
+            in_flight=""
+        fi
+    fi
+    if [[ -n "$in_flight" || -n "$(open_line_numbers "$dir/unknown-creates" "$dir/unknown-resolved")" ]]; then
+        if ! { IFS= read -r precondition && ! IFS= read -r extra; } 2>/dev/null <"$dir/precondition-at" ||
+            ! utc_time_key "$precondition" >/dev/null; then
+            return 1
+        fi
+    fi
+    if [[ -n "$(open_line_numbers "$dir/unknown-creates" "$dir/unknown-resolved")" ]]; then
+        mapfile -t records <"$dir/unknown-creates"
+        while IFS= read -r n; do
+            if ! read_create_line "${records[n - 1]}" || [[ ! "$CR_FIRST" =~ ^[0-9]+$ ]]; then
+                return 1
+            fi
+            printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$precondition" "$CR_ACCOUNT" "$CR_TYPE" \
+                "$CR_INSTRUMENT" "$CR_DIRECTION" "$CR_THRESHOLD"
+        done < <(open_line_numbers "$dir/unknown-creates" "$dir/unknown-resolved")
+    fi
+    if [[ -n "$in_flight" ]]; then
+        read_create_line "$in_flight" || return 1
+        printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$precondition" "$CR_ACCOUNT" "$CR_TYPE" \
+            "$CR_INSTRUMENT" "$CR_DIRECTION" "$CR_THRESHOLD"
+    fi
+    if [[ -n "$(open_line_numbers "$dir/carried-creates" "$dir/carried-resolved")" ]]; then
+        mapfile -t records <"$dir/carried-creates"
+        while IFS= read -r n; do
+            if ! read_create_line "${records[n - 1]}" || ! utc_time_key "$CR_FIRST" >/dev/null; then
+                return 1
+            fi
+            printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$CR_FIRST" "$CR_ACCOUNT" "$CR_TYPE" \
+                "$CR_INSTRUMENT" "$CR_DIRECTION" "$CR_THRESHOLD"
+        done < <(open_line_numbers "$dir/carried-creates" "$dir/carried-resolved")
+    fi
+}
+
+# adopt_earlier_runs: adopts the owned alerts that earlier runs on this project left undeleted,
+# and carries on the creates whose outcome they left unknown. Every other record is checked
+# first, and one that cannot be read, whose run directory is gone, that names another base URL
+# or compose file, or whose run directory lists unreconciled creates that cannot be read
+# (earlier_open_creates) aborts the run as "recovery" before anything is changed: those alerts
+# can only be deleted through the stack that record names, and only by what that run recorded.
+# Then the owned ids of each recorded run that are canonical UUIDs and not in its deleted file
+# are appended to this run's owned set and to $RUN_DIR/recovered, its unreconciled creates are
+# appended to $RUN_DIR/carried-creates, and that record is removed, since this run's own record
+# now stands for them. recover_earlier_alerts reconciles those creates and deletes those alerts
+# once the flag is on. Carried creates are looked for until CARRIED_SETTLE_UNTIL, which is
+# HTTP_TIMEOUT_SECONDS + UNKNOWN_CREATE_SETTLE_SECONDS after they were carried: the run lock
+# shows that run ended, but a POST its kill left in flight may run on until its curl's --max-time.
+adopt_earlier_runs() {
+    local record count carried i
+    local -a checked=() checked_dirs=()
+    for record in "$STATE_DIR"/runs/*; do
+        if [[ ! -f "$record" || "$record" == "$RUN_RECORD" ]]; then
+            continue
+        fi
+        if ! read_run_record "$record"; then
+            abort "recovery" "the record $record of an earlier run on project [$PROJECT] cannot be read; remove it once no alert of that run remains"
+        fi
+        if [[ "$RECORD_BASE_URL" != "$BASE_URL" || "$RECORD_COMPOSE" != "$COMPOSE_PATH" ]]; then
+            abort "recovery" "run dir ${RECORD_RUN_DIR//[[:cntrl:]]/?} of an earlier run on project [$PROJECT] may hold alerts created through base url $RECORD_BASE_URL with compose file ${RECORD_COMPOSE//[[:cntrl:]]/?}; this run uses $BASE_URL with $COMPOSE_PATH, so it changes nothing. Run perf.sh with that run's base url and compose file to delete them, or remove $record once they are gone"
+        fi
+        if [[ ! -d "$RECORD_RUN_DIR" ]]; then
+            abort "recovery" "run dir ${RECORD_RUN_DIR//[[:cntrl:]]/?}, recorded by an earlier run on project [$PROJECT], no longer exists, so the alerts it may hold cannot be deleted by id; remove $record once they are gone"
+        fi
+        if ! earlier_open_creates "$RECORD_RUN_DIR" >"$RUN_DIR/adopt.creates.${record##*/}"; then
+            abort "recovery" "run dir ${RECORD_RUN_DIR//[[:cntrl:]]/?} of an earlier run on project [$PROJECT] lists creates whose outcome is unknown that cannot be read, or lacks the precondition time they are matched by, so their alerts cannot be told from others; remove $record once no alert of that run remains"
+        fi
+        checked+=("$record")
+        checked_dirs+=("$RECORD_RUN_DIR")
+    done
+    # Only the records checked above are adopted, with what was read from them then.
+    for ((i = 0; i < ${#checked[@]}; i++)); do
+        record="${checked[i]}"
+        RECORD_RUN_DIR="${checked_dirs[i]}"
+        : >"$RUN_DIR/adopt.owned"
+        : >"$RUN_DIR/adopt.deleted"
+        if [[ -f "$RECORD_RUN_DIR/owned" ]]; then
+            { grep -E "$UUID_RE" "$RECORD_RUN_DIR/owned" || true; } | LC_ALL=C sort -u >"$RUN_DIR/adopt.owned"
+        fi
+        if [[ -f "$RECORD_RUN_DIR/deleted" ]]; then
+            LC_ALL=C sort -u "$RECORD_RUN_DIR/deleted" >"$RUN_DIR/adopt.deleted"
+        fi
+        LC_ALL=C comm -23 "$RUN_DIR/adopt.owned" "$RUN_DIR/adopt.deleted" >"$RUN_DIR/adopt.ids"
+        count=$(($(wc -l <"$RUN_DIR/adopt.ids")))
+        carried=$(($(wc -l <"$RUN_DIR/adopt.creates.${record##*/}")))
+        cat "$RUN_DIR/adopt.ids" >>"$RUN_DIR/owned"
+        cat "$RUN_DIR/adopt.ids" >>"$RUN_DIR/recovered"
+        cat "$RUN_DIR/adopt.creates.${record##*/}" >>"$RUN_DIR/carried-creates"
+        rm -f "$record"
+        info "recovery: adopted $count owned alert ids that run dir $RECORD_RUN_DIR left undeleted"
+        if [[ $carried -gt 0 ]]; then
+            CARRIED_SETTLE_UNTIL=$((SECONDS + HTTP_TIMEOUT_SECONDS + UNKNOWN_CREATE_SETTLE_SECONDS))
+            info "recovery: carried $carried creates whose outcome run dir $RECORD_RUN_DIR left unknown"
+        fi
+    done
+}
+
+# recover_earlier_alerts: the "recovery" check, run once the flag is on and before anything is
+# measured, so the cycle precondition finds none of the earlier runs' alerts armed. It first
+# reconciles the creates adopt_earlier_runs carried (reconcile_unknown_creates): each alert shown
+# to be one of them joins the owned set, and a create whose alert cannot be shown, or whose list
+# cannot be read, aborts the run with nothing deleted for it; it stays carried, so cleanup looks
+# for it again and the run record keeps it for the next run. Then it deletes by id the alerts
+# adopt_earlier_runs adopted and those the reconciliation found. An alert left in place aborts
+# the run; it stays owned, so cleanup tries it again and the run record keeps it for the next
+# run.
+recover_earlier_alerts() {
+    local count carried problems
+    carried=$(($(unknown_open_lines carried | wc -l)))
+    if [[ ! -s "$RUN_DIR/recovered" && $carried -eq 0 ]]; then
+        return 0
+    fi
+    CLEANUP_PROBLEMS=""
+    if [[ $carried -gt 0 ]]; then
+        info "recovery: reconciling $carried creates whose outcome earlier runs on project [$PROJECT] did not know"
+        reconcile_unknown_creates "recovery" carried
+        problems="$CLEANUP_PROBLEMS"
+        CLEANUP_PROBLEMS=""
+        if [[ -n "$problems" ]]; then
+            abort "recovery" "$problems"
+        fi
+    fi
+    count="$(undeleted_count)"
+    if [[ $count -gt 0 ]]; then
+        info "recovery: deleting $count alerts that earlier runs on project [$PROJECT] left in place"
+        delete_owned_alerts "recovery"
+        problems="$CLEANUP_PROBLEMS"
+        CLEANUP_PROBLEMS=""
+        if [[ -n "$problems" ]]; then
+            abort "recovery" "$problems"
+        fi
+    fi
+    pass "recovery"
 }
 
 # ---------------------------------------------------------------------------------------------
 # Report and exit
 
+# print_report: prints the REPORT block and notes that it did (REPORT_PRINTED), so a run that
+# ends early after finish printed it does not print it twice.
 print_report() {
+    REPORT_PRINTED=1
     echo "REPORT"
     printf '  %-24s %s\n' \
         "project" "$PROJECT" \
@@ -960,6 +2039,7 @@ finish() {
     else
         fail "cleanup" "$CLEANUP_PROBLEMS"
     fi
+    release_run_lock
     FINISHED=1
     echo "SUMMARY $passed passed, $failed failed"
     if [[ $failed -gt 0 ]]; then
@@ -968,16 +2048,26 @@ finish() {
     exit 0
 }
 
-# Runs when the script ends anywhere but finish: an interrupt or an unexpected error.
+# Runs when the script ends anywhere but finish: an interrupt or an unexpected error. The early
+# end is a failed check of its own ("run"), so the SUMMARY counts it, and the REPORT block is
+# printed before cleanup unless finish already printed it. The exit status is kept, and 0
+# becomes 1. Every line goes to the run's own stdout and stderr (restore_run_output).
 # shellcheck disable=SC2329 # Invoked by the EXIT trap below.
 on_exit() {
     local status=$?
     trap - EXIT
+    # The trap runs under the redirections of the call the run ended in, such as a log read into
+    # broker.log, so the run's own stdout and stderr come back before anything is printed.
+    restore_run_output
     if [[ $FINISHED -eq 1 ]]; then
         exit "$status"
     fi
     set +e
     info "run ended early with status $status; cleaning up"
+    fail "run" "ended early with status $status"
+    if [[ $REPORT_PRINTED -eq 0 ]]; then
+        print_report
+    fi
     if [[ $CLEANUP_DONE -eq 0 ]]; then
         cleanup_all
         if [[ -n "$CLEANUP_PROBLEMS" ]]; then
@@ -986,6 +2076,7 @@ on_exit() {
             pass "cleanup"
         fi
     fi
+    release_run_lock
     info "run dir $RUN_DIR"
     echo "SUMMARY $passed passed, $failed failed"
     if [[ $status -eq 0 ]]; then
@@ -1013,18 +2104,17 @@ readyz() {
 }
 
 setup() {
-    local running missing="" service deadline broker_ready flag_ready raw_interval flag_id modifiable enabled
+    local deadline broker_ready flag_ready dialect raw_interval
 
-    running="$(running_services)" || running=""
-    for service in $REQUIRED_SERVICES; do
-        if ! grep -qxF "$service" <<<"$running"; then
-            missing="$missing $service"
-        fi
-    done
-    if [[ -n "$missing" ]]; then
-        abort "readiness" "services not running in project [$PROJECT]:$missing"
-    fi
-    if grep -qxF "loadgen" <<<"$running"; then
+    # The lock comes before anything about the stack is sampled: a run that sampled it first
+    # could see loadgen stopped by the run holding the lock, which starts it again on exit, and
+    # would then leave it running. This run's record follows, and the records of earlier runs
+    # are read before the first change to the stack, so a mismatching one changes nothing.
+    acquire_run_lock
+    record_run
+    adopt_earlier_runs
+    require_running_services
+    if grep -qxF "loadgen" <<<"$RUNNING_SERVICES"; then
         LOADGEN_WAS_RUNNING=1
     fi
     # Both answers must come by the deadline: no probe starts once it has passed, each may take
@@ -1050,34 +2140,22 @@ setup() {
     pass "readiness"
 
     # The x keeps a trailing line feed of the value; printf %q prints a value with control
-    # characters on one line, as $'...'.
-    DIALECT="$(container_env db-adapter DB_TYPE && printf x)" || DIALECT=""
-    DIALECT="${DIALECT%x}"
-    if [[ "$DIALECT" != "mssql" && "$DIALECT" != "postgres" ]]; then
-        abort "runtime facts" "db-adapter DB_TYPE is [${DIALECT:+$(printf '%q' "$DIALECT")}], expected mssql or postgres"
+    # characters on one line, as $'...'. The value is read and checked in a local, so DIALECT,
+    # which the REPORT shows, only ever holds mssql or postgres: an interrupt between the steps
+    # leaves it empty, n/a in the REPORT.
+    dialect="$(container_env db-adapter DB_TYPE && printf x)" || dialect=""
+    dialect="${dialect%x}"
+    if [[ "$dialect" != "mssql" && "$dialect" != "postgres" ]]; then
+        abort "runtime facts" "db-adapter DB_TYPE is [${dialect:+$(printf '%q' "$dialect")}], expected mssql or postgres"
     fi
+    DIALECT="$dialect"
     raw_interval="$(container_env broker-service ALERT_EVALUATION_INTERVAL_SECONDS && printf x)" || raw_interval=""
     raw_interval="${raw_interval%x}"
     EVAL_INTERVAL="$(resolve_interval "$raw_interval")"
     pass "runtime facts"
     info "db type $DIALECT; evaluation interval ${EVAL_INTERVAL}s (ALERT_EVALUATION_INTERVAL_SECONDS [${raw_interval:+$(printf '%q' "$raw_interval")}]); loadgen running at start: $([[ $LOADGEN_WAS_RUNNING -eq 1 ]] && echo yes || echo no)"
 
-    http GET "$FLAG_URL"
-    if [[ "$HTTP_STATUS" != "200" ]]; then
-        abort "flag modifiable" "GET $FLAG_ID gave $(status_text)"
-    fi
-    flag_id="$(jget '.id' "$HTTP_BODY")"
-    modifiable="$(jget '.isModifiable' "$HTTP_BODY")"
-    enabled="$(jget '.enabled' "$HTTP_BODY")"
-    if [[ "$flag_id" != "$FLAG_ID" || ("$enabled" != "true" && "$enabled" != "false") ]]; then
-        abort "flag modifiable" "GET $FLAG_ID answered id [$flag_id] enabled [$enabled] as ${HTTP_CTYPE:-untyped content}"
-    fi
-    if [[ "$modifiable" != "true" ]]; then
-        abort "flag modifiable" "isModifiable is [$modifiable]; a deployment with ENABLE_MODIFY=false cannot be toggled"
-    fi
-    FLAG_INITIAL="$enabled"
-    pass "flag modifiable"
-    info "flag $FLAG_ID initially enabled=$FLAG_INITIAL"
+    read_initial_flag
 
     if [[ $LOADGEN_WAS_RUNNING -eq 1 ]]; then
         # Recorded first, so an interrupted stop still restores loadgen on exit.
@@ -1091,10 +2169,33 @@ setup() {
     fi
     pass "loadgen isolation"
 
+    enable_flag
+}
+
+# read_initial_flag: GETs the flag, whose reply must read through read_flag as a modifiable
+# flag, and keeps its value in FLAG_INITIAL for cleanup to restore. Aborts the run otherwise.
+read_initial_flag() {
+    http GET "$FLAG_URL"
+    if [[ "$HTTP_STATUS" != "200" ]]; then
+        abort "flag modifiable" "GET $FLAG_ID gave $(status_text)"
+    fi
+    if ! read_flag "$HTTP_BODY"; then
+        abort "flag modifiable" "GET $FLAG_ID gave status 200, but $FLAG_ERROR"
+    fi
+    if [[ "$FLAG_MODIFIABLE" != "true" ]]; then
+        abort "flag modifiable" "isModifiable is false; a deployment with ENABLE_MODIFY=false cannot be toggled"
+    fi
+    FLAG_INITIAL="$FLAG_ENABLED"
+    pass "flag modifiable"
+    info "flag $FLAG_ID initially enabled=$FLAG_INITIAL"
+}
+
+# enable_flag: switches the flag on for the measurement, and the reply must show it on
+# (put_flag). FLAG_TOUCHED is set first, so an interrupted PUT still restores the flag on exit.
+enable_flag() {
     FLAG_TOUCHED=1
-    http PUT "$FLAG_URL" '{"enabled": true}'
-    if [[ "$HTTP_STATUS" != "200" || "$(jget '.enabled' "$HTTP_BODY")" != "true" ]]; then
-        abort "flag enabled" "PUT {\"enabled\": true} gave $(status_text)"
+    if ! put_flag true; then
+        abort "flag enabled" "PUT {\"enabled\": true} gave $FLAG_PUT_ERROR"
     fi
     pass "flag enabled"
 }
@@ -1537,22 +2638,35 @@ measure_insights() {
 # Limit 2: one evaluation cycle < 10 s for 1,000 alerts
 
 # rearm_missing: PATCHes {"enabled":true} on every owned alert missing from the armed set and
-# records the returned armingRevision in the expected set. REARMED counts the alerts re-armed.
-# Sets REARM_ERROR on failure.
+# records the returned armingRevision in the expected set. A 200 counts only when its reply,
+# read by read_alert_reply, is the patched alert, enabled, with an integer revision. REARMED
+# counts the alerts re-armed. Sets REARM_ERROR on failure, with a fixed reason for a reply that
+# does not show the re-arm.
 rearm_missing() {
-    local id revision
+    local id reason
     REARMED=0
     cut -d, -f1 "$RUN_DIR/expected" | LC_ALL=C sort >"$RUN_DIR/expected.ids"
     cut -d, -f1 "$RUN_DIR/armed" | LC_ALL=C sort >"$RUN_DIR/armed.ids"
     LC_ALL=C comm -23 "$RUN_DIR/expected.ids" "$RUN_DIR/armed.ids" >"$RUN_DIR/missing"
     while IFS= read -r id; do
         http PATCH "$ALERTS_URL/$id" '{"enabled":true}'
-        revision="$(jget '.armingRevision // empty' "$HTTP_BODY")"
-        if [[ "$HTTP_STATUS" != "200" || ! "$revision" =~ ^[0-9]+$ ]]; then
-            REARM_ERROR="PATCH alert [$id] gave $(status_text)"
+        reason=""
+        if [[ "$HTTP_STATUS" != "200" ]]; then
+            reason="$(status_text)"
+        elif ! read_alert_reply "$HTTP_BODY"; then
+            reason="status 200, but its reply is not one JSON object"
+        elif [[ "$REPLY_ID" != "$id" ]]; then
+            reason="status 200, but its id is not the patched alert's"
+        elif [[ "$REPLY_ENABLED" != "true" ]]; then
+            reason="status 200, but its enabled is not true"
+        elif [[ -z "$REPLY_REVISION" ]]; then
+            reason="status 200, but its armingRevision is not a JSON integer of at least 1"
+        fi
+        if [[ -n "$reason" ]]; then
+            REARM_ERROR="PATCH alert [$id] gave $reason"
             return 1
         fi
-        awk -F, -v id="$id" -v rev="$revision" 'BEGIN { OFS = "," } $1 == id { $2 = rev } { print }' \
+        awk -F, -v id="$id" -v rev="$REPLY_REVISION" 'BEGIN { OFS = "," } $1 == id { $2 = rev } { print }' \
             "$RUN_DIR/expected" >"$RUN_DIR/expected.new"
         mv "$RUN_DIR/expected.new" "$RUN_DIR/expected"
         REARMED=$((REARMED + 1))
@@ -1838,6 +2952,15 @@ measure_cycle() {
         fail "cycle precondition" "$armed armed alerts already exist; the measurement needs none besides its own"
         return 0
     fi
+    # The database's time of the query that passed: every alert this run creates is stamped at
+    # or after it, which tells the alert of a create whose outcome is unknown from alerts made
+    # before (reconcile_unknown_creates). The file hands it to the next run, with any such create
+    # left unreconciled (adopt_earlier_runs). Nothing is created without it.
+    if ! printf '%s\n' "$ARMED_AT" >"$RUN_DIR/precondition-at"; then
+        fail "cycle precondition" "its time could not be written to $RUN_DIR/precondition-at"
+        return 0
+    fi
+    PRECONDITION_AT="$ARMED_AT"
     pass "cycle precondition"
 
     # Workload: per account, 20 TARGET_PRICE then 20 PROFIT_LOSS alerts, round-robin over its
@@ -1906,19 +3029,38 @@ on_signal() {
     exit 130
 }
 
+# install_traps: keeps copies of the run's stdout and stderr on descriptors 8 and 9, names them
+# in RUN_STDOUT_FD and RUN_STDERR_FD for restore_run_output, then runs on_exit on EXIT and
+# on_signal on INT and TERM. The descriptors are fixed because bash 3.2 cannot allocate one into
+# a variable, and the script opens no other descriptor by number. Child processes inherit the
+# copies as they inherit stdout and stderr, and the run starts none in the background, so no
+# copy holds the run's output open once it has exited. When the copies cannot be made, as with
+# stdout closed, the run ends with exit 2 before any trap is set or the stack is touched.
+install_traps() {
+    if ! exec 8>&1 9>&2; then
+        echo "Could not keep copies of stdout and stderr for the exit report." >&2
+        exit 2
+    fi
+    RUN_STDOUT_FD=8
+    RUN_STDERR_FD=9
+    trap on_exit EXIT
+    trap on_signal INT TERM
+}
+
 # main ARGS...: reads the options, checks the tools and makes the run directory, then installs
-# the traps, whose cleanup needs that directory, and runs the checks in order.
+# the traps, whose cleanup needs that directory, and runs the checks in order. The state
+# directory and the run lock are written only from here on, by setup.
 main() {
     parse_options "$@"
     check_tools
     prepare_run
-    trap on_exit EXIT
-    trap on_signal INT TERM
+    install_traps
 
     STARTED_AT="$(now_rfc3339)"
     info "run dir $RUN_DIR"
     info "started $STARTED_AT: project [$PROJECT], base url $BASE_URL, compose file $COMPOSE_FILE"
     setup
+    recover_earlier_alerts
     fetch_presets
     preflight_inputs
     measure_insights
@@ -1927,7 +3069,8 @@ main() {
 }
 
 # Sourcing the file defines its functions and constants without running it: it reads no option,
-# checks no tool, makes no run directory and sets no trap.
+# checks no tool, makes no run directory, writes no state directory, takes no lock and sets no
+# trap.
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
     main "$@"
 fi

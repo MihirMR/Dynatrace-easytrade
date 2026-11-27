@@ -349,6 +349,7 @@ start_test() {
     OWNED_ERROR=""
     ARMED_ERROR=""
     ARMED_AT=""
+    PRECONDITION_AT=""
     REARM_ERROR=""
     REARMED=0
     SECONDS=0
@@ -964,6 +965,42 @@ done <<EOF
 measureCycle_onlyTimeRowArmed_passesPrecondition|$DEFAULT_TIME_ROW|PASS cycle precondition
 measureCycle_oneArmedAlertBesideTimeRow_failsPreconditionWithOne|$DEFAULT_TIME_ROW;c0000000-0000-4000-8000-000000000000,1|FAIL cycle precondition: 1 armed alerts already exist; the measurement needs none besides its own
 EOF
+
+# One case per precondition outcome: the database time of the query that passed is kept in
+# PRECONDITION_AT and in $RUN_DIR/precondition-at, for telling the alert of a create whose
+# outcome is unknown from alerts made before; a failed precondition keeps none.
+while IFS='|' read -r name rows recorded; do
+    start_test "$name"
+    measure_presets
+    tr ';' '\n' <<<"$rows" >"$RUN_DIR/db-rows"
+    logs_unreadable=1
+    run_measure
+    kept="none"
+    if [[ -f "$RUN_DIR/precondition-at" ]]; then
+        kept="$(cat "$RUN_DIR/precondition-at")"
+    fi
+    if [[ "$kept" == "$recorded" && "${PRECONDITION_AT:-none}" == "$recorded" ]]; then
+        test_pass
+    else
+        test_fail "PRECONDITION_AT '$PRECONDITION_AT' and precondition-at '$kept', expected '$recorded' in both; output: $(one_line "$RUN_DIR/out")"
+    fi
+done <<EOF
+measureCycle_preconditionPasses_keepsItsDatabaseTime|at,2026-11-26t01:49:38.1518570|2026-11-26T01:49:38.1518570Z
+measureCycle_preconditionFails_keepsNoTime|at,2026-11-26t01:49:38.1518570;c0000000-0000-4000-8000-000000000000,1|none
+EOF
+
+# A precondition time that cannot be kept fails the precondition, and nothing is created.
+start_test "measureCycle_preconditionTimeNotWritable_failsPreconditionCreatingNothing"
+measure_presets
+mkdir "$RUN_DIR/precondition-at"
+logs_unreadable=1
+run_measure
+if grep -qxF -- "FAIL cycle precondition: its time could not be written to $RUN_DIR/precondition-at" "$RUN_DIR/out" &&
+    [[ $created_alerts -eq 0 && -z "$PRECONDITION_AT" ]] && ! grep -q '^PASS cycle precondition' "$RUN_DIR/out"; then
+    test_pass
+else
+    test_fail "$created_alerts alerts created, PRECONDITION_AT '$PRECONDITION_AT'; output: $(one_line "$RUN_DIR/out")"
+fi
 
 start_test "measureCycle_acceptedSampleOverLimit_recordsFollowUpsAfterFailVerdict"
 measure_presets

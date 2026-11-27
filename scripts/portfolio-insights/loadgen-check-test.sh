@@ -29,7 +29,7 @@ case "${1:-}" in
         ;;
 esac
 
-for t_tool in jq awk sed comm; do
+for t_tool in jq awk sed comm sha256sum base64; do
     if ! command -v "$t_tool" >/dev/null 2>&1; then
         echo "Missing required tool: $t_tool" >&2
         exit 2
@@ -111,7 +111,19 @@ t_fresh_run_dir() {
     LOADGEN_WAS_RUNNING=0
     LOADGEN_TOUCHED=0
     LOADGEN_AT_START=""
+    LOADGEN_IMAGE_AT_START=""
+    LOADGEN_HASH_AT_START=""
+    LOADGEN_CONFIG_AT_START=""
+    LOADGEN_STARTED_AT=""
     RESTORE_ERROR=""
+    LOADGEN_ID_AT_START=""
+    LOADGEN_TWIN=""
+    TWIN_ERROR=""
+    TWIN_REMOVED=""
+    TWIN_DETAIL=""
+    LOADGEN_CID_AT_START=""
+    AT_START_DRAINING=0
+    RECOVER_ERROR=""
     DIALECT=""
     WINDOW_OPEN=0
     WINDOW_UNREAD=0
@@ -122,6 +134,11 @@ t_fresh_run_dir() {
     PROBE_DEADLINE=""
     LOG_PROBE_DETAIL=""
     STARTED_AT="2026-01-01T00:00:00Z"
+    # The run lock under this run directory, never the shared /tmp main() uses.
+    LOCK_ROOT="$RUN_DIR"
+    LOCK_DIR=""
+    LOCK_HELD=0
+    LOCK_ERROR=""
 }
 
 # ---------------------------------------------------------------------------------------------
@@ -739,6 +756,497 @@ test_close_window_finalOutputLostObservedCreate_ownsIt() {
 }
 
 # ---------------------------------------------------------------------------------------------
+# Loadgen at start (alert_visits_in_flight, secure_loadgen_at_start, main)
+
+# The start time of the loadgen container found at start, as docker inspect gives it.
+T_AT_START_SINCE="2025-12-31T23:00:00.123456789Z"
+
+test_alert_visits_in_flight_visitLines_countsVisitsBeforeTheirOutcome() {
+    local row label expected message
+    local id="$T_DRAIN_ALERT_1"
+    # LABEL|EXPECTED|MESSAGE: visit 1 opens the page, then logs MESSAGE; a MESSAGE of - adds none.
+    for row in "page opened|1|-" \
+        "page opened, alert created|1|Created alert [$id] threshold [1000000.40271936]" \
+        "deleted via ui|0|Deleted alert [$id] via ui" \
+        "deleted via api|0|Deleted alert [$id] via api" \
+        "already absent|0|Alert [$id] already absent" \
+        "left in place|0|Alert [$id] left in place: 403" \
+        "unconfirmed create|0|Create unconfirmed threshold [1000000.40271936], outcome unknown" \
+        "no instrument options|0|$NO_OPTIONS_LINE" \
+        "page unavailable|0|$PAGE_UNAVAILABLE_LINE" \
+        "feature lost before submit|0|$FEATURE_LOST_LINE" \
+        "visit error|0|$ERROR_MARKER"; do
+        IFS='|' read -r label expected message <<<"$row"
+        {
+            t_drain_opened "$T_DRAIN_RUN_1"
+            if [[ "$message" != "-" ]]; then
+                t_drain_line "$T_DRAIN_RUN_1" "$message"
+            fi
+        } >"$RUN_DIR/visit.log"
+        t_eq "alert_visits_in_flight after [$label]" "$expected" "$(alert_visits_in_flight "$RUN_DIR/visit.log")"
+    done
+    # A create whose opening line came before the output read: in flight until its outcome.
+    t_drain_line "$T_DRAIN_RUN_1" "Created alert [$id] threshold [1000000.40271936]" >"$RUN_DIR/created.log"
+    t_eq "alert_visits_in_flight counts a create read without its opening line" 1 \
+        "$(alert_visits_in_flight "$RUN_DIR/created.log")"
+    t_drain_line "$T_DRAIN_RUN_1" "Deleted alert [$id] via ui" >>"$RUN_DIR/created.log"
+    t_eq "alert_visits_in_flight ends that visit at its outcome" 0 "$(alert_visits_in_flight "$RUN_DIR/created.log")"
+    {
+        t_drain_resolved "$T_DRAIN_RUN_1" "$T_DRAIN_ALERT_1" ui
+        t_drain_opened "$T_DRAIN_RUN_2"
+    } >"$RUN_DIR/two.log"
+    t_eq "alert_visits_in_flight counts the one open visit of two" 1 "$(alert_visits_in_flight "$RUN_DIR/two.log")"
+    echo "[2026-01-01 00:00:10+00:00][worker:0][visit:deposit_and_buy][id:$T_DRAIN_RUN_1][INFO]: $OPENING_LINE" \
+        >"$RUN_DIR/other.log"
+    t_eq "alert_visits_in_flight ignores another visit's line" 0 "$(alert_visits_in_flight "$RUN_DIR/other.log")"
+}
+
+# The full ID of the loadgen container found at start, invented, and its first 12 hex digits.
+T_AT_START_CID="4c6f6164676e00000000000000000000000000000000000000000000000000a1"
+T_AT_START_SHORT="4c6f6164676e"
+
+# t_at_start_stubs RUNNING FLAG: loadgen found at start with weight 2, running when RUNNING is 1,
+# with the flag at FLAG, and the drain's clock, Compose and output stubbed (t_drain_stubs). http
+# records each request in $RUN_DIR/http-calls and answers none. That loadgen is the container
+# T_AT_START_CID, last started at T_AT_START_SINCE ($RUN_DIR/lg-started), in the state
+# $RUN_DIR/lg-state holds: running, paused or exited. On top of t_drain_stubs:
+#   - compose ps -a -q loadgen prints $RUN_DIR/lg-cid, that ID unless a test changes it, and a
+#     pause, unpause or kill that succeeds changes lg-state as Docker would. The subcommand in
+#     $RUN_DIR/compose.fail.once fails once, and the run is interrupted (exit 130, as the INT trap
+#     does) right after the subcommand in $RUN_DIR/compose.exit.after.
+#   - docker inspect --type container --format {{json .State}} answers for that ID from lg-state
+#     and lg-started, and fails while $RUN_DIR/lg-inspect-fail exists; hard_timeout runs docker
+#     without the time limit, which harness-test.sh covers.
+#   - sleep N interrupts the run (exit 130) when N is in $RUN_DIR/sleep.exit.
+t_at_start_stubs() {
+    t_drain_stubs
+    if [[ "$1" == "1" ]]; then
+        LOADGEN_AT_START="running, PORTFOLIO_INSIGHTS_ALERT_WEIGHT=2"
+        echo running >"$RUN_DIR/lg-state"
+    else
+        LOADGEN_AT_START="stopped, PORTFOLIO_INSIGHTS_ALERT_WEIGHT=2"
+        echo exited >"$RUN_DIR/lg-state"
+    fi
+    LOADGEN_WAS_RUNNING="$1"
+    FLAG_INITIAL="$2"
+    LOADGEN_STARTED_AT="$T_AT_START_SINCE"
+    echo "$T_AT_START_CID" >"$RUN_DIR/lg-cid"
+    echo "$T_AT_START_SINCE" >"$RUN_DIR/lg-started"
+    : >"$RUN_DIR/compose.fail.once"
+    : >"$RUN_DIR/compose.exit.after"
+    : >"$RUN_DIR/sleep.exit"
+    : >"$RUN_DIR/http-calls"
+    # shellcheck disable=SC2329 # Invoked only if the code under test sends a request.
+    http() {
+        echo "$*" >>"$RUN_DIR/http-calls"
+        HTTP_STATUS="000"
+        HTTP_ERROR="not expected"
+        HTTP_BODY=""
+    }
+    compose() {
+        local state=""
+        echo "$*" >>"$RUN_DIR/compose.calls"
+        if grep -qxF -- "$1" "$RUN_DIR/compose.fail"; then
+            return 1
+        fi
+        if grep -qxF -- "$1" "$RUN_DIR/compose.fail.once"; then
+            : >"$RUN_DIR/compose.fail.once"
+            return 1
+        fi
+        case "$*" in
+            "ps -a -q loadgen") cat "$RUN_DIR/lg-cid" ;;
+            "pause loadgen") state=paused ;;
+            "unpause loadgen") state=running ;;
+            "kill -s SIGKILL loadgen") state=exited ;;
+        esac
+        if [[ -n "$state" ]]; then
+            echo "$state" >"$RUN_DIR/lg-state"
+        fi
+        if grep -qxF -- "$1" "$RUN_DIR/compose.exit.after"; then
+            exit 130
+        fi
+    }
+    hard_timeout() {
+        shift
+        "$@"
+    }
+    # shellcheck disable=SC2329 # Invoked by hard_timeout, as loadgen_run_state calls it.
+    docker() {
+        if [[ "$*" == "inspect --type container --format {{json .State}} $T_AT_START_CID" &&
+            ! -f "$RUN_DIR/lg-inspect-fail" ]]; then
+            jq -c -n --arg status "$(cat "$RUN_DIR/lg-state")" --arg started "$(cat "$RUN_DIR/lg-started")" \
+                '{Status: $status, Running: ($status != "exited"), Paused: ($status == "paused"),
+                    StartedAt: $started}' | tr -d '\r'
+            return 0
+        fi
+        echo "Error: No such container: ${*: -1}" >&2
+        return 1
+    }
+    sleep() {
+        if grep -qxF -- "$1" "$RUN_DIR/sleep.exit"; then
+            exit 130
+        fi
+        echo $(($(cat "$RUN_DIR/clock") + $1)) >"$RUN_DIR/clock"
+    }
+}
+
+# t_at_start_run: secure_loadgen_at_start in a subshell, which an abort ends, leaving its status
+# and the state cleanup reads in $RUN_DIR/at-start.state, and the container ID it recorded in
+# $RUN_DIR/at-start.cid.
+t_at_start_run() {
+    local rc=0
+    (
+        trap 'echo "LOADGEN_TOUCHED=$LOADGEN_TOUCHED LOADGEN_PAUSED=$LOADGEN_PAUSED FLAG_TOUCHED=$FLAG_TOUCHED WINDOW_OPEN=$WINDOW_OPEN AT_START_DRAINING=$AT_START_DRAINING" >"$RUN_DIR/at-start.state"; echo "$LOADGEN_CID_AT_START" >"$RUN_DIR/at-start.cid"' EXIT
+        secure_loadgen_at_start
+    ) || rc=$?
+    echo "status $rc $(cat "$RUN_DIR/at-start.state")" >"$RUN_DIR/at-start.state"
+}
+
+# t_at_start_then_cleanup: secure_loadgen_at_start in a subshell that ends through the script's
+# EXIT trap, as a run does after an abort or an interrupt. cleanup's own output goes to
+# $RUN_DIR/cleanup.out and the subshell's exit status to $RUN_DIR/cleanup.status.
+t_at_start_then_cleanup() {
+    local rc=0
+    (
+        trap cleanup EXIT
+        secure_loadgen_at_start
+    ) >"$RUN_DIR/cleanup.out" 2>&1 || rc=$?
+    echo "$rc" >"$RUN_DIR/cleanup.status"
+}
+
+# t_at_start_workload: loadgen's output at start: a visit whose alert was deleted via the UI, one
+# that left its alert in place on a 403 long before, and an unconfirmed create.
+t_at_start_workload() {
+    echo "$T_DRAIN_FIRST_LINE"
+    t_drain_resolved "$T_DRAIN_RUN_1" "$T_DRAIN_ALERT_1" ui
+    t_drain_created "$T_DRAIN_RUN_2" "$T_DRAIN_ALERT_2"
+    t_drain_line "$T_DRAIN_RUN_2" "Alert [$T_DRAIN_ALERT_2] left in place: 403"
+    t_drain_opened 5e1f2a3b-0000-4000-8000-00000000000c
+    t_drain_line 5e1f2a3b-0000-4000-8000-00000000000c "Create unconfirmed threshold [1000000.40271936], outcome unknown"
+}
+
+# t_at_start_in_flight: loadgen's output at start, kept first and read running by the drain, then
+# a visit that opens the page between that read and the pause and never ends, so the frozen output
+# holds it in flight and the drain unpauses loadgen.
+t_at_start_in_flight() {
+    t_at_start_workload >"$RUN_DIR/logs.1"
+    cp "$RUN_DIR/logs.1" "$RUN_DIR/logs.2"
+    {
+        cat "$RUN_DIR/logs.1"
+        t_drain_opened 5e1f2a3b-0000-4000-8000-00000000000d
+    } >"$RUN_DIR/logs.3"
+}
+
+test_secure_loadgen_at_start_runningWithFlagOn_drainsToQAndOwnsNothing() {
+    local prefix="INFO loadgen at start (not this run's, not deleted)"
+    t_at_start_stubs 1 true
+    t_at_start_workload >"$RUN_DIR/logs.1"
+    t_at_start_run
+    t_report_has "secure_loadgen_at_start passes at Q, naming the kept output" \
+        "PASS loadgen at start: Q at 2026-01-01T00:00:01Z with no $VISIT visit in flight; loadgen killed while paused; its output since $T_AT_START_SINCE is kept in $RUN_DIR/at-start.log"
+    t_eq "secure_loadgen_at_start reads the container's ID, then pauses and kills loadgen while the flag is on" \
+        "ps -a -q loadgen|pause loadgen|kill -s SIGKILL loadgen" "$(t_drain_calls)"
+    t_eq "secure_loadgen_at_start records the ID of the container it drained" "$T_AT_START_CID" \
+        "$(cat "$RUN_DIR/at-start.cid")"
+    t_eq "secure_loadgen_at_start sends no request, so the flag is untouched" "" "$(cat "$RUN_DIR/http-calls")"
+    t_eq "secure_loadgen_at_start leaves loadgen touched for cleanup, no window open and the drain over at Q" \
+        "status 0 LOADGEN_TOUCHED=1 LOADGEN_PAUSED=0 FLAG_TOUCHED=0 WINDOW_OPEN=0 AT_START_DRAINING=0" \
+        "$(cat "$RUN_DIR/at-start.state")"
+    t_eq "secure_loadgen_at_start keeps the frozen output at Q" "$(cat "$RUN_DIR/logs.1")" \
+        "$(cat "$RUN_DIR/at-start.log")"
+    t_eq "secure_loadgen_at_start owns none of that workload's alerts" "" "$(t_drain_owned)"
+    t_report_has "secure_loadgen_at_start reports the unresolved create as not this run's" \
+        "$prefix: alert [$T_DRAIN_ALERT_2] was logged as created and never resolved"
+    t_report_has "secure_loadgen_at_start reports the alert left in place by its parsed fields" \
+        "$prefix: alert [$T_DRAIN_ALERT_2] left in place: 403"
+    t_report_has "secure_loadgen_at_start reports the unconfirmed create by its marker" \
+        "$prefix: unconfirmed create, threshold [1000000.40271936], outcome unknown"
+}
+
+test_secure_loadgen_at_start_visitStaysInFlight_unpausesAndEndsWithNothingChanged() {
+    t_at_start_stubs 1 true
+    t_at_start_in_flight
+    t_at_start_run
+    t_report_has "secure_loadgen_at_start fails without Q, stating nothing was changed" \
+        "FAIL loadgen at start: not quiescent within 180s: 1 $VISIT visits between opening the page or creating an alert and its outcome; nothing was changed: loadgen runs on as at start and the flag is untouched"
+    t_eq "secure_loadgen_at_start unpauses loadgen after the frozen output showed the visit" \
+        "ps -a -q loadgen|pause loadgen|unpause loadgen" "$(t_drain_calls)"
+    t_eq "secure_loadgen_at_start ends the run with loadgen untouched for cleanup" \
+        "status 1 LOADGEN_TOUCHED=0 LOADGEN_PAUSED=0 FLAG_TOUCHED=0 WINDOW_OPEN=0 AT_START_DRAINING=0" \
+        "$(cat "$RUN_DIR/at-start.state")"
+    t_eq "secure_loadgen_at_start without Q sends no request" "" "$(cat "$RUN_DIR/http-calls")"
+    t_eq "secure_loadgen_at_start without Q owns nothing" "" "$(t_drain_owned)"
+}
+
+test_secure_loadgen_at_start_killFails_endsWithLoadgenLeftForCleanup() {
+    t_at_start_stubs 1 true
+    t_at_start_workload >"$RUN_DIR/logs.1"
+    echo kill >"$RUN_DIR/compose.fail"
+    t_at_start_run
+    t_report_has "secure_loadgen_at_start fails naming the kill and the unpause in place on exit" \
+        "FAIL loadgen at start: killing the paused loadgen failed, exit 1 (see $RUN_DIR/compose.log); loadgen may be left paused, and cleanup unpauses it in place rather than recreating it"
+    t_eq "secure_loadgen_at_start leaves the paused loadgen touched, short of Q, for cleanup" \
+        "status 1 LOADGEN_TOUCHED=1 LOADGEN_PAUSED=1 FLAG_TOUCHED=0 WINDOW_OPEN=0 AT_START_DRAINING=1" \
+        "$(cat "$RUN_DIR/at-start.state")"
+}
+
+# t_at_start_late_kill: the at-start drain of a running loadgen with the flag on whose kill, sent
+# one second in, after the frozen output's two reads, ends in the drain deadline's second: loadgen
+# has ended, yet the drain claims no Q.
+t_at_start_late_kill() {
+    t_at_start_stubs 1 true
+    t_at_start_workload >"$RUN_DIR/logs.1"
+    echo $((QUIESCE_TIMEOUT_SECONDS - 1)) >"$RUN_DIR/takes.kill"
+}
+
+test_secure_loadgen_at_start_killEndsAtDeadline_failsAndCleanupRecreatesEndedLoadgen() {
+    t_at_start_late_kill
+    t_at_start_run
+    t_report_has "secure_loadgen_at_start fails without Q, naming loadgen as not running as at start" \
+        "FAIL loadgen at start: paused loadgen killed at or after the drain deadline of $QUIESCE_TIMEOUT_SECONDS s, so no Q; loadgen is not shown running as at start, so cleanup puts it back: in place while it runs, recreated once it has ended"
+    t_eq "secure_loadgen_at_start pauses and kills loadgen once, sending no unpause" \
+        "ps -a -q loadgen|pause loadgen|kill -s SIGKILL loadgen" "$(t_drain_calls)"
+    t_eq "secure_loadgen_at_start leaves the ended loadgen touched, short of Q, for cleanup" \
+        "status 1 LOADGEN_TOUCHED=1 LOADGEN_PAUSED=0 FLAG_TOUCHED=0 WINDOW_OPEN=0 AT_START_DRAINING=1" \
+        "$(cat "$RUN_DIR/at-start.state")"
+    t_fresh_run_dir
+    t_at_start_late_kill
+    t_at_start_then_cleanup
+    t_report_has "cleanup finds loadgen at start ended by the late kill" \
+        "INFO cleanup: loadgen at start (container $T_AT_START_SHORT) has ended (status exited), so no visit of its workload is in flight; its output since $T_AT_START_SINCE is kept in $RUN_DIR/at-start.log before it is recreated"
+    t_eq "cleanup recreates the loadgen the late kill ended, through restore_loadgen" 1 \
+        "$(t_calls_count '^up -d .*--force-recreate.* loadgen$')"
+    t_eq "cleanup never unpauses the loadgen the late kill ended" 0 "$(t_calls_count '^unpause loadgen$')"
+}
+
+test_secure_loadgen_at_start_containerNotAsSetupFound_endsWithNothingChanged() {
+    local row label switch value detail
+    local restarted="2026-01-01T00:30:00Z"
+    # LABEL;SWITCH;VALUE;DETAIL: VALUE goes to $RUN_DIR/SWITCH (t_at_start_stubs) before the step.
+    for row in "ID unreadable;compose.fail;ps;reading loadgen's container ID failed, exit 1 (see @RUN_DIR@/compose.log)" \
+        "no container ID;lg-cid;;loadgen's container ID is [], not a full container ID cleanup could inspect again" \
+        "state unreadable;lg-inspect-fail;1;reading the state of loadgen's container $T_AT_START_SHORT failed, exit 1 (see @RUN_DIR@/compose.log)" \
+        "restarted since setup;lg-started;$restarted;loadgen's container $T_AT_START_SHORT is [status running, paused false, started $restarted] instead of [status running, paused false, started $T_AT_START_SINCE] as setup found it"; do
+        IFS=';' read -r label switch value detail <<<"$row"
+        (
+            t_fresh_run_dir
+            t_at_start_stubs 1 true
+            t_at_start_workload >"$RUN_DIR/logs.1"
+            printf '%s\n' "$value" >"$RUN_DIR/$switch"
+            t_at_start_run
+            t_report_has "secure_loadgen_at_start fails before the drain when the container's $label" \
+                "FAIL loadgen at start: ${detail//@RUN_DIR@/$RUN_DIR}; nothing was changed"
+            t_eq "secure_loadgen_at_start neither pauses nor kills loadgen when the container's $label" \
+                "ps -a -q loadgen" "$(t_drain_calls)"
+            t_eq "secure_loadgen_at_start leaves loadgen untouched when the container's $label" \
+                "status 1 LOADGEN_TOUCHED=0 LOADGEN_PAUSED=0 FLAG_TOUCHED=0 WINDOW_OPEN=0 AT_START_DRAINING=0" \
+                "$(cat "$RUN_DIR/at-start.state")"
+        )
+    done
+}
+
+# The INFO line cleanup reports once it has put the container found at start back in place.
+T_AT_START_RECOVERED="INFO cleanup: loadgen at start recovered in place: running as at start (container $T_AT_START_SHORT), not recreated"
+
+# t_calls_count REGEX: how many Compose commands run so far match the extended REGEX.
+t_calls_count() {
+    grep -cE -- "$1" "$RUN_DIR/compose.calls" || true
+}
+
+test_cleanup_atStartDrainShortOfQ_recoversLoadgenInPlaceWithoutRecreate() {
+    local row label switch value unpauses status
+    # LABEL;SWITCH;VALUE;UNPAUSES;STATUS: VALUE written to $RUN_DIR/SWITCH (t_at_start_stubs)
+    # makes the drain fail or the run be interrupted short of Q; UNPAUSES is the number of unpause
+    # commands the drain and cleanup run together, STATUS the run's exit status.
+    for row in "the drain's unpause fails;compose.fail.once;unpause;2;1" \
+        "an interrupt between the drain's polls;sleep.exit;$QUIESCE_STEP_SECONDS;1;130" \
+        "an interrupt while loadgen is paused;sleep.exit;$QUIESCE_FLUSH_STEP_SECONDS;1;130" \
+        "an interrupt after an unpause, before LOADGEN_PAUSED clears;compose.exit.after;unpause;1;130"; do
+        IFS=';' read -r label switch value unpauses status <<<"$row"
+        (
+            t_fresh_run_dir
+            t_at_start_stubs 1 true
+            t_at_start_in_flight
+            printf '%s\n' "$value" >"$RUN_DIR/$switch"
+            t_at_start_then_cleanup
+            t_report_has "cleanup after $label reports loadgen at start recovered in place" "$T_AT_START_RECOVERED"
+            t_report_has "cleanup after $label passes" "PASS cleanup"
+            t_eq "cleanup after $label unpauses loadgen only if it is paused" "$unpauses" \
+                "$(t_calls_count '^unpause loadgen$')"
+            t_eq "cleanup after $label neither recreates nor removes loadgen" 0 "$(t_calls_count '^(up|rm) ')"
+            t_eq "cleanup after $label leaves the container found at start running" running \
+                "$(cat "$RUN_DIR/lg-state")"
+            t_eq "the run after $label exits with its own status" "$status" "$(cat "$RUN_DIR/cleanup.status")"
+        )
+    done
+}
+
+# t_at_start_not_recoverable_row LABEL STATE SWITCH VALUE DETAIL UNPAUSES: one row of the case
+# below, which runs it in a subshell, so the run state it sets ends with the row.
+t_at_start_not_recoverable_row() {
+    local label="$1" state="$2" switch="$3" value="$4" detail="$5" unpauses="$6"
+    t_fresh_run_dir
+    t_at_start_stubs 1 true
+    # What an interrupted at-start drain leaves for cleanup.
+    LOADGEN_CID_AT_START="$T_AT_START_CID"
+    AT_START_DRAINING=1
+    LOADGEN_PAUSED=1
+    echo "$state" >"$RUN_DIR/lg-state"
+    printf '%s\n' "$value" >"$RUN_DIR/$switch"
+    t_cleanup
+    t_report_has "cleanup fails naming loadgen at start when its $label" \
+        "FAIL cleanup: loadgen at start (container $T_AT_START_SHORT) ${detail//@RUN_DIR@/$RUN_DIR}"
+    t_eq "cleanup tries to unpause loadgen at start only if it is paused, when its $label" "$unpauses" \
+        "$(t_calls_count '^unpause loadgen$')"
+    t_eq "cleanup neither recreates nor removes loadgen at start when its $label" 0 \
+        "$(t_calls_count '^(up|rm) ')"
+    t_eq "cleanup leaves loadgen at start $state when its $label" "$state" "$(cat "$RUN_DIR/lg-state")"
+}
+
+test_cleanup_atStartLoadgenNotRecoverable_failsWithoutRecreate() {
+    local row label state switch value detail unpauses
+    local restarted="2026-01-01T00:30:00Z" why="not recreated, since a visit of its workload may be in flight"
+    # LABEL;STATE;SWITCH;VALUE;DETAIL;UNPAUSES: the container found at start is in STATE, short of
+    # Q, when cleanup runs, with VALUE written to $RUN_DIR/SWITCH (t_at_start_stubs); DETAIL is the
+    # cleanup problem, in which @RUN_DIR@ stands for the run directory, and UNPAUSES the number of
+    # unpause commands cleanup runs.
+    for row in "unpause fails;paused;compose.fail;unpause;left paused, $why: unpausing loadgen failed, exit 1 (see @RUN_DIR@/compose.log);1" \
+        "state unreadable;running;lg-inspect-fail;1;unverified, $why: reading its state failed, exit 1 (see @RUN_DIR@/compose.log);0" \
+        "restarted since start;running;lg-started;$restarted;is [status running, paused false, started $restarted] instead of [status running, paused false, started $T_AT_START_SINCE] as at start, $why;0"; do
+        IFS=';' read -r label state switch value detail unpauses <<<"$row"
+        (t_at_start_not_recoverable_row "$label" "$state" "$switch" "$value" "$detail" "$unpauses")
+    done
+}
+
+test_cleanup_interruptedAfterAtStartKill_keepsOutputAndRecreates() {
+    local row label final kept
+    # LABEL;FINAL;KEPT: FINAL is the output loadgen gives once killed, final for its output at
+    # start and one line more, or the marker of an unreadable read; KEPT is the INFO tail cleanup
+    # reports, in which @RUN_DIR@ stands for the run directory.
+    for row in "readable;final;is kept in @RUN_DIR@/at-start.log before it is recreated" \
+        "unreadable;!unreadable;could not be kept before it is recreated: loadgen logs unreadable, exit 1 (see @RUN_DIR@/compose.log)"; do
+        IFS=';' read -r label final kept <<<"$row"
+        (
+            t_fresh_run_dir
+            t_at_start_stubs 1 true
+            t_at_start_workload >"$RUN_DIR/logs.1"
+            if [[ "$final" == "final" ]]; then
+                {
+                    cat "$RUN_DIR/logs.1"
+                    echo "[2026-01-01 00:00:12+00:00][worker:1][INFO]: Running visit [deposit_and_buy]"
+                } >"$RUN_DIR/logs.final"
+            else
+                echo "$final" >"$RUN_DIR/logs.final"
+            fi
+            # Interrupted right after the kill at Q, before the step records that Q was reached.
+            echo kill >"$RUN_DIR/compose.exit.after"
+            t_at_start_then_cleanup
+            t_report_has "cleanup finds loadgen at start ended after the kill, its output $label" \
+                "INFO cleanup: loadgen at start (container $T_AT_START_SHORT) has ended (status exited), so no visit of its workload is in flight; its output since $T_AT_START_SINCE ${kept//@RUN_DIR@/$RUN_DIR}"
+            if [[ "$final" == "final" ]]; then
+                t_eq "cleanup keeps the ended container's final output before the recreate" \
+                    "$(cat "$RUN_DIR/logs.final")" "$(cat "$RUN_DIR/at-start.log")"
+            else
+                t_eq "cleanup keeps the output read at start when the final output is unreadable" \
+                    "$(cat "$RUN_DIR/logs.1")" "$(cat "$RUN_DIR/at-start.log")"
+            fi
+            # restore_loadgen's own result is the subject of the restore tests below.
+            t_eq "cleanup recreates the ended loadgen through restore_loadgen, its output $label" 1 \
+                "$(t_calls_count '^up -d .*--force-recreate.* loadgen$')"
+            t_eq "cleanup never unpauses the ended loadgen, its output $label" 0 \
+                "$(t_calls_count '^unpause loadgen$')"
+        )
+    done
+}
+
+test_secure_loadgen_at_start_flagOffOrStopped_keepsOutputWithoutDrain() {
+    local row running flag detail
+    # RUNNING|FLAG|DETAIL
+    for row in "1|false|running with the flag off, so no visit creates or deletes an alert; not drained" \
+        "0|true|stopped, so no visit can be in flight" \
+        "0|false|stopped, so no visit can be in flight"; do
+        IFS='|' read -r running flag detail <<<"$row"
+        (
+            t_fresh_run_dir
+            t_at_start_stubs "$running" "$flag"
+            t_at_start_workload >"$RUN_DIR/logs.1"
+            t_at_start_run
+            t_report_has "secure_loadgen_at_start passes loadgen running $running with the flag $flag" \
+                "PASS loadgen at start: $detail; its output since $T_AT_START_SINCE is kept in $RUN_DIR/at-start.log"
+            t_eq "secure_loadgen_at_start runs no Compose command with loadgen running $running and the flag $flag" \
+                "" "$(t_drain_calls)"
+            t_eq "secure_loadgen_at_start reads the output once with loadgen running $running and the flag $flag" \
+                1 "$(cat "$RUN_DIR/logs.n")"
+            t_eq "secure_loadgen_at_start keeps that output with loadgen running $running and the flag $flag" \
+                "$(cat "$RUN_DIR/logs.1")" "$(cat "$RUN_DIR/at-start.log")"
+            t_eq "secure_loadgen_at_start leaves loadgen untouched with loadgen running $running and the flag $flag" \
+                "status 0 LOADGEN_TOUCHED=0 LOADGEN_PAUSED=0 FLAG_TOUCHED=0 WINDOW_OPEN=0 AT_START_DRAINING=0" \
+                "$(cat "$RUN_DIR/at-start.state")"
+            t_report_has "secure_loadgen_at_start reports the unresolved create with loadgen running $running and the flag $flag" \
+                "INFO loadgen at start (not this run's, not deleted): alert [$T_DRAIN_ALERT_2] was logged as created and never resolved"
+            t_eq "secure_loadgen_at_start owns nothing with loadgen running $running and the flag $flag" "" "$(t_drain_owned)"
+        )
+    done
+}
+
+test_secure_loadgen_at_start_noContainer_passesWithoutReading() {
+    t_at_start_stubs 0 true
+    LOADGEN_AT_START="no container"
+    t_at_start_run
+    t_report_has "secure_loadgen_at_start passes without a container" \
+        "PASS loadgen at start: no container, so no visit of an earlier workload can be in flight"
+    t_eq "secure_loadgen_at_start reads no output without a container" 0 "$(cat "$RUN_DIR/logs.n")"
+    t_eq "secure_loadgen_at_start runs no Compose command without a container" "" "$(t_drain_calls)"
+}
+
+test_secure_loadgen_at_start_outputUnreadable_endsWithNothingChanged() {
+    t_at_start_stubs 1 true
+    echo '!unreadable' >"$RUN_DIR/logs.1"
+    t_at_start_run
+    t_report_has "secure_loadgen_at_start fails when the output cannot be kept" \
+        "FAIL loadgen at start: reading loadgen's output since it started at $T_AT_START_SINCE: loadgen logs unreadable, exit 1 (see $RUN_DIR/compose.log); nothing was changed"
+    t_eq "secure_loadgen_at_start without its output runs no Compose command" "" "$(t_drain_calls)"
+    t_eq "secure_loadgen_at_start without its output leaves loadgen untouched" \
+        "status 1 LOADGEN_TOUCHED=0 LOADGEN_PAUSED=0 FLAG_TOUCHED=0 WINDOW_OPEN=0 AT_START_DRAINING=0" \
+        "$(cat "$RUN_DIR/at-start.state")"
+    (
+        t_fresh_run_dir
+        t_at_start_stubs 1 true
+        LOADGEN_STARTED_AT="-"
+        t_at_start_run
+        t_report_has "secure_loadgen_at_start fails on a start time it cannot read from" \
+            "FAIL loadgen at start: loadgen's start time - is not an RFC 3339 time, so its output cannot be read; nothing was changed"
+        t_eq "secure_loadgen_at_start reads no output without a start time" 0 "$(cat "$RUN_DIR/logs.n")"
+    )
+}
+
+test_main_steps_securesLoadgenAtStartBetweenSetupAndRunA() {
+    local step
+    T_STEPS="$RUN_DIR/steps"
+    : >"$T_STEPS"
+    (
+        # Every step main runs records its name, so only the order is under test.
+        parse_options() {
+            BASE_URL="http://localhost"
+            COMPOSE_FILES=("compose.dev.yaml")
+            PROJECT="pi-test"
+            WEIGHT="1"
+            MINUTES="35"
+            OUT_FILE=""
+            RESUME_RUN_DIR=""
+        }
+        for step in check_tools setup secure_loadgen_at_start run_a run_b flag_off_window finish_run cleanup; do
+            eval "$step() { echo $step >>\"\$T_STEPS\"; }"
+        done
+        TMPDIR="$RUN_DIR"
+        main --project pi-test
+    ) >/dev/null 2>&1 || true
+    t_eq "main secures loadgen at start after setup and before run A switches the flag" \
+        "check_tools setup secure_loadgen_at_start run_a run_b flag_off_window finish_run cleanup" \
+        "$(join_lines <"$T_STEPS")"
+}
+
+# ---------------------------------------------------------------------------------------------
 # Loadgen log sanitizing (loadgen_logs)
 
 # Fixture values, all invented: no preset password ever appears in a fixture.
@@ -923,35 +1431,158 @@ test_report_outcomes_outcomeLines_printsOnlyParsedFields() {
 
 T_WEIGHT_2='["EASYTRADE_URL=http://reverse-proxy","PORTFOLIO_INSIGHTS_ALERT_WEIGHT=2"]'
 T_NO_WEIGHT='["EASYTRADE_URL=http://reverse-proxy"]'
+# Image IDs, both invented: the one loadgen runs at start, and one its image reference names after
+# a rebuild.
+T_IMAGE_A="sha256:a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a7b8"
+T_IMAGE_B="sha256:b2c3d4e5f6a7b2c3d4e5f6a7b2c3d4e5f6a7b2c3d4e5f6a7b2c3d4e5f6a7b8c9"
+T_IMAGE_REF="pi-test-loadgen"
+T_STARTED_AT="2026-01-01T00:00:00.123456789Z"
+
+# t_config_hash TOKEN: the 64-hex config hash the docker stub's Compose gives loadgen: a SHA-256 of
+# the other settings in $RUN_DIR/t-settings and TOKEN, the base64 of the weight value loadgen's
+# environment gets, or - when the compose files do not declare the weight.
+t_config_hash() {
+    local sum
+    sum="$(printf 'settings=%s weight=%s' "$(cat "$RUN_DIR/t-settings")" "$1" | sha256sum)"
+    printf '%s' "${sum:0:64}"
+}
+
+# t_compose_weight_token: the weight token (t_config_hash) of the loadgen the stub's Compose would
+# create now, from t-declared and this shell's PORTFOLIO_INSIGHTS_ALERT_WEIGHT, as
+# ${PORTFOLIO_INSIGHTS_ALERT_WEIGHT:-0} interpolates it.
+t_compose_weight_token() {
+    if [[ "$(cat "$RUN_DIR/t-declared")" == "1" ]]; then
+        printf '%s' "${PORTFOLIO_INSIGHTS_ALERT_WEIGHT:-0}" | base64 -w0
+    else
+        printf '%s' "-"
+    fi
+}
+
+# t_env_weight_token: the weight token (t_config_hash) of the container environment in
+# $RUN_DIR/t-env: the base64 of its PORTFOLIO_INSIGHTS_ALERT_WEIGHT value, or - without one.
+t_env_weight_token() {
+    jq -r 'first(.[]? | select(startswith("PORTFOLIO_INSIGHTS_ALERT_WEIGHT="))
+        | ltrimstr("PORTFOLIO_INSIGHTS_ALERT_WEIGHT=") | @base64) // "-"' "$RUN_DIR/t-env" 2>/dev/null |
+        tr -d '\r\n'
+}
+
+# t_container_json ID NUMBER IMAGE HASH STARTED RUNNING CPU RESTART ENV_FILE DEPENDS REPLACE ULIMITS:
+# the docker inspect object of stub loadgen container ID, pi-test-loadgen-NUMBER, as the engine
+# gives the fields loadgen_identity and loadgen_config_snapshot read: image ID IMAGE, created from
+# T_IMAGE_REF with config hash HASH, the depends_on label DEPENDS and, unless REPLACE is empty, the
+# replace label REPLACE; last started at STARTED; the JSON environment in ENV_FILE (null when it
+# is no JSON); CpuShares CPU, restart policy RESTART and the ulimits named in ULIMITS, in that
+# order. Running when RUNNING is 1, it has the endpoint addresses and DNS names, and the null
+# OomKillDisable, the engine gives a started container; otherwise none, and false, as created.
+t_container_json() {
+    jq -c -n --arg id "$1" --arg number "$2" --arg image "$3" --arg ref "$T_IMAGE_REF" --arg hash "$4" \
+        --arg started "$5" --arg running "$6" --argjson cpu "$7" --arg restart "$8" --rawfile env "$9" \
+        --arg depends "${10}" --arg replace "${11}" --arg ulimits "${12}" '
+        ("pi-test-loadgen-" + $number) as $name | ($running == "1") as $up
+        | {Id: $id, Name: ("/" + $name), Image: $image,
+            Config: {Hostname: $id, Image: $ref, Env: ($env | fromjson? // null),
+                Labels: ({"com.docker.compose.service": "loadgen", "com.docker.compose.config-hash": $hash,
+                    "com.docker.compose.container-number": $number, "com.docker.compose.depends_on": $depends}
+                    + (if $replace == "" then {} else {"com.docker.compose.replace": $replace} end))},
+            HostConfig: {CpuShares: $cpu, OomKillDisable: (if $up then null else false end),
+                RestartPolicy: {Name: $restart, MaximumRetryCount: 0},
+                Ulimits: ($ulimits | split(" ") | map({Name: ., Soft: 0, Hard: 0}))},
+            NetworkSettings: {Networks: {"pi-test_default": {Aliases: [$name, "loadgen"],
+                DNSNames: (if $up then [$name, "loadgen", $id[0:12]] else null end),
+                IPAddress: (if $up then "172.18.0.5" else "" end), IPAMConfig: null, Links: null,
+                DriverOpts: null, GwPriority: 0}}},
+            State: {StartedAt: $started}}' | tr -d '\r'
+}
 
 # t_loadgen_fixture CID RUNNING ENV [DECLARED]: a project whose loadgen container CID (none when
-# empty) runs when RUNNING is 1 and has the JSON environment ENV, answered by a docker stub. Each
+# empty) runs when RUNNING is 1 and has the JSON environment ENV, answered by a docker stub. The
+# container runs T_IMAGE_A, created from T_IMAGE_REF, which names T_IMAGE_A (t-ref-image), and its
+# config-hash label is the t_config_hash of the settings in t-settings and its weight. Each
 # compose up or rm of loadgen is logged to $RUN_DIR/docker-calls with the
 # PORTFOLIO_INSIGHTS_ALERT_WEIGHT it was called with, then applied: up makes a new container,
-# running for -d, whose weight is Compose's ${PORTFOLIO_INSIGHTS_ALERT_WEIGHT:-0}, or absent when
-# DECLARED is 0, as with compose files lacking the declaration. The files t-fail, t-inspect-fail
-# and t-exits in $RUN_DIR make up and rm fail, loadgen's inspect fail, and a started container exit.
-# hard_timeout, which bounds those calls, runs the stub here without the time limit, which
-# harness-test.sh covers.
+# running for -d, that runs the image in t-ref-image with the config hash of the stub's Compose
+# now (t_compose_weight_token), and whose weight is Compose's ${PORTFOLIO_INSIGHTS_ALERT_WEIGHT:-0},
+# or absent when DECLARED is 0, as with compose files lacking the declaration; config --hash loadgen
+# prints that hash and config --no-interpolate whether the weight is declared. The files t-fail,
+# t-inspect-fail, t-identity-fail, t-image-missing, t-config-fail, t-declare-fail and t-exits in
+# $RUN_DIR make up and rm fail, every inspect of loadgen fail, only its {{json .}} inspect fail,
+# the image reference name no image, config --hash fail, config --no-interpolate fail, and a
+# started container exit. hard_timeout, which bounds those calls, runs the stub here without the
+# time limit, which harness-test.sh covers.
+# Every docker call is also logged to $RUN_DIR/docker-all. docker inspect --format '{{json .}}'
+# answers t_container_json of the container, with the CpuShares in t-cpu and the restart policy
+# in t-restart, which docker update would change and a recreate resets to Compose's 0 and always.
+# The twin check_loadgen_restorable creates, up --no-start ... --scale loadgen=2, is logged as an
+# up is and becomes container lg-twin (t-twin-cid), not started, as Compose creates loadgen now:
+# its environment and ulimits in another order, number 2, another depends_on label; docker rm
+# --force --volumes ID is logged as "docker rm ..." and removes it. t-twin-create-fail makes the
+# create fail before it creates the twin, t-twin-create-fail-late after, t-twin-none create none,
+# t-twin-inspect-fail fail its inspect, t-twin-rm-fail fail its removal, t-twin-rm-fail-once only
+# the first one, t-twin-rm-noop leave it in place while succeeding, t-ps-fail fail every
+# ps -a -q loadgen, t-ps-fail-with-twin fail those while a twin exists, and t-vanish-after-env
+# remove loadgen's container once its environment has been read.
 t_loadgen_fixture() {
     echo "$1" >"$RUN_DIR/t-cid"
     echo "$2" >"$RUN_DIR/t-running"
     echo "$3" >"$RUN_DIR/t-env"
     echo "${4:-1}" >"$RUN_DIR/t-declared"
+    echo "as at start" >"$RUN_DIR/t-settings"
+    echo "$T_IMAGE_A" >"$RUN_DIR/t-image"
+    echo "$T_IMAGE_A" >"$RUN_DIR/t-ref-image"
+    echo "$T_STARTED_AT" >"$RUN_DIR/t-started"
+    echo 0 >"$RUN_DIR/t-cpu"
+    echo always >"$RUN_DIR/t-restart"
+    : >"$RUN_DIR/t-replace"
+    : >"$RUN_DIR/t-twin-cid"
+    t_config_hash "$(t_env_weight_token)" >"$RUN_DIR/t-label"
     : >"$RUN_DIR/docker-calls"
+    : >"$RUN_DIR/docker-all"
     hard_timeout() {
         shift
         "$@"
     }
     docker() {
-        local weight="${PORTFOLIO_INSIGHTS_ALERT_WEIGHT-(unset)}" cid
+        local weight="${PORTFOLIO_INSIGHTS_ALERT_WEIGHT-(unset)}" cid twin
+        echo "$*" >>"$RUN_DIR/docker-all"
         cid="$(cat "$RUN_DIR/t-cid")"
+        twin="$(cat "$RUN_DIR/t-twin-cid")"
+        if [[ "$1" == "rm" ]]; then
+            echo "docker $*" >>"$RUN_DIR/docker-calls"
+            if [[ -f "$RUN_DIR/t-twin-rm-fail" || -f "$RUN_DIR/t-twin-rm-fail-once" ]]; then
+                rm -f "$RUN_DIR/t-twin-rm-fail-once"
+                echo "Error response from daemon: simulated removal failure" >&2
+                return 1
+            fi
+            if [[ "$*" == "rm --force --volumes $twin" && -n "$twin" && ! -f "$RUN_DIR/t-twin-rm-noop" ]]; then
+                : >"$RUN_DIR/t-twin-cid"
+            fi
+            return 0
+        fi
+        if [[ "$1 $2" == "image inspect" ]]; then
+            if [[ "$*" == "image inspect --format {{.Id}} $T_IMAGE_REF" && ! -f "$RUN_DIR/t-image-missing" ]]; then
+                cat "$RUN_DIR/t-ref-image"
+                return 0
+            fi
+            echo "Error response from daemon: No such image: ${*: -1}" >&2
+            return 1
+        fi
         if [[ "$1" == "inspect" ]]; then
             if [[ "${*: -1}" == "db-adapter-1" ]]; then
                 echo '["DB_TYPE=postgres"]'
             elif [[ -n "$cid" && "${*: -1}" == "$cid" && "$3" == "{{json .Config.Env}}" &&
                 ! -f "$RUN_DIR/t-inspect-fail" ]]; then
                 cat "$RUN_DIR/t-env"
+                if [[ -f "$RUN_DIR/t-vanish-after-env" ]]; then
+                    : >"$RUN_DIR/t-cid"
+                fi
+            elif [[ -n "$cid" && "${*: -1}" == "$cid" && "$3" == "{{json .}}" &&
+                ! -f "$RUN_DIR/t-inspect-fail" && ! -f "$RUN_DIR/t-identity-fail" ]]; then
+                t_container_json "$cid" 1 "$(cat "$RUN_DIR/t-image")" "$(cat "$RUN_DIR/t-label")" \
+                    "$(cat "$RUN_DIR/t-started")" "$(cat "$RUN_DIR/t-running")" "$(cat "$RUN_DIR/t-cpu")" \
+                    "$(cat "$RUN_DIR/t-restart")" "$RUN_DIR/t-env" "" "$(cat "$RUN_DIR/t-replace")" "core nofile"
+            elif [[ -n "$twin" && "${*: -1}" == "$twin" && "$3" == "{{json .}}" &&
+                ! -f "$RUN_DIR/t-twin-inspect-fail" ]]; then
+                cat "$RUN_DIR/t-twin.json"
             else
                 echo "Error: No such object: ${*: -1}" >&2
                 return 1
@@ -966,6 +1597,23 @@ t_loadgen_fixture() {
             "config --services")
                 printf '%s\n' broker-service db db-adapter feature-flag-service loadgen reverse-proxy
                 ;;
+            "config --hash loadgen")
+                if [[ -f "$RUN_DIR/t-config-fail" ]]; then
+                    echo "simulated compose failure" >&2
+                    return 1
+                fi
+                echo "loadgen $(t_config_hash "$(t_compose_weight_token)")"
+                ;;
+            "config --no-interpolate --format json")
+                if [[ -f "$RUN_DIR/t-declare-fail" ]]; then
+                    echo "simulated compose failure" >&2
+                    return 1
+                fi
+                # shellcheck disable=SC2016 # The declaration is Compose's text, never expanded.
+                jq -c -n --arg declared "$(cat "$RUN_DIR/t-declared")" '{services: {loadgen: {environment:
+                    ({EASYTRADE_URL: "http://reverse-proxy"} + (if $declared == "1" then
+                        {PORTFOLIO_INSIGHTS_ALERT_WEIGHT: "${PORTFOLIO_INSIGHTS_ALERT_WEIGHT:-0}"} else {} end))}}}'
+                ;;
             "ps --status running --services")
                 printf '%s\n' broker-service db db-adapter feature-flag-service reverse-proxy
                 if [[ -n "$cid" && "$(cat "$RUN_DIR/t-running")" == "1" ]]; then
@@ -976,11 +1624,48 @@ t_loadgen_fixture() {
                 echo db-adapter-1
                 ;;
             "ps -a -q loadgen")
+                if [[ -f "$RUN_DIR/t-ps-fail" || (-n "$twin" && -f "$RUN_DIR/t-ps-fail-with-twin") ]]; then
+                    echo "simulated compose failure" >&2
+                    return 1
+                fi
                 if [[ -n "$cid" ]]; then
                     echo "$cid"
                 fi
+                if [[ -n "$twin" ]]; then
+                    echo "$twin"
+                fi
                 ;;
-            "up -d --no-deps --force-recreate loadgen" | "up --no-start --no-deps --force-recreate loadgen" | \
+            # check_loadgen_restorable's twin, created without starting it as Compose creates loadgen
+            # now, with the weight it is called with.
+            "up --no-start --no-deps --no-recreate --no-build --pull never --scale loadgen=2 loadgen")
+                echo "$* | weight $weight" >>"$RUN_DIR/docker-calls"
+                if [[ -f "$RUN_DIR/t-twin-create-fail" ]]; then
+                    echo "simulated compose failure" >&2
+                    return 1
+                fi
+                if [[ ! -f "$RUN_DIR/t-twin-none" ]]; then
+                    if [[ "$(cat "$RUN_DIR/t-declared")" == "1" ]]; then
+                        jq -c -n --arg entry "PORTFOLIO_INSIGHTS_ALERT_WEIGHT=${PORTFOLIO_INSIGHTS_ALERT_WEIGHT:-0}" \
+                            '[$entry, "EASYTRADE_URL=http://reverse-proxy"]' | tr -d '\r' >"$RUN_DIR/t-twin-env"
+                    else
+                        echo "$T_NO_WEIGHT" >"$RUN_DIR/t-twin-env"
+                    fi
+                    t_container_json lg-twin 2 "$(cat "$RUN_DIR/t-ref-image")" \
+                        "$(t_config_hash "$(t_compose_weight_token)")" "0001-01-01T00:00:00Z" 0 0 always \
+                        "$RUN_DIR/t-twin-env" "reverse-proxy:service_started:false" "" "nofile core" \
+                        >"$RUN_DIR/t-twin.json"
+                    echo lg-twin >"$RUN_DIR/t-twin-cid"
+                fi
+                if [[ -f "$RUN_DIR/t-twin-create-fail-late" ]]; then
+                    echo "simulated compose failure after the create" >&2
+                    return 1
+                fi
+                ;;
+            # A window's recreate, and restore_loadgen's bounded recreates, which neither build nor
+            # pull.
+            "up -d --no-deps --force-recreate loadgen" | \
+                "up -d --no-deps --force-recreate --no-build --pull never loadgen" | \
+                "up --no-start --no-deps --force-recreate --no-build --pull never loadgen" | \
                 "rm --force --stop loadgen")
                 echo "$* | weight $weight" >>"$RUN_DIR/docker-calls"
                 if [[ -f "$RUN_DIR/t-fail" ]]; then
@@ -991,11 +1676,20 @@ t_loadgen_fixture() {
                     : >"$RUN_DIR/t-cid"
                     return 0
                 fi
+                # The container it replaces, and what Compose sets that docker update may have
+                # changed on that one.
+                echo "$cid" >"$RUN_DIR/t-replace"
                 echo loadgen-recreated >"$RUN_DIR/t-cid"
+                echo 0 >"$RUN_DIR/t-cpu"
+                echo always >"$RUN_DIR/t-restart"
+                cp "$RUN_DIR/t-ref-image" "$RUN_DIR/t-image"
+                t_config_hash "$(t_compose_weight_token)" >"$RUN_DIR/t-label"
                 if [[ "$2" == "-d" && ! -f "$RUN_DIR/t-exits" ]]; then
                     echo 1 >"$RUN_DIR/t-running"
+                    echo "2026-01-01T01:00:00.000000001Z" >"$RUN_DIR/t-started"
                 else
                     echo 0 >"$RUN_DIR/t-running"
+                    echo "0001-01-01T00:00:00Z" >"$RUN_DIR/t-started"
                 fi
                 if [[ "$(cat "$RUN_DIR/t-declared")" == "1" ]]; then
                     jq -c -n --arg entry "PORTFOLIO_INSIGHTS_ALERT_WEIGHT=${PORTFOLIO_INSIGHTS_ALERT_WEIGHT:-0}" \
@@ -1012,23 +1706,44 @@ t_loadgen_fixture() {
     }
 }
 
-# t_stub_flag_service: http answers 200 with the flag off and modifiable, as a ready stack does.
+# t_stub_flag_service: http answers 200 with the flag off and modifiable, as a ready stack does:
+# every field feature-flag-service serializes from flag/model.go's Flag.
 t_stub_flag_service() {
     http() {
         HTTP_STATUS="200"
-        HTTP_CTYPE="application/json"
         HTTP_ERROR=""
-        HTTP_BODY="{\"id\":\"$FLAG_ID\",\"enabled\":false,\"isModifiable\":true}"
+        HTTP_BODY="{\"id\":\"$FLAG_ID\",\"enabled\":false,\"name\":\"Portfolio insights\",\"description\":\"Demo feature, not financial advice.\",\"isModifiable\":true,\"tag\":\"feature\"}"
     }
 }
 
-# t_capture_start: records loadgen at start as setup does.
+# t_capture_start: records loadgen at start as setup does, with the image ID, config hash,
+# effective configuration, start time and container ID check_loadgen_restorable records, whether
+# or not the container is restorable.
 t_capture_start() {
+    local identity
     LOADGEN_AT_START="$(loadgen_state && printf x)"
     LOADGEN_AT_START="${LOADGEN_AT_START%x}"
     if [[ "$LOADGEN_AT_START" == running,* ]]; then
         LOADGEN_WAS_RUNNING=1
     fi
+    identity="$(loadgen_identity "$RUN_DIR/loadgen-at-start.config.json")"
+    IFS=$'\t' read -r LOADGEN_IMAGE_AT_START LOADGEN_HASH_AT_START _ LOADGEN_STARTED_AT LOADGEN_ID_AT_START \
+        <<<"$identity"
+    if [[ -n "$identity" ]]; then
+        LOADGEN_CONFIG_AT_START="$RUN_DIR/loadgen-at-start.config.json"
+    fi
+}
+
+# t_short HASH: the first 12 hex digits of HASH, a digest with or without its sha256: prefix.
+t_short() {
+    local hex="${1#sha256:}"
+    printf '%s' "${hex:0:12}"
+}
+
+# t_weight_hash VALUE: the config hash the docker stub's Compose gives loadgen with the declared
+# weight VALUE and the settings in t-settings.
+t_weight_hash() {
+    t_config_hash "$(printf '%s' "$1" | base64 -w0)"
 }
 
 # t_cleanup: cleanup after a run that recreated loadgen, with the table written and no alert
@@ -1067,21 +1782,184 @@ test_container_env_entry_environmentShapes_printsEntryOrFails() {
 }
 
 test_setup_loadgenAtStart_recordsStateAndWeight() {
-    local i
+    local i hash identity restorable calls config
+    local twin_create="up --no-start --no-deps --no-recreate --no-build --pull never --scale loadgen=2 loadgen"
     local cids=(lg-1 lg-1 "")
     local running=(1 0 0)
     local envs=("$T_WEIGHT_2" "$T_NO_WEIGHT" '[]')
+    # The second row's compose files drop the weight's declaration, as an override file can, so
+    # its container, which has no weight entry, is restorable through the unset-weight recreate.
+    local declared=(1 0 1)
     local expected=("running, PORTFOLIO_INSIGHTS_ALERT_WEIGHT=2" "stopped, PORTFOLIO_INSIGHTS_ALERT_WEIGHT unset"
         "no container")
+    # The twin is created with the weight at start, set or unset, never the shell's, and removed.
+    local twin_weights=(2 "(unset)" "")
+    # A shell value that differs from the weight at start: the restorability check predicts the
+    # hash under the weight the restore sets, not this one.
+    export PORTFOLIO_INSIGHTS_ALERT_WEIGHT=5
     for i in "${!cids[@]}"; do
         t_fresh_run_dir
-        t_loadgen_fixture "${cids[$i]}" "${running[$i]}" "${envs[$i]}"
+        t_loadgen_fixture "${cids[$i]}" "${running[$i]}" "${envs[$i]}" "${declared[$i]}"
         t_stub_flag_service
+        hash="$(cat "$RUN_DIR/t-label")"
+        identity="$T_IMAGE_A $hash $T_STARTED_AT lg-1"
+        restorable="PASS loadgen restorable: image ID $(t_short "$T_IMAGE_A") ($T_IMAGE_REF) and config hash $(t_short "$hash"), as these compose files give it, and a twin created from them, now removed, matched its effective configuration"
+        calls="$(printf '%s\n' "$twin_create | weight ${twin_weights[$i]}" "docker rm --force --volumes lg-twin")"
+        config="$RUN_DIR/loadgen-at-start.config.json"
+        if [[ -z "${cids[$i]}" ]]; then
+            identity="   "
+            restorable="PASS loadgen restorable: no loadgen container at start; the one this run creates is removed on exit"
+            calls=""
+            config=""
+        fi
         setup
         t_eq "setup records loadgen at start as [${expected[$i]}]" \
             "${expected[$i]}; was running ${running[$i]}" "$LOADGEN_AT_START; was running $LOADGEN_WAS_RUNNING"
         t_report_has "setup reports loadgen at start as [${expected[$i]}]" \
             "INFO db type postgres; loadgen at start: ${expected[$i]}"
+        t_report_has "setup passes loadgen at start [${expected[$i]}] as restorable" "$restorable"
+        t_eq "setup records the image ID, config hash, start time and container ID of loadgen at start [${expected[$i]}]" \
+            "$identity" "$LOADGEN_IMAGE_AT_START $LOADGEN_HASH_AT_START $LOADGEN_STARTED_AT $LOADGEN_ID_AT_START"
+        t_eq "setup records the effective configuration of loadgen at start [${expected[$i]}]" \
+            "$config" "$LOADGEN_CONFIG_AT_START"
+        t_eq "setup creates and removes one twin, and changes nothing else, with loadgen at start [${expected[$i]}]" \
+            "$calls" "$(cat "$RUN_DIR/docker-calls")"
+        t_eq "setup leaves no twin and loadgen at start as it was [${expected[$i]}]" \
+            "twin [] tracked [] loadgen [${cids[$i]}] running [${running[$i]}]" \
+            "twin [$(cat "$RUN_DIR/t-twin-cid")] tracked [$LOADGEN_TWIN] loadgen [$(cat "$RUN_DIR/t-cid")] running [$(cat "$RUN_DIR/t-running")]"
+        t_eq "setup leaves the shell's weight with loadgen at start [${expected[$i]}]" 5 \
+            "$PORTFOLIO_INSIGHTS_ALERT_WEIGHT"
+    done
+}
+
+# The changes t_restorable_case makes to the docker stub's state before setup, one per function.
+# shellcheck disable=SC2329 # Each runs through t_restorable_case.
+t_settings_changed() {
+    echo "other settings" >"$RUN_DIR/t-settings"
+}
+# shellcheck disable=SC2329 # Runs through t_restorable_case.
+t_image_rebuilt() {
+    echo "$T_IMAGE_B" >"$RUN_DIR/t-ref-image"
+}
+# shellcheck disable=SC2329 # Runs through t_restorable_case.
+t_image_missing() {
+    touch "$RUN_DIR/t-image-missing"
+}
+# t_weight_unset_at_start: a container without a weight entry, created from compose files that did
+# not declare it.
+# shellcheck disable=SC2329 # Runs through t_restorable_case.
+t_weight_unset_at_start() {
+    echo "$T_NO_WEIGHT" >"$RUN_DIR/t-env"
+    t_config_hash - >"$RUN_DIR/t-label"
+}
+# t_weight_empty_at_start: a container whose weight entry is empty, created from compose files
+# that leave an empty value empty.
+# shellcheck disable=SC2329 # Runs through t_restorable_case.
+t_weight_empty_at_start() {
+    echo '["EASYTRADE_URL=http://reverse-proxy","PORTFOLIO_INSIGHTS_ALERT_WEIGHT="]' >"$RUN_DIR/t-env"
+    t_weight_hash "" >"$RUN_DIR/t-label"
+}
+# shellcheck disable=SC2329 # Runs through t_restorable_case.
+t_identity_unreadable() {
+    touch "$RUN_DIR/t-identity-fail"
+}
+# shellcheck disable=SC2329 # Runs through t_restorable_case.
+t_config_hash_fails() {
+    touch "$RUN_DIR/t-config-fail"
+}
+# shellcheck disable=SC2329 # Runs through t_restorable_case.
+t_declaration_unreadable() {
+    touch "$RUN_DIR/t-declare-fail"
+}
+
+# t_restorable_case DETAIL CHANGE...: setup, in a fresh run directory, of a project whose loadgen
+# runs with weight 2 under compose files declaring it, after each CHANGE function alters the
+# stub's state, ends with "FAIL loadgen restorable: DETAIL" as its only check, with no container
+# changed and no request sent. In DETAIL, @RUN_DIR@ stands for that directory, @START@ for the
+# short config hash of the container, @NOW@ for the one the stub's Compose gives loadgen with
+# weight 2 and @ZERO@ for the one with weight 0.
+t_restorable_case() {
+    (
+        local detail="$1" change changes
+        shift
+        changes="$*"
+        t_fresh_run_dir
+        t_loadgen_fixture lg-1 1 "$T_WEIGHT_2"
+        : >"$RUN_DIR/http-calls"
+        http() {
+            echo "$1 $2" >>"$RUN_DIR/http-calls"
+            HTTP_STATUS="000"
+            HTTP_ERROR="not expected"
+            HTTP_BODY=""
+        }
+        for change in "$@"; do
+            "$change"
+        done
+        detail="${detail//@RUN_DIR@/$RUN_DIR}"
+        detail="${detail//@START@/$(t_short "$(cat "$RUN_DIR/t-label")")}"
+        detail="${detail//@NOW@/$(t_short "$(t_weight_hash 2)")}"
+        detail="${detail//@ZERO@/$(t_short "$(t_weight_hash 0)")}"
+        (setup) >/dev/null 2>&1 || true
+        t_report_has "setup refuses loadgen after [$changes]" "FAIL loadgen restorable: $detail"
+        # Besides the run lock, which setup takes before it reads anything.
+        t_eq "setup refusing loadgen after [$changes] reports no other check" 1 \
+            "$(grep -E '^(PASS|FAIL) ' "$RUN_DIR/report" | grep -cvF 'PASS run lock: ')"
+        t_eq "setup refusing loadgen after [$changes] changes no container" "" "$(cat "$RUN_DIR/docker-calls")"
+        t_eq "setup refusing loadgen after [$changes] sends no request" "" "$(cat "$RUN_DIR/http-calls")"
+    )
+}
+
+test_check_loadgen_restorable_unrestorableStates_failsBeforeAnyChange() {
+    local prefix="a recreate from these compose files would not give loadgen back as it is, so the run changes nothing: "
+    local hash_differs="these compose files give loadgen config hash @NOW@ under its weight at start, its container has @START@"
+    local zero="these compose files give loadgen config hash @ZERO@ under its weight at start, its container has @START@"
+    local rebuilt
+    rebuilt="its image reference $T_IMAGE_REF now names image ID $(t_short "$T_IMAGE_B"), its container runs $(t_short "$T_IMAGE_A")"
+    # The shell's own weight, which the prediction never uses: it sets the weight at start, or
+    # leaves it unset.
+    export PORTFOLIO_INSIGHTS_ALERT_WEIGHT=5
+    t_restorable_case "$prefix$hash_differs" t_settings_changed
+    t_restorable_case "$prefix$rebuilt" t_image_rebuilt
+    t_restorable_case "${prefix}its image reference $T_IMAGE_REF names no image a recreate could run: docker image inspect failed, exit 1 (see @RUN_DIR@/compose.log)" \
+        t_image_missing
+    t_restorable_case "$prefix$hash_differs; $rebuilt" t_settings_changed t_image_rebuilt
+    # A weight entry unset or empty, which compose files declaring ${PORTFOLIO_INSIGHTS_ALERT_WEIGHT:-0}
+    # never give a container.
+    t_restorable_case "$prefix$zero; its PORTFOLIO_INSIGHTS_ALERT_WEIGHT is unset, and these compose files always declare it" \
+        t_weight_unset_at_start
+    t_restorable_case "$prefix$zero; its PORTFOLIO_INSIGHTS_ALERT_WEIGHT is empty, and these compose files always declare it" \
+        t_weight_empty_at_start
+}
+
+test_check_loadgen_restorable_dockerCallFails_failsNamingCall() {
+    t_restorable_case "reading loadgen's image, config hash and effective configuration failed, exit 1 (see @RUN_DIR@/compose.log)" \
+        t_identity_unreadable
+    t_restorable_case "docker compose config --hash loadgen failed, exit 1 (see @RUN_DIR@/compose.log)" \
+        t_config_hash_fails
+    t_restorable_case "a recreate from these compose files would not give loadgen back as it is, so the run changes nothing: these compose files give loadgen config hash @ZERO@ under its weight at start, its container has @START@; whether these compose files declare PORTFOLIO_INSIGHTS_ALERT_WEIGHT is unknown: docker compose config --no-interpolate failed, exit 1 (see @RUN_DIR@/compose.log)" \
+        t_weight_unset_at_start t_declaration_unreadable
+}
+
+test_predicted_loadgen_hash_outputWithoutHash_failsAndLogsIt() {
+    local rc=0
+    t_loadgen_fixture lg-1 1 "$T_WEIGHT_2"
+    t_capture_start
+    compose_within() {
+        echo "loadgen"
+    }
+    predicted_loadgen_hash >/dev/null || rc=$?
+    t_eq "predicted_loadgen_hash fails on output without a hash" 1 "$rc"
+    t_eq "predicted_loadgen_hash logs that output" \
+        "docker compose config --hash loadgen printed no hash: loadgen" "$(cat "$RUN_DIR/compose.log")"
+}
+
+test_short_digest_values_printsShortDigestNoneOrQuoted() {
+    local i
+    local values=("$T_IMAGE_A" "${T_IMAGE_A#sha256:}" "" "-" "not a digest" "${T_IMAGE_A^^}")
+    local expected=("$(t_short "$T_IMAGE_A")" "$(t_short "$T_IMAGE_A")" none none 'not\ a\ digest'
+        "$(printf '%q' "${T_IMAGE_A^^}")")
+    for i in "${!values[@]}"; do
+        t_eq "short_digest of [${values[$i]}]" "${expected[$i]}" "$(short_digest "${values[$i]}")"
     done
 }
 
@@ -1101,11 +1979,13 @@ test_restore_loadgen_runningWithWeight2_recreatesStartedWithWeight2() {
     t_capture_start
     recreate_loadgen 1
     restore_loadgen || rc=$?
-    t_eq "restore_loadgen recreates loadgen started with its weight 2 after the run's weight 1" \
+    t_eq "restore_loadgen recreates loadgen started with its weight 2 after the run's weight 1, neither building nor pulling" \
         "$(printf '%s\n' "up -d --no-deps --force-recreate loadgen | weight 1" \
-            "up -d --no-deps --force-recreate loadgen | weight 2")" "$(cat "$RUN_DIR/docker-calls")"
+            "up -d --no-deps --force-recreate --no-build --pull never loadgen | weight 2")" "$(cat "$RUN_DIR/docker-calls")"
     t_eq "restore_loadgen verifies loadgen running with weight 2" \
         "0 [] running, PORTFOLIO_INSIGHTS_ALERT_WEIGHT=2" "$rc [$RESTORE_ERROR] $(loadgen_state)"
+    t_eq "restore_loadgen leaves loadgen with its image ID and config hash at start" \
+        "$LOADGEN_IMAGE_AT_START $LOADGEN_HASH_AT_START" "$(loadgen_identity | cut -f 1,2 | tr '\t' ' ')"
 }
 
 test_restore_loadgen_stoppedWithWeight2_recreatesWithoutStarting() {
@@ -1116,7 +1996,8 @@ test_restore_loadgen_stoppedWithWeight2_recreatesWithoutStarting() {
     recreate_loadgen 1
     restore_loadgen || rc=$?
     t_eq "restore_loadgen recreates a loadgen stopped at start with --no-start and weight 2" \
-        "up --no-start --no-deps --force-recreate loadgen | weight 2" "$(sed -n '2p' "$RUN_DIR/docker-calls")"
+        "up --no-start --no-deps --force-recreate --no-build --pull never loadgen | weight 2" \
+        "$(sed -n '2p' "$RUN_DIR/docker-calls")"
     t_eq "restore_loadgen verifies loadgen stopped with weight 2" \
         "0 [] stopped, PORTFOLIO_INSIGHTS_ALERT_WEIGHT=2" "$rc [$RESTORE_ERROR] $(loadgen_state)"
 }
@@ -1139,8 +2020,9 @@ test_restore_loadgen_weightUnsetAtStart_recreatesWithWeightUnset() {
     t_loadgen_fixture lg-1 1 "$T_NO_WEIGHT" 0
     t_capture_start
     restore_loadgen || rc=$?
-    t_eq "restore_loadgen recreates loadgen without the shell's weight" \
-        "up -d --no-deps --force-recreate loadgen | weight (unset)" "$(cat "$RUN_DIR/docker-calls")"
+    t_eq "restore_loadgen recreates loadgen without the shell's weight, neither building nor pulling" \
+        "up -d --no-deps --force-recreate --no-build --pull never loadgen | weight (unset)" \
+        "$(cat "$RUN_DIR/docker-calls")"
     t_eq "restore_loadgen verifies loadgen running with the weight unset, leaving the shell's value" \
         "0 [] running, PORTFOLIO_INSIGHTS_ALERT_WEIGHT unset; shell 5" \
         "$rc [$RESTORE_ERROR] $(loadgen_state); shell $PORTFOLIO_INSIGHTS_ALERT_WEIGHT"
@@ -1152,15 +2034,17 @@ test_cleanup_loadgenRestored_reportsStateAsAtStartAndPasses() {
     t_capture_start
     recreate_loadgen 1
     t_cleanup
-    t_report_has "cleanup reports loadgen restored as at start" \
-        "INFO cleanup: loadgen restored as at start: running, PORTFOLIO_INSIGHTS_ALERT_WEIGHT=2"
+    t_report_has "cleanup reports loadgen restored as at start, naming every verified field" \
+        "INFO cleanup: loadgen restored as at start: running, PORTFOLIO_INSIGHTS_ALERT_WEIGHT=2, image ID $(t_short "$T_IMAGE_A"), config hash $(t_short "$(t_weight_hash 2)"), effective configuration verified as recorded at start"
     t_report_has "cleanup passes after the restore" "PASS cleanup"
 }
 
 test_cleanup_weightWithControlCharacters_restoresItByteExactAndPrintsItQuoted() {
-    local after
+    local after hash
     unset PORTFOLIO_INSIGHTS_ALERT_WEIGHT
     t_loadgen_fixture lg-1 1 '["EASYTRADE_URL=http://reverse-proxy","PORTFOLIO_INSIGHTS_ALERT_WEIGHT=2\r\n"]'
+    # The container's own hash, from that weight's bytes as docker inspect's JSON gives them.
+    hash="$(cat "$RUN_DIR/t-label")"
     t_capture_start
     recreate_loadgen 1
     t_cleanup
@@ -1168,22 +2052,24 @@ test_cleanup_weightWithControlCharacters_restoresItByteExactAndPrintsItQuoted() 
     t_eq "cleanup restores a weight ending in a carriage return and a line feed byte for byte" \
         "running, PORTFOLIO_INSIGHTS_ALERT_WEIGHT=2"$'\r\n'"x" "$after"
     t_report_has "cleanup prints that weight quoted, on one line" \
-        "INFO cleanup: loadgen restored as at start: running, PORTFOLIO_INSIGHTS_ALERT_WEIGHT=\$'2\\r\\n'"
+        "INFO cleanup: loadgen restored as at start: running, PORTFOLIO_INSIGHTS_ALERT_WEIGHT=\$'2\\r\\n', image ID $(t_short "$T_IMAGE_A"), config hash $(t_short "$hash"), effective configuration verified as recorded at start"
     t_report_has "cleanup passes after that restore" "PASS cleanup"
 }
 
 test_cleanup_restoredStateDiffers_failsNamingExpectedAndActual() {
     local i
-    # The weight unset at start against compose files declaring it, and a container that exits.
+    local -a expected
+    # The weight unset at start against compose files declaring it, which also changes the config
+    # hash and the environment, and a container that exits.
     local envs=("$T_NO_WEIGHT" "$T_WEIGHT_2")
     local exits=(0 1)
-    local expected=(
-        "expected [running, PORTFOLIO_INSIGHTS_ALERT_WEIGHT unset] as at start, got [running, PORTFOLIO_INSIGHTS_ALERT_WEIGHT=0]"
-        "expected [running, PORTFOLIO_INSIGHTS_ALERT_WEIGHT=2] as at start, got [stopped, PORTFOLIO_INSIGHTS_ALERT_WEIGHT=2]")
     unset PORTFOLIO_INSIGHTS_ALERT_WEIGHT
     for i in "${!envs[@]}"; do
         t_fresh_run_dir
         t_loadgen_fixture lg-1 1 "${envs[$i]}"
+        expected=(
+            "expected [running, PORTFOLIO_INSIGHTS_ALERT_WEIGHT unset] as at start, got [running, PORTFOLIO_INSIGHTS_ALERT_WEIGHT=0]; config hash $(t_short "$(t_weight_hash 0)") instead of $(t_short "$(t_config_hash -)") as at start; Config.Env differs from the one at start"
+            "expected [running, PORTFOLIO_INSIGHTS_ALERT_WEIGHT=2] as at start, got [stopped, PORTFOLIO_INSIGHTS_ALERT_WEIGHT=2]")
         t_capture_start
         if [[ ${exits[$i]} -eq 1 ]]; then
             touch "$RUN_DIR/t-exits"
@@ -1196,14 +2082,15 @@ test_cleanup_restoredStateDiffers_failsNamingExpectedAndActual() {
 
 test_cleanup_dockerCommandFails_failsCleanup() {
     local i
-    local cids=(lg-1 lg-1 "" lg-1)
-    local envs=("$T_WEIGHT_2" "$T_NO_WEIGHT" '[]' "$T_WEIGHT_2")
-    local declared=(1 0 1 1)
-    local switches=(t-fail t-fail t-fail t-inspect-fail)
+    local cids=(lg-1 lg-1 "" lg-1 lg-1)
+    local envs=("$T_WEIGHT_2" "$T_NO_WEIGHT" '[]' "$T_WEIGHT_2" "$T_WEIGHT_2")
+    local declared=(1 0 1 1 1)
+    local switches=(t-fail t-fail t-fail t-inspect-fail t-identity-fail)
     local expected=("recreating loadgen as [running, PORTFOLIO_INSIGHTS_ALERT_WEIGHT=2] failed, exit 1"
         "recreating loadgen as [running, PORTFOLIO_INSIGHTS_ALERT_WEIGHT unset] failed, exit 1"
         "removing the loadgen container this run created failed, exit 1"
-        "reading loadgen's state after the restore failed, exit 1")
+        "reading loadgen's state after the restore failed, exit 1"
+        "reading loadgen's image, config hash and effective configuration after the restore failed, exit 1")
     for i in "${!cids[@]}"; do
         t_fresh_run_dir
         t_loadgen_fixture "${cids[$i]}" 1 "${envs[$i]}" "${declared[$i]}"
@@ -1212,6 +2099,352 @@ test_cleanup_dockerCommandFails_failsCleanup() {
         t_cleanup
         t_report_has "cleanup fails when restoring loadgen [$LOADGEN_AT_START] meets ${switches[$i]}" \
             "FAIL cleanup: loadgen not restored: ${expected[$i]} (see $RUN_DIR/compose.log)"
+    done
+}
+
+test_cleanup_identityChangedDuringRun_failsNamingEachDifferingField() {
+    local i change image_differs hash_differs
+    local -a expected
+    local changes=(t_image_rebuilt t_settings_changed "t_image_rebuilt t_settings_changed")
+    unset PORTFOLIO_INSIGHTS_ALERT_WEIGHT
+    for i in "${!changes[@]}"; do
+        t_fresh_run_dir
+        t_loadgen_fixture lg-1 1 "$T_WEIGHT_2"
+        t_capture_start
+        recreate_loadgen 1
+        # The image rebuilt, or the compose files changed, while the run went on.
+        # shellcheck disable=SC2086 # The row splits into one function name per word.
+        for change in ${changes[$i]}; do
+            "$change"
+        done
+        image_differs="image ID $(t_short "$T_IMAGE_B") instead of $(t_short "$T_IMAGE_A") as at start"
+        hash_differs="config hash $(t_short "$(t_weight_hash 2)") instead of $(t_short "$LOADGEN_HASH_AT_START") as at start"
+        expected=("$image_differs" "$hash_differs" "$image_differs; $hash_differs")
+        t_cleanup
+        t_report_has "cleanup fails naming what differs after [${changes[$i]}]" \
+            "FAIL cleanup: loadgen not restored: ${expected[$i]}"
+        t_eq "cleanup still recreates loadgen with its weight at start after [${changes[$i]}]" \
+            "up -d --no-deps --force-recreate --no-build --pull never loadgen | weight 2" \
+            "$(sed -n '2p' "$RUN_DIR/docker-calls")"
+    done
+}
+
+# ---------------------------------------------------------------------------------------------
+# Effective configuration and the twin (loadgen_config_snapshot, snapshot_differences,
+# loadgen_twin_check, remove_loadgen_twin)
+
+# The changes docker update makes to a container after Compose created it, which its config hash
+# does not show and its twin does, one per function, applied to the stub's container at start.
+# shellcheck disable=SC2329 # Runs through t_twin_refusal_case and the restore cases.
+t_cpu_shares_updated() {
+    echo 128 >"$RUN_DIR/t-cpu"
+}
+# shellcheck disable=SC2329 # Runs through t_twin_refusal_case and the restore cases.
+t_restart_policy_updated() {
+    echo no >"$RUN_DIR/t-restart"
+}
+# t_second_loadgen_container: a second loadgen container in the project before the run, as a
+# scale-up leaves one.
+# shellcheck disable=SC2329 # Runs through t_twin_refusal_case.
+t_second_loadgen_container() {
+    echo lg-2 >"$RUN_DIR/t-twin-cid"
+}
+
+# t_twin_refusal_case DETAIL CALLS TWIN LEFT CHANGE...: setup, in a fresh run directory, of a
+# project whose loadgen runs with weight 2 under compose files declaring it, after each CHANGE
+# alters the stub's state (a function, or +FILE, which creates that switch file in $RUN_DIR),
+# ends with "FAIL loadgen restorable: DETAIL" as its only check besides the run lock and before
+# any request, with the container found at start as it was, the docker calls CALLS logged (their
+# docker-calls lines joined by ;), container TWIN left beside it (none when empty) and
+# LOADGEN_TWIN at LEFT on exit, which cleanup reads. @RUN_DIR@ in DETAIL stands for that directory.
+t_twin_refusal_case() {
+    (
+        local detail="$1" calls="$2" twin="$3" left="$4" lf=$'\n' change changes before rc=0
+        shift 4
+        changes="$*"
+        t_fresh_run_dir
+        t_loadgen_fixture lg-1 1 "$T_WEIGHT_2"
+        : >"$RUN_DIR/http-calls"
+        http() {
+            echo "$1 $2" >>"$RUN_DIR/http-calls"
+            HTTP_STATUS="000"
+            HTTP_ERROR="not expected"
+            HTTP_BODY=""
+        }
+        for change in "$@"; do
+            if [[ "$change" == +* ]]; then
+                touch "$RUN_DIR/${change#+}"
+            else
+                "$change"
+            fi
+        done
+        before="$(cat "$RUN_DIR/t-cid" "$RUN_DIR/t-running" "$RUN_DIR/t-env" "$RUN_DIR/t-cpu" "$RUN_DIR/t-restart" | join_lines)"
+        detail="${detail//@RUN_DIR@/$RUN_DIR}"
+        (
+            trap 'echo "LOADGEN_TWIN=$LOADGEN_TWIN FLAG_TOUCHED=$FLAG_TOUCHED LOADGEN_TOUCHED=$LOADGEN_TOUCHED" >"$RUN_DIR/setup.state"' EXIT
+            setup
+        ) >/dev/null 2>&1 || rc=$?
+        t_report_has "setup refuses loadgen after [$changes]" "FAIL loadgen restorable: $detail"
+        t_eq "setup refusing loadgen after [$changes] ends the run before any other check or request" \
+            "status 1, 1 check, 0 requests" \
+            "status $rc, $(grep -E '^(PASS|FAIL) ' "$RUN_DIR/report" | grep -cvF 'PASS run lock: ') check, $(grep -c . "$RUN_DIR/http-calls" || true) requests"
+        t_eq "setup refusing loadgen after [$changes] makes only the twin's docker calls" "${calls//;/$lf}" \
+            "$(cat "$RUN_DIR/docker-calls")"
+        t_eq "setup refusing loadgen after [$changes] leaves loadgen at start as it was" "$before" \
+            "$(cat "$RUN_DIR/t-cid" "$RUN_DIR/t-running" "$RUN_DIR/t-env" "$RUN_DIR/t-cpu" "$RUN_DIR/t-restart" | join_lines)"
+        t_eq "setup refusing loadgen after [$changes] leaves twin [$twin] tracked as [$left], the flag and loadgen untouched" \
+            "twin [$twin] LOADGEN_TWIN=$left FLAG_TOUCHED=0 LOADGEN_TOUCHED=0" \
+            "twin [$(cat "$RUN_DIR/t-twin-cid")] $(cat "$RUN_DIR/setup.state")"
+    )
+}
+
+test_loadgen_config_snapshot_perContainerFields_leftOutOfTheComparison() {
+    local i filter twin hash="stub-config-hash"
+    local -a filters expected
+    echo "$T_WEIGHT_2" >"$RUN_DIR/env-a"
+    echo '["PORTFOLIO_INSIGHTS_ALERT_WEIGHT=2","EASYTRADE_URL=http://reverse-proxy"]' >"$RUN_DIR/env-b"
+    # Container lg-1, running as at start, and lg-twin as Compose creates it, not started: they
+    # differ in their IDs, names, hostnames, numbers, depends_on and replace labels, own aliases,
+    # DNS names, addresses, OomKillDisable null and false, and the order of the environment and
+    # the ulimits.
+    t_container_json lg-1 1 "$T_IMAGE_A" "$hash" "$T_STARTED_AT" 1 0 always "$RUN_DIR/env-a" "" "" \
+        "core nofile" | loadgen_config_snapshot >"$RUN_DIR/a.json"
+    twin="$(t_container_json lg-twin 2 "$T_IMAGE_A" "$hash" "0001-01-01T00:00:00Z" 0 0 always \
+        "$RUN_DIR/env-b" "reverse-proxy:service_started:false" lg-0 "nofile core")"
+    t_eq "loadgen_config_snapshot keeps no field naming one container or derived while it runs" 0 \
+        "$(grep -c -e lg-1 -e pi-test-loadgen-1 -e 172.18 -e DNSNames -e Hostname -e container-number \
+            -e com.docker.compose.replace -e depends_on "$RUN_DIR/a.json" || true)"
+    # FILTER on the twin's docker inspect object, and the field the comparison then names, none
+    # for a field the snapshot leaves out.
+    filters=('.' '.Config.Hostname = "loadgen-host"' '.NetworkSettings.Networks["pi-test_default"].MacAddress = "02:42:ac:12:00:05"'
+        '.HostConfig.CpuShares = 128' '.Config.Labels["com.docker.compose.version"] = "5.3.1"'
+        '.NetworkSettings.Networks["pi-test_default"].Aliases += ["lg-alias"]'
+        '.NetworkSettings.Networks.other = {Aliases: ["lg-alias"]}' '.HostConfig.OomKillDisable = true')
+    expected=("" "" "" "its HostConfig.CpuShares is 0, a recreate gives 128"
+        "its Config.Labels.com.docker.compose.version is absent, a recreate gives 5.3.1"
+        "its Networks.pi-test_default.Aliases differs from what a recreate gives"
+        "its Networks.other is absent, a recreate gives a map"
+        "its HostConfig.OomKillDisable is false, a recreate gives true")
+    for i in "${!filters[@]}"; do
+        filter="${filters[$i]}"
+        jq -c "$filter" <<<"$twin" | tr -d '\r' | loadgen_config_snapshot >"$RUN_DIR/b.json"
+        t_eq "loadgen_config_snapshot of a running container and its created twin after [$filter]" \
+            "${expected[$i]}" "$(snapshot_differences "$RUN_DIR/a.json" "$RUN_DIR/b.json" check)"
+    done
+}
+
+test_snapshot_differences_valueKinds_namesFieldsWithoutListContents() {
+    local i out
+    local -a filters modes expected
+    echo '{"Config": {"Env": ["A=1"], "Labels": {"com.docker.compose.config-hash": "h1"}},
+        "HostConfig": {"CpuShares": 0}, "Image": "sha256:1", "Networks": {}}' | jq -S . | tr -d '\r' >"$RUN_DIR/a.json"
+    filters=('.HostConfig.CpuShares = 128' '.HostConfig.CpuShares = 128' '.Config.Labels.note = "a\nb c"'
+        '.Config.Env = ["A=secret-7d1e"]' '.Config.Labels["x y"] = ""'
+        '.Image = "sha256:2" | .Config.Labels["com.docker.compose.config-hash"] = "h2"'
+        '.Config.Labels["com.docker.compose.image"] = "sha256:2"')
+    modes=(check restore check check restore check check)
+    expected=("its HostConfig.CpuShares is 0, a recreate gives 128" "HostConfig.CpuShares 128 instead of 0 as at start"
+        "its Config.Labels.note is absent, a recreate gives \$'a\\nb c'" "its Config.Env differs from what a recreate gives"
+        "Config.Labels.\"x y\" '' instead of absent as at start" "" "")
+    for i in "${!filters[@]}"; do
+        jq -S "${filters[$i]}" "$RUN_DIR/a.json" | tr -d '\r' >"$RUN_DIR/b.json"
+        out="$(snapshot_differences "$RUN_DIR/a.json" "$RUN_DIR/b.json" "${modes[$i]}")"
+        t_eq "snapshot_differences in mode ${modes[$i]} after [${filters[$i]}]" "${expected[$i]}" "$out"
+        t_eq "snapshot_differences prints no list content after [${filters[$i]}]" 0 \
+            "$(grep -c secret-7d1e <<<"$out" || true)"
+    done
+    jq -S '.HostConfig += ([range(12)] | map({key: "X\(. + 10)", value: 1}) | from_entries)' "$RUN_DIR/a.json" |
+        tr -d '\r' >"$RUN_DIR/b.json"
+    out="$(snapshot_differences "$RUN_DIR/a.json" "$RUN_DIR/b.json" check)"
+    t_eq "snapshot_differences names the first $SNAPSHOT_FIELDS_SHOWN of 12 differing fields and counts the rest" \
+        "11 lines, first [its HostConfig.X10 is absent, a recreate gives 1], last [2 more fields differ]" \
+        "$(grep -c . <<<"$out") lines, first [$(sed -n '1p' <<<"$out")], last [$(sed -n '$p' <<<"$out")]"
+    t_eq "snapshot_differences fails on a missing configuration" "fails" \
+        "$(snapshot_differences "$RUN_DIR/a.json" "$RUN_DIR/absent.json" check >/dev/null 2>&1 && echo passes || echo fails)"
+}
+
+test_check_loadgen_restorable_containerChangedOutsideCompose_failsBeforeAnyChangeAndRemovesTwin() {
+    local prefix="a recreate from these compose files would not give loadgen back as it is, so the run changes nothing: "
+    local suffix="; the twin that shows it is removed"
+    local cpu="its HostConfig.CpuShares is 128, a recreate gives 0"
+    local restart="its HostConfig.RestartPolicy differs from what a recreate gives"
+    local calls="up --no-start --no-deps --no-recreate --no-build --pull never --scale loadgen=2 loadgen | weight 2;docker rm --force --volumes lg-twin"
+    # The shell's own weight, which the twin never gets: it is created with the weight at start.
+    export PORTFOLIO_INSIGHTS_ALERT_WEIGHT=5
+    t_twin_refusal_case "$prefix$cpu$suffix" "$calls" "" "" t_cpu_shares_updated
+    t_twin_refusal_case "$prefix$restart$suffix" "$calls" "" "" t_restart_policy_updated
+    t_twin_refusal_case "$prefix$cpu; $restart$suffix" "$calls" "" "" t_cpu_shares_updated t_restart_policy_updated
+}
+
+test_check_loadgen_restorable_twinStepFails_failsNamingStepAndTracksAnyTwinLeft() {
+    local create="up --no-start --no-deps --no-recreate --no-build --pull never --scale loadgen=2 loadgen | weight 2"
+    local rm="docker rm --force --volumes lg-twin" log="(see @RUN_DIR@/compose.log)"
+    t_twin_refusal_case "creating a twin loadgen container failed, exit 1 $log; no twin is left and nothing else was changed" \
+        "$create" "" "" +t-twin-create-fail
+    t_twin_refusal_case "creating a twin loadgen container failed, exit 1 $log; no twin is left and nothing else was changed" \
+        "$create;$rm" "" "" +t-twin-create-fail-late
+    t_twin_refusal_case "creating a twin loadgen container gave 0 new loadgen containers instead of 1; none is left and nothing else was changed" \
+        "$create" "" "" +t-twin-none
+    t_twin_refusal_case "reading the twin loadgen container's effective configuration failed, exit 1 $log; the twin is removed and nothing else was changed" \
+        "$create;$rm" "" "" +t-twin-inspect-fail
+    t_twin_refusal_case "twin loadgen container lg-twin not removed: removing twin loadgen container lg-twin failed, exit 1 $log; cleanup removes it on exit" \
+        "$create;$rm" lg-twin lg-twin +t-twin-rm-fail
+    t_twin_refusal_case "twin loadgen container lg-twin not removed: twin loadgen container lg-twin is still listed after its removal; cleanup removes it on exit" \
+        "$create;$rm" lg-twin lg-twin +t-twin-rm-noop
+    t_twin_refusal_case "listing loadgen's containers after creating its twin failed, exit 1 $log; cleanup removes the twin on exit" \
+        "$create" lg-twin unknown +t-ps-fail-with-twin
+    t_twin_refusal_case "the project has 2 loadgen containers, and a restore recreates one only; nothing was changed" \
+        "" lg-2 "" t_second_loadgen_container
+}
+
+test_loadgen_twin_check_containerOrRecordUnusable_failsNamingCause() {
+    local i rc
+    local switches=(t-ps-fail t-gone "" "")
+    local ids=(lg-1 lg-1 lg-0 lg-1)
+    local configs=(recorded recorded recorded absent)
+    local -a expected
+    for i in "${!switches[@]}"; do
+        t_fresh_run_dir
+        t_loadgen_fixture lg-1 1 "$T_WEIGHT_2"
+        t_capture_start
+        expected=("listing loadgen's containers failed, exit 1 (see $RUN_DIR/compose.log); nothing was changed|"
+            "loadgen's container was removed while setup read it; nothing was changed|"
+            "loadgen's container was replaced while setup read it; nothing was changed|"
+            "comparing loadgen's effective configuration with its twin's failed (see $RUN_DIR/compose.log); the twin is removed and nothing else was changed|up --no-start --no-deps --no-recreate --no-build --pull never --scale loadgen=2 loadgen | weight 2 docker rm --force --volumes lg-twin")
+        case "${switches[$i]}" in
+            t-gone) : >"$RUN_DIR/t-cid" ;;
+            ?*) touch "$RUN_DIR/${switches[$i]}" ;;
+        esac
+        LOADGEN_ID_AT_START="${ids[$i]}"
+        if [[ "${configs[$i]}" == absent ]]; then
+            LOADGEN_CONFIG_AT_START="$RUN_DIR/absent.config.json"
+        fi
+        rc=0
+        loadgen_twin_check "$LOADGEN_CONFIG_AT_START" || rc=$?
+        t_eq "loadgen_twin_check fails after [${switches[$i]:-container ID ${ids[$i]}}, configuration ${configs[$i]}]" \
+            "1 ${expected[$i]}" "$rc $TWIN_DETAIL|$(join_lines <"$RUN_DIR/docker-calls")"
+        t_eq "loadgen_twin_check leaves no twin after [${switches[$i]:-container ID ${ids[$i]}}, configuration ${configs[$i]}]" \
+            "twin [] tracked []" "twin [$(cat "$RUN_DIR/t-twin-cid")] tracked [$LOADGEN_TWIN]"
+    done
+}
+
+test_cleanup_twinLeftByRestorabilityCheck_removesItOrFailsNamingCall() {
+    local i switch
+    local -a expected
+    # TRACKED is LOADGEN_TWIN on exit and TWIN the stub's twin container; SWITCHES break calls.
+    local tracked=(lg-twin unknown unknown lg-twin unknown lg-twin)
+    local twins=(lg-twin lg-twin "" lg-twin lg-twin lg-twin)
+    local switches=("" "" "" t-twin-rm-fail t-ps-fail "t-twin-rm-noop t-ps-fail-with-twin")
+    local calls=(1 1 0 1 0 1)
+    local left=("" "" "" lg-twin lg-twin lg-twin)
+    for i in "${!tracked[@]}"; do
+        t_fresh_run_dir
+        t_loadgen_fixture lg-1 1 "$T_WEIGHT_2"
+        echo "${twins[$i]}" >"$RUN_DIR/t-twin-cid"
+        LOADGEN_ID_AT_START=lg-1
+        LOADGEN_TWIN="${tracked[$i]}"
+        # shellcheck disable=SC2086 # The row splits into one switch file per word.
+        for switch in ${switches[$i]}; do
+            touch "$RUN_DIR/$switch"
+        done
+        expected=("INFO cleanup: twin loadgen container lg-twin removed; no twin loadgen container is left|PASS cleanup"
+            "INFO cleanup: twin loadgen container lg-twin removed; no twin loadgen container is left|PASS cleanup"
+            "INFO cleanup: no twin loadgen container is left|PASS cleanup"
+            "FAIL cleanup: twin loadgen container not removed: removing twin loadgen container lg-twin failed, exit 1 (see $RUN_DIR/compose.log)"
+            "FAIL cleanup: twin loadgen container not removed: listing loadgen's containers to find its twin failed, exit 1 (see $RUN_DIR/compose.log)"
+            "FAIL cleanup: twin loadgen container not removed: listing loadgen's containers after removing its twin failed, exit 1 (see $RUN_DIR/compose.log)")
+        (cleanup) >"$RUN_DIR/cleanup.out" 2>&1 || true
+        t_eq "cleanup with twin [${twins[$i]}] tracked as [${tracked[$i]}] after [${switches[$i]}]" "${expected[$i]}" \
+            "$(grep -E '^(INFO cleanup: |PASS cleanup|FAIL cleanup)' "$RUN_DIR/report" | paste -s -d '|' - | tr -d '\r')"
+        t_eq "cleanup removes twin [${twins[$i]}] tracked as [${tracked[$i]}] by its ID only after [${switches[$i]}]" \
+            "${calls[$i]} removals, twin [${left[$i]}], loadgen [lg-1]" \
+            "$(grep -c '^docker rm --force --volumes lg-twin$' "$RUN_DIR/docker-calls" || true) removals, twin [$(cat "$RUN_DIR/t-twin-cid")], loadgen [$(cat "$RUN_DIR/t-cid")]"
+    done
+}
+
+test_setup_twinRemovalFailsOnce_cleanupRemovesTwinOnExit() {
+    local rc=0
+    t_loadgen_fixture lg-1 1 "$T_WEIGHT_2"
+    t_stub_flag_service
+    touch "$RUN_DIR/t-twin-rm-fail-once"
+    (
+        trap cleanup EXIT
+        setup
+    ) >"$RUN_DIR/run.out" 2>&1 || rc=$?
+    t_report_has "setup fails the check naming the twin it could not remove" \
+        "FAIL loadgen restorable: twin loadgen container lg-twin not removed: removing twin loadgen container lg-twin failed, exit 1 (see $RUN_DIR/compose.log); cleanup removes it on exit"
+    t_report_has "cleanup removes that twin on exit" \
+        "INFO cleanup: twin loadgen container lg-twin removed; no twin loadgen container is left"
+    t_report_has "cleanup passes with the twin removed" "PASS cleanup"
+    t_eq "the run creates the twin once, removes it twice and leaves loadgen at start as it was" \
+        "status 1|up --no-start --no-deps --no-recreate --no-build --pull never --scale loadgen=2 loadgen | weight 2 docker rm --force --volumes lg-twin docker rm --force --volumes lg-twin|twin [] loadgen [lg-1] running [1]" \
+        "status $rc|$(join_lines <"$RUN_DIR/docker-calls")|twin [$(cat "$RUN_DIR/t-twin-cid")] loadgen [$(cat "$RUN_DIR/t-cid")] running [$(cat "$RUN_DIR/t-running")]"
+}
+
+test_check_loadgen_restorable_containerRemovedWhileSetupReadIt_failsWithNothingChanged() {
+    local rc=0
+    t_loadgen_fixture lg-1 1 "$T_WEIGHT_2"
+    # loadgen_state reads the container; it is gone when check_loadgen_restorable reads it again.
+    touch "$RUN_DIR/t-vanish-after-env"
+    : >"$RUN_DIR/http-calls"
+    http() {
+        echo "$1 $2" >>"$RUN_DIR/http-calls"
+        HTTP_STATUS="000"
+        HTTP_ERROR="not expected"
+        HTTP_BODY=""
+    }
+    (
+        trap 'echo "LOADGEN_AT_START=[$LOADGEN_AT_START] FLAG_TOUCHED=$FLAG_TOUCHED LOADGEN_TOUCHED=$LOADGEN_TOUCHED LOADGEN_TWIN=[$LOADGEN_TWIN]" >"$RUN_DIR/setup.state"' EXIT
+        setup
+    ) >/dev/null 2>&1 || rc=$?
+    t_report_has "check_loadgen_restorable fails when loadgen's container is gone as it reads it" \
+        "FAIL loadgen restorable: loadgen's container was removed while setup read it; nothing was changed"
+    t_eq "check_loadgen_restorable ends the run there, with loadgen at start recorded and no other check" \
+        "status 1, 1 check, LOADGEN_AT_START=[running, PORTFOLIO_INSIGHTS_ALERT_WEIGHT=2]" \
+        "status $rc, $(grep -E '^(PASS|FAIL) ' "$RUN_DIR/report" | grep -cvF 'PASS run lock: ') check, $(sed 's/ FLAG_TOUCHED.*//' "$RUN_DIR/setup.state")"
+    t_eq "check_loadgen_restorable makes no docker call that creates, changes or removes a container" "" \
+        "$(grep -E '(^| )(up|rm|create|update|start|stop|restart|kill|pause|unpause)( |$)' "$RUN_DIR/docker-all" || true)"
+    # loadgen_identity finds no container, so its docker inspect never runs: the branch under test,
+    # not the twin step's own check of the container list.
+    t_eq "check_loadgen_restorable stops at the empty identity, its last docker call the container list" \
+        "0 inspects of the configuration, last call [ps -a -q loadgen]" \
+        "$(grep -cF '{{json .}}' "$RUN_DIR/docker-all" || true) inspects of the configuration, last call [$(sed -n '$p' "$RUN_DIR/docker-all" | sed 's/^compose -p pi-test -f compose.dev.yaml //')]"
+    t_eq "check_loadgen_restorable leaves the flag and loadgen untouched and no twin to remove" \
+        "FLAG_TOUCHED=0 LOADGEN_TOUCHED=0 LOADGEN_TWIN=[]" "$(sed 's/^.*\] FLAG_TOUCHED/FLAG_TOUCHED/' "$RUN_DIR/setup.state")"
+    t_eq "check_loadgen_restorable sends no request" "" "$(cat "$RUN_DIR/http-calls")"
+}
+
+test_restore_loadgen_effectiveConfigurationDiffers_failsNamingEachField() {
+    local i change
+    local -a expected
+    # BEFORE changes the container before setup records it; AFTER changes that record.
+    local before=(t_cpu_shares_updated t_restart_policy_updated "t_cpu_shares_updated t_restart_policy_updated" "" "")
+    local after=("" "" "" unrecorded absent)
+    unset PORTFOLIO_INSIGHTS_ALERT_WEIGHT
+    for i in "${!before[@]}"; do
+        t_fresh_run_dir
+        t_loadgen_fixture lg-1 1 "$T_WEIGHT_2"
+        # shellcheck disable=SC2086 # The row splits into one function name per word.
+        for change in ${before[$i]}; do
+            "$change"
+        done
+        t_capture_start
+        case "${after[$i]}" in
+            unrecorded) LOADGEN_CONFIG_AT_START="" ;;
+            absent) LOADGEN_CONFIG_AT_START="$RUN_DIR/absent.config.json" ;;
+        esac
+        expected=("HostConfig.CpuShares 0 instead of 128 as at start"
+            "HostConfig.RestartPolicy differs from the one at start"
+            "HostConfig.CpuShares 0 instead of 128 as at start; HostConfig.RestartPolicy differs from the one at start"
+            "no effective configuration was recorded at start to verify it against"
+            "its effective configuration could not be compared with the one at start (see $RUN_DIR/compose.log)")
+        recreate_loadgen 1
+        t_cleanup
+        t_report_has "cleanup fails naming what the restore did not give back after [${before[$i]}${after[$i]}]" \
+            "FAIL cleanup: loadgen not restored: ${expected[$i]}"
+        t_eq "cleanup still recreates loadgen with its weight at start after [${before[$i]}${after[$i]}]" \
+            "up -d --no-deps --force-recreate --no-build --pull never loadgen | weight 2" \
+            "$(sed -n '2p' "$RUN_DIR/docker-calls")"
     done
 }
 
@@ -1530,12 +2763,11 @@ test_cleanup_windowUnread_retriesReadAndOwnsNewIds() {
         http() {
             echo "$1 $2" >>"$RUN_DIR/http.calls"
             HTTP_ERROR=""
-            HTTP_CTYPE="application/json"
             HTTP_STATUS="204"
             HTTP_BODY=""
             if [[ "$1" == "GET" ]]; then
                 HTTP_STATUS="200"
-                HTTP_BODY="{\"id\":\"$FLAG_ID\",\"enabled\":true,\"isModifiable\":true}"
+                HTTP_BODY="{\"id\":\"$FLAG_ID\",\"enabled\":true,\"name\":\"Portfolio insights\",\"description\":\"Demo feature, not financial advice.\",\"isModifiable\":true,\"tag\":\"feature\",\"enabledAt\":\"2026-01-01T00:00:00Z\"}"
             fi
         }
         TABLE_WRITTEN=1
@@ -1785,12 +3017,11 @@ test_cleanup_closeEndedAroundOwnership_rereadsWindowAndOwnsEachIdOnce() {
             http() {
                 echo "$1 $2" >>"$RUN_DIR/http.calls"
                 HTTP_ERROR=""
-                HTTP_CTYPE="application/json"
                 HTTP_STATUS="204"
                 HTTP_BODY=""
                 if [[ "$1" == "GET" ]]; then
                     HTTP_STATUS="200"
-                    HTTP_BODY="{\"id\":\"$FLAG_ID\",\"enabled\":true,\"isModifiable\":true}"
+                    HTTP_BODY="{\"id\":\"$FLAG_ID\",\"enabled\":true,\"name\":\"Portfolio insights\",\"description\":\"Demo feature, not financial advice.\",\"isModifiable\":true,\"tag\":\"feature\",\"enabledAt\":\"2026-01-01T00:00:00Z\"}"
                 fi
             }
             TABLE_WRITTEN=1
@@ -1945,12 +3176,11 @@ test_close_window_ownershipTransferStepFails_failsAndCleanupOwnsIds() {
             http() {
                 echo "$1 $2" >>"$RUN_DIR/http.calls"
                 HTTP_ERROR=""
-                HTTP_CTYPE="application/json"
                 HTTP_STATUS="204"
                 HTTP_BODY=""
                 if [[ "$1" == "GET" ]]; then
                     HTTP_STATUS="200"
-                    HTTP_BODY="{\"id\":\"$FLAG_ID\",\"enabled\":true,\"isModifiable\":true}"
+                    HTTP_BODY="{\"id\":\"$FLAG_ID\",\"enabled\":true,\"name\":\"Portfolio insights\",\"description\":\"Demo feature, not financial advice.\",\"isModifiable\":true,\"tag\":\"feature\",\"enabledAt\":\"2026-01-01T00:00:00Z\"}"
                 fi
             }
             TABLE_WRITTEN=1

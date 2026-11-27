@@ -16,9 +16,16 @@
 #     answers, and loadgen-check.sh's cleanup still deletes the owned alerts and restores the
 #     flag then, whether loadgen was running or paused;
 #   - perf.sh's cycle-line wait discards a read that ends after its deadline, qualifying line
-#     and all, when Docker answered in time but the output filter ran late.
-# No Docker engine, network or stack is used: a fake docker, first on PATH, answers, fails or
-# hangs as each case needs and records every call.
+#     and all, when Docker answered in time but the output filter ran late;
+#   - loadgen-check.sh's cleanup report reaches the run's own stdout and stderr when an INT or an
+#     exit lands inside a call whose output is redirected to a file, and the output it has without
+#     install_cleanup; install_cleanup ends a run whose stdout is closed with exit 2;
+#   - perf.sh's exit report, from on_exit or abort, reaches the run's own stdout and stderr when an
+#     INT, a TERM, an exit or an abort lands inside a call whose output is redirected to a file,
+#     with the exit status kept, and the output it has without install_traps; install_traps ends a
+#     run whose stdout is closed with exit 2.
+# No Docker engine, network or stack is used: a fake docker, first on PATH, answers, fails, hangs
+# or interrupts the run as each case needs and records every call.
 #
 # Usage: bash scripts/portfolio-insights/harness-test.sh [--help]
 #   --help  Show this help and exit
@@ -84,6 +91,10 @@ ALERT_ID_2="22222222-2222-4222-8222-222222222222"
 ALERT_ID_3="33333333-3333-4333-8333-333333333333"
 # The id of the visit run whose log lines the loadgen-check.sh cases read.
 VISIT_RUN_ID="44444444-4444-4444-8444-444444444444"
+# The image ID, without its sha256: prefix, and the config hash of the loadgen container the
+# fake docker answers for in the loadgen-check.sh cases.
+FAKE_IMAGE_HEX="5555555555556666666666667777777777778888888888889999999999990000"
+FAKE_CONFIG_HASH="aaaaaaaaaaaabbbbbbbbbbbbccccccccccccddddddddddddeeeeeeeeeeeeffff"
 CR=$'\r'
 LF=$'\n'
 TAB=$'\t'
@@ -167,25 +178,33 @@ cat >"$TEST_DIR/bin/docker" <<'EOF'
 #!/usr/bin/env bash
 # Fake docker for harness-test.sh. It appends each call's arguments to FAKE_DOCKER_RECORD and
 # never reaches a Docker engine. The verb is the first of logs, stop, up, pause, unpause, kill,
-# rm, ps and inspect among the arguments. FAKE_DOCKER_MODE_<verb>, else FAKE_DOCKER_MODE, sets
-# what the call does:
+# rm, ps, inspect and config among the arguments. FAKE_DOCKER_MODE_<verb>, else FAKE_DOCKER_MODE,
+# sets what the call does:
 #   answer            (default) logs prints the file FAKE_DOCKER_LINES; stop, up, pause,
 #                     unpause, kill and rm succeed; ps --services prints FAKE_DOCKER_RUNNING, the
 #                     running services, and any other ps FAKE_DOCKER_CID when it is set; inspect
 #                     renders the environment of container FAKE_DOCKER_CID, the NUL-separated
-#                     entries of the file FAKE_DOCKER_ENV;
+#                     entries of the file FAKE_DOCKER_ENV, or with {{json .}} that container,
+#                     which runs FAKE_DOCKER_IMAGE and carries the config hash
+#                     FAKE_DOCKER_CONFIG_HASH; image inspect prints FAKE_DOCKER_IMAGE; config
+#                     --hash SERVICE prints SERVICE and FAKE_DOCKER_CONFIG_HASH;
 #   fail              exits 3 at once with an error on stderr;
 #   hang              waits, ending on TERM;
-#   hang-ignore-term  waits with TERM ignored, ending only on KILL.
+#   hang-ignore-term  waits with TERM ignored, ending only on KILL;
+#   interrupt         sends INT, or the signal FAKE_DOCKER_INTERRUPT_SIGNAL names, to the process
+#                     FAKE_DOCKER_INTERRUPT_PID, the run making the call, then answers as answer
+#                     does.
 # A wait ends by itself after FAKE_DOCKER_HANG_SECONDS. Its sleeps hold none of the call's
 # descriptors, so a killed call closes its output pipe at once. With FAKE_DOCKER_HANG_FAILS set,
 # as in a timing case's baseline run, a call in either hang mode fails as in fail mode instead.
 set -u
 printf '%s\n' "$*" >>"$FAKE_DOCKER_RECORD"
+image="${FAKE_DOCKER_IMAGE:-sha256:1111111111111111111111111111111111111111111111111111111111111111}"
+config_hash="${FAKE_DOCKER_CONFIG_HASH:-2222222222222222222222222222222222222222222222222222222222222222}"
 verb=""
 for arg in "$@"; do
     case "$arg" in
-        logs | stop | up | pause | unpause | kill | rm | ps | inspect)
+        logs | stop | up | pause | unpause | kill | rm | ps | inspect | config)
             verb="$arg"
             break
             ;;
@@ -216,6 +235,9 @@ case "$mode" in
         done
         exit 0
         ;;
+    interrupt)
+        kill -"${FAKE_DOCKER_INTERRUPT_SIGNAL:-INT}" "$FAKE_DOCKER_INTERRUPT_PID"
+        ;;
     *)
         echo "fake docker: unknown mode $mode" >&2
         exit 1
@@ -237,7 +259,16 @@ case "$verb" in
             printf '%s\n' "$FAKE_DOCKER_CID"
         fi
         ;;
+    config)
+        if [[ " $* " == *" --hash "* ]]; then
+            printf '%s %s\n' "${!#}" "$config_hash"
+        fi
+        ;;
     inspect)
+        if [[ "$1" == image ]]; then
+            printf '%s\n' "$image"
+            exit 0
+        fi
         format=""
         previous=""
         for arg in "$@"; do
@@ -276,6 +307,10 @@ case "$verb" in
                 for entry in "${entries[@]}"; do
                     printf '%s\n' "$entry"
                 done
+                ;;
+            '{{json .}}')
+                printf '{"Image":"%s","Config":{"Image":"harness-test-loadgen","Labels":{"com.docker.compose.config-hash":"%s"}},"State":{"StartedAt":"2026-01-01T00:00:00Z"}}\n' \
+                    "$image" "$config_hash"
                 ;;
             *)
                 echo "fake docker: unsupported format $format" >&2
@@ -413,6 +448,21 @@ expect_line_re() {
     fi
 }
 
+# expect_line_in FILE LINE: the file FILE of the case directory has the line LINE.
+expect_line_in() {
+    if ! grep -qxF -- "$2" "$CASE_DIR/$1"; then
+        reasons+=("no line [$2] in $1; $1 holds [$(one_line "$CASE_DIR/$1")]")
+    fi
+}
+
+# expect_no_line_in FILE ERE: no line of the file FILE of the case directory matches ERE,
+# anchored by the caller.
+expect_no_line_in() {
+    if grep -qE -- "$2" "$CASE_DIR/$1"; then
+        reasons+=("a line of $1 matches [$2]; $1 holds [$(one_line "$CASE_DIR/$1")]")
+    fi
+}
+
 expect_within_ms() {
     if [[ "$CASE_MS" -gt "$1" ]]; then
         reasons+=("took ${CASE_MS} ms, more than the $1 ms bound")
@@ -453,8 +503,28 @@ load_script() {
         source "$SCRIPT_DIR/loadgen-check.sh"
         # main()'s defaults of the loadgen state the stop, drain and restore read.
         LOADGEN_PAUSED=0
+        LOADGEN_TOUCHED=0
         LOADGEN_AT_START=""
+        LOADGEN_IMAGE_AT_START=""
+        LOADGEN_HASH_AT_START=""
+        LOADGEN_CONFIG_AT_START=""
+        LOADGEN_STARTED_AT=""
         RESTORE_ERROR=""
+        LOADGEN_ID_AT_START=""
+        LOADGEN_TWIN=""
+        TWIN_ERROR=""
+        TWIN_REMOVED=""
+        TWIN_DETAIL=""
+        LOADGEN_CID_AT_START=""
+        AT_START_DRAINING=0
+        RECOVER_ERROR=""
+        # main()'s default of the window state cleanup reads besides WINDOW_OPEN.
+        WINDOW_UNREAD=0
+        # main()'s run lock state, rooted in the case directory rather than the shared /tmp.
+        LOCK_ROOT="$CASE_DIR"
+        LOCK_DIR=""
+        LOCK_HELD=0
+        LOCK_ERROR=""
     else
         # shellcheck source=/dev/null
         source "$TEST_DIR/lib-$1.sh"
@@ -490,7 +560,7 @@ E2E_CONSTANTS="$SHARED_CONSTANTS INSIGHTS_LINE_RE"
 E2E_FUNCTIONS="$ORIGIN_HELPERS compose hard_timeout container_env resolve_interval probe_limit broker_logs insights_line_logged poll fail"
 PERF_CONSTANTS="$SHARED_CONSTANTS LOG_STEP_SECONDS CYCLE_MARKER CYCLE_RE"
 PERF_FUNCTIONS="$ORIGIN_HELPERS compose hard_timeout container_env resolve_interval probe_limit broker_logs read_window parse_cycle_line cycle_summary_text info wait_cycle_line"
-LOADGEN_CHECK_FUNCTIONS="$ORIGIN_HELPERS hard_timeout container_env loadgen_logs probe_limit watch_progress cleanup"
+LOADGEN_CHECK_FUNCTIONS="$ORIGIN_HELPERS hard_timeout container_env loadgen_logs probe_limit watch_progress cleanup install_cleanup"
 # The guard line of loadgen-check.sh that keeps sourcing it from starting a run.
 # shellcheck disable=SC2016 # Matched as text, never expanded.
 LOADGEN_CHECK_GUARD='if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then'
@@ -1217,6 +1287,46 @@ expect_within_baseline_ms 2000
 expect_docker_calls inspect 1
 conclude "containerEnv_loadgenCheckInspectNeverAnswers_failsWith137ByCallLimit"
 
+# loadgen-check.sh: setup's restorability check of a running loadgen, with docker compose config
+# --hash never answering. The call has ended by DOCKER_CALL_TIMEOUT_SECONDS, and the run ends
+# with the check failed before any change.
+# shellcheck disable=SC2034 # The variables are read by check_loadgen_restorable.
+case_restorable_config_hang() {
+    load_script loadgen-check
+    export FAKE_DOCKER_CID="$FAKE_CID" FAKE_DOCKER_MODE_config=hang-ignore-term
+    LOADGEN_AT_START="running, PORTFOLIO_INSIGHTS_ALERT_WEIGHT=0"
+    DOCKER_CALL_TIMEOUT_SECONDS=2
+    mark_start
+    check_loadgen_restorable
+}
+run_case restorable-config-hang case_restorable_config_hang
+expect_status 1
+expect_line "FAIL loadgen restorable: docker compose config --hash loadgen timed out after 2 s (Docker did not answer)"
+expect_within_ms 4000
+expect_docker_calls config 1
+expect_docker_calls up 0
+conclude "checkLoadgenRestorable_configHashNeverAnswers_failsByCallLimitBeforeAnyChange"
+
+# loadgen-check.sh: the same check once the hash and image match, with the create of the twin it
+# compares loadgen with never answering. The create has ended by DOCKER_CALL_TIMEOUT_SECONDS, the
+# check finds no twin to remove, and the run ends with the check failed before any change.
+# shellcheck disable=SC2034 # The variables are read by check_loadgen_restorable.
+case_restorable_twin_create_hang() {
+    load_script loadgen-check
+    export FAKE_DOCKER_CID="$FAKE_CID" FAKE_DOCKER_MODE_up=hang-ignore-term
+    LOADGEN_AT_START="running, PORTFOLIO_INSIGHTS_ALERT_WEIGHT=0"
+    DOCKER_CALL_TIMEOUT_SECONDS=2
+    mark_start
+    check_loadgen_restorable
+}
+run_case restorable-twin-create-hang case_restorable_twin_create_hang
+expect_status 1
+expect_line "FAIL loadgen restorable: creating a twin loadgen container timed out after 2 s (Docker did not answer); no twin is left and nothing else was changed"
+expect_within_ms 5000
+expect_docker_calls up 1
+expect_docker_calls rm 0
+conclude "checkLoadgenRestorable_twinCreateNeverAnswers_failsByCallLimitWithNoTwinLeft"
+
 # case_watch_progress STEP SECONDS: loadgen-check.sh's watch_progress over a window that ends
 # SECONDS from now, with a progress read due every STEP seconds and Docker never answering.
 # shellcheck disable=SC2034 # The variables are read by watch_progress.
@@ -1257,13 +1367,13 @@ expect_docker_calls logs 1
 conclude "watchProgress_logsNeverAnswer_readEndsByWindowEnd"
 
 # record_http METHOD URL [BODY]: stands in for loadgen-check.sh's http, records each request in
-# CASE_DIR/http.calls and answers it: the flag reads back as FAKE_FLAG, which a PUT sets, and a
+# CASE_DIR/http.calls and answers it: a GET or PUT gets the flag with every field of
+# feature-flag-service's flag/model.go Flag, enabled as FAKE_FLAG, which a PUT sets, and a
 # DELETE gets 204.
 record_http() {
     local enabled_re='"enabled": *(true|false)'
     printf '%s %s %s\n' "$1" "$2" "${3:-}" >>"$CASE_DIR/http.calls"
     HTTP_ERROR=""
-    HTTP_CTYPE="application/json"
     HTTP_BODY=""
     case "$1" in
         GET) HTTP_STATUS=200 ;;
@@ -1277,17 +1387,24 @@ record_http() {
         *) HTTP_STATUS=405 ;;
     esac
     if [[ "$1" != DELETE ]]; then
-        HTTP_BODY="{\"id\":\"portfolio-insights-enabled\",\"enabled\":$FAKE_FLAG}"
+        HTTP_BODY="{\"id\":\"portfolio-insights-enabled\",\"enabled\":$FAKE_FLAG,\"name\":\"Portfolio insights\",\"description\":\"Demo feature, not financial advice.\",\"isModifiable\":true,\"tag\":\"feature\"}"
     fi
 }
 
 # case_cleanup MODE [PAUSED]: loadgen-check.sh's EXIT cleanup after a run ended inside run B, the
 # fake docker in MODE, and loadgen paused by the run B drain when PAUSED is 1. Two alerts are
 # owned, and the window's log shows loadgen created a third that it never resolved; the flag was
-# false at start, and loadgen was running with weight 0, as it is again once recreated.
+# false at start, and loadgen was running with weight 0, the fake docker's image and config hash,
+# as it is again once recreated.
 # shellcheck disable=SC2034 # The variables are the run state cleanup reads.
 case_cleanup() {
     load_script loadgen-check
+    # The effective configuration check_loadgen_restorable records at start, read while the fake
+    # docker answers, in calls recorded apart from the ones the case counts.
+    LOADGEN_CONFIG_AT_START="$CASE_DIR/loadgen-at-start.config.json"
+    FAKE_DOCKER_RECORD="$CASE_DIR/setup.calls" FAKE_DOCKER_MODE=answer FAKE_DOCKER_CID="$FAKE_CID" \
+        FAKE_DOCKER_IMAGE="sha256:$FAKE_IMAGE_HEX" FAKE_DOCKER_CONFIG_HASH="$FAKE_CONFIG_HASH" \
+        loadgen_identity "$LOADGEN_CONFIG_AT_START" >/dev/null
     export FAKE_DOCKER_MODE="$1" FAKE_DOCKER_CID="$FAKE_CID" FAKE_DOCKER_RUNNING=loadgen
     http() {
         record_http "$@"
@@ -1309,6 +1426,9 @@ case_cleanup() {
     FLAG_TOUCHED=1
     LOADGEN_WAS_RUNNING=1
     LOADGEN_AT_START="running, PORTFOLIO_INSIGHTS_ALERT_WEIGHT=0"
+    LOADGEN_IMAGE_AT_START="sha256:$FAKE_IMAGE_HEX"
+    LOADGEN_HASH_AT_START="$FAKE_CONFIG_HASH"
+    export FAKE_DOCKER_IMAGE="$LOADGEN_IMAGE_AT_START" FAKE_DOCKER_CONFIG_HASH="$FAKE_CONFIG_HASH"
     LOADGEN_PAUSED="${2:-0}"
     LOADGEN_TOUCHED=1
     WINDOW_OPEN=1
@@ -1323,17 +1443,17 @@ case_cleanup() {
     exit 0
 }
 
-# expect_rest_requests ID...: the cleanup's REST requests were the flag read, its switch on, a
-# DELETE of each ID in order and the flag's restore.
+# expect_rest_requests ID...: the cleanup's REST requests were the flag read, its switch on and
+# read-back, a DELETE of each ID in order and the flag's restore and read-back.
 expect_rest_requests() {
     local url="http://harness-test.invalid" id want
-    want="GET $url/$FLAG_PATH ${LF}PUT $url/$FLAG_PATH {\"enabled\": true}"
+    want="GET $url/$FLAG_PATH ${LF}PUT $url/$FLAG_PATH {\"enabled\": true}${LF}GET $url/$FLAG_PATH "
     for id in "$@"; do
         want+="${LF}DELETE $url/broker-service/v1/alerts/$id "
     done
-    want+="${LF}PUT $url/$FLAG_PATH {\"enabled\": false}"
+    want+="${LF}PUT $url/$FLAG_PATH {\"enabled\": false}${LF}GET $url/$FLAG_PATH "
     if [[ "$(cat "$CASE_DIR/http.calls")" != "$want" ]]; then
-        reasons+=("REST requests [$(one_line "$CASE_DIR/http.calls")], expected the flag read and switch on, a DELETE of $* and the flag restore, in that order")
+        reasons+=("REST requests [$(one_line "$CASE_DIR/http.calls")], expected the flag read, its switch on and read-back, a DELETE of $* and the flag restore and read-back, in that order")
     fi
 }
 
@@ -1345,12 +1465,13 @@ expect_line "PASS cleanup"
 expect_line "INFO cleanup: alert [$ALERT_ID_3] was logged as created and never resolved by loadgen; it is deleted on exit"
 expect_line "INFO cleanup: 3 of 3 owned alerts deleted or already absent"
 expect_line "INFO cleanup: flag portfolio-insights-enabled restored to enabled=false"
-expect_line "INFO cleanup: loadgen restored as at start: running, PORTFOLIO_INSIGHTS_ALERT_WEIGHT=0"
+expect_line "INFO cleanup: loadgen restored as at start: running, PORTFOLIO_INSIGHTS_ALERT_WEIGHT=0, image ID ${FAKE_IMAGE_HEX:0:12}, config hash ${FAKE_CONFIG_HASH:0:12}, effective configuration verified as recorded at start"
 expect_rest_requests "$ALERT_ID_1" "$ALERT_ID_2" "$ALERT_ID_3"
 expect_docker_calls stop 1
 expect_docker_calls logs 1
 expect_docker_calls up 1
-expect_docker_calls inspect 1
+# loadgen's weight entry, then its image ID, config hash and effective configuration, in one.
+expect_docker_calls inspect 2
 conclude "cleanup_dockerAnswers_passesWithEveryStepDone"
 cleanup_baseline_ms="$CASE_MS"
 
@@ -1436,6 +1557,254 @@ expect_docker_calls logs 1
 expect_docker_calls pause 1
 expect_docker_calls kill 0
 conclude "drainLoadgen_pauseNeverAnswers_failsByCallLimitAndLeavesKillToStop"
+
+# ---------------------------------------------------------------------------------------------
+# 7. The exit reports of loadgen-check.sh and perf.sh. A trap runs under the redirections in
+# force where it lands, so an INT or an exit inside a call whose output goes to a file runs
+# loadgen-check.sh's cleanup, or perf.sh's on_exit, with that file as its output;
+# install_cleanup and install_traps keep the run's own stdout and stderr for them to put back.
+
+# The bound of each run below under the real timeout(1), far above the second a run takes, so
+# only a run the INT never ends reaches it. It waits for nothing: it turns such a run into a
+# failing case rather than a suite that never ends.
+CLEANUP_RUN_BOUND_SECONDS=20
+
+# The run case_cleanup_report starts. It is a script file, as a run of loadgen-check.sh is: bash
+# -c undoes a redirection before the EXIT trap of an exit inside it, and a script file does not.
+cat >"$TEST_DIR/cleanup-run.sh" <<'EOF'
+# cleanup-run.sh ARM TRIGGER ALERT_ID: loadgen-check.sh loaded by harness-test.sh's load_script,
+# with ALERT_ID owned for cleanup to delete and nothing else to restore, armed by ARM and ended
+# by TRIGGER as case_cleanup_report describes. Prints "not interrupted" if TRIGGER returns.
+set -euo pipefail
+load_script loadgen-check
+BASE_URL="http://harness-test.invalid"
+FLAG_URL="$BASE_URL/feature-flag-service/v1/flags/$FLAG_ID"
+ALERTS_URL="$BASE_URL/broker-service/v1/alerts"
+FLAG_INITIAL=""
+FLAG_TOUCHED=0
+WINDOW_OPEN=0
+WINDOW_LABEL=A
+WINDOW_SINCE="2026-01-01T00:00:00Z"
+TABLE_WRITTEN=0
+printf '%s\n' "$3" >"$RUN_DIR/owned"
+: >"$RUN_DIR/deleted"
+http() {
+    record_http "$@"
+    printf 'harness-test http: %s %s %s\n' "$1" "$2" "$HTTP_STATUS" >&2
+}
+case "$1" in
+    install) install_cleanup ;;
+    trap) trap cleanup EXIT ;;
+esac
+export FAKE_DOCKER_MODE=interrupt FAKE_DOCKER_INTERRUPT_PID="$$"
+case "$2" in
+    window) read_window "$RUN_DIR/window.log" ;;
+    docker) stop_loadgen ;;
+    exit) { exit 0; } >"$RUN_DIR/group.out" ;;
+esac
+echo "not interrupted"
+EOF
+
+# case_cleanup_report ARM TRIGGER: a run of loadgen-check.sh in a fresh bash under the real
+# timeout(1), ended by TRIGGER with one owned alert for cleanup to delete and nothing else to
+# restore. ARM is install, main's install_cleanup, or trap, the EXIT trap alone, as the suites set
+# it. TRIGGER is window, an INT the fake docker sends while read_window reads loadgen's log into
+# CASE_DIR/window.log; docker, that INT while stop_loadgen's Docker call writes its stdout and
+# stderr to CASE_DIR/compose.log; or exit, an exit 0 inside a group whose stdout is
+# CASE_DIR/group.out. record_http answers cleanup's REST requests, and each is also named on
+# stderr, which shows where cleanup's stderr goes. The fresh bash can trap the INT: a background
+# subshell of this suite starts with INT ignored, and timeout(1) resets that for its program.
+case_cleanup_report() {
+    : >"$CASE_DIR/window.log"
+    : >"$CASE_DIR/compose.log"
+    : >"$CASE_DIR/group.out"
+    : >"$CASE_DIR/http.calls"
+    export CASE_DIR SCRIPT_DIR FAKE_FLAG=true
+    export -f load_script record_http
+    command timeout -s KILL "$CLEANUP_RUN_BOUND_SECONDS" bash "$TEST_DIR/cleanup-run.sh" \
+        "$1" "$2" "$ALERT_ID_1" </dev/null
+}
+
+# check|ARM|TRIGGER|the file that must get cleanup's report|the file that must hold none of it,
+# the redirection in force where the run ended, or the run's own stdout|exit status
+CLEANUP_REPORT_ROWS=(
+    "cleanup_interruptInsideRedirectedLogRead_reportsOnRunStdoutAndStderr|install|window|out|window.log|130"
+    "cleanup_interruptInsideDockerCallToComposeLog_reportsOnRunStdoutAndStderr|install|docker|out|compose.log|130"
+    "cleanup_exitInsideRedirectedGroup_reportsOnRunStdoutAndStderr|install|exit|out|group.out|0"
+    "cleanup_withoutInstallCleanup_reportsOnCurrentStdout|trap|exit|group.out|out|0"
+)
+for row in "${CLEANUP_REPORT_ROWS[@]}"; do
+    IFS='|' read -r check arm trigger report elsewhere status <<<"$row"
+    run_case "$check" case_cleanup_report "$arm" "$trigger"
+    expect_status "$status"
+    for line in "INFO cleanup: 1 of 1 owned alerts deleted or already absent" "PASS cleanup" \
+        "INFO run dir $CASE_DIR" "SUMMARY 1 passed, 0 failed"; do
+        expect_line_in "$report" "$line"
+    done
+    expect_no_line_in "$elsewhere" '^(PASS|FAIL|INFO|SUMMARY|harness-test http:) '
+    expect_line_in err "harness-test http: DELETE http://harness-test.invalid/broker-service/v1/alerts/$ALERT_ID_1 204"
+    # Nothing else on stderr: putting the copies back, or finding none, reports no error.
+    if grep -qv '^harness-test http: ' "$CASE_DIR/err"; then
+        reasons+=("stderr holds more than the REST requests: [$(one_line "$CASE_DIR/err")]")
+    fi
+    # The run ended where TRIGGER landed.
+    expect_no_line_in out '^not interrupted$'
+    conclude "$check"
+done
+
+# case_install_cleanup_stdout_closed: case_cleanup_report's run, armed by install_cleanup, with
+# its stdout closed, so no copy of it can be made.
+case_install_cleanup_stdout_closed() {
+    : >"$CASE_DIR/http.calls"
+    export CASE_DIR SCRIPT_DIR FAKE_FLAG=true
+    export -f load_script record_http
+    command timeout -s KILL "$CLEANUP_RUN_BOUND_SECONDS" bash "$TEST_DIR/cleanup-run.sh" \
+        install exit "$ALERT_ID_1" </dev/null >&-
+}
+# The run ends with exit 2 and says why, before any trap is set: cleanup never runs, so it sends
+# no request.
+run_case installCleanup_stdoutClosed_endsWithExit2BeforeAnyTrap case_install_cleanup_stdout_closed
+expect_status 2
+expect_line_in err "Could not keep copies of stdout and stderr for the cleanup report."
+if [[ -s "$CASE_DIR/http.calls" ]]; then
+    reasons+=("cleanup ran and sent [$(one_line "$CASE_DIR/http.calls")]")
+fi
+conclude "installCleanup_stdoutClosed_endsWithExit2BeforeAnyTrap"
+
+# perf.sh: on_exit ends every run that finish does not end, and prints the "run" FAIL line, the
+# REPORT, the cleanup check and the SUMMARY; abort ends the run through finish, which prints the
+# REPORT, the cleanup check and the SUMMARY after abort's own FAIL line. Both put back the copies
+# install_traps kept before they print.
+
+# The run case_perf_exit_report starts, a script file for the reason cleanup-run.sh is one.
+cat >"$TEST_DIR/perf-exit-run.sh" <<'EOF'
+# perf-exit-run.sh ARM TRIGGER ALERT_ID: perf.sh, sourced whole as its source guard allows, with
+# ALERT_ID owned for cleanup to delete and nothing else to restore, armed by ARM and ended by
+# TRIGGER as case_perf_exit_report describes. Prints "not interrupted" if TRIGGER returns.
+set -euo pipefail
+source "$SCRIPT_DIR/perf.sh"
+RUN_DIR="$CASE_DIR"
+PROJECT="harness-test"
+COMPOSE_FILE="fake-compose.yaml"
+BASE_URL="http://harness-test.invalid"
+FLAG_URL="$BASE_URL/feature-flag-service/v1/flags/$FLAG_ID"
+ALERTS_URL="$BASE_URL/broker-service/v1/alerts"
+LOG_SINCE="2026-01-01T00:00:00Z"
+PROBE_DEADLINE=$((SECONDS + 60))
+printf '%s\n' "$3" >"$RUN_DIR/owned"
+: >"$RUN_DIR/expected"
+: >"$RUN_DIR/deleted"
+http() {
+    record_http "$@"
+    printf 'harness-test http: %s %s %s\n' "$1" "$2" "$HTTP_STATUS" >&2
+}
+exit_in_call() {
+    exit 3
+}
+abort_in_call() {
+    abort "probe" "aborted inside a call whose stdout goes to call.out"
+}
+case "$1" in
+    install) install_traps ;;
+    trap)
+        trap on_exit EXIT
+        trap on_signal INT TERM
+        ;;
+esac
+export FAKE_DOCKER_MODE=interrupt FAKE_DOCKER_INTERRUPT_PID="$$"
+case "$2" in
+    window) read_window ;;
+    compose) compose stop loadgen >>"$RUN_DIR/compose.log" 2>&1 ;;
+    exit) exit_in_call >"$RUN_DIR/call.out" ;;
+    abort) abort_in_call >"$RUN_DIR/call.out" ;;
+esac
+echo "not interrupted"
+EOF
+
+# case_perf_exit_report ARM TRIGGER SIGNAL: a run of perf.sh in a fresh bash under the real
+# timeout(1), ended by TRIGGER with one owned alert for cleanup to delete and nothing else to
+# restore. ARM is install, main's install_traps, or trap, the two traps alone, as perf-test.sh
+# sets them. TRIGGER is window, SIGNAL from the fake docker while read_window reads the broker's
+# log into CASE_DIR/broker.log; compose, SIGNAL while perf.sh's compose stops loadgen with its
+# stdout and stderr appended to CASE_DIR/compose.log, as setup stops it; exit, an exit 3 inside a
+# function call whose stdout is CASE_DIR/call.out; or abort, an abort inside such a call. SIGNAL
+# is - for the last two. record_http answers cleanup's REST requests, and each is also named on
+# stderr, which shows where the report's stderr goes.
+case_perf_exit_report() {
+    : >"$CASE_DIR/broker.log"
+    : >"$CASE_DIR/compose.log"
+    : >"$CASE_DIR/call.out"
+    : >"$CASE_DIR/http.calls"
+    export CASE_DIR SCRIPT_DIR FAKE_FLAG=true
+    if [[ "$3" != - ]]; then
+        export FAKE_DOCKER_INTERRUPT_SIGNAL="$3"
+    fi
+    export -f record_http
+    command timeout -s KILL "$CLEANUP_RUN_BOUND_SECONDS" bash "$TEST_DIR/perf-exit-run.sh" \
+        "$1" "$2" "$ALERT_ID_1" </dev/null
+}
+
+# check|ARM|TRIGGER|SIGNAL|the file that must get the report|the file that must hold none of it,
+# the redirection in force where the run ended, or the run's own stdout|the FAIL line that ends
+# the run|exit status
+PERF_EXIT_REPORT_ROWS=(
+    "onExit_interruptInsideRedirectedLogRead_reportsOnRunStdoutAndStderr|install|window|INT|out|broker.log|FAIL run: ended early with status 130|130"
+    "onExit_termInsideComposeCallToComposeLog_reportsOnRunStdoutAndStderr|install|compose|TERM|out|compose.log|FAIL run: ended early with status 130|130"
+    "onExit_exitInsideRedirectedCall_reportsOnRunStdoutAndStderrKeepingStatus|install|exit|-|out|call.out|FAIL run: ended early with status 3|3"
+    "abort_insideRedirectedCall_reportsOnRunStdoutAndStderr|install|abort|-|out|call.out|FAIL probe: aborted inside a call whose stdout goes to call.out|1"
+    "onExit_withoutInstallTraps_reportsOnCurrentStdout|trap|exit|-|call.out|out|FAIL run: ended early with status 3|3"
+)
+for row in "${PERF_EXIT_REPORT_ROWS[@]}"; do
+    IFS='|' read -r check arm trigger signal report elsewhere fail_line status <<<"$row"
+    run_case "$check" case_perf_exit_report "$arm" "$trigger" "$signal"
+    expect_status "$status"
+    for line in "$fail_line" "REPORT" "$(printf '  %-24s %s' "run dir" "$CASE_DIR")" \
+        "INFO cleanup: deleting 1 owned alerts" \
+        "INFO cleanup: 1 alerts deleted, 0 already absent, 0 left in place, 0 not attempted" \
+        "PASS cleanup" "SUMMARY 1 passed, 1 failed"; do
+        expect_line_in "$report" "$line"
+    done
+    # on_exit's own lines; an abort ends through finish, which has none.
+    if [[ "$trigger" != abort ]]; then
+        expect_line_in "$report" "INFO run ended early with status $status; cleaning up"
+        expect_line_in "$report" "INFO run dir $CASE_DIR"
+    fi
+    # The REPORT once, as REPORT_PRINTED guards it, and the SUMMARY last.
+    if [[ "$(grep -cx REPORT "$CASE_DIR/$report" || true)" != 1 ]]; then
+        reasons+=("$report does not hold exactly one REPORT line: [$(one_line "$CASE_DIR/$report")]")
+    fi
+    if [[ "$(tail -n 1 "$CASE_DIR/$report")" != "SUMMARY 1 passed, 1 failed" ]]; then
+        reasons+=("the last line of $report is not the SUMMARY: [$(one_line "$CASE_DIR/$report")]")
+    fi
+    expect_no_line_in "$elsewhere" '^(PASS |FAIL |INFO |SUMMARY |REPORT$|harness-test http: )'
+    expect_line_in err "harness-test http: DELETE http://harness-test.invalid/broker-service/v1/alerts/$ALERT_ID_1 204"
+    # Nothing else on stderr: putting the copies back, or finding none, reports no error.
+    if grep -qv '^harness-test http: ' "$CASE_DIR/err"; then
+        reasons+=("stderr holds more than the REST requests: [$(one_line "$CASE_DIR/err")]")
+    fi
+    # The run ended where TRIGGER landed.
+    expect_no_line_in out '^not interrupted$'
+    conclude "$check"
+done
+
+# case_perf_install_traps_stdout_closed: case_perf_exit_report's run, armed by install_traps,
+# with its stdout closed, so no copy of it can be made.
+case_perf_install_traps_stdout_closed() {
+    : >"$CASE_DIR/http.calls"
+    export CASE_DIR SCRIPT_DIR FAKE_FLAG=true
+    export -f record_http
+    command timeout -s KILL "$CLEANUP_RUN_BOUND_SECONDS" bash "$TEST_DIR/perf-exit-run.sh" \
+        install exit "$ALERT_ID_1" </dev/null >&-
+}
+# The run ends with exit 2 and says why, before any trap is set: on_exit never runs, so cleanup
+# sends no request.
+run_case installTraps_stdoutClosed_endsWithExit2BeforeAnyTrap case_perf_install_traps_stdout_closed
+expect_status 2
+expect_line_in err "Could not keep copies of stdout and stderr for the exit report."
+if [[ -s "$CASE_DIR/http.calls" ]]; then
+    reasons+=("on_exit ran and sent [$(one_line "$CASE_DIR/http.calls")]")
+fi
+conclude "installTraps_stdoutClosed_endsWithExit2BeforeAnyTrap"
 
 summarize
 if [[ "$failed" -ne 0 ]]; then

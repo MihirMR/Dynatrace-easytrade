@@ -1011,7 +1011,7 @@ reset_alerts() {
     reset_state
     : >"$RUN_DIR/owned"
     : >"$RUN_DIR/expected"
-    stub_reply POST "$ALERTS_URL" 201 "{\"id\":\"$ALERT_ID\",\"armingRevision\":1}"
+    stub_reply POST "$ALERTS_URL" 201 "{\"id\":\"$ALERT_ID\",\"enabled\":true,\"armingRevision\":1}"
 }
 
 # post_body_sent CHECK ACCOUNT TYPE INSTRUMENT DIRECTION THRESHOLD BODY: post_alert sends
@@ -1084,17 +1084,30 @@ post_token_refused "postAlert_decimalCommaToken_refusedBeforeRequest" "1,5"
 post_token_refused "postAlert_hexToken_refusedBeforeRequest" "0x10"
 post_token_refused "postAlert_jsonFragmentToken_refusedBeforeRequest" '1,"accountId":"other"'
 post_answered "postAlert_created201_recordsLowerCasedOwnedIdAndRevision" 201 \
-    "{\"id\":\"$(tr '[:lower:]' '[:upper:]' <<<"$ALERT_ID")\",\"armingRevision\":1}" 0 "" \
+    "{\"id\":\"$(tr '[:lower:]' '[:upper:]' <<<"$ALERT_ID")\",\"enabled\":true,\"armingRevision\":1}" 0 "" \
     "$ALERT_ID" "$ALERT_ID,1"
-post_answered "postAlert_created201WithoutReadableId_failsRecordingNothing" 201 \
-    '{"armingRevision":1}' 1 \
-    "201 without a readable id; the created alert cannot be deleted by this run" "" ""
-post_answered "postAlert_created201WithoutRevision_recordsOwnedIdOnly" 201 "{\"id\":\"$ALERT_ID\"}" 1 \
-    "201 for alert [$ALERT_ID] without a readable armingRevision" "$ALERT_ID" ""
+post_answered "postAlert_created201WithoutReadableId_failsOwningNothing" 201 \
+    '{"enabled":true,"armingRevision":1}' 1 \
+    "201 without a readable id; the alert may exist without an id this run knows; cleanup looks for it among the account's alerts" "" ""
+post_answered "postAlert_created201WithoutRevision_recordsOwnedIdOnly" 201 \
+    "{\"id\":\"$ALERT_ID\",\"enabled\":true}" 1 \
+    "201 for alert [$ALERT_ID] whose armingRevision is not the JSON integer 1" "$ALERT_ID" ""
+post_answered "postAlert_created201AtRevision2_recordsOwnedIdOnly" 201 \
+    "{\"id\":\"$ALERT_ID\",\"enabled\":true,\"armingRevision\":2}" 1 \
+    "201 for alert [$ALERT_ID] whose armingRevision is not the JSON integer 1" "$ALERT_ID" ""
+post_answered "postAlert_created201WithoutEnabled_recordsOwnedIdOnly" 201 \
+    "{\"id\":\"$ALERT_ID\",\"armingRevision\":1}" 1 \
+    "201 for alert [$ALERT_ID] whose enabled is not the JSON boolean true" "$ALERT_ID" ""
+post_answered "postAlert_created201EnabledAsString_recordsOwnedIdOnly" 201 \
+    "{\"id\":\"$ALERT_ID\",\"enabled\":\"true\",\"armingRevision\":1}" 1 \
+    "201 for alert [$ALERT_ID] whose enabled is not the JSON boolean true" "$ALERT_ID" ""
+post_answered "postAlert_created201Disabled_recordsOwnedIdOnly" 201 \
+    "{\"id\":\"$ALERT_ID\",\"enabled\":false,\"armingRevision\":1}" 1 \
+    "201 for alert [$ALERT_ID] whose enabled is not the JSON boolean true" "$ALERT_ID" ""
 post_answered "postAlert_rejected400_failsNamingStatus" 400 '{"error":"invalid_threshold"}' 1 \
     "status 400" "" ""
 post_answered "postAlert_transportError_failsNamingPossiblyCreatedAlert" 000 "" 1 \
-    "transport error ($TRANSPORT_ERROR); the alert may exist without an id this run knows" "" ""
+    "transport error ($TRANSPORT_ERROR); the alert may exist without an id this run knows; cleanup looks for it among the account's alerts" "" ""
 
 # ---------------------------------------------------------------------------------------------
 # Isolation

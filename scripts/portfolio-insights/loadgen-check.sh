@@ -25,26 +25,59 @@
 #   --out FILE           Per-family markdown table (default: loadgen-families.md in the run dir)
 #   --resume-cleanup DIR Resume the owned-alert cleanup of the earlier run with run directory DIR
 #                        instead of making a run (see Recovery below)
-#   --help               Show this help and exit
+#   -h, --help           Show this help and exit
 #
-# One project per invocation. Never run it alongside e2e.sh or perf.sh: all three toggle the same
-# flag, and perf.sh stops loadgen to measure with no visit running.
+# Examples:
+#   A full run with every default, against the stack of Compose project pi-dev-mssql:
+#     scripts/portfolio-insights/loadgen-check.sh --project pi-dev-mssql
+#   A stack started with an override file on its own port, the table written to FILE:
+#     scripts/portfolio-insights/loadgen-check.sh --project NAME --base-url http://localhost:PORT \
+#         --compose-file compose.dev.yaml --compose-file OVERRIDE.yaml --out FILE
+#
+# One project per invocation, and one invocation per project at a time: from setup until it exits
+# a run holds the lock directory /tmp/pi-loadgen-check.NAME.lock, as a --resume-cleanup does from
+# before its flag read, and a second invocation on the same project is refused while the first
+# holds it, before it reads the flag or changes anything. The
+# refusal names the holding run and says when that run has ended; a lock left by a run killed
+# before its cleanup is removed by hand once no run on the project is active. Never run it
+# alongside e2e.sh or perf.sh: all three toggle the same flag, and perf.sh stops loadgen to
+# measure with no visit running.
 #
 # What it touches: it toggles only portfolio-insights-enabled and restores it. It recreates
 # loadgen with the weight passed through Compose interpolation of the existing
 # PORTFOLIO_INSIGHTS_ALERT_WEIGHT declaration, set on that one command and never exported. It
 # deletes, by id, only alerts loadgen logged as created and did not delete itself, and reads the
-# Alerts table read-only through the db container's own client. On exit, normal or not, it
-# restores the flag and puts loadgen back as it was at start: recreated with the
-# PORTFOLIO_INSIGHTS_ALERT_WEIGHT its container had (set on that one command, or unset when it
-# was unset), running or stopped as it was, or removed when the project had no loadgen
-# container; the cleanup check fails unless the restored container matches. Run B ends at an
-# instant Q when every alert it logged as created is resolved and no visit is between opening
-# the page and its create outcome: loadgen is paused, its frozen output checked again, and
-# killed while paused, so it logs and does nothing after Q. Run B's owned-id checks judge every
-# create seen in any read of run B's output, and fail when the final output lost one, as log
-# rotation can. A create cut off before loadgen logs its id by any other stop, such as an
-# interrupt while loadgen runs, cannot be tied to an id and is not deleted; an unconfirmed
+# Alerts table read-only through the db container's own client. Before it changes anything, it
+# checks that a loadgen container it finds can be put back as it is: these compose files, under
+# the weight that container has, must give loadgen the Compose config hash the container was
+# created with, and the image reference it was created from must still name the image it runs.
+# What changed on the container since, outside Compose, as docker update does to its resource
+# limits or restart policy, only a container shows: so it then briefly creates a twin loadgen
+# container in the project, from these compose files under that weight, without starting it or
+# touching the container found, reads the twin's effective configuration and removes it again,
+# and the two must match in image, settings, host configuration and network endpoints, apart
+# from what names one container; the project must also hold that one loadgen container only.
+# Otherwise the run ends with nothing changed. It then keeps that container's output since it
+# last started in at-start.log in the run directory, since a recreate discards it. When that
+# loadgen runs with the flag on, it is first ended, while the flag is still on, at an instant Q
+# when no portfolio_insights_alert visit is between opening the page or creating an alert and its
+# outcome, as run B ends below, so no visit of that workload has a create or delete refused once
+# run A switches the flag off; its alerts are reported, never deleted, and when no Q comes within
+# the drain's deadline the run ends with the flag and loadgen as at start. Short of Q that
+# container is never recreated, as a visit of its workload may be in flight: when the run ends
+# or is interrupted before Q, cleanup unpauses it in place if it is paused, checks that it runs as
+# at start, and recreates it only once it has exited, killed at Q. Otherwise, on exit, normal or
+# not, it restores the flag and puts loadgen back as it was at start: recreated, without building
+# or pulling, with the PORTFOLIO_INSIGHTS_ALERT_WEIGHT its container had (set on that one
+# command, or unset when it was unset), running or stopped as it was, or removed when the project
+# had no loadgen container; the cleanup check fails unless the restored container matches in
+# state, weight, image ID, config hash and effective configuration, with no twin left behind.
+# Run B ends at an instant Q when every alert it logged as created is resolved and no visit is
+# between opening the page and its create outcome: loadgen is paused, its frozen output checked
+# again, and killed while paused, so it logs and does nothing after Q. Run B's owned-id checks
+# judge every create seen in any read of run B's output, and fail when the final output lost
+# one, as log rotation can. A create cut off before loadgen logs its id by any other stop, such
+# as an interrupt while loadgen runs, cannot be tied to an id and is not deleted; an unconfirmed
 # create is printed with its threshold marker.
 #
 # Recovery: cleanup sends a DELETE that ends in a transport error up to three times, two seconds
@@ -62,11 +95,12 @@
 # table.
 #
 # Prints one PASS or FAIL line per check, writes the per-family table to --out and ends with a
-# SUMMARY line. Exits 0 when every check passes, 1 when any check fails, 2 on a usage error, a
-# missing tool or a run directory or stack --resume-cleanup refuses, and 130 on an interrupt.
-# Working files stay in the run directory printed at start and end. The loadgen output kept there
-# is reduced to the validated lines the checks read, so no DEBUG line, typed value or error detail
-# is retained.
+# SUMMARY line, on the run's own stdout even when an interrupt lands while a step writes to a
+# file. Exits 0 when every check passes, 1 when any check fails, 2 on a usage error, a missing
+# tool, a run that cannot start (no run directory, or stdout closed) or a run directory or stack
+# --resume-cleanup refuses, and 130 on an interrupt. Working files stay in the run directory
+# printed at start and end. The loadgen output kept there is reduced to the validated lines the
+# checks read, so no DEBUG line, typed value or error detail is retained.
 
 set -euo pipefail
 
@@ -108,16 +142,27 @@ LOG_SKEW_MARGIN_SECONDS=30
 # LOG_PROBE_KILL_SECONDS before the limit and KILL at it.
 LOG_PROBE_TIMEOUT_SECONDS=120
 LOG_PROBE_KILL_SECONDS=5
-# The hard limit, termination included as for log reads, of every other Docker call the run B
-# drain and the EXIT cleanup make: pausing, unpausing, stopping and killing loadgen
-# (pause_loadgen, unpause_loadgen, stop_loadgen, kill_loadgen), restoring it (restore_loadgen)
-# and reading container state (running_services, container_env, container_env_entry,
-# loadgen_state), wherever those functions run. Inside the run B drain a pause, unpause or kill
-# takes the time left before the drain's deadline instead when that is shorter, and none starts
-# with no time left, so the drain ends by QUIESCE_TIMEOUT_SECONDS; the stop that follows it and
-# the EXIT cleanup's calls each keep this bound of their own. Each takes seconds on a healthy
-# engine. A call cut off is reported, and cleanup carries on with its other steps.
+# The hard limit, termination included as for log reads, of every other Docker call setup's
+# restorability check, the drains and the EXIT cleanup make: pausing, unpausing, stopping and
+# killing loadgen (pause_loadgen, unpause_loadgen, stop_loadgen, kill_loadgen), restoring it
+# (restore_loadgen), reading container state (running_services, container_env,
+# container_env_entry, loadgen_state, loadgen_identity, loadgen_run_state), reading what a
+# recreate would give loadgen (predicted_loadgen_hash, loadgen_declares_weight, image_id_of), and
+# creating, listing, reading and removing the twin loadgen container the restorability check
+# compares loadgen with (create_loadgen_twin, loadgen_container_ids, container_snapshot,
+# remove_loadgen_twin), wherever those functions run. Inside a drain, run B's or the one of the
+# loadgen found at start, a pause, unpause or kill takes the time left before the drain's deadline
+# instead when that is shorter, and none starts with no time left, so the drain ends by
+# QUIESCE_TIMEOUT_SECONDS; the stop that follows it and the EXIT cleanup's calls each keep this
+# bound of their own. Each takes seconds on a healthy engine. A call cut off is reported, and
+# cleanup carries on with its other steps.
 DOCKER_CALL_TIMEOUT_SECONDS=60
+# The root of the per-project run lock (acquire_run_lock): /tmp, not TMPDIR, so every run on this
+# host finds the lock another run holds, whatever TMPDIR each was given.
+LOCK_ROOT="/tmp"
+# The hard limit of lock_refusal's read of another run's lock owner file: a few hundred bytes of
+# a local file, so a read still running after it is one that will never end.
+LOCK_READ_TIMEOUT_SECONDS=5
 # Cleanup sends a DELETE that ends in a transport error again, CLEANUP_RETRY_STEP_SECONDS later,
 # until it has made CLEANUP_RETRY_ATTEMPTS attempts; any answer is final. It stops sending DELETEs
 # after MAX_CONSECUTIVE_TRANSPORT_ERRORS ids in a row whose every attempt ended in a transport
@@ -185,8 +230,18 @@ Usage: scripts/portfolio-insights/loadgen-check.sh --project NAME [--base-url UR
                        points; --weight, --minutes and --out are refused. No loadgen is touched
                        and no table written. A cleanup that leaves alerts prints this command;
                        repeat it until it passes.
-  --help               Show this help and exit
-Takes roughly 2 x M + 20 minutes. Run one project at a time, never alongside e2e.sh or perf.sh.
+  -h, --help           Show this help and exit
+Examples:
+  A full run with every default, against the stack of Compose project pi-dev-mssql:
+    scripts/portfolio-insights/loadgen-check.sh --project pi-dev-mssql
+  A stack started with an override file on its own port, the table written to FILE:
+    scripts/portfolio-insights/loadgen-check.sh --project NAME --base-url http://localhost:PORT \
+        --compose-file compose.dev.yaml --compose-file OVERRIDE.yaml --out FILE
+Takes roughly 2 x M + 20 minutes. One invocation per project runs at a time, a --resume-cleanup
+included: it holds the lock directory /tmp/pi-loadgen-check.NAME.lock until it exits, and a
+second invocation on the same project is refused while the first holds it. Remove a lock a
+killed run left behind only once no run on that project is active. Run one project at a time,
+never alongside e2e.sh or perf.sh.
 EOF
 }
 
@@ -308,8 +363,14 @@ parse_options() {
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --base-url | --compose-file | --project | --weight | --minutes | --out | --resume-cleanup)
-                if [[ $# -lt 2 || -z "$2" || "$2" == -* ]]; then
+                if [[ $# -lt 2 || -z "$2" ]]; then
                     usage_error "Option $1 requires a value."
+                fi
+                # A count option takes a negative number as its value, so the count check below
+                # names the real problem. Any other value starting with - is refused unseen: it is
+                # most likely the next option, and a misplaced argument can hold credentials.
+                if [[ "$2" == -* ]] && ! [[ ("$1" == --weight || "$1" == --minutes) && "$2" =~ ^-[0-9] ]]; then
+                    usage_error "Option $1 requires a value; the next argument starts with '-' and is not taken as one."
                 fi
                 case "$1" in
                     --base-url) BASE_URL="$2" ;;
@@ -326,7 +387,7 @@ parse_options() {
                 esac
                 shift 2
                 ;;
-            --help)
+            -h | --help)
                 usage
                 exit 0
                 ;;
@@ -440,12 +501,12 @@ check_result() {
 # ---------------------------------------------------------------------------------------------
 # HTTP and JSON
 
-# http METHOD URL [BODY]: sets HTTP_STATUS (000 on a transport error), HTTP_CTYPE, HTTP_BODY and
-# HTTP_ERROR (curl's message on a transport error). Never trips set -e. BODY goes through stdin.
+# http METHOD URL [BODY]: sets HTTP_STATUS (000 on a transport error), HTTP_BODY and HTTP_ERROR
+# (curl's message on a transport error). Never trips set -e. BODY goes through stdin.
 http() {
     local method="$1" url="$2" out rc=0
     local args=(-sS --max-time "$HTTP_TIMEOUT_SECONDS" -X "$method"
-        -o "$RUN_DIR/body" -D "$RUN_DIR/headers" -w '%{http_code} %{content_type}'
+        -o "$RUN_DIR/body" -D "$RUN_DIR/headers" -w '%{http_code}'
         -H 'Accept: application/json')
     : >"$RUN_DIR/body"
     : >"$RUN_DIR/headers"
@@ -460,17 +521,17 @@ http() {
     fi
     if [[ $rc -ne 0 ]]; then
         HTTP_STATUS="000"
-        HTTP_CTYPE=""
         HTTP_ERROR="$(tr -d '\r' <"$RUN_DIR/curl-error" | head -c 300)"
     else
-        HTTP_STATUS="${out%% *}"
-        HTTP_CTYPE="${out#* }"
+        HTTP_STATUS="$out"
         HTTP_ERROR=""
     fi
     HTTP_BODY="$(cat "$RUN_DIR/body")"
 }
 
-# jget FILTER JSON: prints jq's raw output, or nothing when the JSON does not parse.
+# jget FILTER JSON: prints jq's raw output, or nothing when the JSON does not parse. Raw output
+# reads the string "true" as the boolean true, so jget only serves display; a flag reply goes
+# through flag_reply.
 jget() {
     jq -r "$1" 2>/dev/null <<<"$2" | tr -d '\r' || true
 }
@@ -481,6 +542,67 @@ status_text() {
         echo "transport error (${HTTP_ERROR:-no response})"
     else
         echo "status $HTTP_STATUS"
+    fi
+}
+
+# flag_reply BODY: whether BODY is the flag as feature-flag-service serializes flag/model.go's Flag
+# for a GET or PUT of its path: exactly one JSON value, an object whose id is the string FLAG_ID,
+# whose enabled and isModifiable are booleans, whose name, description and tag are strings, and
+# whose enabledAt, omitted while the flag is off, is absent or a string holding the RFC 3339 time
+# Go encodes a time.Time as: date, "T", time with up to nine fraction digits, then "Z" or a
+# +hh:mm or -hh:mm offset, and nothing after it, not even a newline. Each type is checked as
+# jq parsed it, so the string "true" is not the boolean true. On success FLAG_ENABLED and
+# FLAG_MODIFIABLE are true or false. Otherwise it returns 1 with FLAG_REASON a fixed text naming
+# the first rule the reply breaks, which never quotes the reply.
+flag_reply() {
+    local verdict re='^flag (true|false) (true|false)$'
+    FLAG_ENABLED=""
+    FLAG_MODIFIABLE=""
+    FLAG_REASON=""
+    # -s reads the whole body into one array, so a second value is counted; a body that does not
+    # parse makes jq fail without output.
+    verdict="$(jq -r -s --arg id "$FLAG_ID" '
+        if length != 1 then "not one JSON value"
+        else .[0]
+            | if type != "object" then "not a JSON object"
+            elif (.id | type) != "string" then "id is not a string"
+            elif .id != $id then "id is not \($id)"
+            elif (.enabled | type) != "boolean" then "enabled is not a boolean"
+            elif (.isModifiable | type) != "boolean" then "isModifiable is not a boolean"
+            elif (.name | type) != "string" then "name is not a string"
+            elif (.description | type) != "string" then "description is not a string"
+            elif (.tag | type) != "string" then "tag is not a string"
+            elif has("enabledAt") and (.enabledAt | type) != "string" then "enabledAt is not a string"
+            elif has("enabledAt") and (.enabledAt
+                | test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]{1,9})?(Z|[+-][0-9]{2}:[0-9]{2})\\z")
+                | not)
+            then "enabledAt is not an RFC 3339 time"
+            else "flag \(.enabled) \(.isModifiable)"
+            end
+        end' 2>/dev/null <<<"$1")" || verdict=""
+    verdict="${verdict//$'\r'/}"
+    if [[ "$verdict" =~ $re ]]; then
+        FLAG_ENABLED="${BASH_REMATCH[1]}"
+        FLAG_MODIFIABLE="${BASH_REMATCH[2]}"
+        return 0
+    fi
+    FLAG_REASON="${verdict:-not valid JSON}"
+    return 1
+}
+
+# flag_answered WHAT: whether the last http call, the request WHAT, answered 200 with the flag
+# (flag_reply). Otherwise it returns 1 with FLAG_REASON "WHAT gave STATUS" for another status or a
+# transport error (status_text), or "WHAT gave status 200 with a reply that is not the flag: RULE".
+flag_answered() {
+    if [[ "$HTTP_STATUS" != "200" ]]; then
+        FLAG_ENABLED=""
+        FLAG_MODIFIABLE=""
+        FLAG_REASON="$1 gave $(status_text)"
+        return 1
+    fi
+    if ! flag_reply "$HTTP_BODY"; then
+        FLAG_REASON="$1 gave status 200 with a reply that is not the flag: $FLAG_REASON"
+        return 1
     fi
 }
 
@@ -538,31 +660,41 @@ compose_within() {
 # recreate_loadgen WEIGHT [START [LIMIT]]: recreates loadgen alone with
 # PORTFOLIO_INSIGHTS_ALERT_WEIGHT=WEIGHT, started when START is -d (the default) and only created
 # when it is --no-start. The value reaches only this command, where it overrides the shell and
-# .env for Compose's interpolation of the declaration both compose files carry. With LIMIT the
-# call has ended within LIMIT seconds (compose_within), with status 124 or 137 when cut off.
-# Without it, as when a window opens and Compose may first have to build or pull the image, the
-# call is not bounded.
+# .env for Compose's interpolation of the declaration both compose files carry. With LIMIT, as
+# restore_loadgen calls it, the call has ended within LIMIT seconds (compose_within), with status
+# 124 or 137 when cut off, and neither builds nor pulls: the container gets the local image its
+# image reference names, the one check_loadgen_restorable found it running. Without it, as when a
+# window opens and Compose may first have to build or pull the image, the call is not bounded.
 recreate_loadgen() {
     if [[ -n "${3:-}" ]]; then
-        PORTFOLIO_INSIGHTS_ALERT_WEIGHT="$1" compose_within "$3" up "${2:--d}" --no-deps --force-recreate loadgen \
-            >>"$RUN_DIR/compose.log" 2>&1
+        PORTFOLIO_INSIGHTS_ALERT_WEIGHT="$1" compose_within "$3" up "${2:--d}" --no-deps --force-recreate \
+            --no-build --pull never loadgen >>"$RUN_DIR/compose.log" 2>&1
     else
         PORTFOLIO_INSIGHTS_ALERT_WEIGHT="$1" compose up "${2:--d}" --no-deps --force-recreate loadgen \
             >>"$RUN_DIR/compose.log" 2>&1
     fi
 }
 
-# restore_loadgen: puts loadgen back as setup recorded it in LOADGEN_AT_START and verifies the
+# restore_loadgen: puts loadgen back as setup recorded it in LOADGEN_AT_START,
+# LOADGEN_IMAGE_AT_START, LOADGEN_HASH_AT_START and LOADGEN_CONFIG_AT_START and verifies the
 # result; on failure it sets RESTORE_ERROR. A container that existed is recreated alone with the
 # PORTFOLIO_INSIGHTS_ALERT_WEIGHT it had, set or unset on that one command, so neither this shell
 # nor .env replaces a weight the operator set elsewhere. Its other settings come from the same
-# --compose-file files, so the weight is the only interpolated value this run overrides. A loadgen
-# stopped at start is recreated without being started rather than started and stopped: a visit
-# run in between could create an alert and be cut off. Without a container at start, the one this
-# run created is removed. Each Docker call has ended within DOCKER_CALL_TIMEOUT_SECONDS
-# (hard_timeout), and RESTORE_ERROR tells a call Docker did not answer in time from one that failed.
+# --compose-file files, so the weight is the only interpolated value this run overrides, and the
+# recreate neither builds nor pulls. The result must match the start in its state (running or
+# stopped), its weight entry, its image ID, the config hash Compose labels it with, the hash
+# check_loadgen_restorable found these compose files give it, and its effective configuration
+# (loadgen_config_snapshot), the one check_loadgen_restorable recorded at start and found a twin
+# of it gets; RESTORE_ERROR names every one that differs, the configuration by each differing
+# field (snapshot_differences). A loadgen stopped at start is recreated without being started
+# rather than started and stopped: a visit run in between could create an alert and be cut off.
+# Without a container at start, the one this run created is removed. Each Docker call has ended
+# within DOCKER_CALL_TIMEOUT_SECONDS (hard_timeout), and RESTORE_ERROR tells a call Docker did not
+# answer in time from one that failed.
 restore_loadgen() {
-    local start=-d entry actual rc=0
+    local start=-d entry actual identity image hash joined configuration rc=0
+    local restored="$RUN_DIR/loadgen-restored.config.json"
+    local -a differs=() fields=()
     RESTORE_ERROR=""
     if [[ "$LOADGEN_AT_START" == "no container" ]]; then
         compose_within "$DOCKER_CALL_TIMEOUT_SECONDS" rm --force --stop loadgen >>"$RUN_DIR/compose.log" 2>&1 ||
@@ -583,8 +715,8 @@ restore_loadgen() {
             # Unset in a subshell, so only this command runs without it.
             (
                 unset PORTFOLIO_INSIGHTS_ALERT_WEIGHT
-                compose_within "$DOCKER_CALL_TIMEOUT_SECONDS" up "$start" --no-deps --force-recreate loadgen \
-                    >>"$RUN_DIR/compose.log" 2>&1
+                compose_within "$DOCKER_CALL_TIMEOUT_SECONDS" up "$start" --no-deps --force-recreate \
+                    --no-build --pull never loadgen >>"$RUN_DIR/compose.log" 2>&1
             ) || rc=$?
         fi
         if [[ $rc -ne 0 ]]; then
@@ -599,8 +731,38 @@ restore_loadgen() {
         return 1
     fi
     actual="${actual%x}"
+    if [[ "$LOADGEN_AT_START" != "no container" && "$actual" != "no container" ]]; then
+        # Removed first, so a configuration this read does not write is never one read before.
+        rm -f "$restored"
+        identity="$(loadgen_identity "$restored")" || rc=$?
+        if [[ $rc -ne 0 ]]; then
+            RESTORE_ERROR="$(docker_problem "reading loadgen's image, config hash and effective configuration after the restore" "$rc" "$DOCKER_CALL_TIMEOUT_SECONDS")"
+            return 1
+        fi
+        IFS=$'\t' read -r image hash _ <<<"$identity"
+        if [[ "$image" != "$LOADGEN_IMAGE_AT_START" ]]; then
+            differs+=("image ID $(short_digest "$image") instead of $(short_digest "$LOADGEN_IMAGE_AT_START") as at start")
+        fi
+        if [[ "$hash" != "$LOADGEN_HASH_AT_START" ]]; then
+            differs+=("config hash $(short_digest "$hash") instead of $(short_digest "$LOADGEN_HASH_AT_START") as at start")
+        fi
+        # The configuration hash covers what Compose applied when it created the container at
+        # start; what changed on that container since is in its effective configuration.
+        if [[ -z "$LOADGEN_CONFIG_AT_START" ]]; then
+            differs+=("no effective configuration was recorded at start to verify it against")
+        elif ! configuration="$(snapshot_differences "$LOADGEN_CONFIG_AT_START" "$restored" restore)"; then
+            differs+=("its effective configuration could not be compared with the one at start (see $RUN_DIR/compose.log)")
+        elif [[ -n "$configuration" ]]; then
+            mapfile -t fields <<<"$configuration"
+            differs+=("${fields[@]}")
+        fi
+    fi
     if [[ "$actual" != "$LOADGEN_AT_START" ]]; then
-        RESTORE_ERROR="expected [$(loadgen_state_text "$LOADGEN_AT_START")] as at start, got [$(loadgen_state_text "$actual")]"
+        differs=("expected [$(loadgen_state_text "$LOADGEN_AT_START")] as at start, got [$(loadgen_state_text "$actual")]" "${differs[@]}")
+    fi
+    if [[ ${#differs[@]} -gt 0 ]]; then
+        printf -v joined '%s; ' "${differs[@]}"
+        RESTORE_ERROR="${joined%; }"
         return 1
     fi
 }
@@ -622,9 +784,12 @@ stop_loadgen() {
 
 # pause_loadgen [LIMIT]: freezes every loadgen process, so loadgen neither logs nor acts until it
 # is unpaused or killed. LOADGEN_PAUSED is set first, so a stop that cuts the pause short kills
-# loadgen rather than thawing it. Bounded as stop_loadgen is, or by LIMIT seconds when given.
+# loadgen rather than thawing it, and so is LOADGEN_TOUCHED, since a paused loadgen, the one found
+# at start included, is no longer as at start for cleanup. Bounded as stop_loadgen is, or by LIMIT
+# seconds when given.
 pause_loadgen() {
     LOADGEN_PAUSED=1
+    LOADGEN_TOUCHED=1
     compose_within "${1:-$DOCKER_CALL_TIMEOUT_SECONDS}" pause loadgen >>"$RUN_DIR/compose.log" 2>&1
 }
 
@@ -723,6 +888,493 @@ loadgen_state_text() {
         return 0
     fi
     printf '%s, PORTFOLIO_INSIGHTS_ALERT_WEIGHT=%q' "${1%%, *}" "${1#*, PORTFOLIO_INSIGHTS_ALERT_WEIGHT=}"
+}
+
+# The label Compose sets on every container it creates: the hash of the service configuration the
+# container was created from, which docker compose config --hash prints for the configuration the
+# compose files give the service now.
+CONFIG_HASH_LABEL="com.docker.compose.config-hash"
+
+# loadgen_identity [SNAPSHOT]: what restore_loadgen verifies of loadgen's container beyond
+# loadgen_state, on one line of five tab-separated fields: its image ID, its CONFIG_HASH_LABEL
+# hash, the image reference it was created from, the time it last started (.State.StartedAt) and
+# its container ID as docker compose ps -q prints it. A field the container lacks is -, and jq's
+# @tsv escapes a tab, line feed, carriage return or backslash inside one. With SNAPSHOT, the
+# container's effective configuration, as loadgen_config_snapshot writes it from the same docker
+# inspect, goes to the file SNAPSHOT. Prints nothing, and writes no SNAPSHOT, when the project has
+# no loadgen container. Fails when a Compose or docker inspect call fails, with 124 or 137 when
+# DOCKER_CALL_TIMEOUT_SECONDS cut one off, or when jq cannot read what docker inspect printed.
+loadgen_identity() {
+    local cid raw
+    cid="$(compose_within "$DOCKER_CALL_TIMEOUT_SECONDS" ps -a -q loadgen 2>>"$RUN_DIR/compose.log" |
+        tr -d '\r' | sed -n '1p')" || return
+    if [[ -z "$cid" ]]; then
+        return 0
+    fi
+    raw="$(hard_timeout "$DOCKER_CALL_TIMEOUT_SECONDS" docker inspect --format '{{json .}}' "$cid" </dev/null \
+        2>>"$RUN_DIR/compose.log")" || return
+    if [[ -n "${1:-}" ]]; then
+        loadgen_config_snapshot <<<"$raw" >"$1" || return
+    fi
+    jq -r --arg label "$CONFIG_HASH_LABEL" --arg cid "$cid" '[.Image, (.Config.Labels // {})[$label],
+        .Config.Image, .State.StartedAt, $cid] | map(if . == null or . == "" then "-" else tostring end)
+        | @tsv' <<<"$raw" 2>>"$RUN_DIR/compose.log" | tr -d '\r'
+}
+
+# loadgen_config_snapshot: the effective configuration of the container whose docker inspect
+# object is on stdin, as one canonical JSON document (jq -S): what a recreate from the compose
+# files has to give loadgen back beyond its state. It holds the image ID; the container
+# configuration (command, environment, labels and the rest) without its hostname, which is its
+# short ID unless the compose files set one, and without the three labels Compose sets per
+# container or per command rather than from the service: its number in the service, the
+# container it replaced and the dependencies of the up that created it, empty for one with
+# --no-deps; the host configuration, with the resource limits and restart policy docker update
+# changes; and per network the endpoint settings a container is created or connected with: its
+# aliases without the container's own name and IDs, IPAM configuration, links, driver options and
+# gateway priority. What the engine derives while a container runs is left out, so a running
+# container and one only created compare alike: the endpoint's addresses, and its DNS names,
+# which are its name, aliases and IDs and are empty for a container not started. OomKillDisable
+# null, as the engine leaves it once it starts a container on a kernel without that control,
+# counts as false, as Compose creates it. Orders without meaning that Compose does not keep from
+# one create to the next are sorted: the environment, whose names are unique, and the host
+# configuration's lists other than the DNS ones and the console size. Fails when stdin holds no
+# JSON object (jq -e), an empty one included.
+loadgen_config_snapshot() {
+    jq -e -S '. as $c
+        | [($c.Name // "" | ltrimstr("/")), ($c.Id // ""), (($c.Id // "")[0:12])]
+        | map(select(. != "")) as $own
+        | {Image: $c.Image,
+            Config: (($c.Config // {}) | del(.Hostname)
+                | .Labels = ((.Labels // {}) | del(.["com.docker.compose.container-number"],
+                    .["com.docker.compose.replace"], .["com.docker.compose.depends_on"]))
+                | if (.Env | type) == "array" then .Env |= sort else . end),
+            HostConfig: (($c.HostConfig // {}) | .OomKillDisable |= (. // false)
+                | with_entries(if (.value | type) == "array"
+                    and (.key | IN("ConsoleSize", "Dns", "DnsOptions", "DnsSearch") | not)
+                    then .value |= sort else . end)),
+            Networks: (($c.NetworkSettings.Networks // {}) | map_values({
+                Aliases: ((.Aliases // []) - $own | sort), IPAMConfig, Links, DriverOpts,
+                GwPriority}))}' 2>>"$RUN_DIR/compose.log" | tr -d '\r'
+}
+
+# container_snapshot ID FILE: the effective configuration of container ID, as
+# loadgen_config_snapshot writes it, in FILE, from one docker inspect. Fails when the call fails,
+# with 124 or 137 when DOCKER_CALL_TIMEOUT_SECONDS cut it off (hard_timeout), or when jq cannot
+# read what it printed.
+container_snapshot() {
+    local raw
+    raw="$(hard_timeout "$DOCKER_CALL_TIMEOUT_SECONDS" docker inspect --format '{{json .}}' "$1" </dev/null \
+        2>>"$RUN_DIR/compose.log")" || return
+    loadgen_config_snapshot <<<"$raw" >"$2"
+}
+
+# How many differing fields snapshot_differences names before it counts the rest.
+SNAPSHOT_FIELDS_SHOWN=10
+
+# snapshot_value KIND TEXT: a value of snapshot_differences for a report line: a string as
+# printf %q writes it, a number, boolean or null as JSON writes it, a list or map only as such,
+# never its content, and a field one side lacks as absent.
+snapshot_value() {
+    case "$1" in
+        string) printf '%q' "$2" ;;
+        scalar) printf '%s' "$2" ;;
+        list) printf 'a list' ;;
+        map) printf 'a map' ;;
+        *) printf 'absent' ;;
+    esac
+}
+
+# snapshot_differences START OTHER MODE: one line per field in which OTHER, an effective
+# configuration as loadgen_config_snapshot writes it, differs from START, the one recorded at
+# start; the first SNAPSHOT_FIELDS_SHOWN of them, then a line counting the rest. A field is a
+# setting of Config or HostConfig, a label of Config.Labels, a network of Networks or one
+# endpoint setting of a network, named by its path, as HostConfig.CpuShares. MODE check words
+# a line for the restorability check, "its FIELD is A, a recreate gives B", and MODE restore for
+# the restore's verification, "FIELD B instead of A as at start"; values are written by
+# snapshot_value, and two lists or maps that differ are named without either value, so the
+# environment never reaches a report line. The image ID and the labels holding it and the config
+# hash are left to the checks of loadgen_identity's fields, which name them shortened, so no
+# difference is reported twice. Prints nothing when the two match. Fails when either file is
+# missing or no JSON document.
+snapshot_differences() {
+    local rows path a_kind a_text b_kind b_text a b count=0
+    rows="$(cat -- "$1" "$2" 2>>"$RUN_DIR/compose.log" | jq -s -r '
+        def shown: if type == "string" then ["string", .] elif type == "array" then ["list", ""]
+            elif type == "object" then ["map", ""] else ["scalar", tojson] end;
+        def descend($p): ($p | length) < 2 or $p == ["Config", "Labels"]
+            or (($p | length) == 2 and $p[0] == "Networks");
+        def diffs($a; $b; $p):
+            if $a == $b then empty
+            elif ($a | type) == "object" and ($b | type) == "object" and descend($p) then
+                (($a | keys) + ($b | keys) | unique[]) as $k
+                | if ($a | has($k)) and ($b | has($k)) then diffs($a[$k]; $b[$k]; $p + [$k])
+                  elif $a | has($k) then [$p + [$k], ($a[$k] | shown), ["absent", ""]]
+                  else [$p + [$k], ["absent", ""], ($b[$k] | shown)] end
+            else [$p, ($a | shown), ($b | shown)] end;
+        if length != 2 then error("two configurations expected") else . end
+        | diffs(.[0]; .[1]; [])
+        | select(.[0] | IN(["Image"], ["Config", "Labels", "com.docker.compose.config-hash"],
+            ["Config", "Labels", "com.docker.compose.image"]) | not)
+        | [(.[0] | map(if test("^[A-Za-z0-9_.-]+$") then . else tojson end) | join(".")
+            | if . == "" then "configuration" else . end), .[1][0], .[1][1], .[2][0], .[2][1]]
+        | map(@base64) | join(":")' 2>>"$RUN_DIR/compose.log" | tr -d '\r')" || return
+    while IFS=: read -r path a_kind a_text b_kind b_text; do
+        if [[ -z "$path" ]]; then
+            continue
+        fi
+        count=$((count + 1))
+        if [[ $count -gt $SNAPSHOT_FIELDS_SHOWN ]]; then
+            continue
+        fi
+        path="$(base64 -d <<<"$path")"
+        a_kind="$(base64 -d <<<"$a_kind")"
+        b_kind="$(base64 -d <<<"$b_kind")"
+        # The x keeps a trailing line feed of a string value.
+        a_text="$(base64 -d <<<"$a_text" && printf x)"
+        b_text="$(base64 -d <<<"$b_text" && printf x)"
+        a="$(snapshot_value "$a_kind" "${a_text%x}")"
+        b="$(snapshot_value "$b_kind" "${b_text%x}")"
+        if [[ "$a_kind" =~ ^(list|map)$ && "$b_kind" =~ ^(list|map)$ ]]; then
+            if [[ "$3" == check ]]; then
+                echo "its $path differs from what a recreate gives"
+            else
+                echo "$path differs from the one at start"
+            fi
+        elif [[ "$3" == check ]]; then
+            echo "its $path is $a, a recreate gives $b"
+        else
+            echo "$path $b instead of $a as at start"
+        fi
+    done <<<"$rows"
+    if [[ $count -gt $SNAPSHOT_FIELDS_SHOWN ]]; then
+        echo "$((count - SNAPSHOT_FIELDS_SHOWN)) more fields differ"
+    fi
+}
+
+# short_digest VALUE: VALUE, an image ID or a config hash, for a report line: a SHA-256 digest,
+# with or without its sha256: prefix, as its first 12 hex digits, as docker shortens IDs; - or
+# nothing as none; anything else as printf %q writes it.
+short_digest() {
+    if [[ "$1" =~ ^(sha256:)?([0-9a-f]{64})$ ]]; then
+        printf '%s' "${BASH_REMATCH[2]:0:12}"
+    elif [[ -z "$1" || "$1" == "-" ]]; then
+        printf 'none'
+    else
+        printf '%q' "$1"
+    fi
+}
+
+# loadgen_start_text: loadgen as setup recorded it and restore_loadgen verifies it, for a report
+# line: loadgen_state_text of LOADGEN_AT_START and, for a container, its image ID and config hash
+# as short_digest writes them and its effective configuration, named only, as recorded at start.
+loadgen_start_text() {
+    loadgen_state_text "$LOADGEN_AT_START"
+    if [[ "$LOADGEN_AT_START" != "no container" ]]; then
+        printf ', image ID %s, config hash %s, effective configuration verified as recorded at start' \
+            "$(short_digest "$LOADGEN_IMAGE_AT_START")" "$(short_digest "$LOADGEN_HASH_AT_START")"
+    fi
+}
+
+# predicted_loadgen_hash: the hash of the configuration these compose files give loadgen now, as
+# docker compose config --hash prints it, under the PORTFOLIO_INSIGHTS_ALERT_WEIGHT restore_loadgen
+# recreates loadgen with: the value LOADGEN_AT_START records, set on that one command, or unset in
+# the command substitution's subshell when it was unset. Compose labels the container it creates
+# with that hash. Fails when the call fails or prints no hash, with 124 or 137 when
+# DOCKER_CALL_TIMEOUT_SECONDS cut it off.
+predicted_loadgen_hash() {
+    local entry="${LOADGEN_AT_START#*, }" out rc=0
+    if [[ "$entry" == PORTFOLIO_INSIGHTS_ALERT_WEIGHT=* ]]; then
+        out="$(PORTFOLIO_INSIGHTS_ALERT_WEIGHT="${entry#PORTFOLIO_INSIGHTS_ALERT_WEIGHT=}" \
+            compose_within "$DOCKER_CALL_TIMEOUT_SECONDS" config --hash loadgen 2>>"$RUN_DIR/compose.log")" ||
+            rc=$?
+    else
+        out="$(
+            unset PORTFOLIO_INSIGHTS_ALERT_WEIGHT
+            compose_within "$DOCKER_CALL_TIMEOUT_SECONDS" config --hash loadgen 2>>"$RUN_DIR/compose.log"
+        )" || rc=$?
+    fi
+    if [[ $rc -ne 0 ]]; then
+        return "$rc"
+    fi
+    out="${out//$'\r'/}"
+    if [[ ! "$out" =~ ^loadgen\ ([0-9a-f]{64})$ ]]; then
+        printf 'docker compose config --hash loadgen printed no hash: %q\n' "$out" >>"$RUN_DIR/compose.log"
+        return 1
+    fi
+    printf '%s' "${BASH_REMATCH[1]}"
+}
+
+# loadgen_declares_weight: true when these compose files declare PORTFOLIO_INSIGHTS_ALERT_WEIGHT in
+# loadgen's environment, false otherwise, read from docker compose config without interpolation,
+# so no value of this shell or .env enters the read. Fails when the call fails, with 124 or 137
+# when DOCKER_CALL_TIMEOUT_SECONDS cut it off.
+loadgen_declares_weight() {
+    compose_within "$DOCKER_CALL_TIMEOUT_SECONDS" config --no-interpolate --format json 2>>"$RUN_DIR/compose.log" |
+        jq -r --arg name PORTFOLIO_INSIGHTS_ALERT_WEIGHT '(.services.loadgen.environment // {})
+            | if type == "array" then any(.[]; . == $name or startswith($name + "=")) else has($name) end' \
+            2>>"$RUN_DIR/compose.log" | tr -d '\r'
+}
+
+# image_id_of REFERENCE: the ID of the local image REFERENCE names now, the image a recreate with
+# --pull never runs. Fails when no local image has that name or the call fails, with 124 or 137
+# when DOCKER_CALL_TIMEOUT_SECONDS cut it off.
+image_id_of() {
+    hard_timeout "$DOCKER_CALL_TIMEOUT_SECONDS" docker image inspect --format '{{.Id}}' "$1" </dev/null \
+        2>>"$RUN_DIR/compose.log" | tr -d '\r'
+}
+
+# loadgen_container_ids: the IDs of every loadgen container of the project, created and stopped
+# ones included, one per line as docker compose ps -q prints them. Fails when the call fails,
+# with 124 or 137 when DOCKER_CALL_TIMEOUT_SECONDS cut it off (compose_within).
+loadgen_container_ids() {
+    compose_within "$DOCKER_CALL_TIMEOUT_SECONDS" ps -a -q loadgen 2>>"$RUN_DIR/compose.log" | tr -d '\r' |
+        { grep -v '^$' || true; }
+}
+
+# loadgen_twin_ids: the IDs of the project's loadgen containers other than the one setup found
+# (LOADGEN_ID_AT_START), one per line: twins create_loadgen_twin made, as check_loadgen_restorable
+# creates one only while that container is the project's only loadgen container. Fails as
+# loadgen_container_ids does.
+loadgen_twin_ids() {
+    local ids id
+    ids="$(loadgen_container_ids)" || return
+    while IFS= read -r id; do
+        if [[ -n "$id" && "$id" != "$LOADGEN_ID_AT_START" ]]; then
+            printf '%s\n' "$id"
+        fi
+    done <<<"$ids"
+}
+
+# create_loadgen_twin: creates one more loadgen container in the project, not started, exactly as
+# restore_loadgen's recreate creates loadgen: from these compose files, with the
+# PORTFOLIO_INSIGHTS_ALERT_WEIGHT LOADGEN_AT_START records set on that one command, or unset in a
+# subshell when it was unset, neither building nor pulling, and with no other service touched.
+# --no-recreate leaves the container found at start as it is, running or not. The call has ended
+# within DOCKER_CALL_TIMEOUT_SECONDS (compose_within), with status 124 or 137 when cut off.
+create_loadgen_twin() {
+    local entry="${LOADGEN_AT_START#*, }"
+    if [[ "$entry" == PORTFOLIO_INSIGHTS_ALERT_WEIGHT=* ]]; then
+        PORTFOLIO_INSIGHTS_ALERT_WEIGHT="${entry#PORTFOLIO_INSIGHTS_ALERT_WEIGHT=}" \
+            compose_within "$DOCKER_CALL_TIMEOUT_SECONDS" up --no-start --no-deps --no-recreate --no-build \
+            --pull never --scale loadgen=2 loadgen >>"$RUN_DIR/compose.log" 2>&1
+    else
+        (
+            unset PORTFOLIO_INSIGHTS_ALERT_WEIGHT
+            compose_within "$DOCKER_CALL_TIMEOUT_SECONDS" up --no-start --no-deps --no-recreate --no-build \
+                --pull never --scale loadgen=2 loadgen >>"$RUN_DIR/compose.log" 2>&1
+        )
+    fi
+}
+
+# remove_loadgen_twin: removes the twin loadgen container LOADGEN_TWIN names by its ID, or, when
+# LOADGEN_TWIN is "unknown" because a create may have made one whose ID was not read, every
+# loadgen container but the one setup found (loadgen_twin_ids), then checks that none of them is
+# listed any more. LOADGEN_TWIN is then empty, and TWIN_REMOVED holds the short IDs removed,
+# empty when there was none. Otherwise TWIN_ERROR says what failed, telling a call Docker did not
+# answer in time from one that failed. docker rm --force succeeds for a container already gone,
+# and --volumes takes any anonymous volume the twin got with it. Each Docker call has ended
+# within DOCKER_CALL_TIMEOUT_SECONDS (hard_timeout).
+remove_loadgen_twin() {
+    local ids id rm_error="" rc=0
+    local -a twins=()
+    TWIN_ERROR=""
+    TWIN_REMOVED=""
+    if [[ "$LOADGEN_TWIN" == "unknown" ]]; then
+        ids="$(loadgen_twin_ids)" || rc=$?
+        if [[ $rc -ne 0 ]]; then
+            TWIN_ERROR="$(docker_problem "listing loadgen's containers to find its twin" "$rc" "$DOCKER_CALL_TIMEOUT_SECONDS")"
+            return 1
+        fi
+        if [[ -n "$ids" ]]; then
+            mapfile -t twins <<<"$ids"
+        fi
+    elif [[ -n "$LOADGEN_TWIN" ]]; then
+        twins=("$LOADGEN_TWIN")
+    fi
+    if [[ ${#twins[@]} -eq 0 ]]; then
+        LOADGEN_TWIN=""
+        return 0
+    fi
+    for id in "${twins[@]}"; do
+        rc=0
+        hard_timeout "$DOCKER_CALL_TIMEOUT_SECONDS" docker rm --force --volumes "$id" </dev/null \
+            >>"$RUN_DIR/compose.log" 2>&1 || rc=$?
+        if [[ $rc -ne 0 && -z "$rm_error" ]]; then
+            rm_error="$(docker_problem "removing twin loadgen container $(short_digest "$id")" "$rc" "$DOCKER_CALL_TIMEOUT_SECONDS")"
+        fi
+    done
+    rc=0
+    ids="$(loadgen_container_ids)" || rc=$?
+    if [[ $rc -ne 0 ]]; then
+        TWIN_ERROR="${rm_error:+$rm_error; }$(docker_problem "listing loadgen's containers after removing its twin" "$rc" "$DOCKER_CALL_TIMEOUT_SECONDS")"
+        return 1
+    fi
+    for id in "${twins[@]}"; do
+        if grep -qxF -e "$id" <<<"$ids"; then
+            TWIN_ERROR="${rm_error:-twin loadgen container $(short_digest "$id") is still listed after its removal}"
+            return 1
+        fi
+        TWIN_REMOVED="${TWIN_REMOVED:+$TWIN_REMOVED }$(short_digest "$id")"
+    done
+    LOADGEN_TWIN=""
+}
+
+# loadgen_twin_check CONFIG: the twin step of check_loadgen_restorable, for the loadgen container
+# setup found (LOADGEN_ID_AT_START), whose effective configuration is in the file CONFIG. That
+# container must be the project's only loadgen container, as a restore recreates one. A twin is
+# then created as a restore would create loadgen (create_loadgen_twin), its effective
+# configuration read into $RUN_DIR/loadgen-twin.config.json (container_snapshot), and the twin
+# removed (remove_loadgen_twin) before the two are compared (snapshot_differences). Returns 0 when
+# they match, with no twin left. Otherwise sets TWIN_DETAIL, the check's failure: each field that
+# differs, with its two values, or the step that failed and whether a twin is left; a twin not
+# confirmed removed stays in LOADGEN_TWIN, for cleanup to remove. No other container is created,
+# changed or removed either way.
+loadgen_twin_check() {
+    local twin="$RUN_DIR/loadgen-twin.config.json" ids count create_error differences joined rc=0
+    local -a fields=()
+    TWIN_DETAIL=""
+    ids="$(loadgen_container_ids)" || rc=$?
+    if [[ $rc -ne 0 ]]; then
+        TWIN_DETAIL="$(docker_problem "listing loadgen's containers" "$rc" "$DOCKER_CALL_TIMEOUT_SECONDS"); nothing was changed"
+        return 1
+    fi
+    count="$(grep -c . <<<"$ids" || true)"
+    if [[ $count -eq 0 ]]; then
+        TWIN_DETAIL="loadgen's container was removed while setup read it; nothing was changed"
+        return 1
+    elif [[ $count -gt 1 ]]; then
+        TWIN_DETAIL="the project has $count loadgen containers, and a restore recreates one only; nothing was changed"
+        return 1
+    elif [[ "$ids" != "$LOADGEN_ID_AT_START" ]]; then
+        TWIN_DETAIL="loadgen's container was replaced while setup read it; nothing was changed"
+        return 1
+    fi
+    # From here until remove_loadgen_twin has seen it gone, cleanup removes any twin left.
+    LOADGEN_TWIN="unknown"
+    create_loadgen_twin || rc=$?
+    if [[ $rc -ne 0 ]]; then
+        create_error="$(docker_problem "creating a twin loadgen container" "$rc" "$DOCKER_CALL_TIMEOUT_SECONDS")"
+        if remove_loadgen_twin; then
+            TWIN_DETAIL="$create_error; no twin is left and nothing else was changed"
+        else
+            TWIN_DETAIL="$create_error; a twin it may have made is not confirmed removed ($TWIN_ERROR), so cleanup removes it on exit"
+        fi
+        return 1
+    fi
+    ids="$(loadgen_twin_ids)" || rc=$?
+    if [[ $rc -ne 0 ]]; then
+        TWIN_DETAIL="$(docker_problem "listing loadgen's containers after creating its twin" "$rc" "$DOCKER_CALL_TIMEOUT_SECONDS"); cleanup removes the twin on exit"
+        return 1
+    fi
+    count="$(grep -c . <<<"$ids" || true)"
+    if [[ $count -ne 1 ]]; then
+        if remove_loadgen_twin; then
+            TWIN_DETAIL="creating a twin loadgen container gave $count new loadgen containers instead of 1; none is left and nothing else was changed"
+        else
+            TWIN_DETAIL="creating a twin loadgen container gave $count new loadgen containers instead of 1, not confirmed removed ($TWIN_ERROR), so cleanup removes them on exit"
+        fi
+        return 1
+    fi
+    LOADGEN_TWIN="$ids"
+    container_snapshot "$LOADGEN_TWIN" "$twin" || rc=$?
+    # Removed before the comparison, so no outcome of it leaves the twin behind.
+    if ! remove_loadgen_twin; then
+        TWIN_DETAIL="twin loadgen container $(short_digest "$LOADGEN_TWIN") not removed: $TWIN_ERROR; cleanup removes it on exit"
+        return 1
+    fi
+    if [[ $rc -ne 0 ]]; then
+        TWIN_DETAIL="$(docker_problem "reading the twin loadgen container's effective configuration" "$rc" "$DOCKER_CALL_TIMEOUT_SECONDS"); the twin is removed and nothing else was changed"
+        return 1
+    fi
+    differences="$(snapshot_differences "$1" "$twin" check)" || rc=$?
+    if [[ $rc -ne 0 ]]; then
+        TWIN_DETAIL="comparing loadgen's effective configuration with its twin's failed (see $RUN_DIR/compose.log); the twin is removed and nothing else was changed"
+        return 1
+    fi
+    if [[ -n "$differences" ]]; then
+        mapfile -t fields <<<"$differences"
+        printf -v joined '%s; ' "${fields[@]}"
+        TWIN_DETAIL="a recreate from these compose files would not give loadgen back as it is, so the run changes nothing: ${joined%; }; the twin that shows it is removed"
+        return 1
+    fi
+}
+
+# check_loadgen_restorable: the check "loadgen restorable", which setup runs before the run changes
+# anything. restore_loadgen puts a loadgen container back by recreating it from these compose
+# files with its weight at start, neither building nor pulling, so the container is restorable
+# when that recreate gives what it has now: the hash these compose files give loadgen under that
+# weight (predicted_loadgen_hash) equals its CONFIG_HASH_LABEL, so every setting Compose applies
+# matches, and the image reference it was created from still names the image it runs. The hash
+# covers only what Compose applied when it created the container, so its effective configuration
+# (loadgen_config_snapshot), read with its image ID and hash before anything changes, must also
+# match a twin created as the restore would create loadgen (loadgen_twin_check), which shows
+# what was changed on the container since, as docker update changes resource limits. Its image
+# ID, hash and effective configuration then go to LOADGEN_IMAGE_AT_START, LOADGEN_HASH_AT_START
+# and LOADGEN_CONFIG_AT_START, which restore_loadgen verifies, and its start time to
+# LOADGEN_STARTED_AT, from which secure_loadgen_at_start reads its output. Otherwise the run ends
+# with nothing changed, naming each difference. Without a loadgen container the check passes:
+# cleanup removes the one the run creates. Each Docker call has ended within
+# DOCKER_CALL_TIMEOUT_SECONDS (hard_timeout).
+check_loadgen_restorable() {
+    local check="loadgen restorable" entry="${LOADGEN_AT_START#*, }" weight="" identity image hash ref
+    local started cid predicted resolved declared joined rc=0
+    local config="$RUN_DIR/loadgen-at-start.config.json"
+    local -a differs=()
+    if [[ "$LOADGEN_AT_START" == "no container" ]]; then
+        pass "$check: no loadgen container at start; the one this run creates is removed on exit"
+        return 0
+    fi
+    identity="$(loadgen_identity "$config")" || rc=$?
+    if [[ $rc -ne 0 ]]; then
+        abort "$check" "$(docker_problem "reading loadgen's image, config hash and effective configuration" "$rc" "$DOCKER_CALL_TIMEOUT_SECONDS")"
+    fi
+    if [[ -z "$identity" ]]; then
+        abort "$check" "loadgen's container was removed while setup read it; nothing was changed"
+    fi
+    IFS=$'\t' read -r image hash ref started cid <<<"$identity"
+    predicted="$(predicted_loadgen_hash)" || rc=$?
+    if [[ $rc -ne 0 ]]; then
+        abort "$check" "$(docker_problem "docker compose config --hash loadgen" "$rc" "$DOCKER_CALL_TIMEOUT_SECONDS")"
+    fi
+    if [[ "$hash" != "$predicted" ]]; then
+        differs+=("these compose files give loadgen config hash $(short_digest "$predicted") under its weight at start, its container has $(short_digest "$hash")")
+        case "$entry" in
+            "PORTFOLIO_INSIGHTS_ALERT_WEIGHT unset") weight="unset" ;;
+            "PORTFOLIO_INSIGHTS_ALERT_WEIGHT=") weight="empty" ;;
+        esac
+        if [[ -n "$weight" ]]; then
+            declared="$(loadgen_declares_weight)" || rc=$?
+            if [[ $rc -ne 0 ]]; then
+                differs+=("whether these compose files declare PORTFOLIO_INSIGHTS_ALERT_WEIGHT is unknown: $(docker_problem "docker compose config --no-interpolate" "$rc" "$DOCKER_CALL_TIMEOUT_SECONDS")")
+            elif [[ "$declared" == "true" ]]; then
+                differs+=("its PORTFOLIO_INSIGHTS_ALERT_WEIGHT is $weight, and these compose files always declare it")
+            fi
+        fi
+    fi
+    rc=0
+    if [[ "$ref" == "-" ]]; then
+        differs+=("its container records no image reference to recreate it from")
+    else
+        resolved="$(image_id_of "$ref")" || rc=$?
+        if [[ $rc -ne 0 ]]; then
+            differs+=("its image reference $(printf '%q' "$ref") names no image a recreate could run: $(docker_problem "docker image inspect" "$rc" "$DOCKER_CALL_TIMEOUT_SECONDS")")
+        elif [[ "$resolved" != "$image" ]]; then
+            differs+=("its image reference $(printf '%q' "$ref") now names image ID $(short_digest "$resolved"), its container runs $(short_digest "$image")")
+        fi
+    fi
+    if [[ ${#differs[@]} -gt 0 ]]; then
+        printf -v joined '%s; ' "${differs[@]}"
+        abort "$check" "a recreate from these compose files would not give loadgen back as it is, so the run changes nothing: ${joined%; }"
+    fi
+    LOADGEN_ID_AT_START="$cid"
+    if ! loadgen_twin_check "$config"; then
+        abort "$check" "$TWIN_DETAIL"
+    fi
+    LOADGEN_IMAGE_AT_START="$image"
+    LOADGEN_HASH_AT_START="$hash"
+    LOADGEN_CONFIG_AT_START="$config"
+    LOADGEN_STARTED_AT="$started"
+    pass "$check: image ID $(short_digest "$image") ($(printf '%q' "$ref")) and config hash $(short_digest "$hash"), as these compose files give it, and a twin created from them, now removed, matched its effective configuration"
 }
 
 now_rfc3339() {
@@ -915,24 +1567,25 @@ sanitize_loadgen_log() {
     '
 }
 
-# report_outcomes FILE: one INFO line per line of FILE, an outcome line of run B. Only parsed
-# fields are printed: the id and status token of an alert left in place, or the threshold marker
-# of an unconfirmed create. A line in neither form gets a fixed notice, never its text.
+# report_outcomes FILE [PREFIX]: one INFO line per line of FILE, an outcome line of run B, or of
+# loadgen's output at start, each line starting with PREFIX (default: outcome). Only parsed fields
+# are printed: the id and status token of an alert left in place, or the threshold marker of an
+# unconfirmed create. A line in neither form gets a fixed notice, never its text.
 report_outcomes() {
-    local line id status
+    local line id status prefix="${2:-outcome}"
     while IFS= read -r line || [[ -n "$line" ]]; do
         if [[ "$line" =~ $LEFT_RE ]]; then
             status="${BASH_REMATCH[2]}"
             id="$(lower <<<"${BASH_REMATCH[1]}")"
             if [[ "$id" =~ $UUID_RE ]]; then
-                info "outcome: alert [$id] left in place: $status"
+                info "$prefix: alert [$id] left in place: $status"
                 continue
             fi
         elif [[ "$line" =~ $UNCONFIRMED_RE ]]; then
-            info "outcome: unconfirmed create, threshold [${BASH_REMATCH[1]}], outcome unknown"
+            info "$prefix: unconfirmed create, threshold [${BASH_REMATCH[1]}], outcome unknown"
             continue
         fi
-        info "outcome: a line in no known outcome form, not printed"
+        info "$prefix: a line in no known outcome form, not printed"
     done <"$1"
 }
 
@@ -1359,19 +2012,33 @@ db_count_ids() {
 # ---------------------------------------------------------------------------------------------
 # Flag and loadgen windows
 
-# set_flag CHECK VALUE: PUTs {"enabled": VALUE} and reads the flag back. PASS CHECK when the
-# read-back equals VALUE; otherwise the run ends.
-set_flag() {
-    local check="$1" value="$2" read_back
-    FLAG_TOUCHED=1
+# put_flag VALUE: PUTs {"enabled": VALUE}, which feature-flag-service answers with the updated
+# flag, and then reads the flag back. Succeeds when both answer 200 with the flag (flag_reply) at
+# VALUE. Otherwise it returns 1 at the first step that fails, with FLAG_REASON a fixed text naming
+# the request and why.
+put_flag() {
+    local value="$1" put="PUT {\"enabled\": $1}"
     http PUT "$FLAG_URL" "{\"enabled\": $value}"
-    if [[ "$HTTP_STATUS" != "200" ]]; then
-        abort "$check" "PUT {\"enabled\": $value} gave $(status_text)"
+    flag_answered "$put" || return 1
+    if [[ "$FLAG_ENABLED" != "$value" ]]; then
+        FLAG_REASON="$put gave status 200 with enabled=$FLAG_ENABLED, expected $value"
+        return 1
     fi
     http GET "$FLAG_URL"
-    read_back="$(jget '.enabled' "$HTTP_BODY")"
-    if [[ "$HTTP_STATUS" != "200" || "$read_back" != "$value" ]]; then
-        abort "$check" "read-back gave $(status_text) with enabled [$read_back], expected $value"
+    flag_answered "read-back" || return 1
+    if [[ "$FLAG_ENABLED" != "$value" ]]; then
+        FLAG_REASON="read-back gave status 200 with enabled=$FLAG_ENABLED, expected $value"
+        return 1
+    fi
+}
+
+# set_flag CHECK VALUE: put_flag VALUE. PASS CHECK when the PUT and the read-back both give the
+# flag at VALUE; otherwise the run ends.
+set_flag() {
+    local check="$1" value="$2"
+    FLAG_TOUCHED=1
+    if ! put_flag "$value"; then
+        abort "$check" "$FLAG_REASON"
     fi
     pass "$check"
 }
@@ -1760,11 +2427,102 @@ readiness_once() {
     [[ $ok -eq 1 ]]
 }
 
+# The run lock: one invocation per Compose project runs at a time. setup, or resume_cleanup for a
+# --resume-cleanup, takes it with mkdir, which creates the directory or fails in one step, so of
+# two invocations on one project only one gets it and the other stops before it records a
+# baseline, reads the flag or changes anything. The directory holds an owner file naming its run,
+# and cleanup, or resume_exit, removes both last, only when this run created them.
+
+# acquire_run_lock: creates LOCK_DIR for PROJECT under LOCK_ROOT, records this run in its owner
+# file and sets LOCK_HELD to 1. Otherwise it ends the run with a FAIL of the run lock check: for a
+# project name that is no Compose project name, for a lock another run holds, naming that run,
+# and for a directory that cannot be created.
+acquire_run_lock() {
+    local name_re='^[abcdefghijklmnopqrstuvwxyz0123456789][abcdefghijklmnopqrstuvwxyz0123456789_-]*$'
+    local error
+    # The name becomes part of a path. Compose has accepted it already, and this keeps the path to
+    # a Compose project name whatever Compose accepts.
+    if [[ ! "$PROJECT" =~ $name_re ]]; then
+        abort "run lock" "project name [$(printf '%q' "$PROJECT")] is not a Compose project name (lower-case letters, digits, - and _, starting with a letter or digit), so no lock is taken for it"
+    fi
+    LOCK_DIR="$LOCK_ROOT/pi-loadgen-check.$PROJECT.lock"
+    if ! error="$(mkdir "$LOCK_DIR" 2>&1)"; then
+        if [[ -d "$LOCK_DIR" ]]; then
+            abort "run lock" "$(lock_refusal)"
+        fi
+        abort "run lock" "could not create $LOCK_DIR: $(join_lines <<<"$error")"
+    fi
+    LOCK_HELD=1
+    # Written aside and renamed into place, so a run reading it finds all of it or none of it.
+    if ! error="$( {
+        printf 'pid=%s\nhost=%s\nstarted=%s\nrun_dir=%s\n' "$$" "${HOSTNAME:-}" "$STARTED_AT" "$RUN_DIR" \
+            >"$LOCK_DIR/owner.new" && mv -f "$LOCK_DIR/owner.new" "$LOCK_DIR/owner"
+    } 2>&1)"; then
+        abort "run lock" "created $LOCK_DIR but could not record this run in it: $(join_lines <<<"$error")"
+    fi
+    pass "run lock: $LOCK_DIR"
+}
+
+# lock_refusal: why LOCK_DIR stops this run, naming the run its owner file records (start time,
+# pid, host and run dir) and how the lock is cleared. A field is shown only in the form
+# acquire_run_lock writes it, so no other text of the file reaches the output. Only a regular
+# owner file, never a symlink, is read, and that read has ended within LOCK_READ_TIMEOUT_SECONDS
+# (hard_timeout): a FIFO, a device or a symlink in its place, or a read that fails or is cut off,
+# leaves every field unknown, so no owner entry can hold the run. A run recorded on this host
+# whose pid no longer answers kill -0 has ended and left the lock stale. The lock is never removed
+# here: it may be one another run has only just created.
+lock_refusal() {
+    local alnum='0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz' d='0123456789'
+    local started_re="^[$d]{4}-[$d]{2}-[$d]{2}T[$d]{2}:[$d]{2}:[$d]{2}Z\$"
+    local pid_re="^[123456789][$d]{0,9}\$"
+    local host_re="^[$alnum][$alnum._-]{0,252}\$"
+    # Bounded by length rather than by an interval: a regex library may allow no more than 255.
+    local dir_re="^[$alnum /._:~+-]+\$"
+    local content="" line value started="" pid="" host="" run_dir="" holder
+    # At most 4 KiB, read in one step, so a file that grows or goes meanwhile cannot hold the run;
+    # the time limit also ends the read of an entry swapped for a FIFO after the type test.
+    if [[ -f "$LOCK_DIR/owner" && ! -L "$LOCK_DIR/owner" ]]; then
+        content="$(hard_timeout "$LOCK_READ_TIMEOUT_SECONDS" head -c 4096 -- "$LOCK_DIR/owner" 2>/dev/null)" || content=""
+    fi
+    while IFS= read -r line; do
+        value="${line#*=}"
+        case "${line%%=*}" in
+            started) if [[ -z "$started" && "$value" =~ $started_re ]]; then started="$value"; fi ;;
+            pid) if [[ -z "$pid" && "$value" =~ $pid_re ]]; then pid="$value"; fi ;;
+            host) if [[ -z "$host" && "$value" =~ $host_re ]]; then host="$value"; fi ;;
+            run_dir) if [[ -z "$run_dir" && ${#value} -le 1024 && "$value" =~ $dir_re ]]; then run_dir="$value"; fi ;;
+        esac
+    done <<<"$content"
+    holder="started ${started:-unknown}, pid ${pid:-unknown}, host ${host:-unknown}, run dir ${run_dir:-unknown}"
+    printf '%s' "project [$PROJECT] is in use by another run, which holds $LOCK_DIR ($holder). One invocation per project runs at a time, so this run stops before it reads or changes anything."
+    if [[ -n "$pid" && -n "$host" && "$host" == "${HOSTNAME:-}" ]] && ! kill -0 "$pid" 2>/dev/null; then
+        printf '%s' " Pid $pid no longer runs on this host, so that run has ended and left the lock stale: remove $LOCK_DIR once no run on the project is active, and start again."
+    else
+        printf '%s' " If no run on the project is active, as after a run killed before its cleanup, remove $LOCK_DIR and start again."
+    fi
+}
+
+# release_run_lock: removes the lock this run holds, its owner file first, and sets LOCK_HELD to
+# 0; on failure sets LOCK_ERROR. It removes only what acquire_run_lock wrote, so a lock directory
+# holding anything else stays and is reported.
+release_run_lock() {
+    local error
+    if error="$( { rm -f "$LOCK_DIR/owner" "$LOCK_DIR/owner.new" && rmdir "$LOCK_DIR"; } 2>&1)"; then
+        LOCK_HELD=0
+        return 0
+    fi
+    LOCK_ERROR="removing $LOCK_DIR failed: $(join_lines <<<"$error")"
+    return 1
+}
+
 setup() {
-    local defined required running missing="" service flag_id modifiable enabled state_rc=0
+    local defined required running missing="" service state_rc=0
     if ! defined="$(compose config --services 2>>"$RUN_DIR/compose.log" | tr -d '\r')"; then
         abort "readiness" "docker compose config failed for project [$PROJECT] (see $RUN_DIR/compose.log)"
     fi
+    # Before anything is recorded or changed: a run that finds the project's lock held stops here,
+    # so it never takes another run's test settings for the state to restore.
+    acquire_run_lock
     if ! grep -qxF loadgen <<<"$defined"; then
         abort "readiness" "the compose files define no loadgen service"
     fi
@@ -1794,6 +2552,8 @@ setup() {
     if [[ "$LOADGEN_AT_START" == running,* ]]; then
         LOADGEN_WAS_RUNNING=1
     fi
+    # A loadgen that cleanup could not put back as it is ends the run here, before any change.
+    check_loadgen_restorable
     if ! poll "readiness" "$READY_TIMEOUT_SECONDS" "$READY_STEP_SECONDS" readiness_once; then
         exit 1
     fi
@@ -1809,22 +2569,193 @@ setup() {
     pass "runtime facts"
     info "db type $DIALECT; loadgen at start: $(loadgen_state_text "$LOADGEN_AT_START")"
 
+    # Only a reply that is the flag (flag_reply) sets the value cleanup restores, and a failure
+    # names the broken rule, never the reply's content.
     http GET "$FLAG_URL"
-    if [[ "$HTTP_STATUS" != "200" ]]; then
-        abort "flag modifiable" "GET $FLAG_ID gave $(status_text)"
+    if ! flag_answered "GET $FLAG_ID"; then
+        abort "flag modifiable" "$FLAG_REASON"
     fi
-    flag_id="$(jget '.id' "$HTTP_BODY")"
-    modifiable="$(jget '.isModifiable' "$HTTP_BODY")"
-    enabled="$(jget '.enabled' "$HTTP_BODY")"
-    if [[ "$flag_id" != "$FLAG_ID" || ("$enabled" != "true" && "$enabled" != "false") ]]; then
-        abort "flag modifiable" "GET $FLAG_ID answered id [$flag_id] enabled [$enabled] as ${HTTP_CTYPE:-untyped content}"
+    if [[ "$FLAG_MODIFIABLE" != "true" ]]; then
+        abort "flag modifiable" "isModifiable is [false]; a deployment with ENABLE_MODIFY=false cannot be toggled"
     fi
-    if [[ "$modifiable" != "true" ]]; then
-        abort "flag modifiable" "isModifiable is [$modifiable]; a deployment with ENABLE_MODIFY=false cannot be toggled"
-    fi
-    FLAG_INITIAL="$enabled"
+    FLAG_INITIAL="$FLAG_ENABLED"
     pass "flag modifiable"
     info "flag $FLAG_ID initially enabled=$FLAG_INITIAL"
+}
+
+# ---------------------------------------------------------------------------------------------
+# Loadgen at start
+
+# How the outcomes of loadgen's output at start are reported: that workload's alerts are none of
+# this run's, so they are never owned or deleted.
+AT_START_PREFIX="loadgen at start (not this run's, not deleted)"
+# An RFC 3339 time, as docker inspect gives a container's .State.StartedAt.
+STARTED_AT_RE='^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\.[0-9]+)?(Z|[+-][0-9]{2}:[0-9]{2})$'
+
+# loadgen_run_state CID: the run state of the container whose full ID is CID, so of that
+# container and no other, on one line of three tab-separated fields: its .State.Status (running,
+# paused, exited, ...), .State.Paused (true or false) and .State.StartedAt, each - when missing,
+# and escaped by jq's @tsv; nothing when docker inspect prints no state. Fails when that container
+# no longer exists or a Docker call fails, with 124 or 137 when DOCKER_CALL_TIMEOUT_SECONDS cut
+# the call off (hard_timeout).
+loadgen_run_state() {
+    hard_timeout "$DOCKER_CALL_TIMEOUT_SECONDS" docker inspect --type container --format '{{json .State}}' "$1" \
+        </dev/null 2>>"$RUN_DIR/compose.log" |
+        jq -r '[.Status, .Paused, .StartedAt] | map(if . == null or . == "" then "-" else tostring end)
+            | @tsv' 2>>"$RUN_DIR/compose.log" | tr -d '\r'
+}
+
+# run_state_text STATE: STATE, a loadgen_run_state line, for a report line.
+run_state_text() {
+    local status paused started
+    IFS=$'\t' read -r status paused started <<<"$1"
+    printf 'status %s, paused %s, started %s' "${status:--}" "${paused:--}" "${started:--}"
+}
+
+# record_loadgen_cid_at_start CHECK: records in LOADGEN_CID_AT_START the full ID of the loadgen
+# container the at-start drain acts on, so that cleanup inspects that container and no other,
+# once loadgen_run_state shows it as setup found it: running, not paused, last started at
+# LOADGEN_STARTED_AT. Otherwise the run ends, as the check CHECK, with nothing changed. Each
+# Docker call has ended within DOCKER_CALL_TIMEOUT_SECONDS (hard_timeout).
+record_loadgen_cid_at_start() {
+    local cid state expected="running"$'\t'"false"$'\t'"$LOADGEN_STARTED_AT" rc=0
+    cid="$(compose_within "$DOCKER_CALL_TIMEOUT_SECONDS" ps -a -q loadgen 2>>"$RUN_DIR/compose.log" |
+        tr -d '\r' | sed -n '1p')" || rc=$?
+    if [[ $rc -ne 0 ]]; then
+        abort "$1" "$(docker_problem "reading loadgen's container ID" "$rc" "$DOCKER_CALL_TIMEOUT_SECONDS"); nothing was changed"
+    fi
+    if [[ ! "$cid" =~ ^[0-9a-f]{64}$ ]]; then
+        abort "$1" "loadgen's container ID is [${cid:+$(printf '%q' "$cid")}], not a full container ID cleanup could inspect again; nothing was changed"
+    fi
+    state="$(loadgen_run_state "$cid")" || rc=$?
+    if [[ $rc -ne 0 ]]; then
+        abort "$1" "$(docker_problem "reading the state of loadgen's container ${cid:0:12}" "$rc" "$DOCKER_CALL_TIMEOUT_SECONDS"); nothing was changed"
+    fi
+    if [[ "$state" != "$expected" ]]; then
+        abort "$1" "loadgen's container ${cid:0:12} is [$(run_state_text "$state")] instead of [$(run_state_text "$expected")] as setup found it; nothing was changed"
+    fi
+    LOADGEN_CID_AT_START="$cid"
+}
+
+# secure_loadgen_at_start: the check "loadgen at start", which main runs after setup and before
+# anything switches the flag or recreates loadgen. A recreate discards a container's output, the
+# only receipt of the alerts its visits created, so the output of the loadgen container found at
+# start, since it last started (LOADGEN_STARTED_AT), is first kept in $RUN_DIR/at-start.log. A
+# loadgen running with the flag on can have a portfolio_insights_alert visit between opening the
+# page or creating an alert and its outcome, whose create or delete the flag switched off for run
+# A would refuse. So that loadgen is drained while the flag is still on: drain_loadgen with the
+# per-visit test at_start_settled ends it at an instant Q at which no such visit is in flight, by
+# killing it while paused, and its frozen output at Q replaces the kept one. Only a visit in
+# flight holds Q off, never an id an earlier visit left unresolved. The reads go through
+# read_window with the window set to that output, labelled at-start; WINDOW_OPEN stays 0, so
+# cleanup never closes that window or owns its alerts. Before the drain,
+# record_loadgen_cid_at_start records the container's ID, and AT_START_DRAINING is 1 from then
+# until Q: a run that ends or is interrupted short of Q has that container, which a visit of its
+# workload may still be using, put back in place by cleanup (recover_loadgen_in_place), never
+# recreated. Without Q the run ends: with loadgen's container shown running on as at start,
+# LOADGEN_TOUCHED, which a pause sets, goes back to 0, since the flag and loadgen are as at start;
+# with it left paused, cleanup unpauses it in place, and with it killed too late for Q, cleanup
+# recreates it, as no visit of it can still be in flight. A loadgen running with the flag off, or
+# stopped, has no alert work in flight, so its output is only kept. The created ids the kept
+# output never resolves and its left-in-place and unknown outcomes are reported, as INFO lines of
+# parsed fields only, as that workload's and not deleted.
+secure_loadgen_at_start() {
+    local check="loadgen at start" detail id
+    if [[ "$LOADGEN_AT_START" == "no container" ]]; then
+        pass "$check: no container, so no visit of an earlier workload can be in flight"
+        return 0
+    fi
+    if [[ ! "$LOADGEN_STARTED_AT" =~ $STARTED_AT_RE ]]; then
+        abort "$check" "loadgen's start time $(printf '%q' "$LOADGEN_STARTED_AT") is not an RFC 3339 time, so its output cannot be read; nothing was changed"
+    fi
+    WINDOW_LABEL="at-start"
+    WINDOW_SINCE="$LOADGEN_STARTED_AT"
+    if ! read_window "$RUN_DIR/at-start.log"; then
+        abort "$check" "reading loadgen's output since it started at $LOADGEN_STARTED_AT: $LOG_PROBE_DETAIL; nothing was changed"
+    fi
+    if [[ $LOADGEN_WAS_RUNNING -eq 1 && "$FLAG_INITIAL" == "true" ]]; then
+        record_loadgen_cid_at_start "$check"
+        AT_START_DRAINING=1
+        if ! drain_loadgen at_start_settled at_start_summary; then
+            if [[ $LOADGEN_PAUSED -eq 1 ]]; then
+                abort "$check" "$DRAIN_DETAIL; loadgen may be left paused, and cleanup unpauses it in place rather than recreating it"
+            fi
+            # Unpaused, nothing was changed only when the container's own state shows it running
+            # on as at start: a kill that ended too late for Q leaves it ended, and cleanup then
+            # recreates it (recover_loadgen_in_place), as no visit of it can still be in flight.
+            if [[ "$(loadgen_run_state "$LOADGEN_CID_AT_START")" == "running"$'\t'"false"$'\t'"$LOADGEN_STARTED_AT" ]]; then
+                # LOADGEN_TOUCHED first: an interrupt in between leaves cleanup nothing to put back.
+                LOADGEN_TOUCHED=0
+                AT_START_DRAINING=0
+                abort "$check" "$DRAIN_DETAIL; nothing was changed: loadgen runs on as at start and the flag is untouched"
+            fi
+            abort "$check" "$DRAIN_DETAIL; loadgen is not shown running as at start, so cleanup puts it back: in place while it runs, recreated once it has ended"
+        fi
+        # Q: the container was killed while paused, so a recreate cuts off no visit of it.
+        AT_START_DRAINING=0
+        cp "$RUN_DIR/frozen.log" "$RUN_DIR/at-start.log"
+        detail="$DRAIN_DETAIL"
+    elif [[ $LOADGEN_WAS_RUNNING -eq 1 ]]; then
+        detail="running with the flag off, so no visit creates or deletes an alert; not drained"
+    else
+        detail="stopped, so no visit can be in flight"
+    fi
+    unresolved_ids "$RUN_DIR/at-start.log" >"$RUN_DIR/at-start.unresolved"
+    while IFS= read -r id; do
+        info "$AT_START_PREFIX: alert [$id] was logged as created and never resolved"
+    done <"$RUN_DIR/at-start.unresolved"
+    { grep -F -e "$LEFT_MARKER" -e "$UNKNOWN_MARKER" "$RUN_DIR/at-start.log" || true; } \
+        >"$RUN_DIR/at-start.outcomes"
+    report_outcomes "$RUN_DIR/at-start.outcomes" "$AT_START_PREFIX"
+    pass "$check: $detail; its output since $LOADGEN_STARTED_AT is kept in $RUN_DIR/at-start.log"
+}
+
+# recover_loadgen_in_place: cleanup's step for the loadgen container found at start while the
+# at-start drain holds it short of Q (AT_START_DRAINING): paused, or running again between the
+# drain's polls, when the drain failed or the run was interrupted. A visit of that workload may
+# then be between creating an alert and deleting it, and a recreate would cut it off and discard
+# its receipt, so the container LOADGEN_CID_AT_START names is put back in place, as its own state
+# shows it rather than LOADGEN_PAUSED: unpaused when paused, left alone when running, and then
+# verified running as at start. Returns 0 when it is, and 0 with RECOVER_ERROR set when it cannot
+# be unpaused, its state cannot be read, or it is otherwise not as at start: it is then left as
+# it is, never recreated. Returns 1 when it has ended, as after the kill at Q, so no visit of it
+# can be in flight and restore_loadgen recreates it; its output since LOADGEN_STARTED_AT, which
+# that recreate discards, is first kept in $RUN_DIR/at-start.log. Each Docker call has ended
+# within DOCKER_CALL_TIMEOUT_SECONDS (hard_timeout), and the log read within its probe_limit.
+recover_loadgen_in_place() {
+    local cid="$LOADGEN_CID_AT_START" state status paused rc=0
+    local expected="running"$'\t'"false"$'\t'"$LOADGEN_STARTED_AT"
+    local what="loadgen at start (container ${LOADGEN_CID_AT_START:0:12})"
+    local why="not recreated, since a visit of its workload may be in flight"
+    RECOVER_ERROR=""
+    state="$(loadgen_run_state "$cid")" || rc=$?
+    IFS=$'\t' read -r status paused _ <<<"$state"
+    if [[ $rc -eq 0 && "$paused" == "true" ]]; then
+        unpause_loadgen || rc=$?
+        if [[ $rc -ne 0 ]]; then
+            RECOVER_ERROR="$what left paused, $why: $(docker_problem "unpausing loadgen" "$rc" "$DOCKER_CALL_TIMEOUT_SECONDS")"
+            return 0
+        fi
+        state="$(loadgen_run_state "$cid")" || rc=$?
+        IFS=$'\t' read -r status paused _ <<<"$state"
+    fi
+    if [[ $rc -ne 0 ]]; then
+        RECOVER_ERROR="$what unverified, $why: $(docker_problem "reading its state" "$rc" "$DOCKER_CALL_TIMEOUT_SECONDS")"
+        return 0
+    fi
+    if [[ "$status" == "exited" || "$status" == "dead" ]]; then
+        if loadgen_logs "$LOADGEN_STARTED_AT" >"$RUN_DIR/at-start.final"; then
+            mv -f "$RUN_DIR/at-start.final" "$RUN_DIR/at-start.log"
+            info "cleanup: $what has ended (status $status), so no visit of its workload is in flight; its output since $LOADGEN_STARTED_AT is kept in $RUN_DIR/at-start.log before it is recreated"
+        else
+            info "cleanup: $what has ended (status $status), so no visit of its workload is in flight; its output since $LOADGEN_STARTED_AT could not be kept before it is recreated: $LOG_PROBE_DETAIL"
+        fi
+        return 1
+    fi
+    if [[ "$state" != "$expected" ]]; then
+        RECOVER_ERROR="$what is [$(run_state_text "$state")] instead of [$(run_state_text "$expected")] as at start, $why"
+    fi
+    return 0
 }
 
 # ---------------------------------------------------------------------------------------------
@@ -1980,10 +2911,60 @@ frozen_log() {
     done
 }
 
-# drain_call_limit DEADLINE: sets DRAIN_CALL_LIMIT to the seconds a Docker call of the run B drain
-# may take now, the smaller of DOCKER_CALL_TIMEOUT_SECONDS and the time left before DEADLINE
-# (epoch seconds). Fails when no time is left. It sets a variable rather than print, so the drain
-# starts no subshell for it.
+# quiescent_summary FILE: what run B's Q holds, for its DRAIN_DETAIL: the number of alerts FILE,
+# the frozen output, logged as created, all resolved, and no create in flight.
+quiescent_summary() {
+    echo "$(($(created_ids "$1" | wc -l))) created alerts, all resolved, and no create in flight"
+}
+
+# alert_visits_in_flight FILE: how many portfolio_insights_alert visits in FILE, told apart by
+# their [id:..] tag, are between opening the page or logging a create and their alert's outcome:
+# an alert deleted via ui or api, already absent or left in place, an unconfirmed create, a
+# no-create outcome (no instrument options, page unavailable, feature lost before submit) or a
+# visit error. A visit in that stretch may still send a create or a delete, which the flag
+# switched off would refuse. A visit that reached its outcome counts no more, whatever that was,
+# so an id an earlier visit left unresolved never holds the count up.
+alert_visits_in_flight() {
+    LC_ALL=C awk -v tag="[visit:$VISIT][id:" -v opening="$OPENING_LINE" -v created="$CREATED_MARKER" \
+        -v deleted="$DELETED_MARKER" -v absent="$ABSENT_TAIL" -v left="$LEFT_MARKER" \
+        -v unconfirmed="$UNCONFIRMED_MARKER" -v no_options="$NO_OPTIONS_LINE" \
+        -v page_unavailable="$PAGE_UNAVAILABLE_LINE" -v feature_lost="$FEATURE_LOST_LINE" \
+        -v visit_error="$ERROR_MARKER" '
+        index($0, tag) && match($0, /\[id:[^]]*\]/) {
+            id = substr($0, RSTART, RLENGTH)
+            if (index($0, opening) || index($0, created)) {
+                open[id] = 1
+            } else if (index($0, deleted) || index($0, absent) || index($0, left) ||
+                index($0, unconfirmed) || index($0, no_options) || index($0, page_unavailable) ||
+                index($0, feature_lost) || index($0, visit_error)) {
+                open[id] = 0
+            }
+        }
+        END { n = 0; for (id in open) if (open[id]) n++; print n }
+    ' "$1"
+}
+
+# at_start_settled FILE: whether no portfolio_insights_alert visit in FILE is in flight
+# (alert_visits_in_flight). Sets POLL_DETAIL when one is.
+at_start_settled() {
+    local in_flight
+    in_flight="$(alert_visits_in_flight "$1")"
+    if [[ "$in_flight" != "0" ]]; then
+        POLL_DETAIL="$in_flight $VISIT visits between opening the page or creating an alert and its outcome"
+        return 1
+    fi
+}
+
+# at_start_summary FILE: what the at-start drain's Q holds, for its DRAIN_DETAIL.
+# shellcheck disable=SC2329 # Invoked by drain_loadgen as secure_loadgen_at_start names it.
+at_start_summary() {
+    echo "no $VISIT visit in flight"
+}
+
+# drain_call_limit DEADLINE: sets DRAIN_CALL_LIMIT to the seconds a Docker call of a drain may
+# take now, the smaller of DOCKER_CALL_TIMEOUT_SECONDS and the time left before DEADLINE (epoch
+# seconds). Fails when no time is left. It sets a variable rather than print, so the drain starts
+# no subshell for it.
 drain_call_limit() {
     local left
     left=$(($1 - $(date -u +%s)))
@@ -1993,21 +2974,24 @@ drain_call_limit() {
     DRAIN_CALL_LIMIT=$((left < DOCKER_CALL_TIMEOUT_SECONDS ? left : DOCKER_CALL_TIMEOUT_SECONDS))
 }
 
-# drain_loadgen: ends run B at an instant Q after which loadgen neither logs nor acts. Every
-# QUIESCE_STEP_SECONDS until the QUIESCE_TIMEOUT_SECONDS deadline, it checks loadgen's running
-# output with quiescent. Once that holds, it pauses loadgen and checks the settled frozen output
-# again, since a visit may have opened the page or created an alert after the running read. When
-# that holds too, it kills the paused loadgen, and that is Q; otherwise it unpauses loadgen and
-# polls on. Returns 0 at Q and 1 when the deadline passes or Compose fails, with DRAIN_DETAIL
-# describing the outcome; loadgen may then still run or be paused, for close_window to stop
-# under its own bound. The deadline holds for every step: the log reads take at most the time
-# left, each pause, unpause and kill the smaller of that and DOCKER_CALL_TIMEOUT_SECONDS
+# drain_loadgen [SETTLED [SUMMARY]]: ends loadgen's output at an instant Q after which loadgen
+# neither logs nor acts, by default for run B. SETTLED FILE (default quiescent) tells whether
+# loadgen's output FILE is settled, setting POLL_DETAIL when not, and SUMMARY FILE (default
+# quiescent_summary) prints what the frozen output FILE holds at Q. Every QUIESCE_STEP_SECONDS
+# until the QUIESCE_TIMEOUT_SECONDS deadline, it checks loadgen's running output with SETTLED.
+# Once that holds, it pauses loadgen and checks the settled frozen output again, since a visit
+# may have opened the page or created an alert after the running read. When that holds too, it
+# kills the paused loadgen, and that is Q; otherwise it unpauses loadgen and polls on. Returns 0
+# at Q and 1 when the deadline passes or Compose fails, with DRAIN_DETAIL describing the outcome;
+# loadgen may then still run, be paused, or have been killed past the deadline, for its caller to
+# handle under its own bound. The deadline holds for every step: the log reads take at most the
+# time left, each pause, unpause and kill the smaller of that and DOCKER_CALL_TIMEOUT_SECONDS
 # (drain_call_limit), a step due with no time left is not started, and a kill seen to end in the
 # deadline's second or later is no Q: on the whole-second clock only a kill seen before that
 # second ended within QUIESCE_TIMEOUT_SECONDS of the drain's start. DRAIN_DETAIL tells a call
 # Docker did not answer within its limit from one that failed.
 drain_loadgen() {
-    local deadline rc now late
+    local settled="${1:-quiescent}" summary="${2:-quiescent_summary}" deadline rc now late
     DRAIN_DETAIL=""
     deadline=$(($(date -u +%s) + QUIESCE_TIMEOUT_SECONDS))
     # The log reads of the drain see this deadline, local to this call, so the closing read of
@@ -2018,7 +3002,7 @@ drain_loadgen() {
         rc=0
         if ! read_window "$RUN_DIR/quiesce.log"; then
             DRAIN_DETAIL="$LOG_PROBE_DETAIL"
-        elif ! quiescent "$RUN_DIR/quiesce.log"; then
+        elif ! "$settled" "$RUN_DIR/quiesce.log"; then
             DRAIN_DETAIL="$POLL_DETAIL"
         else
             if ! drain_call_limit "$deadline"; then
@@ -2030,7 +3014,7 @@ drain_loadgen() {
                 DRAIN_DETAIL="$(docker_problem "pausing loadgen" "$rc" "$DRAIN_CALL_LIMIT")"
                 return 1
             fi
-            if frozen_log && quiescent "$RUN_DIR/frozen.log"; then
+            if frozen_log && "$settled" "$RUN_DIR/frozen.log"; then
                 if ! drain_call_limit "$deadline"; then
                     DRAIN_DETAIL="drain deadline of $QUIESCE_TIMEOUT_SECONDS s reached before killing the paused loadgen"
                     return 1
@@ -2049,7 +3033,7 @@ drain_loadgen() {
                     DRAIN_DETAIL="paused loadgen killed at or after the drain deadline of $QUIESCE_TIMEOUT_SECONDS s$late, so no Q"
                     return 1
                 fi
-                DRAIN_DETAIL="Q at $(now_rfc3339) with $(($(created_ids "$RUN_DIR/frozen.log" | wc -l))) created alerts, all resolved, and no create in flight; loadgen killed while paused"
+                DRAIN_DETAIL="Q at $(now_rfc3339) with $("$summary" "$RUN_DIR/frozen.log"); loadgen killed while paused"
                 return 0
             fi
             DRAIN_DETAIL="paused: $POLL_DETAIL"
@@ -2469,6 +3453,14 @@ cleanup() {
     local rc=$? remaining problems="" stopped closed
     trap - EXIT
     set +e
+    # An exit or a signal inside a call with its output redirected, as read_window's log read into
+    # a file, runs this trap with that redirection still in force. The run's own stdout and
+    # stderr, which install_cleanup kept, are put back first, so every line below reaches them.
+    # Without those copies, as when a suite calls cleanup directly, it writes to the stdout and
+    # stderr it has.
+    if [[ -n "${RUN_STDOUT_FD:-}" && -n "${RUN_STDERR_FD:-}" ]]; then
+        exec 1>&"$RUN_STDOUT_FD" 2>&"$RUN_STDERR_FD"
+    fi
     # An exit inside a poll, the quiescence wait or the progress watch leaves that wait's deadline
     # in scope here, so the closing log read below would inherit it; cleanup reads with the fixed
     # bound instead. Every Docker call below has a hard limit, so none can hold the exit.
@@ -2506,12 +3498,19 @@ cleanup() {
         problems="${problems:+$problems; }owned-alert lists of the run dir could not be read or written, owned alerts not deleted"
         info "cleanup: to delete the owned alerts left, and only those, run: $(resume_command)"
     elif [[ "$remaining" -gt 0 ]]; then
-        # DELETE answers 403 while the flag is off, so the flag is switched on to delete.
+        # DELETE answers 403 while the flag is off, so the flag is switched on to delete. Only a
+        # reply that is the flag (flag_reply) shows it off; after any other reply, or a switch the
+        # PUT and its read-back do not confirm, the deletes still run and report their statuses.
         http GET "$FLAG_URL"
-        if [[ "$HTTP_STATUS" == "200" && "$(jget '.enabled' "$HTTP_BODY")" == "false" ]]; then
+        if ! flag_answered "GET $FLAG_ID"; then
+            info "cleanup: flag $FLAG_ID not read before deleting $remaining owned alerts: $FLAG_REASON"
+        elif [[ "$FLAG_ENABLED" == "false" ]]; then
             FLAG_TOUCHED=1
-            http PUT "$FLAG_URL" '{"enabled": true}'
-            info "cleanup: flag $FLAG_ID switched on to delete $remaining owned alerts ($(status_text))"
+            if put_flag true; then
+                info "cleanup: flag $FLAG_ID switched on to delete $remaining owned alerts (status 200)"
+            else
+                info "cleanup: flag $FLAG_ID not confirmed switched on to delete $remaining owned alerts: $FLAG_REASON"
+            fi
         fi
         delete_remaining "$remaining"
         info "cleanup: $((remaining - CLEANUP_LEFT)) of $remaining owned alerts deleted or already absent"
@@ -2524,18 +3523,45 @@ cleanup() {
         fi
     fi
     if [[ $FLAG_TOUCHED -eq 1 && -n "$FLAG_INITIAL" ]]; then
-        http PUT "$FLAG_URL" "{\"enabled\": $FLAG_INITIAL}"
-        if [[ "$HTTP_STATUS" == "200" && "$(jget '.enabled' "$HTTP_BODY")" == "$FLAG_INITIAL" ]]; then
+        # Restored only when the PUT and the read-back both give the flag at its value at start.
+        if put_flag "$FLAG_INITIAL"; then
             info "cleanup: flag $FLAG_ID restored to enabled=$FLAG_INITIAL"
         else
-            problems="${problems:+$problems; }flag $FLAG_ID not restored to enabled=$FLAG_INITIAL: $(status_text)"
+            problems="${problems:+$problems; }flag $FLAG_ID not restored to enabled=$FLAG_INITIAL: $FLAG_REASON"
         fi
     fi
     if [[ $LOADGEN_TOUCHED -eq 1 ]]; then
-        if restore_loadgen; then
-            info "cleanup: loadgen restored as at start: $(loadgen_state_text "$LOADGEN_AT_START")"
+        # Short of the at-start drain's Q, the container found at start is put back in place and
+        # never recreated; recover_loadgen_in_place hands it to the restore once it has ended.
+        if [[ $AT_START_DRAINING -eq 1 ]] && recover_loadgen_in_place; then
+            if [[ -n "$RECOVER_ERROR" ]]; then
+                problems="${problems:+$problems; }$RECOVER_ERROR"
+            else
+                info "cleanup: loadgen at start recovered in place: running as at start (container ${LOADGEN_CID_AT_START:0:12}), not recreated"
+            fi
+        elif restore_loadgen; then
+            info "cleanup: loadgen restored as at start: $(loadgen_start_text)"
         else
             problems="${problems:+$problems; }loadgen not restored: $RESTORE_ERROR"
+        fi
+    fi
+    # A twin loadgen container the restorability check made and did not see removed, as when an
+    # exit cut its create short: removed before the lock goes, since every later read of loadgen
+    # takes the project's first loadgen container.
+    if [[ -n "$LOADGEN_TWIN" ]]; then
+        if remove_loadgen_twin; then
+            info "cleanup: ${TWIN_REMOVED:+twin loadgen container $TWIN_REMOVED removed; }no twin loadgen container is left"
+        else
+            problems="${problems:+$problems; }twin loadgen container not removed: $TWIN_ERROR"
+        fi
+    fi
+    # Last, with the flag and loadgen put back: the lock this run took. A run refused at the lock
+    # holds none, so it never removes the lock of the run it found.
+    if [[ $LOCK_HELD -eq 1 ]]; then
+        if release_run_lock; then
+            info "cleanup: run lock $LOCK_DIR released"
+        else
+            problems="${problems:+$problems; }run lock not released: $LOCK_ERROR"
         fi
     fi
     # A check of its own, as in perf.sh and e2e.sh: an alert left behind, a flag left changed or
@@ -2551,6 +3577,20 @@ cleanup() {
         rc=1
     fi
     exit "$rc"
+}
+
+# install_cleanup: keeps copies of the run's stdout and stderr in RUN_STDOUT_FD and RUN_STDERR_FD
+# for cleanup to put back, then runs cleanup on EXIT and turns INT and TERM into exit 130, which
+# runs it too. Child processes inherit the copies as they inherit stdout and stderr, and the run
+# starts none in the background, so no copy holds the run's output open once it has exited. When
+# the copies cannot be made, as with stdout closed, the run ends with exit 2 before any change.
+install_cleanup() {
+    if ! exec {RUN_STDOUT_FD}>&1 {RUN_STDERR_FD}>&2; then
+        echo "Could not keep copies of stdout and stderr for the cleanup report." >&2
+        exit 2
+    fi
+    trap cleanup EXIT
+    trap 'exit 130' INT TERM
 }
 
 # ---------------------------------------------------------------------------------------------
@@ -2661,33 +3701,53 @@ resume_origin_bound() {
     info "resume: --base-url reaches reverse-proxy of project [$PROJECT], port 80 published at $published"
 }
 
+# resume_exit: the EXIT trap of a --resume-cleanup run from its run lock until cleanup takes
+# over, which runs when the lock is refused, the flag read fails or an interrupt lands. Nothing
+# has been deleted and the flag not switched by then, so it only releases the lock when this run
+# holds it, failing the cleanup check when that fails, and prints the SUMMARY line.
+# shellcheck disable=SC2329 # Invoked by the EXIT trap resume_cleanup sets.
+resume_exit() {
+    local rc=$?
+    trap - EXIT
+    set +e
+    if [[ $LOCK_HELD -eq 1 ]]; then
+        if release_run_lock; then
+            info "cleanup: run lock $LOCK_DIR released"
+        else
+            fail "cleanup" "run lock not released: $LOCK_ERROR"
+        fi
+    fi
+    echo "SUMMARY $passed passed, $failed failed"
+    if [[ $rc -eq 0 && $failed -gt 0 ]]; then
+        rc=1
+    fi
+    exit "$rc"
+}
+
 # resume_cleanup: the --resume-cleanup run. It checks that --base-url is the origin of --project
-# (resume_origin_bound) and reads the flag, then ends through cleanup, which DELETEs by id the
-# owned ids of the run directory no earlier cleanup deleted, switching the flag on to delete while
-# it is off and restoring it after, and appends each id deleted or found absent to the deleted
-# list, so a later resume goes on from there. It sends no POST, deletes nothing by account,
-# touches no loadgen, opens no window and writes no table.
+# (resume_origin_bound), takes the project's run lock (acquire_run_lock), since a resume
+# alongside a run or another resume on the project would toggle the same flag and could take the
+# other's test value for the one to restore, and reads the flag, then ends through cleanup, which
+# DELETEs by id the owned ids of the run directory no earlier cleanup deleted, switching the flag
+# on to delete while it is off and restoring it after, appends each id deleted or found absent to
+# the deleted list, so a later resume goes on from there, and releases the lock. Until cleanup
+# takes over, resume_exit releases it. It sends no POST, deletes nothing by account, touches no
+# loadgen, opens no window and writes no table.
 resume_cleanup() {
-    local enabled remaining
+    local remaining
     trap 'exit 130' INT TERM
     info "run dir $RUN_DIR"
     info "resuming the owned-alert cleanup of project [$PROJECT], base url $BASE_URL"
     resume_origin_bound
+    trap resume_exit EXIT
+    acquire_run_lock
     http GET "$FLAG_URL"
-    enabled="$(jq -r --arg id "$FLAG_ID" \
-        'if type == "object" and .id == $id and (.enabled | type) == "boolean" then .enabled
-        else "invalid" end' <<<"$HTTP_BODY" 2>/dev/null | tr -d '\r')" || enabled=""
-    # Without the flag's value cleanup could not restore it, so nothing is deleted.
-    if [[ "$HTTP_STATUS" != "200" ]]; then
-        fail "resume flag" "GET $FLAG_ID gave $(status_text); nothing was deleted"
-    elif [[ "$enabled" != "true" && "$enabled" != "false" ]]; then
-        fail "resume flag" "GET $FLAG_ID answered without its id and a boolean enabled; nothing was deleted"
+    # Only a reply that is the flag (flag_reply) gives the value cleanup restores, so without one
+    # nothing is deleted; the failure names the broken rule, never the reply's content.
+    if ! flag_answered "GET $FLAG_ID"; then
+        abort "resume flag" "$FLAG_REASON; nothing was deleted"
     fi
-    if [[ $failed -gt 0 ]]; then
-        echo "SUMMARY $passed passed, $failed failed"
-        exit 1
-    fi
-    FLAG_INITIAL="$enabled"
+    FLAG_INITIAL="$FLAG_ENABLED"
     pass "resume flag: enabled=$FLAG_INITIAL"
     # Without a count nothing is printed for it; cleanup then fails on the same lists.
     if remaining="$(remaining_owned)"; then
@@ -2730,7 +3790,27 @@ main() {
     LOADGEN_WAS_RUNNING=0
     LOADGEN_TOUCHED=0
     LOADGEN_AT_START=""
+    # The image ID, config hash and effective configuration file restore_loadgen verifies, and
+    # the time loadgen's container at start last started, all set by check_loadgen_restorable.
+    LOADGEN_IMAGE_AT_START=""
+    LOADGEN_HASH_AT_START=""
+    LOADGEN_CONFIG_AT_START=""
+    LOADGEN_STARTED_AT=""
     RESTORE_ERROR=""
+    # The container ID check_loadgen_restorable read for loadgen at start, the twin it compares
+    # with while one may exist (its ID, or unknown before it is read), and remove_loadgen_twin's
+    # and loadgen_twin_check's outcomes.
+    LOADGEN_ID_AT_START=""
+    LOADGEN_TWIN=""
+    TWIN_ERROR=""
+    TWIN_REMOVED=""
+    TWIN_DETAIL=""
+    # The ID of loadgen's container at start, 1 while the at-start drain holds it short of Q, and
+    # why cleanup could not recover it in place (record_loadgen_cid_at_start,
+    # recover_loadgen_in_place).
+    LOADGEN_CID_AT_START=""
+    AT_START_DRAINING=0
+    RECOVER_ERROR=""
     DIALECT=""
     WINDOW_OPEN=0
     WINDOW_UNREAD=0
@@ -2743,15 +3823,20 @@ main() {
     PROBE_DEADLINE=""
     LOG_PROBE_DETAIL=""
     STARTED_AT="$(now_rfc3339)"
+    # The per-project run lock under LOCK_ROOT (acquire_run_lock).
+    LOCK_DIR=""
+    LOCK_HELD=0
+    LOCK_ERROR=""
 
+    # A resume ends inside resume_cleanup, through its own exit steps or cleanup.
     if [[ -n "$RESUME_RUN_DIR" ]]; then
         resume_cleanup
     fi
-    trap cleanup EXIT
-    trap 'exit 130' INT TERM
+    install_cleanup
     info "run dir $RUN_DIR"
     info "started $STARTED_AT: project [$PROJECT], base url $BASE_URL, compose files [${COMPOSE_FILES[*]}], weight $WEIGHT, runs of $MINUTES minutes, table $OUT_FILE"
     setup
+    secure_loadgen_at_start
     run_a
     run_b
     flag_off_window
